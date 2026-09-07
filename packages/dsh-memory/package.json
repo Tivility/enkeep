@@ -1,0 +1,47 @@
+{
+  "name": "@enkeep/dsh-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./invariant": {
+      "types": "./src/invariant.ts",
+      "import": "./dist/invariant.js",
+      "default": "./dist/invariant.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-system-prompt": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-user-approval": "0.1.2-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "@enkeep/protocol": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-agent-loop": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.1.2-rc.1",
+    "@enkeep/dsh-platform-client": "workspace:*",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.8"
+  }
+}

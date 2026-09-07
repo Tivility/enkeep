@@ -1,0 +1,72 @@
+# The Enkeep profile bundle patch:
+# Complete runtime orchestration inserting core persistence, inbound dispatch,
+# event relay, tools, external interaction, and affinity routing.
+
+- insert:
+    # ── 1. Enkeep SQLite Receipt Store (State & Deduplication) ────────────────
+    # Persists deliveryId -> messageId, session sources, and event cursors in volume storage.
+    - id: receipt-store
+      name: '@enkeep/dsh-receipt-store-sqlite'
+      config:
+        path: data/receipts.db
+        busyTimeoutMs: 5000
+
+    # ── 2. Enkeep Inbound Dispatch ───────────────────────────────────────────
+    # Dispatches platform transport requests (followup/cancel) with receipt verification.
+    - id: inbound
+      name: '@enkeep/dsh-inbound'
+      config:
+        defaultTarget: followup
+
+    # ── 3. Enkeep Event Relay ────────────────────────────────────────────────
+    # Listens to session/event and provides per-session buffered polling and cursor ack.
+    - id: event-relay
+      name: '@enkeep/dsh-event-relay'
+      config:
+        maxBufferSize: 1000
+
+    # ── 4. Enkeep Tool Suite ─────────────────────────────────────────────────
+    # Registers send_platform_message, send_file, create_task, and check_quota tools with sandbox checks.
+    - id: enkeep-tools
+      name: '@enkeep/dsh-tools'
+      config:
+        maxFileSizeBytes: 10485760 # 10MB
+
+    # ── 5. Enkeep External Interaction ───────────────────────────────────────
+    # Suspends approval and question requests for source=external/im sessions.
+    # Yields web sessions to DSH built-in handlers. Does NOT start an HTTP server.
+    - id: enkeep-external-interaction
+      name: '@enkeep/dsh-external-interaction'
+      config:
+        defaultTimeoutMs: 60000
+
+    # ── 6. Enkeep Affinity Policy (Fail-Loud Verification) ────────────────────
+    # Strictly validates sessionId presence on llm/stream requests without mutating payload.
+    - id: enkeep-affinity-policy
+      name: '@enkeep/dsh-affinity-policy'
+      config:
+        strict: true
+        exemptAuxiliary: false
+
+    # ── 7. Upstream Transport Wire Affinity ──────────────────────────────────
+    # Reuses @tivility/dsh-llm-affinity to inject X-Session-ID header on outgoing HTTP calls.
+    - id: llm-affinity
+      name: '@tivility/dsh-llm-affinity'
+      config:
+        header: X-Session-ID
+
+    # ── 8. Enkeep Browser Automation Tool Suite ─────────────────────────────
+    # Registers browser_open, browser_snapshot, browser_interact, browser_screenshot, browser_close tools.
+    - id: browser-tools
+      name: '@enkeep/dsh-tool-browser'
+      config:
+        maxSnapshotLength: 65536
+        defaultTimeoutMs: 30000
+
+    # ── 9. Enkeep MCP Governance & Tool Dynamic Mounting ────────────────────
+    # Mounts McpGovernanceService on ctx.mcpGovernance and provides dynamic per-agent tool registration.
+    - id: mcp-governance
+      name: '@enkeep/dsh-mcp-governance'
+      config:
+        defaultTimeoutMs: 60000
+        maxInlineBytes: 65536

@@ -1,0 +1,1125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Enkeep Web Console</title>
+  <script src="/static/theme-bootstrap.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Toast Notification System -->
+  <div id="toast-container" role="status" aria-live="polite"></div>
+
+  <!-- Authentication View -->
+  <div id="auth-view" class="auth-container">
+    <div class="auth-card">
+      <div class="auth-header-row">
+        <div class="auth-brand">
+          <span class="brand-icon">⚡</span>
+          <h1 data-i18n="auth.brandTitle">Enkeep Web</h1>
+        </div>
+        <div class="auth-controls-wrapper flex-row-center">
+          <div class="auth-theme-wrapper">
+            <select id="auth-theme-select" class="form-select theme-select-control" aria-label="Select Theme" data-i18n-aria-label="common.selectTheme">
+              <option value="dark" data-i18n="theme.dark">Dark</option>
+              <option value="light" data-i18n="theme.light">Light</option>
+              <option value="eye-care" data-i18n="theme.eyeCare">Eye-care</option>
+            </select>
+          </div>
+          <div class="auth-locale-wrapper">
+            <select id="auth-locale-select" class="form-select locale-select-control" aria-label="Select Language" data-i18n-aria-label="common.selectLanguage">
+              <option value="en">English</option>
+              <option value="zh-CN">简体中文</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <p class="subtitle" data-i18n="auth.signInSubtitle">Sign in to your workspace</p>
+      <form id="login-form">
+        <div class="form-group">
+          <label for="login-username" data-i18n="auth.usernameLabel">Username</label>
+          <input type="text" id="login-username" class="form-input" required autocomplete="username" placeholder="e.g. alice or bob" data-i18n-placeholder="auth.usernamePlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="login-password" data-i18n="auth.passwordLabel">Password</label>
+          <input type="password" id="login-password" class="form-input" required autocomplete="current-password" placeholder="••••••••" data-i18n-placeholder="auth.passwordPlaceholder">
+        </div>
+        <button type="submit" id="btn-login-submit" class="btn btn-primary btn-block" data-i18n="auth.signInButton">Sign In</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Forced Password Change View -->
+  <div id="forced-password-view" class="auth-container hidden" role="region" aria-labelledby="forced-password-title">
+    <div class="auth-card">
+      <div class="auth-header-row">
+        <div class="auth-brand">
+          <span class="brand-icon">🔒</span>
+          <h1 id="forced-password-title" data-i18n="forcedPassword.title">Password Change Required</h1>
+        </div>
+        <div class="auth-controls-wrapper flex-row-center">
+          <div class="auth-theme-wrapper">
+            <select id="forced-password-theme-select" class="form-select theme-select-control" aria-label="Select Theme" data-i18n-aria-label="common.selectTheme">
+              <option value="dark" data-i18n="theme.dark">Dark</option>
+              <option value="light" data-i18n="theme.light">Light</option>
+              <option value="eye-care" data-i18n="theme.eyeCare">Eye-care</option>
+            </select>
+          </div>
+          <div class="auth-locale-wrapper">
+            <select id="forced-password-locale-select" class="form-select locale-select-control" aria-label="Select Language" data-i18n-aria-label="common.selectLanguage">
+              <option value="en">English</option>
+              <option value="zh-CN">简体中文</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <p class="subtitle" data-i18n="forcedPassword.subtitle">Your account is using a temporary password. Please set a permanent password to continue.</p>
+      <form id="forced-password-form">
+        <div class="form-group">
+          <label for="forced-current-password" data-i18n="forcedPassword.currentPasswordLabel">Current Temporary Password *</label>
+          <input type="password" id="forced-current-password" class="form-input" required autocomplete="current-password" placeholder="••••••••" data-i18n-placeholder="forcedPassword.currentPasswordPlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="forced-new-password" data-i18n="forcedPassword.newPasswordLabel">New Password *</label>
+          <input type="password" id="forced-new-password" class="form-input" required autocomplete="new-password" minlength="8" placeholder="••••••••" data-i18n-placeholder="forcedPassword.newPasswordPlaceholder">
+          <small class="form-help" data-i18n="forcedPassword.passwordHelp">Minimum 8 characters.</small>
+        </div>
+        <div class="form-group">
+          <label for="forced-confirm-password" data-i18n="forcedPassword.confirmPasswordLabel">Confirm New Password *</label>
+          <input type="password" id="forced-confirm-password" class="form-input" required autocomplete="new-password" minlength="8" placeholder="••••••••" data-i18n-placeholder="forcedPassword.confirmPasswordPlaceholder">
+        </div>
+        <button type="submit" id="btn-forced-password-submit" class="btn btn-primary btn-block" data-i18n="forcedPassword.submitButton">Update Password & Continue</button>
+        <button type="button" id="btn-forced-password-logout" class="btn btn-secondary btn-block mt-sm" data-i18n="auth.signOut">Sign Out</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main Application Management Console View -->
+  <div id="app-view" class="app-layout hidden">
+    <!-- Top Application Bar -->
+    <header class="app-topbar">
+      <div class="topbar-left">
+        <div class="brand-badge">
+          <span class="brand-glyph">⚡</span>
+          <span class="brand-title" data-i18n="common.consoleTitle">Enkeep Console</span>
+        </div>
+        <div class="nav-breadcrumbs" id="topbar-breadcrumb">
+          <span class="breadcrumb-root" data-i18n="common.appName">Enkeep</span>
+          <span class="breadcrumb-separator">/</span>
+          <span id="active-view-label" class="breadcrumb-current">Workspace</span>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="theme-select-wrapper">
+          <select id="theme-select" class="form-select theme-select-control" aria-label="Select Theme" data-i18n-aria-label="common.selectTheme">
+            <option value="dark" data-i18n="theme.dark">Dark</option>
+            <option value="light" data-i18n="theme.light">Light</option>
+            <option value="eye-care" data-i18n="theme.eyeCare">Eye-care</option>
+          </select>
+        </div>
+        <div class="locale-select-wrapper">
+          <select id="locale-select" class="form-select locale-select-control" aria-label="Select Language" data-i18n-aria-label="common.selectLanguage">
+            <option value="en">English</option>
+            <option value="zh-CN">简体中文</option>
+          </select>
+        </div>
+        <div class="user-profile-badge">
+          <span class="user-status-dot"></span>
+          <span id="user-display-name" class="user-name">User</span>
+          <span id="user-role-badge" class="badge badge-role">Member</span>
+        </div>
+        <button id="btn-logout" class="btn btn-danger btn-sm" title="Sign out of console" data-i18n-title="auth.signOutTitle" data-i18n="auth.signOut">Sign Out</button>
+      </div>
+    </header>
+
+    <!-- Console Main Workspace & Navigation Grid -->
+    <div class="app-body">
+      <!-- Left Navigation Bar -->
+      <nav id="management-nav" class="management-nav" aria-label="Console Navigation">
+        <div class="nav-group">
+          <a href="#workspace" id="nav-workspace" class="nav-item active" data-view="workspace">
+            <span class="nav-label" data-i18n="chat.navLabel">Chat</span>
+          </a>
+          <a href="#management" id="nav-management" class="nav-item" data-view="management">
+            <span class="nav-label" data-i18n="management.navLabel">Management</span>
+          </a>
+        </div>
+
+        <div class="nav-footer">
+          <a href="#management/users/account" id="nav-account" class="nav-item" data-view="account">
+            <span class="nav-label" data-i18n="account.navLabel">Account</span>
+          </a>
+          <button id="btn-nav-logout" class="btn btn-danger btn-sm btn-block" title="Sign out of console" data-i18n-title="auth.signOutTitle" data-i18n="auth.signOut">Sign Out</button>
+        </div>
+      </nav>
+
+      <!-- View Containers -->
+      <main class="management-main" id="main-content-area">
+        <!-- 1. Workspace / Chat View Panel -->
+        <div id="view-workspace" class="workspace-layout">
+          <!-- Sidebar: Spaces and Sessions -->
+          <aside id="workspace-sidebar" class="workspace-sidebar">
+            <div class="sidebar-header">
+              <div class="sidebar-title-row">
+                <h2 data-i18n="chat.spacesHeader">Spaces</h2>
+                <button id="btn-new-space" class="btn btn-secondary btn-xs" title="Create a new space" data-i18n-title="chat.newSpaceTitle" data-i18n="chat.newSpace">+ Space</button>
+              </div>
+              <div class="space-select-wrapper">
+                <select id="space-select" class="form-select" aria-label="Select active workspace space" data-i18n-aria-label="chat.selectSpaceAria"></select>
+                <span id="space-mode-badge" class="badge badge-info space-mode-badge hidden">Docker</span>
+              </div>
+              <div class="space-actions-row">
+                <button id="btn-rename-space" class="btn btn-secondary btn-xs" title="Rename current space" data-i18n-title="chat.renameSpaceTitle" data-i18n="chat.renameSpace">Rename</button>
+                <button id="btn-manage-mounts" class="btn btn-secondary btn-xs hidden" title="Manage Controlled Mounts" data-i18n-title="chat.mountsTitle" data-i18n="chat.mounts">Mounts</button>
+                <button id="btn-archive-space" class="btn btn-danger btn-xs" title="Archive current space" data-i18n-title="chat.archiveSpaceTitle" data-i18n="chat.archiveSpace">Archive</button>
+                <button id="btn-restore-space" class="btn btn-success btn-xs hidden" title="Restore current space" data-i18n-title="chat.restoreSpaceTitle" data-i18n="chat.restoreSpace">Restore</button>
+              </div>
+            </div>
+
+            <div class="sidebar-section">
+              <div class="sidebar-title-row">
+                <h3 data-i18n="chat.sessionsHeader">Sessions</h3>
+                <div class="sidebar-section-actions">
+                  <button id="btn-toggle-archived-sessions" class="btn btn-secondary btn-xs" title="Toggle archived sessions" data-i18n-title="chat.showArchived" data-i18n="chat.showArchived">Archived</button>
+                  <button id="btn-refresh-sessions" class="btn btn-secondary btn-xs" title="Refresh sessions" data-i18n-title="chat.refreshSessionsTitle">↻</button>
+                  <button id="btn-new-session" class="btn btn-primary btn-xs" title="Create a new chat session" data-i18n-title="chat.newSessionTitle" data-i18n="chat.newSession">+ Session</button>
+                </div>
+              </div>
+              <div class="session-search-wrapper">
+                <input type="search" id="session-search-input" class="form-input session-search-input" placeholder="Search sessions..." data-i18n-placeholder="chat.searchSessionsPlaceholder" aria-label="Search sessions" data-i18n-aria-label="chat.searchSessionsAria">
+              </div>
+              <div id="session-list" class="session-list" role="list"></div>
+            </div>
+
+            <div class="sidebar-footer">
+              <div class="sidebar-status-box">
+                <div class="status-indicator">
+                  <span class="status-dot"></span>
+                  <span id="polling-badge" class="badge badge-active" data-i18n="chat.liveSync">Live Sync</span>
+                </div>
+                <span id="tenant-indicator" class="session-meta"></span>
+              </div>
+            </div>
+          </aside>
+
+          <!-- Chat Area -->
+          <section class="chat-layout">
+            <header class="chat-header">
+              <div class="chat-header-info">
+                <div class="chat-title-group">
+                  <button id="btn-toggle-sidebar" class="btn btn-secondary btn-xs sidebar-toggle-btn" title="Toggle sidebar" data-i18n-title="chat.toggleSidebarTitle" aria-label="Toggle workspace sidebar" data-i18n-aria-label="chat.toggleSidebarAria">☰</button>
+                  <h3 id="current-session-title" data-i18n="chat.noSessionSelected">Select or create a session</h3>
+                  <span id="session-status-badge" class="badge badge-active hidden" data-i18n="chat.statusActive">active</span>
+                  <span id="session-generation-badge" class="badge badge-generation hidden">Gen 1</span>
+                  <span id="session-turn-status-badge" class="badge badge-running hidden" data-i18n="chat.statusThinking">Thinking...</span>
+                  <span id="session-model-badge" class="badge badge-info hidden" title="Current effective model" data-i18n-title="models.kpiRouting">⚡ Model</span>
+                </div>
+                <span id="current-session-meta" class="session-meta">Active Session: -</span>
+              </div>
+              <div class="chat-header-actions">
+                <button id="btn-chat-approvals" class="btn btn-warning btn-sm hidden" title="Inspect pending tool execution approvals" data-i18n-title="approvals.title" data-i18n="approvals.headerPendingCount">⚠️ Approvals</button>
+                <button id="btn-refresh-session" class="btn btn-secondary btn-sm" title="Refresh session messages" data-i18n-title="chat.refreshMessagesTitle" data-i18n="chat.refreshMessages">↻ Refresh</button>
+                <button id="btn-fork-session" class="btn btn-secondary btn-sm hidden" title="Fork session from current history" data-i18n-title="chat.forkSessionTitle" data-i18n="chat.forkSession">🍴 Fork</button>
+                <button id="btn-inspect-turns" class="btn btn-secondary btn-sm hidden" title="Inspect session turns history" data-i18n-title="chat.inspectTurnsTitle" data-i18n="chat.inspectTurns">🔍 Turns</button>
+                <button id="btn-session-generations" class="btn btn-secondary btn-sm hidden" title="Inspect session generation lifecycle history" data-i18n-title="chat.inspectGenerationsTitle" data-i18n="chat.inspectGenerations">📜 Generations</button>
+                <button id="btn-reset-session" class="btn btn-warning btn-sm hidden" title="Reset session context to start Generation N+1" data-i18n-title="chat.resetGenTitle" data-i18n="chat.resetGen">🔄 Reset Gen</button>
+                <button id="btn-rename-session" class="btn btn-secondary btn-sm hidden" title="Rename current session" data-i18n-title="chat.renameSessionTitle" data-i18n="chat.renameSession">✎ Rename</button>
+                <button id="btn-archive-session" class="btn btn-danger btn-sm hidden" title="Archive current session (Read-Only)" data-i18n-title="chat.archiveSessionTitle" data-i18n="chat.archiveSession">📦 Archive</button>
+                <button id="btn-restore-session" class="btn btn-success btn-sm hidden" title="Restore current archived session" data-i18n-title="chat.restoreSessionTitle" data-i18n="chat.restoreSession">♻️ Restore</button>
+                <button id="btn-stop-turn" class="btn btn-danger btn-sm hidden" title="Stop current active turn" data-i18n-title="chat.stopTurnTitle" data-i18n="chat.stopTurn">⏹ Stop Turn</button>
+              </div>
+            </header>
+
+            <div id="messages-container" class="chat-messages" role="log" aria-live="polite">
+              <div class="empty-chat">
+                <h3 data-i18n="chat.emptyTitle">No active session</h3>
+                <p data-i18n="chat.emptySubtitle">Select an existing session from the sidebar or create a new one to start collaborating.</p>
+              </div>
+            </div>
+
+            <footer class="chat-composer">
+              <div id="composer-reply-banner" class="composer-reply-banner hidden" role="region" aria-label="Reply context"></div>
+              <div id="composer-attachment-tray" class="composer-attachment-tray hidden" role="region" aria-label="Attached files" data-i18n-aria-label="chat.attachmentsTrayAria"></div>
+              <div class="composer-box" id="composer-box">
+                <textarea id="chat-input" class="chat-textarea" placeholder="Type a message or instruction for Enkeep agent..." data-i18n-placeholder="chat.inputPlaceholder" rows="2" disabled></textarea>
+                <div class="composer-controls">
+                  <div class="composer-controls-left">
+                    <div class="attach-dropdown-container">
+                      <button type="button" id="btn-attach" class="btn btn-secondary btn-sm btn-icon attach-btn" title="Attach files from workspace or upload" data-i18n-title="chat.attachTitle" aria-label="Attach files from workspace or upload" data-i18n-aria-label="chat.attachTitle" aria-expanded="false" aria-haspopup="true" disabled>📎</button>
+                      <input type="file" id="chat-file-input" class="visually-hidden" multiple tabindex="-1">
+                      <div id="attach-menu" class="attach-menu hidden" role="menu" aria-label="Attach file options">
+                        <button type="button" id="btn-attach-local" class="attach-menu-item" role="menuitem" data-i18n="chat.attachLocal">Upload from Computer</button>
+                        <button type="button" id="btn-attach-workspace" class="attach-menu-item" role="menuitem" data-i18n="chat.attachWorkspace">Browse Workspace Files</button>
+                      </div>
+                    </div>
+                    <div class="composer-meta">
+                      <span id="chat-char-count" class="composer-char-count">0 / 4000</span>
+                      <span class="composer-hint text-muted" data-i18n="chat.composerHint">Press Enter to send, Shift+Enter for new line</span>
+                    </div>
+                  </div>
+                  <button id="btn-send-message" class="btn btn-primary btn-send" disabled data-i18n="chat.send">Send</button>
+                </div>
+              </div>
+            </footer>
+          </section>
+        </div>
+
+        <!-- 2. Management / Admin Console View Panel -->
+        <div id="view-management" class="management-layout hidden">
+          <div id="management-content" class="management-content">
+            <div id="management-tabs-bar" class="management-tabs flex-row-wrap" role="tablist" aria-label="Management Tabs">
+              <button type="button" class="btn btn-secondary btn-sm" id="tab-btn-runtime" data-tab="runtime" role="tab" aria-selected="false" data-i18n="management.tabRuntime">Runtime</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="tab-btn-workspaces" data-tab="workspaces" role="tab" aria-selected="false" data-i18n="management.tabWorkspaces">Workspaces</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="tab-btn-storage" data-tab="storage" role="tab" aria-selected="false" data-i18n="management.tabStorage">Storage</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="tab-btn-users" data-tab="users" role="tab" aria-selected="false" data-i18n="management.tabUsers">Users</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="tab-btn-models" data-tab="models" role="tab" aria-selected="false" data-i18n="management.tabModels">Models</button>
+            </div>
+            <div id="management-canvas" class="management-canvas" role="region" aria-label="Management Content Area">
+              <!-- Dynamic DOM Views rendered via pure DOM APIs in app.js -->
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- ========================================== -->
+  <!-- Dialog Modals (Accessible CSP Compliant)    -->
+  <!-- ========================================== -->
+
+  <!-- Workspace File Picker Modal -->
+  <div id="modal-file-picker" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-file-picker-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="modal-file-picker-title" data-i18n="modal.filePickerTitle">Select Workspace Files</h3>
+        <button class="modal-close" data-close="modal-file-picker" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body file-picker-modal-body">
+        <div class="file-picker-toolbar">
+          <div class="file-picker-search-wrapper">
+            <input type="search" id="file-picker-search-input" class="form-input file-picker-search-input" placeholder="Search files in workspace..." data-i18n-placeholder="modal.filePickerSearchPlaceholder" aria-label="Search files in workspace" data-i18n-aria-label="modal.filePickerSearchAria">
+          </div>
+          <div class="file-picker-breadcrumbs" id="file-picker-breadcrumbs"></div>
+        </div>
+        <div id="file-picker-list" class="file-picker-list" role="listbox" aria-multiselectable="true"></div>
+      </div>
+      <div class="modal-actions file-picker-modal-actions">
+        <span id="file-picker-selected-count" class="file-picker-selection-info"></span>
+        <div class="modal-actions-buttons">
+          <button type="button" class="btn btn-secondary" data-close="modal-file-picker" data-i18n="modal.cancel">Cancel</button>
+          <button type="button" id="btn-file-picker-select" class="btn btn-primary" data-i18n="modal.filePickerSelect" disabled>Attach Selected</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Space Modal -->
+  <div id="modal-space" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-space-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-space-title" data-i18n="modal.createSpaceTitle">Create New Space</h3>
+        <button class="modal-close" data-close="modal-space" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="create-space-form">
+        <div class="form-group">
+          <label for="space-name-input" data-i18n="modal.spaceNameLabel">Space Name</label>
+          <input type="text" id="space-name-input" class="form-input" required placeholder="e.g. Workspace Alpha" data-i18n-placeholder="modal.spaceNamePlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="space-folder-input" data-i18n="modal.folderNameLabel">Folder Name</label>
+          <input type="text" id="space-folder-input" class="form-input" required placeholder="e.g. workspace-alpha" data-i18n-placeholder="modal.folderNamePlaceholder">
+        </div>
+        <div class="form-group" id="space-exec-mode-group">
+          <label for="space-exec-mode-select" data-i18n="modal.executionModeLabel">Execution Mode</label>
+          <select id="space-exec-mode-select" class="form-select" aria-label="Execution Mode" data-i18n-aria-label="modal.executionModeLabel">
+            <option value="container" data-i18n="modal.execModeDocker">Docker (Default)</option>
+          </select>
+          <div id="space-exec-mode-host-desc" class="form-hint text-warning hidden" data-i18n="modal.execModeHostDesc">runs on platform host with controlled Enkeep workspace;not arbitrary mount yet;admin only</div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-space" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" data-i18n="modal.createSpaceButton">Create Space</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Create Session Modal -->
+  <div id="modal-session" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-session-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-session-title" data-i18n="modal.createSessionTitle">Create New Session</h3>
+        <button class="modal-close" data-close="modal-session" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="create-session-form">
+        <div class="form-group">
+          <label for="session-space-select" data-i18n="modal.targetSpaceLabel">Target Space</label>
+          <select id="session-space-select" class="form-select" required></select>
+        </div>
+        <div class="form-group">
+          <label for="session-title-input" data-i18n="modal.sessionTitleLabel">Session Title (Optional)</label>
+          <input type="text" id="session-title-input" class="form-input" placeholder="e.g. Debugging task or general chat" data-i18n-placeholder="modal.sessionTitlePlaceholder">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-session" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" data-i18n="modal.createSessionButton">Create Session</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Fork Session Modal -->
+  <div id="modal-fork-session" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-fork-session-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-fork-session-title" data-i18n="modal.forkSessionTitle">Fork Session</h3>
+        <button class="modal-close" data-close="modal-fork-session" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="fork-session-form">
+        <input type="hidden" id="fork-source-message-id" value="">
+        <input type="hidden" id="fork-source-turn-id" value="">
+        <p class="form-help mb-2" data-i18n="modal.forkSessionNotice">Forking creates an independent session branching from the selected history point. The original session remains completely unchanged.</p>
+        <div id="fork-point-indicator" class="fork-point-indicator hidden">
+          <span class="badge badge-info" id="fork-point-badge">Fork point: Message</span>
+        </div>
+        <div class="form-group">
+          <label for="fork-session-title-input" data-i18n="modal.forkSessionTitleLabel">Forked Session Title</label>
+          <input type="text" id="fork-session-title-input" class="form-input" placeholder="e.g. Experiment with alternative solution" data-i18n-placeholder="modal.forkSessionTitlePlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="fork-space-select" data-i18n="modal.forkTargetSpaceLabel">Target Space</label>
+          <select id="fork-space-select" class="form-select" required></select>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-fork-session" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-fork-session" class="btn btn-primary" data-i18n="modal.forkSessionButton">Fork Session</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Edit Message Modal -->
+  <div id="modal-edit-message" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-edit-message-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-edit-message-title" data-i18n="modal.editMessageTitle">Edit User Message</h3>
+        <button class="modal-close" data-close="modal-edit-message" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="edit-message-form">
+        <input type="hidden" id="edit-message-source-id" value="">
+        <p class="form-help mb-2" data-i18n="modal.editMessageNotice">Editing creates a new branched session from before this message. The original session history remains unchanged.</p>
+        <div class="form-group">
+          <label for="edit-message-content-input" data-i18n="modal.editMessageContentLabel">Edited Message Content</label>
+          <textarea id="edit-message-content-input" class="form-textarea" rows="4" required placeholder="Enter updated message content..." data-i18n-placeholder="modal.editMessageContentPlaceholder"></textarea>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-edit-message" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-edit-message" class="btn btn-primary" data-i18n="modal.editMessageButton">Send &amp; Branch</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Edit User Modal (Admin) -->
+  <div id="modal-edit-user" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-edit-user-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-edit-user-title" data-i18n="modal.editUserTitle">Edit User Access</h3>
+        <button class="modal-close" data-close="modal-edit-user" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="edit-user-form">
+        <input type="hidden" id="edit-user-id">
+        <div class="form-group">
+          <label for="edit-user-displayname" data-i18n="modal.displayNameLabel">Display Name</label>
+          <input type="text" id="edit-user-displayname" class="form-input" required placeholder="User display name" data-i18n-placeholder="modal.displayNamePlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="edit-user-role" data-i18n="modal.roleLabel">Role</label>
+          <select id="edit-user-role" class="form-select">
+            <option value="user" data-i18n="auth.roleUser">User</option>
+            <option value="admin" data-i18n="auth.roleAdmin">Admin</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="edit-user-status" data-i18n="modal.statusLabel">Account Status</label>
+          <select id="edit-user-status" class="form-select">
+            <option value="active" data-i18n="status.active">Active</option>
+            <option value="disabled" data-i18n="status.disabled">Disabled</option>
+          </select>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-edit-user" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-save-user" class="btn btn-primary" data-i18n="modal.saveChangesButton">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Generic Confirmation Modal -->
+  <div id="modal-confirm" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="confirm-modal-title" data-i18n="modal.confirmActionTitle">Confirm Action</h3>
+        <button class="modal-close" data-close="modal-confirm" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="confirm-modal-message" data-i18n="modal.confirmDefaultMessage">Are you sure you want to proceed?</p>
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="btn-confirm-cancel" class="btn btn-secondary" data-close="modal-confirm" data-i18n="modal.cancel">Cancel</button>
+        <button type="button" id="btn-confirm-proceed" class="btn btn-danger" data-i18n="modal.confirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Session Turn History Modal -->
+  <div id="modal-turns-history" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="turns-modal-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="turns-modal-title" data-i18n="modal.turnsHistoryTitle">Turns History</h3>
+        <button class="modal-close" data-close="modal-turns-history" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div id="turns-history-content" class="modal-body turns-history-container">
+        <!-- Dynamically rendered turns table -->
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-turns-history" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task Runs History Modal -->
+  <div id="modal-task-runs" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="task-runs-modal-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="task-runs-modal-title" data-i18n="tasks.runsModalTitle">Task Execution Runs History</h3>
+        <button class="modal-close" data-close="modal-task-runs" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div id="task-runs-content" class="modal-body turns-history-container">
+        <!-- Dynamically rendered task runs table -->
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-task-runs" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rename Space Modal -->
+  <div id="modal-rename-space" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="rename-space-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="rename-space-modal-title" data-i18n="modal.renameSpaceTitle">Rename Space</h3>
+        <button class="modal-close" data-close="modal-rename-space" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="rename-space-form">
+        <div class="form-group">
+          <label for="rename-space-input" data-i18n="modal.newSpaceNameLabel">New Space Name</label>
+          <input type="text" id="rename-space-input" class="form-input" required placeholder="e.g. Production Workspace" data-i18n-placeholder="modal.newSpaceNamePlaceholder">
+        </div>
+        <div class="form-group">
+          <label data-i18n="spaces.executionMode">Execution Mode</label>
+          <div class="space-mode-readonly-row">
+            <span id="rename-space-mode-badge" class="badge badge-info">Docker</span>
+            <span class="text-muted text-xs" data-i18n="spaces.migrationRequired">Migration required</span>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-rename-space" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-rename-space" class="btn btn-primary" data-i18n="modal.renameButton">Rename</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Rename Session Modal -->
+  <div id="modal-rename-session" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="rename-session-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="rename-session-modal-title" data-i18n="modal.renameSessionTitle">Rename Session</h3>
+        <button class="modal-close" data-close="modal-rename-session" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="rename-session-form">
+        <div class="form-group">
+          <label for="rename-session-input" data-i18n="modal.newSessionTitleLabel">New Session Title</label>
+          <input type="text" id="rename-session-input" class="form-input" required placeholder="e.g. Implement Authorization Middleware" data-i18n-placeholder="modal.newSessionTitlePlaceholder">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-rename-session" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-rename-session" class="btn btn-primary" data-i18n="modal.renameButton">Rename</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Space Controlled Mounts Modal -->
+  <div id="modal-space-mounts" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-space-mounts-title">
+    <div class="modal-card modal-card-lg">
+      <div class="modal-header">
+        <h3 id="modal-space-mounts-title" data-i18n="modal.spaceMountsTitle">Controlled Directory Mounts</h3>
+        <button class="modal-close" data-close="modal-space-mounts" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="space-mounts-header-row mb-2">
+          <p class="text-muted text-sm" data-i18n="modal.spaceMountsSubtitle">Controlled host directories mounted as /mnt/&lt;name&gt; into space runtime.</p>
+        </div>
+        <div class="form-notice warning-notice mb-3" id="space-mounts-warning">
+          <p data-i18n="modal.mountHostWarning"><strong>Warning:</strong> Mounts use real host filesystem paths. In Docker runtime, the container may restart, and mount changes take effect on the next turn.</p>
+        </div>
+        <div id="space-mounts-list-container" class="mounts-list-container mb-3"></div>
+        <hr class="modal-divider mb-3">
+        <div id="mounts-archived-notice" class="form-notice text-warning mb-3 hidden" data-i18n="modal.mountsArchivedNotice">This space is archived. Adding mounts is disabled.</div>
+        <h4 class="mb-2" data-i18n="modal.addMountTitle">Add Controlled Mount</h4>
+        <form id="add-controlled-mount-form">
+          <div class="form-row">
+            <div class="form-group col-6">
+              <label for="mount-name-input" data-i18n="modal.mountNameLabel">Mount Name (Slug)</label>
+              <input type="text" id="mount-name-input" class="form-input" required placeholder="e.g. project" data-i18n-placeholder="modal.mountNamePlaceholder">
+            </div>
+            <div class="form-group col-6">
+              <label for="mount-mode-select" data-i18n="modal.mountModeLabel">Access Mode</label>
+              <select id="mount-mode-select" class="form-select">
+                <option value="ro" selected data-i18n="modal.mountModeRo">Read-Only (RO)</option>
+                <option value="rw" data-i18n="modal.mountModeRw">Read-Write (RW)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="mount-source-path-input" data-i18n="modal.mountSourcePathLabel">Host Source Directory Path</label>
+            <input type="text" id="mount-source-path-input" class="form-input" required placeholder="/tmp/my-project" data-i18n-placeholder="modal.mountSourcePathPlaceholder">
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-secondary" data-close="modal-space-mounts" data-i18n="modal.cancel">Cancel</button>
+            <button type="submit" id="btn-submit-add-mount" class="btn btn-primary" data-i18n="modal.btnAddMount">Add Mount</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reset Session Modal -->
+  <div id="modal-reset-session" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="reset-session-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="reset-session-modal-title" data-i18n="modal.resetSessionTitle">Reset Session Generation</h3>
+        <button class="modal-close" data-close="modal-reset-session" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="reset-session-form">
+        <div class="form-notice">
+          <p data-i18n="modal.resetNotice"><strong>Note:</strong> Resetting this session increments its generation number (Generation N+1) and starts a fresh execution context. <strong>All previous chat messages, turns, and history remain fully preserved.</strong></p>
+        </div>
+        <div class="form-group">
+          <label for="reset-session-reason-input" data-i18n="modal.resetReasonLabel">Reset Reason (Optional)</label>
+          <input type="text" id="reset-session-reason-input" class="form-input" placeholder="e.g. Switch active task / agent update" data-i18n-placeholder="modal.resetReasonPlaceholder">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-reset-session" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-reset-session" class="btn btn-warning" data-i18n="modal.resetSubmitButton">Reset (New Generation)</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Generation History Modal -->
+  <div id="modal-generations" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="generations-modal-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="generations-modal-title" data-i18n="modal.generationsTitle">Session Generation History</h3>
+        <button class="modal-close" data-close="modal-generations" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div id="generations-history-content" class="modal-body turns-history-container">
+        <!-- Dynamically rendered generations -->
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-generations" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Agent Profile Modal -->
+  <div id="modal-create-profile" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="create-profile-modal-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="create-profile-modal-title" data-i18n="modal.createProfileTitle">Create Agent Profile</h3>
+        <button class="modal-close" data-close="modal-create-profile" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="create-profile-form">
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="profile-name-input" data-i18n="modal.profileNameLabel">Profile Name *</label>
+            <input type="text" id="profile-name-input" class="form-input" required placeholder="e.g. Lead Full-Stack Architect" data-i18n-placeholder="modal.profileNamePlaceholder">
+          </div>
+          <div class="form-group">
+            <label for="profile-changes-input" data-i18n="modal.profileChangesLabel">Initial Change Summary</label>
+            <input type="text" id="profile-changes-input" class="form-input" placeholder="e.g. Initial creation of profile" data-i18n-placeholder="modal.profileChangesPlaceholder">
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="profile-desc-input" data-i18n="modal.profileDescLabel">Description</label>
+          <input type="text" id="profile-desc-input" class="form-input" placeholder="e.g. Specialized in Node.js backend systems and PostgreSQL" data-i18n-placeholder="modal.profileDescPlaceholder">
+        </div>
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="profile-identity-input" data-i18n="modal.profileIdentityLabel">1. Identity Section</label>
+            <textarea id="profile-identity-input" class="form-textarea" rows="3" placeholder="Define the agent persona, role, and demeanor..." data-i18n-placeholder="modal.profileIdentityPlaceholder"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="profile-soul-input" data-i18n="modal.profileSoulLabel">2. Soul &amp; Behavioral Rules</label>
+            <textarea id="profile-soul-input" class="form-textarea" rows="3" placeholder="Define safety, boundaries, non-negotiable guidelines..." data-i18n-placeholder="modal.profileSoulPlaceholder"></textarea>
+          </div>
+        </div>
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="profile-agents-input" data-i18n="modal.profileAgentsLabel">3. Sub-agents &amp; Delegations</label>
+            <textarea id="profile-agents-input" class="form-textarea" rows="3" placeholder="Define delegation policies, orchestrators, peers..." data-i18n-placeholder="modal.profileAgentsPlaceholder"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="profile-tools-input" data-i18n="modal.profileToolsLabel">4. Tool Permissions &amp; Access</label>
+            <textarea id="profile-tools-input" class="form-textarea" rows="3" placeholder="Define allowed tools, file operations, bash policies..." data-i18n-placeholder="modal.profileToolsPlaceholder"></textarea>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-create-profile" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-create-profile" class="btn btn-primary" data-i18n="modal.createProfileButton">Create Profile</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Create Profile Version Modal -->
+  <div id="modal-create-profile-version" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="create-version-modal-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="create-version-modal-title" data-i18n="modal.createVersionTitle">Create Profile Version</h3>
+        <button class="modal-close" data-close="modal-create-profile-version" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="create-profile-version-form">
+        <input type="hidden" id="version-target-profile-id">
+        <div class="form-group">
+          <label for="profile-ver-changes-input" data-i18n="modal.versionChangesLabel">Change Summary *</label>
+          <input type="text" id="profile-ver-changes-input" class="form-input" required placeholder="e.g. Added TypeScript strict-mode guidelines" data-i18n-placeholder="modal.versionChangesPlaceholder">
+        </div>
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="profile-ver-identity-input" data-i18n="modal.profileIdentityLabel">1. Identity Section</label>
+            <textarea id="profile-ver-identity-input" class="form-textarea" rows="3"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="profile-ver-soul-input" data-i18n="modal.profileSoulLabel">2. Soul &amp; Behavioral Rules</label>
+            <textarea id="profile-ver-soul-input" class="form-textarea" rows="3"></textarea>
+          </div>
+        </div>
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="profile-ver-agents-input" data-i18n="modal.profileAgentsLabel">3. Sub-agents &amp; Delegations</label>
+            <textarea id="profile-ver-agents-input" class="form-textarea" rows="3"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="profile-ver-tools-input" data-i18n="modal.profileToolsLabel">4. Tool Permissions &amp; Access</label>
+            <textarea id="profile-ver-tools-input" class="form-textarea" rows="3"></textarea>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-create-profile-version" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-create-version" class="btn btn-primary" data-i18n="modal.publishVersionButton">Publish Version</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Agent Profile Versions Inspector Modal -->
+  <div id="modal-profile-versions" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="profile-versions-modal-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="profile-versions-modal-title" data-i18n="modal.profileVersionsTitle">Profile Version History</h3>
+        <button class="modal-close" data-close="modal-profile-versions" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div id="profile-versions-content" class="modal-body turns-history-container">
+        <!-- Dynamically rendered version list -->
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-profile-versions" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin Edit Quota Modal -->
+  <div id="modal-edit-quota" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-edit-quota-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-edit-quota-title" data-i18n="modal.editQuotaTitle">Set Resource Quota Limit</h3>
+        <button class="modal-close" data-close="modal-edit-quota" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="edit-quota-form">
+        <div class="form-group">
+          <label for="quota-target-user-id" data-i18n="modal.quotaTargetUserLabel">User ID / Username</label>
+          <input type="text" id="quota-target-user-id" class="form-input" required placeholder="e.g. alice or bob" data-i18n-placeholder="modal.quotaTargetUserPlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="quota-metric-select" data-i18n="modal.quotaMetricLabel">Metric / Resource (5 Fixed Core Metrics)</label>
+          <select id="quota-metric-select" class="form-select" required>
+            <option value="tokens" data-i18n="metric.tokens">tokens (Token consumption)</option>
+            <option value="messages" data-i18n="metric.messages">messages (Chat message volume)</option>
+            <option value="turns" data-i18n="metric.turns">turns (Execution turns count)</option>
+            <option value="storage_bytes" data-i18n="metric.storage_bytes">storage_bytes (Space volume storage)</option>
+            <option value="api_calls" data-i18n="metric.api_calls">api_calls (Total HTTP/REST requests)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="quota-limit-input" data-i18n="modal.quotaLimitLabel">Explicit Limit Amount (Integer &ge; 0 or -1 for Unlimited)</label>
+          <input type="number" id="quota-limit-input" class="form-input" required min="-1" step="1" placeholder="e.g. -1 for unlimited" data-i18n-placeholder="modal.quotaLimitPlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="quota-window-input" data-i18n="modal.quotaWindowLabel">Window Seconds (Optional &gt; 0)</label>
+          <input type="number" id="quota-window-input" class="form-input" min="1" step="1" placeholder="e.g. 3600" data-i18n-placeholder="modal.quotaWindowPlaceholder">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-edit-quota" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-save-quota" class="btn btn-primary" data-i18n="modal.saveQuotaButton">Save Quota Limit</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Admin Create User Modal -->
+  <div id="modal-create-user" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-create-user-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-create-user-title" data-i18n="modal.createUserTitle">Create Platform User</h3>
+        <button class="modal-close" data-close="modal-create-user" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="create-user-form">
+        <div class="form-group">
+          <label for="create-user-username" data-i18n="modal.createUserUsernameLabel">Username *</label>
+          <input type="text" id="create-user-username" class="form-input" required placeholder="e.g. devuser" data-i18n-placeholder="modal.createUserUsernamePlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="create-user-displayname" data-i18n="modal.createUserDisplayNameLabel">Display Name (Optional)</label>
+          <input type="text" id="create-user-displayname" class="form-input" placeholder="e.g. Alice Developer" data-i18n-placeholder="modal.createUserDisplayNamePlaceholder">
+        </div>
+        <div class="form-group">
+          <label for="create-user-role" data-i18n="modal.createUserRoleLabel">Role *</label>
+          <select id="create-user-role" class="form-select" required>
+            <option value="user" data-i18n="auth.roleUser">user (Standard Member)</option>
+            <option value="admin" data-i18n="auth.roleAdmin">admin (Platform Administrator)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="create-user-temppassword" data-i18n="modal.createUserTempPasswordLabel">Custom Temporary Password (Optional)</label>
+          <input type="password" id="create-user-temppassword" class="form-input" placeholder="Leave empty to auto-generate secure password" data-i18n-placeholder="modal.createUserTempPasswordPlaceholder">
+          <small class="form-help" data-i18n="modal.createUserHelp">If empty, a cryptographically secure random temporary password will be generated automatically.</small>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-create-user" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-create-user" class="btn btn-primary" data-i18n="modal.createUserSubmitButton">Create User</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Temporary Credentials One-Time Display Modal -->
+  <div id="modal-temp-credentials" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-temp-credentials-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-temp-credentials-title" data-i18n="modal.tempCredentialsTitle">One-Time Temporary Credentials</h3>
+        <button class="modal-close" data-close="modal-temp-credentials" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="callout callout-warning">
+          <strong data-i18n="modal.securityNoticePrefix">Security Notice:</strong> <span data-i18n="modal.tempCredentialsNotice">This temporary password will be displayed <strong>ONLY ONCE</strong>. Please copy and store it securely.</span>
+        </div>
+        <div class="form-group">
+          <label for="display-target-username" data-i18n="modal.targetUserLabel">Target User</label>
+          <input type="text" id="display-target-username" class="form-input mono-cell" readonly>
+        </div>
+        <div class="form-group">
+          <label for="display-temp-password" data-i18n="modal.tempPasswordLabel">Temporary Password</label>
+          <div class="flex-row-center">
+            <input type="text" id="display-temp-password" class="form-input mono-cell" readonly>
+            <button type="button" id="btn-copy-temp-password" class="btn btn-secondary btn-sm" data-i18n="common.copy">Copy</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-primary" data-close="modal-temp-credentials" data-i18n="modal.doneButton">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Approvals Inspection & Decision Modal -->
+  <div id="modal-approvals" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-approvals-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="modal-approvals-title" data-i18n="approvals.modalTitle">Sensitive Tool Execution Approval</h3>
+        <button class="modal-close" data-close="modal-approvals" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="form-help mb-2" data-i18n="approvals.subtitle">Review and decide sensitive tool executions requiring human authorization</p>
+        <div id="approvals-modal-list" class="approvals-list-container">
+          <!-- Dynamically populated approvals cards -->
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-approvals" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Install Skill Modal -->
+  <div id="modal-install-skill" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-install-skill-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="modal-install-skill-title" data-i18n="skills.installModalTitle">Install Skill Package</h3>
+        <button class="modal-close" data-close="modal-install-skill" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="install-skill-form">
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="skill-source-type-select" data-i18n="skills.formSourceType">Source Type *</label>
+            <select id="skill-source-type-select" class="form-select" required>
+              <option value="git" data-i18n="skills.sourceGit">Git Repository</option>
+              <option value="upload" data-i18n="skills.sourceArchive">Upload Archive Package</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="skill-scope-select" data-i18n="skills.formScope">Installation Scope *</label>
+            <select id="skill-scope-select" class="form-select" required>
+              <option value="space" data-i18n="skills.scopeSpace">Space-Bound</option>
+              <option value="global" id="skill-scope-opt-global" data-i18n="skills.scopeGlobal">Global (Admin)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group" id="skill-target-space-group">
+          <label for="skill-target-space-select" data-i18n="skills.formTargetSpace">Target Space *</label>
+          <select id="skill-target-space-select" class="form-select"></select>
+        </div>
+
+        <!-- Git Source Fields -->
+        <div id="skill-git-fields-group">
+          <div class="form-group">
+            <label for="skill-repo-url-input" data-i18n="skills.formRepoUrl">Git Repository URL *</label>
+            <input type="url" id="skill-repo-url-input" class="form-input" placeholder="https://github.com/example-org/custom-skill.git" data-i18n-placeholder="skills.formRepoUrlPlaceholder">
+            <small class="form-help" data-i18n="skills.formRepoUrlHelp">Must be HTTPS, Git, or SSH URL compliant with security policy.</small>
+          </div>
+          <div class="form-row grid-2-col">
+            <div class="form-group">
+              <label for="skill-git-ref-input" data-i18n="skills.formGitRef">Branch / Tag / Ref (Optional)</label>
+              <input type="text" id="skill-git-ref-input" class="form-input" placeholder="e.g. main or v1.2.0" data-i18n-placeholder="skills.formGitRefPlaceholder">
+            </div>
+            <div class="form-group">
+              <label for="skill-subdirectory-input" data-i18n="skills.formSubdirectory">Subdirectory in Repo (Optional)</label>
+              <input type="text" id="skill-subdirectory-input" class="form-input" placeholder="e.g. skills/weather-checker" data-i18n-placeholder="skills.formSubdirectoryPlaceholder">
+            </div>
+          </div>
+          <div class="form-row grid-2-col">
+            <div class="form-group">
+              <label for="skill-expected-commit-input" data-i18n="skills.formExpectedCommit">Expected Commit Hash (Optional)</label>
+              <input type="text" id="skill-expected-commit-input" class="form-input mono-cell" placeholder="e.g. 7a3f89b..." data-i18n-placeholder="skills.formExpectedCommitPlaceholder">
+            </div>
+            <div class="form-group">
+              <label for="skill-credential-ref-input" data-i18n="skills.formCredentialRef">Credential Reference (Optional)</label>
+              <input type="text" id="skill-credential-ref-input" class="form-input" placeholder="e.g. cred_github_deploy_key" data-i18n-placeholder="skills.formCredentialRefPlaceholder">
+              <small class="form-help" data-i18n="skills.formCredentialRefHelp">Identifier of stored Git credential. Strictly no plaintext secrets are accepted.</small>
+            </div>
+          </div>
+        </div>
+
+        <!-- Archive Upload Fields -->
+        <div id="skill-upload-fields-group" class="hidden">
+          <div class="form-group">
+            <label for="skill-archive-file-input" data-i18n="skills.formArchiveFile">Archive File (.tar.gz, .zip, .tar) *</label>
+            <input type="file" id="skill-archive-file-input" class="form-input" accept=".tar.gz,.tgz,.zip,.tar">
+          </div>
+          <div class="form-group">
+            <label for="skill-checksum-input" data-i18n="skills.formChecksum">Expected Checksum (SHA-256, Optional)</label>
+            <input type="text" id="skill-checksum-input" class="form-input mono-cell" placeholder="e.g. 5f4dcc3b5aa765d61d8327deb882cf99..." data-i18n-placeholder="skills.formChecksumPlaceholder">
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-install-skill" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-install-skill" class="btn btn-primary" data-i18n="skills.btnInstall">Install Skill</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Update Skill Modal (Diff Preview & Commit) -->
+  <div id="modal-update-skill" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-update-skill-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="modal-update-skill-title" data-i18n="skills.updateModalTitle">Update Skill Package &amp; Preview Diff</h3>
+        <button class="modal-close" data-close="modal-update-skill" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="update-skill-form">
+        <input type="hidden" id="update-skill-name">
+        <input type="hidden" id="update-skill-scope">
+        <input type="hidden" id="update-skill-space-id">
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="update-skill-ref-input" data-i18n="skills.formGitRef">Branch / Tag / Ref (Optional)</label>
+            <input type="text" id="update-skill-ref-input" class="form-input" placeholder="e.g. main">
+          </div>
+          <div class="form-group">
+            <label for="update-skill-expected-commit-input" data-i18n="skills.formExpectedCommit">Expected Commit Hash (Optional)</label>
+            <input type="text" id="update-skill-expected-commit-input" class="form-input mono-cell" placeholder="e.g. 7a3f89b...">
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="update-skill-credential-ref-input" data-i18n="skills.formCredentialRef">Credential Reference (Optional)</label>
+          <input type="text" id="update-skill-credential-ref-input" class="form-input" placeholder="e.g. cred_github_deploy_key">
+        </div>
+
+        <div class="modal-actions mb-2">
+          <button type="button" id="btn-preview-skill-diff" class="btn btn-secondary" data-i18n="skills.btnPreviewDiff">Preview Update Diff</button>
+        </div>
+
+        <div id="skill-diff-preview-container" class="skill-diff-container hidden">
+          <h4 id="skill-diff-summary-title" data-i18n="skills.diffSummaryTitle">Diff Preview</h4>
+          <p id="skill-diff-summary-text" class="form-help"></p>
+          <div id="skill-diff-files-list" class="diff-files-list"></div>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-update-skill" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-commit-update-skill" class="btn btn-primary" data-i18n="skills.btnCommitUpdate">Confirm &amp; Apply Update</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Rollback Skill Modal -->
+  <div id="modal-rollback-skill" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-rollback-skill-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-rollback-skill-title" data-i18n="skills.rollbackModalTitle">Rollback Skill to Version</h3>
+        <button class="modal-close" data-close="modal-rollback-skill" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="rollback-skill-form">
+        <input type="hidden" id="rollback-skill-name">
+        <input type="hidden" id="rollback-skill-scope">
+        <input type="hidden" id="rollback-skill-space-id">
+        <div class="form-group">
+          <label for="rollback-skill-target-version-input" data-i18n="skills.formTargetVersion">Target Version (Positive Integer) *</label>
+          <input type="number" id="rollback-skill-target-version-input" class="form-input" min="1" step="1" required placeholder="e.g. 1">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-rollback-skill" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-rollback-skill" class="btn btn-warning" data-i18n="skills.btnRollback">Rollback</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Extension Details & Manifest Modal -->
+  <div id="modal-extension-detail" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-extension-detail-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="modal-extension-detail-title" data-i18n="extensions.detailModalTitle">Extension Details &amp; Manifest</h3>
+        <button class="modal-close" data-close="modal-extension-detail" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body" id="extension-detail-body">
+        <!-- Injected dynamically via safe DOM -->
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-extension-detail" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Runtime Diagnostics Modal -->
+  <div id="modal-diagnostics" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-diagnostics-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="modal-diagnostics-title" data-i18n="diagnostics.modalTitle">Runtime Diagnostics &amp; Telemetry</h3>
+        <button class="modal-close" data-close="modal-diagnostics" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="callout callout-info mb-2">
+          <span data-i18n="diagnostics.redactionNotice">Diagnostics are strictly sanitized. Prompt content, tokens, and raw execution secrets are redacted.</span>
+        </div>
+        <div id="diagnostics-resource-grid" class="kpi-grid mb-2">
+          <!-- CPU, Memory, PIDs, Volume resource cards -->
+        </div>
+        <div class="filter-toolbar mb-2">
+          <label for="diagnostics-level-select" data-i18n="diagnostics.filterLevel">Log Level</label>
+          <select id="diagnostics-level-select" class="form-select">
+            <option value="" data-i18n="diagnostics.filterAllLevels">All Levels</option>
+            <option value="debug">debug</option>
+            <option value="info">info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+          </select>
+          <button type="button" id="btn-diagnostics-refresh" class="btn btn-secondary btn-sm" data-i18n="diagnostics.btnRefresh">Refresh</button>
+        </div>
+        <div id="diagnostics-timeline-container" class="diagnostics-timeline">
+          <!-- Timeline items -->
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-diagnostics" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Dialog Modal (Direct Streaming Download Links) -->
+  <div id="modal-export" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-export-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-export-title" data-i18n="audit.exportModalTitle">Export Data Log</h3>
+        <button class="modal-close" data-close="modal-export" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="form-help mb-2" data-i18n="audit.exportSubtitle">Stream audit logs in CSV or JSONL format</p>
+        <div class="form-group">
+          <label for="export-format-select" data-i18n="common.format">Format</label>
+          <select id="export-format-select" class="form-select">
+            <option value="csv">CSV (.csv)</option>
+            <option value="jsonl">JSON Lines (.jsonl)</option>
+          </select>
+        </div>
+        <div class="form-row grid-2-col">
+          <div class="form-group">
+            <label for="export-from-date" data-i18n="audit.filterFrom">From Date</label>
+            <input type="date" id="export-from-date" class="form-input">
+          </div>
+          <div class="form-group">
+            <label for="export-to-date" data-i18n="audit.filterTo">To Date</label>
+            <input type="date" id="export-to-date" class="form-input">
+          </div>
+        </div>
+        <div class="form-group" id="export-action-group">
+          <label for="export-action-filter" data-i18n="audit.filterAction">Filter Action</label>
+          <select id="export-action-filter" class="form-select">
+            <option value="" data-i18n="audit.filterAllActions">All Actions</option>
+          </select>
+        </div>
+        <div class="form-group" id="export-user-group">
+          <label for="export-user-filter" data-i18n="audit.filterUser">Filter User</label>
+          <input type="text" id="export-user-filter" class="form-input" placeholder="e.g. alice or bob">
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-export" data-i18n="modal.cancel">Cancel</button>
+        <a id="btn-export-download-link" class="btn btn-primary" href="#" target="_blank" download="export.csv" data-i18n="common.download">Download Export</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Channel Onboarding Modal -->
+  <div id="modal-channel-onboarding" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="channel-onboarding-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="channel-onboarding-modal-title" data-i18n="channels.onboardingModalTitle">配置机器人接入</h3>
+        <button class="modal-close" data-close="modal-channel-onboarding" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div class="modal-body" id="channel-onboarding-modal-body">
+      </div>
+    </div>
+  </div>
+
+  <!-- Application Logic Script -->
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

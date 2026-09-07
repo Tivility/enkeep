@@ -1,0 +1,17 @@
+{
+  "project": "NextGen Analytics",
+  "owner": "Alice",
+  "status": "in-progress",
+  "milestones": [
+    {
+      "phase": "P0",
+      "title": "Architecture Review",
+      "done": true
+    },
+    {
+      "phase": "P1",
+      "title": "Event Sourcing Core",
+      "done": false
+    }
+  ]
+}

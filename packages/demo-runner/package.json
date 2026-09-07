@@ -1,0 +1,74 @@
+{
+  "name": "@enkeep/demo-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "bin": {
+    "demo-runner": "./dist/demo-runner.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./ports": {
+      "types": "./src/ports/index.ts",
+      "import": "./dist/ports/index.js",
+      "default": "./dist/ports/index.js"
+    },
+    "./cli": {
+      "types": "./src/demo-runner.ts",
+      "import": "./dist/demo-runner.js",
+      "default": "./dist/demo-runner.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --exclude '**/*docker*' --exclude '**/attachment-agent-docker-e2e*' --exclude '**/fork-restore-docker-e2e*' --exclude '**/advanced-capabilities-docker-e2e*' --exclude '**/session-queue-docker-e2e*' --exclude '**/instructions-docker-e2e*' --exclude '**/controlled-mounts-docker-e2e*' --exclude '**/browser-docker-e2e*'",
+    "test:host": "vitest run tests/host-runtime-integration.test.ts tests/host-mixed-mode-routing.test.ts tests/host-crash-recovery.test.ts tests/host-security-containment.test.ts",
+    "test:mounts": "vitest run --fileParallelism=false --maxWorkers=1 tests/controlled-mounts-integration.test.ts tests/controlled-mounts-docker-e2e.test.ts",
+    "test:cli": "vitest run tests/cli-docker-e2e.test.ts",
+    "test:docker": "vitest run tests/docker-acceptance.test.ts tests/attachment-agent-docker-e2e.test.ts tests/fork-restore-docker-e2e.test.ts tests/advanced-capabilities-docker-e2e.test.ts tests/session-queue-docker-e2e.test.ts tests/instructions-docker-e2e.test.ts tests/controlled-mounts-docker-e2e.test.ts tests/browser-docker-e2e.test.ts tests/mcp-docker-e2e.test.ts tests/cli-docker-e2e.test.ts --no-file-parallelism",
+    "test:browser:real": "vitest run tests/browser-integration.test.ts tests/browser-docker-e2e.test.ts",
+    "test:mcp": "vitest run tests/mcp-acceptance.test.ts",
+    "demo:reset": "node ./dist/demo-runner.js reset",
+    "demo:up": "node ./dist/demo-runner.js up",
+    "demo:down": "node ./dist/demo-runner.js down",
+    "demo:test": "node ./dist/demo-runner.js test",
+    "demo:status": "node ./dist/demo-runner.js status"
+  },
+  "dependencies": {
+    "@enkeep/channel-lark": "workspace:*",
+    "@enkeep/dsh-enkeep-bundle": "workspace:*",
+    "@enkeep/dsh-platform-client": "workspace:*",
+    "@enkeep/dsh-tools": "workspace:*",
+    "@enkeep/import-happyclaw": "workspace:*",
+    "@enkeep/platform-auth": "workspace:*",
+    "@enkeep/platform-core": "workspace:*",
+    "@enkeep/platform-server": "workspace:*",
+    "@enkeep/platform-service-browser": "workspace:*",
+    "@enkeep/platform-service-mcp": "workspace:*",
+    "@enkeep/platform-storage-sqlite": "workspace:*",
+    "@enkeep/protocol": "workspace:*",
+    "@enkeep/runtime-runner": "workspace:*",
+    "@enkeep/web-channel": "workspace:*",
+    "@enkeep/web-ui": "workspace:*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-user-approval": "0.1.2-rc.1",
+    "@enkeep/backup-restore": "workspace:*",
+    "@enkeep/dsh-external-interaction": "workspace:*",
+    "@enkeep/dsh-mcp-governance": "workspace:*",
+    "@enkeep/dsh-tool-browser": "workspace:*",
+    "@enkeep/platform-service-mcp": "workspace:*",
+    "@types/node": "^26.2.0",
+    "playwright": "^1.50.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.8"
+  }
+}

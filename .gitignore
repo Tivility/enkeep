@@ -5,3 +5,10 @@ dist/
 .DS_Store
 .env
 data/
+.demo-data/
+.demo-data
+# local data / backups (contain real runtime data)
+.demo-data-backup-original/
+reports/
+*.db-wal
+*.db-shm
