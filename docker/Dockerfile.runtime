@@ -1,0 +1,115 @@
+# syntax=docker/dockerfile:1
+# Enkeep DSH Runtime Container (Zero-Network Architecture)
+#
+# Isolated non-root Docker runtime container for individual users (Alice / Bob).
+# Operates with ZERO open network ports (--network none) via Docker Exec transport.
+# Boots official DeepSeek Harness core and applies @enkeep/dsh-enkeep-bundle typed bundle.
+
+# ==========================================
+# Stage 1: Build Stage (Monorepo Subset)
+# ==========================================
+FROM node:22-alpine AS builder
+
+ENV CI=true
+
+RUN apk add --no-cache bash ca-certificates python3 make g++
+RUN npm install -g pnpm@11.7.0
+RUN pnpm config set ignore-scripts true
+
+WORKDIR /build
+
+# Copy root workspace configuration
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.json ./
+
+# Copy minimal monorepo subset packages needed for DSH runtime + bundle
+COPY packages/protocol/ ./packages/protocol/
+COPY packages/platform-core/ ./packages/platform-core/
+COPY packages/platform-operations/ ./packages/platform-operations/
+COPY packages/platform-storage-sqlite/ ./packages/platform-storage-sqlite/
+COPY packages/import-happyclaw/ ./packages/import-happyclaw/
+COPY packages/dsh-platform-client/ ./packages/dsh-platform-client/
+COPY packages/dsh-receipt-store-sqlite/ ./packages/dsh-receipt-store-sqlite/
+COPY packages/dsh-inbound/ ./packages/dsh-inbound/
+COPY packages/dsh-event-relay/ ./packages/dsh-event-relay/
+COPY packages/dsh-tools/ ./packages/dsh-tools/
+COPY packages/dsh-external-interaction/ ./packages/dsh-external-interaction/
+COPY packages/dsh-affinity-policy/ ./packages/dsh-affinity-policy/
+COPY packages/dsh-tool-browser/ ./packages/dsh-tool-browser/
+COPY packages/dsh-mcp-governance/ ./packages/dsh-mcp-governance/
+COPY packages/dsh-tool-cli/ ./packages/dsh-tool-cli/
+COPY packages/dsh-enkeep-bundle/ ./packages/dsh-enkeep-bundle/
+COPY packages/runtime-runner/ ./packages/runtime-runner/
+
+# Install dependencies for workspace subset
+RUN pnpm install --ignore-scripts && \
+    cd /build/node_modules/.pnpm/node-pty@1.2.0-beta.15/node_modules/node-pty && \
+    npx --yes node-gyp rebuild
+
+# Build all runtime & bundle workspace packages
+RUN pnpm --filter '@enkeep/protocol' \
+         --filter '@enkeep/platform-core' \
+         --filter '@enkeep/platform-operations' \
+         --filter '@enkeep/platform-storage-sqlite' \
+         --filter '@enkeep/import-happyclaw' \
+         --filter '@enkeep/dsh-platform-client' \
+         --filter '@enkeep/dsh-receipt-store-sqlite' \
+         --filter '@enkeep/dsh-inbound' \
+         --filter '@enkeep/dsh-event-relay' \
+         --filter '@enkeep/dsh-tools' \
+         --filter '@enkeep/dsh-external-interaction' \
+         --filter '@enkeep/dsh-affinity-policy' \
+         --filter '@enkeep/dsh-tool-browser' \
+         --filter '@enkeep/dsh-mcp-governance' \
+         --filter '@enkeep/dsh-tool-cli' \
+         --filter '@enkeep/dsh-enkeep-bundle' \
+         --filter '@enkeep/runtime-runner' \
+         run build
+
+# Deploy standalone runtime package with strictly production node_modules
+RUN pnpm --filter '@enkeep/runtime-runner' deploy --legacy --prod /prod/runtime-runner && \
+    cd /prod/runtime-runner/node_modules/.pnpm/node-pty@1.2.0-beta.15/node_modules/node-pty && \
+    npx --yes node-gyp rebuild
+
+# ==========================================
+# Stage 2: Minimal Zero-Network Runtime Stage
+# ==========================================
+FROM node:22-alpine AS runner
+
+RUN apk add --no-cache bash ca-certificates curl
+
+# Remove default node user and create dsh user/group (uid: 1000, gid: 1000)
+RUN deluser --remove-home node && \
+    addgroup -g 1000 dsh && \
+    adduser -u 1000 -G dsh -s /bin/bash -D dsh
+
+# Runtime environment variables
+ENV HOME=/home/dsh
+ENV DSH_HOME=/home/dsh/.dsh
+ENV DSH_SPACES=/home/dsh/spaces
+ENV NODE_ENV=production
+ENV NODE_PATH=/app/runtime-runner/node_modules
+
+# Directory layout: /home/dsh for volume data, /app for code
+RUN mkdir -p /home/dsh/.dsh/sessions \
+             /home/dsh/.dsh/storages \
+             /home/dsh/.dsh/data \
+             /home/dsh/spaces \
+             /app && \
+    chown -R dsh:dsh /home/dsh /app && \
+    chmod 700 /home/dsh/.dsh
+
+WORKDIR /app
+
+# Copy ONLY standalone runtime package with dist and production node_modules
+COPY --from=builder --chown=dsh:dsh /prod/runtime-runner /app/runtime-runner
+COPY --from=builder --chown=dsh:dsh /build/packages/runtime-runner/dist /app/runtime-runner/dist
+
+# Switch to non-root user
+USER dsh
+
+WORKDIR /home/dsh
+
+# ZERO EXPOSE - Container has NO listening network ports
+
+# Resident Runtime Runner Daemon PID 1 entrypoint
+CMD ["node", "/app/runtime-runner/dist/runtime/daemon-cli.js", "daemon"]

@@ -3,13 +3,53 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.7.0",
-  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
   "scripts": {
-    "build": "tsc -b",
-    "test": "vitest run"
+    "preflight": "tsc -b && node dist/scripts/safety/preflight-cli.js",
+    "clean": "node -e \"const fs=require('fs'),path=require('path');const targets=['dist'];if(fs.existsSync('packages')){for(const p of fs.readdirSync('packages')){targets.push(path.join('packages',p,'dist'));}}targets.forEach(t=>{if(fs.existsSync(t))fs.rmSync(t,{recursive:true,force:true});});\"",
+    "build": "tsc -b && pnpm --filter './packages/*' -r --if-present run build",
+    "build:root": "tsc -b",
+    "build:packages": "pnpm --filter './packages/*' -r --if-present run build",
+    "typecheck": "tsc --noEmit && pnpm --filter './packages/*' -r --if-present run typecheck",
+    "typecheck:root": "tsc --noEmit",
+    "typecheck:packages": "pnpm --filter './packages/*' -r --if-present run typecheck",
+    "safety:test": "vitest run tests/safety",
+    "test": "pnpm run safety:test && pnpm --filter './packages/*' -r --if-present run test",
+    "test:root": "vitest run tests/safety",
+    "test:packages": "pnpm --filter './packages/*' -r --if-present run test",
+    "test:migration-v2": "pnpm run build && pnpm --filter @enkeep/import-happyclaw test tests/migration-v2.test.ts && pnpm --filter @enkeep/platform-server test tests/migration-v2-service-and-routes.test.ts tests/migration-v2-pilot.test.ts",
+    "test:lark": "pnpm run build && pnpm --filter @enkeep/channel-lark run test:lark",
+    "test:host-runtime": "pnpm run build && pnpm --filter @enkeep/demo-runner run test:host",
+    "test:cli": "pnpm run build && pnpm run docker:build-runtime && ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/demo-runner run test:cli",
+    "test:plugin": "pnpm run build && pnpm --filter @enkeep/runtime-runner run test tests/trusted-dsh-plugin.test.ts && pnpm --filter @enkeep/platform-server run test tests/extension-trusted-plugins.test.ts && pnpm --filter @enkeep/demo-runner run test tests/trusted-plugin-acceptance.test.ts",
+    "test:mcp": "pnpm run build && pnpm --filter @enkeep/demo-runner run test:mcp && pnpm --filter @enkeep/web-e2e run test:contract tests/contract/contract-mcp-extensions-journey.test.ts",
+    "test:browser": "pnpm --filter @enkeep/web-e2e run test:browser",
+    "test:browser:real": "pnpm --filter @enkeep/demo-runner run test:browser:real",
+    "test:controlled-mounts": "pnpm run build && pnpm run docker:build-runtime && ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/demo-runner run test:mounts",
+    "docker:build-runtime": "docker build --pull=false --no-cache -f docker/Dockerfile.runtime -t enkeep-demo-runtime:acceptance -t enkeep-demo-runtime:latest .",
+    "test:docker": "pnpm run build && pnpm run docker:build-runtime && ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/runtime-runner run test:docker && ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/demo-runner run test:docker && ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/web-e2e run test:docker",
+    "test:docker:demo": "pnpm run build && pnpm run docker:build-runtime && ENKEEP_LLM_ENABLED=0 ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/runtime-runner run test:docker && ENKEEP_LLM_ENABLED=0 ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/demo-runner run test:docker && ENKEEP_LLM_ENABLED=0 ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/web-e2e run test:docker",
+    "verify": "pnpm run preflight && pnpm run typecheck && pnpm run build && pnpm run test",
+    "demo:up": "pnpm --filter @enkeep/demo-runner run demo:up",
+    "demo:down": "pnpm --filter @enkeep/demo-runner run demo:down",
+    "demo:reset": "pnpm --filter @enkeep/demo-runner run demo:reset",
+    "demo:test": "pnpm run build && pnpm run docker:build-runtime && ENKEEP_RUNTIME_IMAGE=enkeep-demo-runtime:acceptance pnpm --filter @enkeep/demo-runner run demo:test",
+    "demo:status": "pnpm --filter @enkeep/demo-runner run demo:status",
+    "backup": "pnpm --filter @enkeep/backup-restore run enkeep-backup",
+    "restore": "pnpm --filter @enkeep/backup-restore run enkeep-restore",
+    "backup:create": "pnpm --filter @enkeep/backup-restore run backup:create",
+    "backup:inspect": "pnpm --filter @enkeep/backup-restore run backup:inspect",
+    "backup:verify": "pnpm --filter @enkeep/backup-restore run backup:verify",
+    "backup:restore": "pnpm --filter @enkeep/backup-restore run backup:restore"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "typescript": "^5.9.0",
     "vitest": "^4.1.8"
+  },
+  "dependencies": {
+    "cron-parser": "^5.10.0"
   }
 }

@@ -1,0 +1,128 @@
+{
+  "name": "@enkeep/runtime-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./spec": {
+      "types": "./src/spec/index.ts",
+      "import": "./dist/spec/index.js",
+      "default": "./dist/spec/index.js"
+    },
+    "./transport": {
+      "types": "./src/transport/index.ts",
+      "import": "./dist/transport/index.js",
+      "default": "./dist/transport/index.js"
+    },
+    "./docker": {
+      "types": "./src/docker/index.ts",
+      "import": "./dist/docker/index.js",
+      "default": "./dist/docker/index.js"
+    },
+    "./runtime": {
+      "types": "./src/runtime/index.ts",
+      "import": "./dist/runtime/index.js",
+      "default": "./dist/runtime/index.js"
+    },
+    "./tunnel": {
+      "types": "./src/tunnel/index.ts",
+      "import": "./dist/tunnel/index.js",
+      "default": "./dist/tunnel/index.js"
+    },
+    "./host": {
+      "types": "./src/host/index.ts",
+      "import": "./dist/host/index.js",
+      "default": "./dist/host/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:docker": "ENKEEP_DOCKER_ACCEPTANCE=1 vitest run tests/docker-optin.e2e.test.ts tests/daemon-docker-topology.e2e.test.ts --no-file-parallelism"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.7",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.3",
+    "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-agent-default-model": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-agent-instructions": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-agent-loop": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-bash-local": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-commands": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-compaction": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-compaction-basic": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-compaction-tool-result-pruner": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-fs": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-fs-local": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-fs-observation-policy": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-jobs": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-jobs-local": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm-deepseek": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-permission-presets": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-repeat-tool-reminder": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-sandbox": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-sandbox-policy": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-session-projection": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-shell": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-shell-env": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-skill": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-skill-filesystem": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-spill": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-spill-local": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-spill-policy": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-subagent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-subagent-fork-in-process": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-subagent-spawn-in-process": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-subprocess": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-subprocess-local": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-token-meter": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-bash": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-call-timeout-policy": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-fs": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-fs-search": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-jobs": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-skill": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-subagent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tool-subagent-control": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-user-approval": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-util-values": "0.1.2-rc.1",
+    "@enkeep/dsh-affinity-policy": "workspace:*",
+    "@enkeep/dsh-enkeep-bundle": "workspace:*",
+    "@enkeep/dsh-event-relay": "workspace:*",
+    "@enkeep/dsh-external-interaction": "workspace:*",
+    "@enkeep/dsh-inbound": "workspace:*",
+    "@enkeep/dsh-mcp-governance": "workspace:*",
+    "@enkeep/dsh-platform-client": "workspace:*",
+    "@enkeep/dsh-receipt-store-sqlite": "workspace:*",
+    "@enkeep/dsh-tool-browser": "workspace:*",
+    "@enkeep/dsh-tool-cli": "workspace:*",
+    "@enkeep/dsh-tools": "workspace:*",
+    "@enkeep/platform-core": "workspace:*",
+    "@enkeep/platform-operations": "workspace:*",
+    "@enkeep/protocol": "workspace:*",
+    "@tivility/dsh-llm-affinity": "0.1.1",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@enkeep/import-happyclaw": "workspace:*",
+    "@enkeep/platform-storage-sqlite": "workspace:*",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.8"
+  }
+}

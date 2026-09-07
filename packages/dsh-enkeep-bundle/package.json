@@ -1,0 +1,66 @@
+{
+  "name": "@enkeep/dsh-enkeep-bundle",
+  "version": "0.1.0",
+  "description": "Enkeep runtime bundle orchestrating receipt store, inbound, event relay, tools, external interaction, and affinity policy via cordis.patch.yml",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./invariant": {
+      "types": "./src/invariant.ts",
+      "import": "./dist/invariant.js",
+      "default": "./dist/invariant.js"
+    },
+    "./trusted-registry": {
+      "types": "./src/trusted-registry.ts",
+      "import": "./dist/trusted-registry.js",
+      "default": "./dist/trusted-registry.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@enkeep/dsh-affinity-policy": "workspace:*",
+    "@enkeep/dsh-event-relay": "workspace:*",
+    "@enkeep/dsh-external-interaction": "workspace:*",
+    "@enkeep/dsh-inbound": "workspace:*",
+    "@enkeep/dsh-mcp-governance": "workspace:*",
+    "@enkeep/dsh-receipt-store-sqlite": "workspace:*",
+    "@enkeep/dsh-tool-browser": "workspace:*",
+    "@enkeep/dsh-tool-cli": "workspace:*",
+    "@enkeep/dsh-tools": "workspace:*",
+    "@tivility/dsh-llm-affinity": "0.1.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.7",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.3",
+    "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-util-values": "0.1.2-rc.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.8"
+  }
+}

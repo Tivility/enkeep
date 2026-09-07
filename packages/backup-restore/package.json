@@ -1,0 +1,44 @@
+{
+  "name": "@enkeep/backup-restore",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "bin": {
+    "enkeep-backup": "./dist/cli/backup-cli.js",
+    "enkeep-restore": "./dist/cli/restore-cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run -c vitest.config.ts",
+    "backup:create": "node dist/cli/backup-cli.js create",
+    "backup:inspect": "node dist/cli/backup-cli.js inspect",
+    "backup:verify": "node dist/cli/backup-cli.js verify",
+    "backup:restore": "node dist/cli/restore-cli.js restore",
+    "enkeep-backup": "node dist/cli/backup-cli.js",
+    "enkeep-restore": "node dist/cli/restore-cli.js"
+  },
+  "dependencies": {
+    "@enkeep/platform-core": "workspace:*",
+    "@enkeep/platform-storage-sqlite": "workspace:*",
+    "@enkeep/platform-server": "workspace:*"
+  },
+  "devDependencies": {
+    "@enkeep/demo-runner": "workspace:*",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.8"
+  }
+}
