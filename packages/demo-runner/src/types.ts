@@ -177,14 +177,20 @@ export interface DemoUpResult {
   timestamp: string;
   platform: DemoServiceEndpoint;
   runtimes: {
-    alice: DemoServiceEndpoint;
-    bob: DemoServiceEndpoint;
+    alice?: DemoServiceEndpoint;
+    bob?: DemoServiceEndpoint;
+    [key: string]: DemoServiceEndpoint | undefined;
   };
   endpoints: Record<string, string>;
   metadata: {
     processes: SignedProcessMetadata[];
     containers: SignedContainerMetadata[];
   };
+  users?: Array<{
+    username: string;
+    userId: string;
+    containerName: string;
+  }>;
 }
 
 export interface ProcessInspector {

@@ -197,4 +197,71 @@ describe('Multi-User Runtime Mapping & Fail-Closed Routing', () => {
       })
     ).rejects.toThrow(/FAIL-CLOSED/);
   });
+
+  it('4. up boots cleanly with only single admin user "owner-user" without Alice or Bob', async () => {
+    // Clean up Alice, Bob, and Shadow from DB, keeping only user "owner-user"
+    const db = new DatabaseSync(`${tempRepo.repoRoot}/.demo-data/platform.db`);
+    db.exec('PRAGMA foreign_keys = OFF;');
+    db.exec('DELETE FROM users;');
+    db.exec('DELETE FROM spaces;');
+    db.exec('DELETE FROM quota_limits;');
+
+    const ownerUserId = '5df32a3a-15d3-4591-a7c3-8a0233c7a5ca';
+    db.prepare(`
+      INSERT INTO users (id, username, password_hash, role, status, display_name)
+      VALUES (?, 'owner-user', 'hashed_pwd_owner-user', 'admin', 'active', 'owner-user Admin')
+    `).run(ownerUserId);
+
+    db.prepare(`
+      INSERT INTO quota_limits (user_id, resource, limit_amount, window_seconds)
+      VALUES (?, 'turns', 100000, 86400)
+    `).run(ownerUserId);
+
+    db.prepare(`
+      INSERT INTO spaces (id, user_id, name, folder, execution_mode, status)
+      VALUES ('spc_owner-user_home', ?, 'owner-user Home', 'owner-user-home', 'container', 'active')
+    `).run(ownerUserId);
+
+    db.close();
+
+    running = await launchDemoSystem({
+      repoRoot: tempRepo.repoRoot,
+      resourceSuffix,
+      runtimeAdapter: fakeContainerAdapter,
+      hostRuntimeAdapter: fakeHostAdapter,
+      allowHostRuntime: true,
+    });
+
+    expect(running.result.ok).toBe(true);
+    expect(running.result.runtimes['owner-user']).toBeDefined();
+    expect(running.result.runtimes['owner-user']?.status).toBe('healthy');
+    expect(running.result.runtimes.alice).toBeUndefined();
+    expect(running.result.runtimes.bob).toBeUndefined();
+    expect(running.runtimeHandles.size).toBe(1);
+    expect(running.runtimeHandles.has(ownerUserId)).toBe(true);
+
+    const ownerHandle = running.runtimeHandles.get(ownerUserId);
+    expect(ownerHandle).toBeDefined();
+    expect(ownerHandle!.userId).toBe(deriveRuntimeIdentity(ownerUserId, 'owner-user'));
+    expect(running.result.users).toBeDefined();
+    expect(running.result.users?.length).toBe(1);
+    expect(running.result.users?.[0].username).toBe('owner-user');
+  });
+
+  it('5. up fails closed when ZERO active users exist in DB', async () => {
+    const db = new DatabaseSync(`${tempRepo.repoRoot}/.demo-data/platform.db`);
+    db.exec('PRAGMA foreign_keys = OFF;');
+    db.exec('DELETE FROM users;');
+    db.close();
+
+    await expect(
+      launchDemoSystem({
+        repoRoot: tempRepo.repoRoot,
+        resourceSuffix,
+        runtimeAdapter: fakeContainerAdapter,
+        hostRuntimeAdapter: fakeHostAdapter,
+        allowHostRuntime: true,
+      })
+    ).rejects.toThrow(/FAIL-CLOSED: Zero active users found in database/);
+  });
 });

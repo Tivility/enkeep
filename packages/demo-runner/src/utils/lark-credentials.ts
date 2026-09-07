@@ -180,18 +180,18 @@ export function loadLarkTestCredentials(filePath: string): LarkTestCredentials {
 }
 
 /**
- * Creates a scoped LarkCredentialResolver that resolves ONLY for Alice and the credentialRef
+ * Creates a scoped LarkCredentialResolver that resolves ONLY for the target user and the credentialRef
  * derived from the loaded credentials appId (lark-test-${appId}).
  * All unknown users or old credentials (e.g. cred_alice_lark) return null without connecting.
  */
 export function createLarkTestCredentialResolver(
   credentials: LarkTestCredentials,
-  aliceUserId: string
+  targetUserId: string
 ): LarkCredentialResolver {
   const expectedCredentialRef = getLarkTestCredentialRef(credentials.appId);
   return {
     async resolve(userId: string, credentialRef: string): Promise<LarkResolvedCredentials | null> {
-      if (userId === aliceUserId && credentialRef === expectedCredentialRef) {
+      if (userId === targetUserId && credentialRef === expectedCredentialRef) {
         return {
           appId: credentials.appId,
           appSecret: credentials.appSecret,
@@ -206,16 +206,16 @@ export function createLarkTestCredentialResolver(
 
 /**
  * Ensures the dedicated test Space '飞书真实渠道测试' (folder lark-live-test) and
- * Channel Account exist for Alice in an idempotent, non-destructive manner.
+ * Channel Account exist for target user in an idempotent, non-destructive manner.
  * The credentialRef and accountId are derived from the given appId (or fallback to an existing lark-test account).
  */
 export async function ensureLarkTestResources(
   storage: PlatformStorage,
-  aliceUserId: string,
+  targetUserId: string,
   spacesDir: string,
   appId?: string
 ): Promise<LarkTestEnvironment> {
-  const tenant = storage.forTenant(aliceUserId);
+  const tenant = storage.forTenant(targetUserId);
 
   // 1. Ensure dedicated test Space
   let space = await tenant.spaces.findByFolder(LARK_TEST_SPACE_FOLDER);
@@ -277,11 +277,11 @@ export async function ensureLarkTestResources(
 }
 
 /**
- * Binds a specific Lark chatId / contextId to Alice's dedicated test space.
+ * Binds a specific Lark chatId / contextId to target user's dedicated test space.
  */
 export async function bindLarkChatContext(
   storage: PlatformStorage,
-  aliceUserId: string,
+  targetUserId: string,
   nativeContextId: string,
   options: {
     activationMode?: 'mention' | 'always';
@@ -289,7 +289,7 @@ export async function bindLarkChatContext(
     spaceId?: string;
   } = {}
 ): Promise<ChannelBinding> {
-  const tenant = storage.forTenant(aliceUserId);
+  const tenant = storage.forTenant(targetUserId);
   let accountId = options.accountId;
 
   if (!accountId) {

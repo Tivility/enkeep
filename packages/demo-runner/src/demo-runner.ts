@@ -213,8 +213,21 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         } else {
           console.log('\n🚀 Enkeep Demo Environment Running');
           console.log(`  Platform Server: ${system.result.platform.endpoint}`);
-          console.log(`  Alice Runtime:   ${system.result.runtimes.alice.endpoint} (${system.result.runtimes.alice.containerId?.slice(0, 12)})`);
-          console.log(`  Bob Runtime:     ${system.result.runtimes.bob.endpoint} (${system.result.runtimes.bob.containerId?.slice(0, 12)})`);
+          if (system.result.users && system.result.users.length > 0) {
+            for (const u of system.result.users) {
+              const rt = system.result.runtimes[u.username];
+              const label = `${u.username.charAt(0).toUpperCase() + u.username.slice(1)} Runtime:`;
+              const containerIdStr = rt?.containerId ? ` (${rt.containerId.slice(0, 12)})` : '';
+              console.log(`  ${label.padEnd(17)} ${rt?.endpoint ?? 'n/a'}${containerIdStr}`);
+            }
+          } else {
+            for (const [name, rt] of Object.entries(system.result.runtimes)) {
+              if (!rt) continue;
+              const label = `${name.charAt(0).toUpperCase() + name.slice(1)} Runtime:`;
+              const containerIdStr = rt.containerId ? ` (${rt.containerId.slice(0, 12)})` : '';
+              console.log(`  ${label.padEnd(17)} ${rt.endpoint}${containerIdStr}`);
+            }
+          }
           if (isLlmConfigured && dshConfig) {
             const providerNames = Object.keys(dshConfig.providers);
             const modelNames = Object.entries(dshConfig.providers).flatMap(([pkey, p]) =>
