@@ -50,8 +50,8 @@ describe('Demo Runner Lifecycle Integration Tests', () => {
 
     expect(system.result.ok).toBe(true);
     expect(system.result.platform.status).toBe('healthy');
-    expect(system.result.runtimes.alice.status).toBe('healthy');
-    expect(system.result.runtimes.bob.status).toBe('healthy');
+    expect(system.result.runtimes.alice?.status).toBe('healthy');
+    expect(system.result.runtimes.bob?.status).toBe('healthy');
 
     // 1. Verify signed process metadata exists with schemaVersion=1 and mode 0600
     const pidFilePath = join(paths.pidsDir, 'platform-server.json');

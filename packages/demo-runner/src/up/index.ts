@@ -523,7 +523,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     }
   }
 
-  // 4. Start Alice and Bob isolated User Runtimes
+  // 4. Start isolated User Runtimes
   const runtimeHandles = new Map<string, UserRuntimeHandle>();
   const hostRuntimeHandles = new Map<string, UserRuntimeHandle>();
   const activeUserMountsByMode = new Map<string, Record<string, RuntimeMountSpec[]>>();
@@ -547,97 +547,13 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     return errors;
   };
 
-  try {
-    // Start Alice container
-    const aliceHandle = await containerAdapter.startUserRuntime({
-      userId: 'alice',
-      image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
-      repoRoot,
-      dataRoot: options.dataRoot,
-      mode: options.mode,
-      resourceSuffix: options.resourceSuffix,
-      timeoutMs: options.timeoutMs ?? 15000,
-      llmEnabled: options.llmEnabled,
-      llmProvider: options.llmProvider,
-      llmModel: options.llmModel,
-    });
-    newlyCreatedHandles.push(aliceHandle);
-    if (aliceHandle.meta) {
-      containersList.push(aliceHandle.meta);
-    }
-
-    // If Alice has imported seed JSON files from demo:reset, install them into Alice container volume via official importSeed (REQUIRED / FAIL LOUD)
-    if (existsSync(paths.importDir)) {
-      const verifiedSeeds = loadAndVerifyFixedSeeds(paths.importDir, pathOptions);
-      if (typeof aliceHandle.importSeed !== 'function') {
-        throw new Error(`FAIL-CLOSED: Alice runtime container handle does not support importSeed`);
-      }
-      for (const { sessionId, seedEvents, receipt } of verifiedSeeds) {
-        const importRes = await aliceHandle.importSeed(sessionId, seedEvents);
-        if (importRes.status !== 'ok' && importRes.status !== 'completed' && importRes.status !== 'imported') {
-          throw new Error(`FAIL-CLOSED: Seed import failed for session "${sessionId}": status ${importRes.status}`);
-        }
-        if (importRes.persisted !== true) {
-          throw new Error(`FAIL-CLOSED: Seed import was not persisted for session "${sessionId}"`);
-        }
-        if (importRes.sessionId !== sessionId) {
-          throw new Error(`FAIL-CLOSED: Seed import sessionId mismatch: expected "${sessionId}", got "${importRes.sessionId}"`);
-        }
-        if (
-          !importRes.receipt ||
-          importRes.receipt.algorithm !== receipt.algorithm ||
-          importRes.receipt.checksum !== receipt.checksum ||
-          importRes.receipt.canonicalBytes !== receipt.canonicalBytes ||
-          importRes.receipt.eventCount !== receipt.eventCount
-        ) {
-          throw new Error(
-            `FAIL-CLOSED: Seed import receipt mismatch for session "${sessionId}": expected ${JSON.stringify(receipt)}, got ${JSON.stringify(importRes.receipt)}`
-          );
-        }
-        if (typeof importRes.duplicate !== 'boolean') {
-          throw new Error(`FAIL-CLOSED: Seed import returned missing or non-boolean duplicate flag for session "${sessionId}"`);
-        }
-      }
-    }
-
-    // Start Bob container
-    const bobHandle = await containerAdapter.startUserRuntime({
-      userId: 'bob',
-      image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
-      repoRoot,
-      dataRoot: options.dataRoot,
-      mode: options.mode,
-      resourceSuffix: options.resourceSuffix,
-      timeoutMs: options.timeoutMs ?? 15000,
-      llmEnabled: options.llmEnabled,
-      llmProvider: options.llmProvider,
-      llmModel: options.llmModel,
-    });
-    newlyCreatedHandles.push(bobHandle);
-    if (bobHandle.meta) {
-      containersList.push(bobHandle.meta);
-    }
-  } catch (err: unknown) {
-    // Fail-closed: Clean up any newly created containers immediately before throwing
-    const teardownErrors = await cleanupStartupHandles(newlyCreatedHandles);
-    const primaryError = err instanceof Error ? err : new Error(String(err));
-    if (teardownErrors.length > 0) {
-      throw new AggregateError(
-        [primaryError, ...teardownErrors],
-        `FAIL-CLOSED: User runtime container initialization failed:\n${primaryError.message}\nCleanup errors: ${teardownErrors.map((e) => e.message).join('; ')}`
-      );
-    }
-    throw primaryError;
-  }
-
   // 5. Connect Platform Storage and Message Store (Strictly validated non-symlink path and ancestors)
   validateSqliteDatabasePath(paths.dbPath, pathOptions);
   let db: DatabaseSync | null = null;
   let storage: SqlitePlatformStorage | null = null;
   let messageStore: SqliteWebMessageStore | null = null;
   let runtimeDiagnosticsService: RuntimeDiagnosticsService | null = null;
-  let aliceAuthoritativeUser: import('@enkeep/platform-core').User | null = null;
-  let bobAuthoritativeUser: import('@enkeep/platform-core').User | null = null;
+  let allActiveUsers: Array<{ id: string; username: string; status: string; role: string }> = [];
 
   try {
     db = new DatabaseSync(paths.dbPath);
@@ -660,36 +576,46 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
 
     storage = new SqlitePlatformStorage(db);
     messageStore = new SqliteWebMessageStore(db);
+    runtimeDiagnosticsService = new RuntimeDiagnosticsService({ db });
 
-    // Authoritative lookup of Alice and Bob DB user records
-    const aliceUser = await storage.users.findByUsername('alice');
-    if (!aliceUser || !aliceUser.id) {
-      throw new Error('FAIL-CLOSED: Authoritative user record for alice not found in database');
+    // Enumerate active users from DB; fail closed if ZERO active users
+    allActiveUsers = db.prepare("SELECT id, username, status, role FROM users WHERE status = 'active'").all() as Array<{ id: string; username: string; status: string; role: string }>;
+    if (allActiveUsers.length === 0) {
+      throw new Error('FAIL-CLOSED: Zero active users found in database');
     }
-    const bobUser = await storage.users.findByUsername('bob');
-    if (!bobUser || !bobUser.id) {
-      throw new Error('FAIL-CLOSED: Authoritative user record for bob not found in database');
-    }
-    aliceAuthoritativeUser = aliceUser;
-    bobAuthoritativeUser = bobUser;
 
     // Lark Test Opt-in Integration
     const larkCredsFile =
       options.larkTestCredentialsFile ?? process.env.ENKEEP_LARK_TEST_CREDENTIALS_FILE;
     if (larkCredsFile) {
       const larkCreds = loadLarkTestCredentials(larkCredsFile);
-      const testEnv = await ensureLarkTestResources(storage, aliceUser.id, paths.spacesDir, larkCreds.appId);
       const expectedCredentialRef = getLarkTestCredentialRef(larkCreds.appId);
 
+      // Bind to user that OWNS the channel account whose credential_ref equals lark-test-<appId>,
+      // falling back to the first active admin user if no such account exists yet.
+      const existingAccount = db.prepare('SELECT user_id FROM channel_accounts WHERE credential_ref = ?').get(expectedCredentialRef) as { user_id: string } | undefined;
+      let targetUserId: string;
+      if (existingAccount && existingAccount.user_id) {
+        targetUserId = existingAccount.user_id;
+      } else {
+        const firstAdmin = allActiveUsers.find((u) => u.role === 'admin');
+        if (!firstAdmin) {
+          throw new Error('FAIL-CLOSED: No active admin user found for Lark test resources');
+        }
+        targetUserId = firstAdmin.id;
+      }
+
+      const testEnv = await ensureLarkTestResources(storage, targetUserId, paths.spacesDir, larkCreds.appId);
+
       if (!effectiveLarkCredentialResolver) {
-        effectiveLarkCredentialResolver = createLarkTestCredentialResolver(larkCreds, aliceUser.id);
+        effectiveLarkCredentialResolver = createLarkTestCredentialResolver(larkCreds, targetUserId);
       }
       if (!effectiveLarkDefaultSpaceResolver) {
         effectiveLarkDefaultSpaceResolver = async (userId: string, account: import('@enkeep/platform-core').ChannelAccount) => {
           if (account.defaultSpaceId !== undefined) {
             return account.defaultSpaceId ?? undefined;
           }
-          if (userId === aliceUser.id && account.credentialRef === expectedCredentialRef) {
+          if (userId === targetUserId && account.credentialRef === expectedCredentialRef) {
             return testEnv.space.id;
           }
           return undefined;
@@ -697,89 +623,27 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       }
     }
 
-    const aliceHandle = newlyCreatedHandles[0];
-    const bobHandle = newlyCreatedHandles[1];
-
-    // Key runtimeHandles strictly by authoritative DB user ID (never usernames)
-    runtimeHandles.set(aliceUser.id, aliceHandle);
-    runtimeHandles.set(bobUser.id, bobHandle);
-
-    // Instantiate and record initial startup diagnostics for Alice and Bob
-    runtimeDiagnosticsService = new RuntimeDiagnosticsService({ db });
-    try {
-      if (aliceHandle) {
-        await runtimeDiagnosticsService.recordDiagnostic({
-          userId: aliceUser.id,
-          containerId: aliceHandle.meta?.containerId ?? null,
-          eventType: 'lifecycle_start',
-          level: 'info',
-          code: 'CONTAINER_START_SUCCESS',
-          details: { username: aliceUser.username },
-        });
-      }
-      if (bobHandle) {
-        await runtimeDiagnosticsService.recordDiagnostic({
-          userId: bobUser.id,
-          containerId: bobHandle.meta?.containerId ?? null,
-          eventType: 'lifecycle_start',
-          level: 'info',
-          code: 'CONTAINER_START_SUCCESS',
-          details: { username: bobUser.username },
-        });
-      }
-    } catch {}
-
-    // Validate Alice and Bob EACH have exactly 5 explicit quota_limits metrics (exact 10 rows in DB total), exact finite nonnegative (no count-only)
-    const expectedQuotaMetrics = ['turns', 'messages', 'tokens', 'storage_bytes', 'api_calls'] as const;
-    const totalQuotaRows = (db.prepare('SELECT COUNT(*) as c FROM quota_limits').get() as { c: number }).c;
-    if (totalQuotaRows < 10 || totalQuotaRows % 5 !== 0) {
-      throw new Error(
-        `FAIL-CLOSED: Missing quota limits configuration in demo database (expected at least 10 rows matching 5 per user, got ${totalQuotaRows}). ` +
-        `Please run "pnpm run demo:reset" to reinitialize a clean demo database with explicit demo quota limits.`
-      );
-    }
-    for (const user of [aliceUser, bobUser]) {
+    // Validate quota configuration: per active user (each active user has >= 1 quota row)
+    for (const user of allActiveUsers) {
       const rows = db.prepare('SELECT resource, limit_amount FROM quota_limits WHERE user_id = ?').all(user.id) as Array<{ resource: string; limit_amount: number }>;
       if (rows.length === 0) {
         throw new Error(
           `FAIL-CLOSED: Missing quota limits configuration in demo database for user "${user.username}". ` +
-          `Unconfigured quota under fail_closed policy blocks all turn execution. ` +
+          `Each active user must have at least 1 quota limit configured. Unconfigured quota under fail_closed policy blocks all turn execution. ` +
           `Please run "pnpm run demo:reset" to reinitialize a clean demo database with explicit demo quota limits.`
         );
       }
-      if (rows.length !== expectedQuotaMetrics.length) {
-        throw new Error(
-          `FAIL-CLOSED: Missing quota limits configuration in demo database for user "${user.username}". ` +
-          `Found ${rows.length} configured metrics; exactly ${expectedQuotaMetrics.length} explicit metrics (${expectedQuotaMetrics.join(', ')}) required. ` +
-          `Please run "pnpm run demo:reset" to reinitialize a clean demo database with explicit demo quota limits.`
-        );
-      }
-      const metricMap = new Map<string, number>();
       for (const row of rows) {
-        if (metricMap.has(row.resource)) {
-          throw new Error(`FAIL-CLOSED: Duplicate quota metric "${row.resource}" for user "${user.username}".`);
-        }
         if (typeof row.limit_amount !== 'number' || !Number.isFinite(row.limit_amount) || (row.limit_amount < 0 && row.limit_amount !== -1)) {
           throw new Error(
             `FAIL-CLOSED: Quota limit for metric "${row.resource}" on user "${user.username}" is invalid (${row.limit_amount}); must be a finite nonnegative number or -1 for unlimited.`
           );
         }
-        metricMap.set(row.resource, row.limit_amount);
-      }
-      for (const expectedMetric of expectedQuotaMetrics) {
-        if (!metricMap.has(expectedMetric)) {
-          throw new Error(
-            `FAIL-CLOSED: Missing required quota limit metric "${expectedMetric}" for user "${user.username}". ` +
-            `Please run "pnpm run demo:reset" to reinitialize a clean demo database with explicit demo quota limits.`
-          );
-        }
       }
     }
 
-    // Discover all active DB users and initialize/reconnect their runtime containers (one user, one runtime)
-    const allActiveUsers = db.prepare("SELECT id, username, status, role FROM users WHERE status = 'active'").all() as Array<{ id: string; username: string; status: string; role: string }>;
+    // Boot runtimes for all active users from DB
     for (const u of allActiveUsers) {
-      if (runtimeHandles.has(u.id)) continue;
       const runtimeIdentity = deriveRuntimeIdentity(u.id, u.username);
       const userHandle = await containerAdapter.startUserRuntime({
         userId: runtimeIdentity,
@@ -797,7 +661,44 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       if (userHandle.meta) {
         containersList.push(userHandle.meta);
       }
+
+      // If Alice exists and has imported seed JSON files from demo:reset, install them into Alice container volume
+      if (u.username === 'alice' && existsSync(paths.importDir)) {
+        const verifiedSeeds = loadAndVerifyFixedSeeds(paths.importDir, pathOptions);
+        if (typeof userHandle.importSeed !== 'function') {
+          throw new Error(`FAIL-CLOSED: Alice runtime container handle does not support importSeed`);
+        }
+        for (const { sessionId, seedEvents, receipt } of verifiedSeeds) {
+          const importRes = await userHandle.importSeed(sessionId, seedEvents);
+          if (importRes.status !== 'ok' && importRes.status !== 'completed' && importRes.status !== 'imported') {
+            throw new Error(`FAIL-CLOSED: Seed import failed for session "${sessionId}": status ${importRes.status}`);
+          }
+          if (importRes.persisted !== true) {
+            throw new Error(`FAIL-CLOSED: Seed import was not persisted for session "${sessionId}"`);
+          }
+          if (importRes.sessionId !== sessionId) {
+            throw new Error(`FAIL-CLOSED: Seed import sessionId mismatch: expected "${sessionId}", got "${importRes.sessionId}"`);
+          }
+          if (
+            !importRes.receipt ||
+            importRes.receipt.algorithm !== receipt.algorithm ||
+            importRes.receipt.checksum !== receipt.checksum ||
+            importRes.receipt.canonicalBytes !== receipt.canonicalBytes ||
+            importRes.receipt.eventCount !== receipt.eventCount
+          ) {
+            throw new Error(
+              `FAIL-CLOSED: Seed import receipt mismatch for session "${sessionId}": expected ${JSON.stringify(receipt)}, got ${JSON.stringify(importRes.receipt)}`
+            );
+          }
+          if (typeof importRes.duplicate !== 'boolean') {
+            throw new Error(`FAIL-CLOSED: Seed import returned missing or non-boolean duplicate flag for session "${sessionId}"`);
+          }
+        }
+      }
+
+      // Key runtimeHandles strictly by authoritative DB user ID (never usernames)
       runtimeHandles.set(u.id, userHandle);
+
       try {
         if (runtimeDiagnosticsService) {
           await runtimeDiagnosticsService.recordDiagnostic({
@@ -830,7 +731,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     if (teardownErrs.length > 0) {
       throw new AggregateError(
         [primary, ...teardownErrs],
-        `FAIL-CLOSED: Database/storage initialization failed:\n${primary.message}\nCleanup errors: ${teardownErrs.map((e) => e.message).join('; ')}`
+        `FAIL-CLOSED: Initialization failed:\n${primary.message}\nCleanup errors: ${teardownErrs.map((e) => e.message).join('; ')}`
       );
     }
     throw primary;
@@ -2014,9 +1915,6 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     };
   }
 
-  const aliceHandle = runtimeHandles.get(aliceAuthoritativeUser!.id)!;
-  const bobHandle = runtimeHandles.get(bobAuthoritativeUser!.id)!;
-
   // Phase 2 Binding: Bind full platform and events handlers to all active runtime tunnels
   for (const [uid, handle] of runtimeHandles.entries()) {
     await bindRuntimeServices(handle, uid);
@@ -2629,8 +2527,8 @@ fs.appendFileSync(p, corruptData);
   let platformActualPort = 0;
 
   try {
-    const aliceHandleForRunId = runtimeHandles.get(aliceAuthoritativeUser!.id);
-    const demoRunId = aliceHandleForRunId?.runId ?? generateRunId();
+    const firstHandleForRunId = runtimeHandles.values().next().value;
+    const demoRunId = firstHandleForRunId?.runId ?? generateRunId();
 
     const hostRuntimeProvider = allowHostRuntime
       ? {
@@ -2739,48 +2637,43 @@ fs.appendFileSync(p, corruptData);
 
     const processesList: SignedProcessMetadata[] = [platformMeta];
 
-    const aliceHandle = runtimeHandles.get(aliceAuthoritativeUser!.id)!;
-    const bobHandle = runtimeHandles.get(bobAuthoritativeUser!.id)!;
+    const runtimesMap: Record<string, DemoServiceEndpoint> = {};
+    const endpointsMap: Record<string, string> = { platform: platformUrl };
+    const usersList: Array<{ username: string; userId: string; containerName: string }> = [];
 
-    // Call health and validate each before return (do not synthesize statuses; fail closed if tools are not operational)
-    const [aliceHealth, bobHealth] = await Promise.all([
-      aliceHandle.checkHealth(),
-      bobHandle.checkHealth(),
-    ]);
+    // Health requires every active user's runtime healthy
+    for (const u of allActiveUsers) {
+      const handle = runtimeHandles.get(u.id);
+      if (!handle) {
+        throw new Error(`FAIL-CLOSED: Runtime handle not found for active user "${u.username}"`);
+      }
+      const health = await handle.checkHealth();
+      if (!health) {
+        throw new Error(`FAIL-CLOSED: Health check failed for user runtime container for user "${u.username}"`);
+      }
+      if (health.toolsOperational !== true) {
+        throw new Error(
+          `FAIL-CLOSED: ${u.username} runtime container toolsOperational is not true after service binding (status: ${health.status}, reason: ${health.toolsUnavailableReason ?? 'none'})`
+        );
+      }
 
-    if (!aliceHealth || !bobHealth) {
-      throw new Error('FAIL-CLOSED: Health check failed for user runtime container');
+      const endpoint: DemoServiceEndpoint = {
+        name: `${u.username}-runtime`,
+        role: u.role === 'admin' ? 'admin-runtime' : 'user-runtime',
+        endpoint: `docker-exec://${handle.containerName}`,
+        transport: 'docker-exec',
+        containerId: handle.containerId,
+        status: health.status === 'ok' ? 'healthy' : 'error',
+      };
+
+      runtimesMap[u.username] = endpoint;
+      endpointsMap[u.username] = endpoint.endpoint;
+      usersList.push({
+        username: u.username,
+        userId: u.id,
+        containerName: handle.containerName,
+      });
     }
-
-    if (aliceHealth.toolsOperational !== true) {
-      throw new Error(
-        `FAIL-CLOSED: Alice runtime container toolsOperational is not true after service binding (status: ${aliceHealth.status}, reason: ${aliceHealth.toolsUnavailableReason ?? 'none'})`
-      );
-    }
-
-    if (bobHealth.toolsOperational !== true) {
-      throw new Error(
-        `FAIL-CLOSED: Bob runtime container toolsOperational is not true after service binding (status: ${bobHealth.status}, reason: ${bobHealth.toolsUnavailableReason ?? 'none'})`
-      );
-    }
-
-    const aliceEndpoint: DemoServiceEndpoint = {
-      name: 'alice-runtime',
-      role: 'admin-runtime',
-      endpoint: `docker-exec://${aliceHandle.containerName}`,
-      transport: 'docker-exec',
-      containerId: aliceHandle.containerId,
-      status: aliceHealth.status === 'ok' ? 'healthy' : 'error',
-    };
-
-    const bobEndpoint: DemoServiceEndpoint = {
-      name: 'bob-runtime',
-      role: 'user-runtime',
-      endpoint: `docker-exec://${bobHandle.containerName}`,
-      transport: 'docker-exec',
-      containerId: bobHandle.containerId,
-      status: bobHealth.status === 'ok' ? 'healthy' : 'error',
-    };
 
     const timestamp = new Date().toISOString();
 
@@ -2798,19 +2691,13 @@ fs.appendFileSync(p, corruptData);
         pid: process.pid,
         status: 'healthy',
       },
-      runtimes: {
-        alice: aliceEndpoint,
-        bob: bobEndpoint,
-      },
-      endpoints: {
-        platform: platformUrl,
-        alice: aliceEndpoint.endpoint,
-        bob: bobEndpoint.endpoint,
-      },
+      runtimes: runtimesMap,
+      endpoints: endpointsMap,
       metadata: {
         processes: processesList,
         containers: containersList,
       },
+      users: usersList,
     };
 
     let isClosed = false;

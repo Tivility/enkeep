@@ -856,8 +856,8 @@ export async function runDemoTestSuite(options: DemoTestOptions = {}): Promise<D
 
       return {
         platformUrl,
-        aliceEndpoint: running.result.runtimes.alice.endpoint,
-        bobEndpoint: running.result.runtimes.bob.endpoint,
+        aliceEndpoint: running.result.runtimes.alice?.endpoint ?? '',
+        bobEndpoint: running.result.runtimes.bob?.endpoint ?? '',
         containerId: aliceHandle.containerId,
         healthStatus: aliceHealth.status,
         dshVersion: aliceHealth.version,

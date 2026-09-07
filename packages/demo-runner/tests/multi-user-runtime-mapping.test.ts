@@ -197,4 +197,71 @@ describe('Multi-User Runtime Mapping & Fail-Closed Routing', () => {
       })
     ).rejects.toThrow(/FAIL-CLOSED/);
   });
+
+  it('4. up boots cleanly with only single admin user "tivility" without Alice or Bob', async () => {
+    // Clean up Alice, Bob, and Shadow from DB, keeping only user "tivility"
+    const db = new DatabaseSync(`${tempRepo.repoRoot}/.demo-data/platform.db`);
+    db.exec('PRAGMA foreign_keys = OFF;');
+    db.exec('DELETE FROM users;');
+    db.exec('DELETE FROM spaces;');
+    db.exec('DELETE FROM quota_limits;');
+
+    const tivilityUserId = '1b587104-4f7c-46a9-8964-72ee9bea23bc';
+    db.prepare(`
+      INSERT INTO users (id, username, password_hash, role, status, display_name)
+      VALUES (?, 'tivility', 'hashed_pwd_tivility', 'admin', 'active', 'Tivility Admin')
+    `).run(tivilityUserId);
+
+    db.prepare(`
+      INSERT INTO quota_limits (user_id, resource, limit_amount, window_seconds)
+      VALUES (?, 'turns', 100000, 86400)
+    `).run(tivilityUserId);
+
+    db.prepare(`
+      INSERT INTO spaces (id, user_id, name, folder, execution_mode, status)
+      VALUES ('spc_tivility_home', ?, 'Tivility Home', 'tivility-home', 'container', 'active')
+    `).run(tivilityUserId);
+
+    db.close();
+
+    running = await launchDemoSystem({
+      repoRoot: tempRepo.repoRoot,
+      resourceSuffix,
+      runtimeAdapter: fakeContainerAdapter,
+      hostRuntimeAdapter: fakeHostAdapter,
+      allowHostRuntime: true,
+    });
+
+    expect(running.result.ok).toBe(true);
+    expect(running.result.runtimes.tivility).toBeDefined();
+    expect(running.result.runtimes.tivility?.status).toBe('healthy');
+    expect(running.result.runtimes.alice).toBeUndefined();
+    expect(running.result.runtimes.bob).toBeUndefined();
+    expect(running.runtimeHandles.size).toBe(1);
+    expect(running.runtimeHandles.has(tivilityUserId)).toBe(true);
+
+    const tivilityHandle = running.runtimeHandles.get(tivilityUserId);
+    expect(tivilityHandle).toBeDefined();
+    expect(tivilityHandle!.userId).toBe(deriveRuntimeIdentity(tivilityUserId, 'tivility'));
+    expect(running.result.users).toBeDefined();
+    expect(running.result.users?.length).toBe(1);
+    expect(running.result.users?.[0].username).toBe('tivility');
+  });
+
+  it('5. up fails closed when ZERO active users exist in DB', async () => {
+    const db = new DatabaseSync(`${tempRepo.repoRoot}/.demo-data/platform.db`);
+    db.exec('PRAGMA foreign_keys = OFF;');
+    db.exec('DELETE FROM users;');
+    db.close();
+
+    await expect(
+      launchDemoSystem({
+        repoRoot: tempRepo.repoRoot,
+        resourceSuffix,
+        runtimeAdapter: fakeContainerAdapter,
+        hostRuntimeAdapter: fakeHostAdapter,
+        allowHostRuntime: true,
+      })
+    ).rejects.toThrow(/FAIL-CLOSED: Zero active users found in database/);
+  });
 });
