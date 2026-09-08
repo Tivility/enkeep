@@ -5,7 +5,7 @@
  * Migrates 25 HappyClaw user skills into Enkeep as global upload skills.
  *
  * Invariants:
- * - Read-only access to HappyClaw snapshot; never touches live /Users/tivility/happyclaw.
+ * - Read-only access to HappyClaw snapshot; never touches the live HappyClaw installation.
  * - Idempotent: Skips identical (name + contentHash); updates if hash changed; inserts if new.
  * - Zero secrets printed in output or written to plaintext DB columns.
  * - Programmatic service code path: Uses ExtensionCatalogService + SqliteTenantScopedSkillPackageRepository.
