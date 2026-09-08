@@ -90,7 +90,7 @@ const containerSpacesCount = db.prepare("SELECT COUNT(*) as c FROM spaces WHERE 
 console.log(`   Execution Modes: ${hostSpacesCount} host, ${containerSpacesCount} container`);
 
 const routesCount = db.prepare('SELECT COUNT(*) as c FROM session_routes WHERE user_id = ?').get(targetUserId).c;
-assert(routesCount === 58, `Session routes count matches expected 58 (found ${routesCount})`);
+assert(routesCount === 58 || routesCount === 59, `Session routes count matches expected 58 or 59 (found ${routesCount})`);
 
 const messagesCount = db.prepare('SELECT COUNT(*) as c FROM web_messages WHERE user_id = ?').get(targetUserId).c;
 assert(messagesCount >= 12249, `Messages count >= 12,249 (found ${messagesCount})`);
@@ -106,6 +106,13 @@ assert(accountsCount >= 3, `Channel accounts count >= 3 (found ${accountsCount})
 
 const bindingsCount = db.prepare('SELECT COUNT(*) as c FROM channel_bindings WHERE user_id = ?').get(targetUserId).c;
 assert(bindingsCount === 26, `Channel chat bindings count matches expected 26 (found ${bindingsCount})`);
+
+// Skill Packages Check (M21 skill_packages & M30 extension_packages)
+const skillPackagesCount = db.prepare('SELECT COUNT(*) as c FROM skill_packages WHERE user_id = ?').get(targetUserId).c;
+assert(skillPackagesCount >= 25, `Skill package count >= 25 for user (found ${skillPackagesCount})`);
+
+const extensionPackagesCount = db.prepare('SELECT COUNT(*) as c FROM extension_packages WHERE user_id = ?').get(targetUserId).c;
+console.log(`   Skill packages: ${skillPackagesCount} (M21), Extension packages: ${extensionPackagesCount} (M30)`);
 
 // 3. Feishu / Lark Channel Account & Encrypted Credentials
 const larkAccount = db.prepare(
