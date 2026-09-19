@@ -44,7 +44,7 @@ function parseCliArgs(): MigrationCliOptions {
   const args = process.argv.slice(2);
   let snapshotDir = process.env.HAPPYCLAW_SNAPSHOT_DIR || undefined;
   let dbPath = process.env.ENKEEP_PLATFORM_DB || undefined;
-  let targetUsername = process.env.TARGET_USERNAME || 'tivility';
+  let targetUsername = process.env.TARGET_USERNAME || 'admin';
   let dryRun = false;
   let dataRoot = process.env.ENKEEP_DATA_ROOT || undefined;
   let bindAllSpaces = false;
@@ -94,7 +94,7 @@ Usage: migrate-happyclaw-skills [options]
 Options:
   --snapshot <dir>          Path to HappyClaw snapshot directory (or set HAPPYCLAW_SNAPSHOT_DIR)
   --db <path>               Path to Enkeep SQLite database (or set ENKEEP_PLATFORM_DB)
-  --target-username <user>  Target Enkeep username (default: tivility)
+  --target-username <user>  Target Enkeep username (default: admin)
   --bind-all-spaces         Bind and enable all migrated skills into all active spaces of target user
   --dry-run                 Simulate migration without modifying files or database
   --data-root <dir>         Root data directory for Enkeep (default: parent of db)
@@ -284,7 +284,7 @@ async function main(): Promise<void> {
       const staged = await stageArchiveSkill(archiveBuffer, `${slug}.tar.gz`);
 
       try {
-        const payload: ValidatedSkillPayload = staged.payload;
+        const payload = staged.payload;
         const contentHash = payload.contentHash;
 
         // 3. Check existing records in M21 (skill_packages) and M30 (extension_packages)

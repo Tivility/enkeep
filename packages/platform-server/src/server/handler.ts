@@ -74,7 +74,7 @@ import type {
   OperationsReadinessStatus,
 } from "../management/types.js";
 import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority } from "@enkeep/platform-operations";
-import { QuotaExceededError } from "@enkeep/platform-operations";
+import { QuotaExceededError, validateTimezone } from "@enkeep/platform-operations";
 import Busboy from "busboy";
 import {
   RuntimeFileApiService,
@@ -170,6 +170,7 @@ const ALLOWED_CREATE_TASK_KEYS = new Set([
   "timezone",
   "misfirePolicy",
   "overlapPolicy",
+  "delivery",
 ]);
 const ALLOWED_PROFILE_KEYS = new Set([
   "name",
@@ -276,6 +277,7 @@ export interface PlatformServerHandlerOptions {
   spaceMountService?: SpaceMountService;
   browserService?: BrowserService;
   mcpService?: PlatformProxyMcpService;
+  dshHome?: string;
 }
 
 function isValidIsoDate(raw: unknown): boolean {
@@ -3625,12 +3627,15 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                 throw new NotFoundError(`Session "${sessionId}" not found`);
               }
 
-              const payload = {
+              const payload: any = {
                 type: "agent_prompt" as const,
                 prompt: body.prompt as string,
                 sessionId,
                 sessionPolicy: "existing_session" as const,
               };
+              if (body.delivery !== undefined && body.delivery !== null) {
+                payload.delivery = body.delivery;
+              }
 
               let validatedMisfirePolicy: 'coalesce' | 'skip' | undefined;
               if (body.misfirePolicy !== undefined && body.misfirePolicy !== null) {
@@ -3648,12 +3653,9 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                 validatedOverlapPolicy = body.overlapPolicy as 'skip';
               }
 
-              let validatedTimezone: string | undefined;
+              let validatedTimezone = 'UTC';
               if (body.timezone !== undefined && body.timezone !== null) {
-                if (body.timezone !== 'UTC') {
-                  throw new ValidationError(`Invalid timezone "${String(body.timezone)}". Only "UTC" is currently supported`);
-                }
-                validatedTimezone = 'UTC';
+                validatedTimezone = validateTimezone(body.timezone);
               }
 
               const result = opsProvider
@@ -5800,7 +5802,12 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             throw new PlatformError("Database service is unavailable", "SERVICE_UNAVAILABLE", 503);
           }
 
-          const dualReconcile = new DualStorageReconcileService({ db });
+          const dualReconcile = new DualStorageReconcileService({
+            db,
+            dshHome: options.dshHome,
+            fileProvider: options.fileProvider,
+            runtimeArtifactPort: customRuntimeArtifactPort,
+          });
           const volumeScan = new VolumeScanService({ db, operations });
 
           if (storageSub === "/reconcile" || storageSub === "reconcile") {
@@ -5811,6 +5818,11 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             const targetSessionId = parsedUrl.searchParams.get("sessionId");
             const dshPath = parsedUrl.searchParams.get("dshJsonlPath") || undefined;
             const dshDir = parsedUrl.searchParams.get("dshSessionsDir") || undefined;
+            const filterStatusParam = parsedUrl.searchParams.get("filterStatus");
+            const filterStatus =
+              filterStatusParam === "active" || filterStatusParam === "archived" || filterStatusParam === "all"
+                ? filterStatusParam
+                : undefined;
 
             if (targetSessionId) {
               const report = await dualReconcile.reconcileSession(targetUserId, targetSessionId, dshPath);
@@ -5818,7 +5830,10 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
               return;
             }
 
-            const allReport = await dualReconcile.reconcileAllSessions(targetUserId, dshDir);
+            const allReport = await dualReconcile.reconcileAllSessions(targetUserId, {
+              dshSessionsDir: dshDir,
+              filterStatus,
+            });
             sendJsonResponse(res, 200, createSuccessEnvelope(allReport));
             return;
           }
@@ -5828,8 +5843,19 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
               throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
             }
             validateCsrf(req, { csrfToken });
-              const body = await parseJsonBody(req, maxBodyBytes);
-            const unknownKeys = getUnknownKeys(body, new Set(["userId", "sessionId", "dshJsonlPath", "dryRun"]));
+            const body = await parseJsonBody(req, maxBodyBytes);
+            const unknownKeys = getUnknownKeys(
+              body,
+              new Set([
+                "userId",
+                "sessionId",
+                "dshJsonlPath",
+                "dryRun",
+                "deleteOrphans",
+                "expectedSnapshotHash",
+                "expectedGeneration",
+              ])
+            );
             if (unknownKeys.length > 0) {
               throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
             }
@@ -5838,15 +5864,27 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             if (typeof body.sessionId !== "string" || !body.sessionId.trim()) {
               throw new ValidationError('Field "sessionId" is required');
             }
-            if (typeof body.dshJsonlPath !== "string" || !body.dshJsonlPath.trim()) {
-              throw new ValidationError('Field "dshJsonlPath" is required');
+            if (body.dshJsonlPath !== undefined && (typeof body.dshJsonlPath !== "string" || !body.dshJsonlPath.trim())) {
+              throw new ValidationError('Field "dshJsonlPath" must be a non-empty string');
             }
+
+            const dshPath =
+              typeof body.dshJsonlPath === "string" && body.dshJsonlPath.trim()
+                ? body.dshJsonlPath.trim()
+                : undefined;
 
             const result = await dualReconcile.repairSession(
               targetUserId,
               body.sessionId as string,
-              body.dshJsonlPath as string,
-              { dryRun: Boolean(body.dryRun) }
+              dshPath,
+              {
+                dryRun: Boolean(body.dryRun),
+                deleteOrphans: Boolean(body.deleteOrphans),
+                expectedSnapshotHash:
+                  typeof body.expectedSnapshotHash === "string" ? body.expectedSnapshotHash : undefined,
+                expectedGeneration:
+                  typeof body.expectedGeneration === "number" ? body.expectedGeneration : undefined,
+              }
             );
             sendJsonResponse(res, 200, createSuccessEnvelope(result));
             return;
