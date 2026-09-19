@@ -112,6 +112,43 @@ export interface CreateChannelOutboxInput {
   status?: ChannelOutboxStatus;
 }
 
+export interface ChannelTurnOrigin {
+  turnId: string;
+  userId: string;
+  sessionId: string;
+  accountId: string;
+  channel: string;
+  chatId: string;
+  nativeContextId: string;
+  nativeEventId?: string | null;
+  replyToMessageId?: string | null;
+  rootId?: string | null;
+  threadId?: string | null;
+  originTurnId?: string | null;
+  createdAt: string;
+}
+
+export interface CreateChannelTurnOriginInput {
+  turnId: string;
+  sessionId: string;
+  accountId: string;
+  channel: string;
+  chatId: string;
+  nativeContextId: string;
+  nativeEventId?: string | null;
+  replyToMessageId?: string | null;
+  rootId?: string | null;
+  threadId?: string | null;
+  originTurnId?: string | null;
+}
+
+export interface TenantScopedTurnOriginRepository {
+  readonly userId: string;
+  create(input: CreateChannelTurnOriginInput): Promise<ChannelTurnOrigin>;
+  findByTurnId(turnId: string): Promise<ChannelTurnOrigin | null>;
+  findByOriginTurnId(originTurnId: string): Promise<ChannelTurnOrigin[]>;
+}
+
 export interface TenantScopedChannelRepository {
   readonly userId: string;
 
@@ -134,7 +171,7 @@ export interface TenantScopedChannelRepository {
   // Inbox operations (idempotent inbound event ingestion)
   findInboxByEvent(accountId: string, nativeEventId: string): Promise<ChannelInboxItem | null>;
   createInboxItem(input: Omit<CreateChannelInboxInput, 'userId'>): Promise<{ item: ChannelInboxItem; isDuplicate: boolean }>;
-  updateInboxStatus(id: string, status: ChannelInboxStatus): Promise<ChannelInboxItem>;
+  updateInboxStatus(id: string, status: ChannelInboxStatus, payloadJson?: string): Promise<ChannelInboxItem>;
   claimInboxForProcessing(id: string): Promise<ChannelInboxItem | null>;
   listHeldInbox(limit?: number, accountId?: string): Promise<ChannelInboxItem[]>;
 
@@ -145,4 +182,10 @@ export interface TenantScopedChannelRepository {
   claimPendingOutboxItem(id: string, accountId?: string): Promise<ChannelOutboxItem | null>;
   updateOutboxStatus(id: string, status: ChannelOutboxStatus, incrementAttempt?: boolean): Promise<ChannelOutboxItem>;
   recoverStaleSendingOutbox(staleAfterSeconds?: number, accountId?: string): Promise<number>;
+
+  // Turn origin operations (immutable per-inbound turn context)
+  createTurnOrigin(input: Omit<CreateChannelTurnOriginInput, 'userId'>): Promise<ChannelTurnOrigin>;
+  findTurnOriginByTurnId(turnId: string): Promise<ChannelTurnOrigin | null>;
+  findTurnOriginsBySessionId(sessionId: string): Promise<ChannelTurnOrigin[]>;
+  findTurnOriginsByOriginTurnId(originTurnId: string): Promise<ChannelTurnOrigin[]>;
 }

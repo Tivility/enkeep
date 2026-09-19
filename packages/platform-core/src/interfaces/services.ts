@@ -47,6 +47,7 @@ import type {
   TenantScopedSkillOperationRepository,
   TenantScopedSpaceMountRepository,
   TenantScopedChannelRepository,
+  TenantScopedTurnOriginRepository,
 } from './repositories.js';
 
 export interface RuntimeMountSpec {
@@ -121,6 +122,7 @@ export interface PlatformStorage {
     readonly extensionBindings: TenantScopedExtensionBindingRepository;
     readonly spaceMounts: TenantScopedSpaceMountRepository;
     readonly channels: TenantScopedChannelRepository;
+    readonly turnOrigins: TenantScopedTurnOriginRepository;
     readonly permissionPresets?: unknown;
   };
 

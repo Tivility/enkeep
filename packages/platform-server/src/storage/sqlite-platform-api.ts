@@ -224,6 +224,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       name: space.name,
       executionMode: space.executionMode,
       status: space.status,
+      canonicalSessionId: space.canonicalSessionId ?? null,
       createdAt: space.createdAt,
       updatedAt: space.updatedAt,
       ...(profileBinding !== undefined ? { profileBinding } : {}),
@@ -521,6 +522,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
     return {
       id: route.id,
       spaceId: route.spaceId,
+      channel: route.channel,
       title: route.title ?? null,
       status: route.status,
       currentGeneration: route.currentGeneration,
@@ -599,7 +601,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       // Re-read Space inside BEGIN IMMEDIATE write lock to prevent archive/create race
       const spaceRow = this.db
         .prepare(
-          `SELECT id, user_id, status, execution_mode, agent_profile_id, agent_profile_snapshot_id
+          `SELECT id, user_id, status, execution_mode, canonical_session_id, agent_profile_id, agent_profile_snapshot_id
            FROM spaces
            WHERE id = ? AND user_id = ?
            LIMIT 1`
@@ -610,6 +612,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
             user_id: string;
             status: string;
             execution_mode: string;
+            canonical_session_id: string | null;
             agent_profile_id: string | null;
             agent_profile_snapshot_id: string | null;
           }
@@ -632,6 +635,57 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
         }
         if (input.executionMode !== spaceExecutionMode) {
           throw new ValidationError('Session executionMode cannot override or mismatch space executionMode');
+        }
+      }
+
+      // Idempotent canonical return: If not forcing a new session, return existing canonical route
+      if (!input.forceNew && spaceRow.canonical_session_id) {
+        const canonicalStmt = this.db.prepare(
+          'SELECT id, execution_mode FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? AND status = ? LIMIT 1'
+        );
+        const canonRow = canonicalStmt.get(spaceRow.canonical_session_id, input.spaceId, userId, 'active') as { id: string; execution_mode: string } | undefined;
+        if (canonRow) {
+          if (canonRow.execution_mode !== spaceExecutionMode) {
+            this.db.prepare(
+              'UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+            ).run(spaceExecutionMode, canonRow.id, userId);
+          }
+          this.db.exec('COMMIT');
+          inTx = false;
+          const tenant = this.storage.forTenant(userId);
+          const existingRoute = await tenant.sessionRoutes.findById(canonRow.id);
+          if (existingRoute) {
+            return this.toPublicSession(existingRoute);
+          }
+        }
+      }
+
+      if (!input.forceNew) {
+        const candidateStmt = this.db.prepare(`
+          SELECT id, execution_mode FROM session_routes
+          WHERE space_id = ? AND user_id = ? AND status = 'active'
+          ORDER BY CASE WHEN channel = 'web' THEN 1 ELSE 0 END ASC,
+                   created_at ASC,
+                   id ASC
+          LIMIT 1
+        `);
+        const candidateRow = candidateStmt.get(input.spaceId, userId) as { id: string; execution_mode: string } | undefined;
+        if (candidateRow) {
+          if (candidateRow.execution_mode !== spaceExecutionMode) {
+            this.db.prepare(
+              'UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+            ).run(spaceExecutionMode, candidateRow.id, userId);
+          }
+          this.db.prepare(
+            'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+          ).run(candidateRow.id, input.spaceId, userId);
+          this.db.exec('COMMIT');
+          inTx = false;
+          const tenant = this.storage.forTenant(userId);
+          const existingRoute = await tenant.sessionRoutes.findById(candidateRow.id);
+          if (existingRoute) {
+            return this.toPublicSession(existingRoute);
+          }
         }
       }
 
@@ -863,6 +917,13 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
         )
         .run(gen1Id, userId, sessionId, sessionId, boundSnapshotId);
 
+      // 3. Persist new session as canonical_session_id on spaces table
+      this.db
+        .prepare(
+          'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+        )
+        .run(sessionId, input.spaceId, userId);
+
       this.db.exec('COMMIT');
       inTx = false;
 
@@ -1063,7 +1124,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       // Re-read route and space inside write lock
       const routeRow = this.db
         .prepare(
-          `SELECT id, space_id, user_id, status, title, dsh_session_id, current_generation, reset_count, agent_profile_snapshot_id, created_at, updated_at
+          `SELECT id, space_id, user_id, channel, status, title, dsh_session_id, current_generation, reset_count, agent_profile_snapshot_id, created_at, updated_at
            FROM session_routes
            WHERE id = ? AND user_id = ?
            LIMIT 1`
@@ -1073,6 +1134,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
             id: string;
             space_id: string;
             user_id: string;
+            channel: string;
             status: string;
             title: string | null;
             dsh_session_id: string;
@@ -1428,6 +1490,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       const publicSession: PublicSession = {
         id: routeRow.id,
         spaceId: routeRow.space_id,
+        channel: routeRow.channel,
         title: routeRow.title,
         status: routeRow.status as PublicSession['status'],
         currentGeneration: nextGeneration,
@@ -1591,7 +1654,13 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
     userId: string,
     sessionId: string,
     options?: { limit?: number; before?: string; after?: string; cursor?: string }
-  ): Promise<{ messages: PublicMessage[]; hasMore: boolean; olderCursor: string | null; newerCursor: string | null }> {
+  ): Promise<{
+    messages: PublicMessage[];
+    hasMore: boolean;
+    olderCursor: string | null;
+    newerCursor: string | null;
+    latestEventCursor?: string | null;
+  }> {
     await this.ensureSessionAccess(userId, sessionId);
 
     if (options && (options as any).cursor !== undefined) {
@@ -1627,6 +1696,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       hasMore: result.hasMore,
       olderCursor: result.olderCursor,
       newerCursor: result.newerCursor,
+      ...(result.latestEventCursor !== undefined ? { latestEventCursor: result.latestEventCursor } : {}),
     };
   }
 

@@ -44,6 +44,10 @@ export class EventRelayService implements IEventRelayService {
   // Streaming forwarding state
   private readonly sessionStreams = new Map<string, SessionStreamState>();
   private readonly sessionLastMappedSeq = new Map<string, number>();
+  private readonly activeTurnContexts = new Map<string, { platformTurnId: string; originTurnId?: string; dshIntTurn?: number }>();
+  private readonly dshIntTurnMap = new Map<string, { platformTurnId: string; originTurnId?: string }>();
+  private readonly pendingAutonomousOrigins = new Map<string, string>();
+  private readonly childOriginMap = new Map<string, string>();
   private pendingOutboundFrames: ContainerStreamingEventFrame[] = [];
   private pendingOutboundBytes = 0;
   private batchTimer: NodeJS.Timeout | null = null;
@@ -164,6 +168,76 @@ export class EventRelayService implements IEventRelayService {
     };
   }
 
+  bindTurnContext(sessionId: string, context: { turnId: string; originTurnId?: string; dshIntTurn?: number }): () => void {
+    if (!sessionId) return () => {};
+    this.activeTurnContexts.set(sessionId, {
+      platformTurnId: context.turnId,
+      originTurnId: context.originTurnId,
+      dshIntTurn: context.dshIntTurn,
+    });
+    if (typeof context.dshIntTurn === 'number') {
+      this.dshIntTurnMap.set(`${sessionId}:${context.dshIntTurn}`, {
+        platformTurnId: context.turnId,
+        originTurnId: context.originTurnId,
+      });
+    }
+    return () => {
+      const cur = this.activeTurnContexts.get(sessionId);
+      if (cur?.platformTurnId === context.turnId) {
+        this.activeTurnContexts.delete(sessionId);
+      }
+    };
+  }
+
+  recordChildInitiation(childId: string, originatingTurnId: string): void {
+    if (childId && originatingTurnId) {
+      this.childOriginMap.set(childId, originatingTurnId);
+    }
+  }
+
+  resolveOriginTurnId(childId: string): string | undefined {
+    if (!childId) return undefined;
+    return this.childOriginMap.get(childId);
+  }
+
+  private extractChildIdFromToolResult(event: SessionEvent): string | undefined {
+    try {
+      const msg = (event.data as any)?.message;
+      if (!msg) return undefined;
+      const content = msg.content;
+      if (!Array.isArray(content)) return undefined;
+      for (const block of content) {
+        if (!block || typeof block !== 'object') continue;
+        const nested = Array.isArray(block.content) ? block.content : [block];
+        for (const item of nested) {
+          const txt = typeof item?.text === 'string' ? item.text : '';
+          const subMatch = txt.match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
+          if (subMatch) return subMatch[1];
+          const jobMatch = txt.match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+          if (jobMatch) return jobMatch[1];
+        }
+      }
+    } catch {}
+    return undefined;
+  }
+
+  private extractSettledChildIdFromUserMessage(event: SessionEvent): string | undefined {
+    try {
+      const source = (event.data as any)?.source;
+      if (source && typeof source === 'object') {
+        if (source.kind === 'subagent-settled' && typeof source.senderSessionId === 'string') {
+          return source.senderSessionId;
+        }
+        if (source.kind === 'plugin' && source.plugin === 'tool-jobs') {
+          const summary = typeof source.summary === 'string' ? source.summary : '';
+          const match = summary.match(/(?:job\s+)?([a-zA-Z0-9_\-]+-\d+)/i);
+          if (match) return match[1];
+        }
+      }
+    } catch {}
+    return undefined;
+  }
+
   attachSession(session: Session, agentCtx?: Context): () => void {
     if (agentCtx && typeof agentCtx.on === 'function') {
       return this.attachAgent(agentCtx);
@@ -223,6 +297,53 @@ export class EventRelayService implements IEventRelayService {
 
   private mapAndQueueStreamingFrames(sessionId: string, event: SessionEvent): void {
     const frames: ContainerStreamingEventFrame[] = [];
+
+    // 1. Tool result: associate returned child ID with initiating platform turn from exact DSH integer turn
+    if (event.type === 'tool/result') {
+      const intTurn = (event.data as any)?.turn;
+      const turnCtx = (intTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${intTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+      const childId = this.extractChildIdFromToolResult(event);
+      if (childId && turnCtx?.platformTurnId) {
+        this.recordChildInitiation(`${sessionId}:${childId}`, turnCtx.platformTurnId);
+        this.recordChildInitiation(childId, turnCtx.platformTurnId);
+        const store = this.receiptStore;
+        if (store && typeof (store as any).recordChildOrigin === 'function') {
+          void (store as any).recordChildOrigin(sessionId, childId, turnCtx.platformTurnId).catch(() => {});
+        }
+      }
+    }
+
+    // 2. User message: check if child completion notice arrived
+    if (event.type === 'user/message') {
+      const childId = this.extractSettledChildIdFromUserMessage(event);
+      if (childId) {
+        const originTurnId = this.resolveOriginTurnId(`${sessionId}:${childId}`) ?? this.resolveOriginTurnId(childId);
+        if (originTurnId) {
+          this.pendingAutonomousOrigins.set(sessionId, originTurnId);
+        }
+      }
+    }
+
+    // 3. Autonomous turn start
+    if (event.type === 'turn/start') {
+      const intTurn = (event.data as any)?.turn;
+      if (this.pendingAutonomousOrigins.has(sessionId)) {
+        const originTurnId = this.pendingAutonomousOrigins.get(sessionId)!;
+        this.pendingAutonomousOrigins.delete(sessionId);
+        const autoTurnId = `turn_auto_${sessionId.slice(0, 8)}_${intTurn ?? 1}_${randomBytes(4).toString('hex')}`;
+        if (intTurn !== undefined) {
+          this.dshIntTurnMap.set(`${sessionId}:${intTurn}`, {
+            platformTurnId: autoTurnId,
+            originTurnId,
+          });
+        }
+      }
+    }
+
+    const currentTurn = (event.data as any)?.turn;
+    const scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+    const turnId = scopedCtx?.platformTurnId ?? (scopedCtx as any)?.turnId;
+    const originTurnId = scopedCtx?.originTurnId;
 
     switch (event.type) {
       case 'turn/start': {
@@ -371,6 +492,8 @@ export class EventRelayService implements IEventRelayService {
 
     if (frames.length > 0) {
       for (const f of frames) {
+        if (turnId && !f.turnId) (f as any).turnId = turnId;
+        if (originTurnId && !f.originTurnId) (f as any).originTurnId = originTurnId;
         this.mappedFrameCounts[f.type] = (this.mappedFrameCounts[f.type] || 0) + 1;
       }
       this.enqueueOutboundFrames(frames);

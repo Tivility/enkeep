@@ -731,6 +731,56 @@ export class SqliteReceiptStore implements IReceiptStore {
     };
   }
 
+  async recordChildOrigin(sessionId: string, childId: string, originTurnId: string): Promise<void> {
+    const db = this.ensureOpen();
+    if (!sessionId || typeof sessionId !== 'string') {
+      throw new ReceiptStoreError('sessionId is required for recordChildOrigin');
+    }
+    if (!childId || typeof childId !== 'string') {
+      throw new ReceiptStoreError('childId is required for recordChildOrigin');
+    }
+    if (!originTurnId || typeof originTurnId !== 'string') {
+      throw new ReceiptStoreError('originTurnId is required for recordChildOrigin');
+    }
+
+    const nowIso = new Date().toISOString();
+    const stmt = db.prepare(`
+      INSERT OR REPLACE INTO dsh_child_origins (user_id, session_id, child_id, origin_turn_id, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    stmt.run(this.userId, sessionId, childId, originTurnId, nowIso);
+  }
+
+  async getChildOrigin(sessionId: string, childId: string): Promise<string | null> {
+    const db = this.ensureOpen();
+    if (!sessionId || !childId) return null;
+    const stmt = db.prepare(`
+      SELECT origin_turn_id FROM dsh_child_origins
+      WHERE user_id = ? AND session_id = ? AND child_id = ?
+      LIMIT 1
+    `);
+    const row = stmt.get(this.userId, sessionId, childId) as { origin_turn_id?: unknown } | undefined;
+    return typeof row?.origin_turn_id === 'string' ? row.origin_turn_id : null;
+  }
+
+  async listChildOrigins(sessionId: string): Promise<readonly import('./types.js').ChildOriginRecord[]> {
+    const db = this.ensureOpen();
+    if (!sessionId) return [];
+    const stmt = db.prepare(`
+      SELECT session_id, child_id, origin_turn_id, created_at
+      FROM dsh_child_origins
+      WHERE user_id = ? AND session_id = ?
+      ORDER BY created_at ASC
+    `);
+    const rows = stmt.all(this.userId, sessionId) as any[];
+    return rows.map((r) => ({
+      sessionId: String(r.session_id),
+      childId: String(r.child_id),
+      originTurnId: String(r.origin_turn_id),
+      createdAt: String(r.created_at),
+    }));
+  }
+
   private mapSeedImportReceiptRow(row: DbSeedImportReceiptRow): SeedImportReceipt {
     return {
       userId: this.validateString(row.user_id, 'user_id'),

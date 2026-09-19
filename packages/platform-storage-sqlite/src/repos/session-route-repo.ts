@@ -8,10 +8,12 @@ import type {
   EffectiveAgentProfile,
   LifecycleStatus,
   SessionGeneration,
+  ExecutionMode,
 } from '@enkeep/platform-core';
 import {
   NotFoundError,
   ValidationError,
+  PlatformError,
   composeAgentProfilePrompt,
 } from '@enkeep/platform-core';
 import {
@@ -506,5 +508,162 @@ export class SqliteTenantScopedSessionRouteRepository implements TenantScopedSes
     // 3. Cascading fallback to Space default binding
     const spaceRepo = new SqliteTenantScopedSpaceRepository(this.db, this.userId);
     return spaceRepo.resolveAgentProfile(route.spaceId);
+  }
+
+  async getOrCreateCanonicalSession(
+    spaceId: string,
+    options?: {
+      forceNew?: boolean;
+      channel?: string;
+      accountId?: string;
+      nativeContextId?: string;
+      peerId?: string;
+      title?: string;
+    }
+  ): Promise<SessionRoute> {
+    validateSpaceId(spaceId);
+
+    return withImmediateTransactionSync(this.db, () => {
+      // 1. Verify space exists, belongs to tenant, and is active
+      let spaceRow: {
+        id: string;
+        status: string;
+        execution_mode: string;
+        canonical_session_id: string | null;
+        agent_profile_id: string | null;
+        agent_profile_snapshot_id: string | null;
+      } | undefined;
+
+      try {
+        const spaceStmt = this.db.prepare(
+          'SELECT id, status, execution_mode, canonical_session_id, agent_profile_id, agent_profile_snapshot_id FROM spaces WHERE id = ? AND user_id = ?'
+        );
+        spaceRow = spaceStmt.get(spaceId, this.userId) as any;
+      } catch (err: any) {
+        if (String(err?.message || '').includes('no such column: canonical_session_id')) {
+          throw new PlatformError(
+            'Migration 036 required: table spaces is missing canonical_session_id column. Canonical session operations cannot execute on pre-M036 database.',
+            'MIGRATION_REQUIRED',
+            500
+          );
+        }
+        throw err;
+      }
+
+      if (!spaceRow) {
+        throw new NotFoundError('Space not found');
+      }
+      if (spaceRow.status !== 'active') {
+        throw new ValidationError('Cannot get or create canonical session in non-active space');
+      }
+
+      // 2. If not forcing new, check existing persisted canonical pointer
+      if (!options?.forceNew && spaceRow.canonical_session_id) {
+        const canonicalStmt = this.db.prepare(
+          'SELECT * FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ?'
+        );
+        const canonicalRoute = queryOne(canonicalStmt, parseSessionRouteRow, spaceRow.canonical_session_id, spaceId, this.userId);
+        if (canonicalRoute && canonicalRoute.status === 'active') {
+          // Authoritative space execution mode alignment: resolve stale container routes on host spaces
+          const spaceExecutionMode = (spaceRow.execution_mode ?? 'container') as ExecutionMode;
+          if (canonicalRoute.executionMode !== spaceExecutionMode) {
+            this.db.prepare(
+              'UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+            ).run(spaceExecutionMode, canonicalRoute.id, this.userId);
+            canonicalRoute.executionMode = spaceExecutionMode;
+          }
+          return canonicalRoute;
+        }
+      }
+
+      // 3. If not forcing new, check if there is an existing active route in space
+      // Deterministically select existing active route: prefer channel != 'web', then oldest created_at, min id tie-break
+      if (!options?.forceNew) {
+        const candidateStmt = this.db.prepare(`
+          SELECT * FROM session_routes
+          WHERE space_id = ? AND user_id = ? AND status = 'active'
+          ORDER BY CASE WHEN channel = 'web' THEN 1 ELSE 0 END ASC,
+                   created_at ASC,
+                   id ASC
+          LIMIT 1
+        `);
+        const candidateRoute = queryOne(candidateStmt, parseSessionRouteRow, spaceId, this.userId);
+        if (candidateRoute) {
+          // Authoritative space execution mode alignment
+          const spaceExecutionMode = (spaceRow.execution_mode ?? 'container') as ExecutionMode;
+          if (candidateRoute.executionMode !== spaceExecutionMode) {
+            this.db.prepare(
+              'UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+            ).run(spaceExecutionMode, candidateRoute.id, this.userId);
+            candidateRoute.executionMode = spaceExecutionMode;
+          }
+          // Persist canonical pointer on spaces table
+          this.db.prepare(
+            'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+          ).run(candidateRoute.id, spaceId, this.userId);
+          return candidateRoute;
+        }
+      }
+
+      // 4. Create fresh canonical route
+      const newSessionId = generateSessionId();
+      const dshSessionId = generateSessionId();
+      const spaceExecutionMode = (spaceRow.execution_mode ?? 'container') as ExecutionMode;
+      const channel = options?.channel || 'web';
+      const accountId = options?.accountId || 'default';
+      const nativeContextId = options?.nativeContextId || newSessionId;
+      const peerId = options?.peerId || `${channel}:${newSessionId}`;
+      const title = options?.title ?? null;
+
+      let initialGenSnapshotId = spaceRow.agent_profile_snapshot_id;
+
+      this.db.prepare(`
+        INSERT INTO session_routes (
+          id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode,
+          status, title, last_reset_at, reset_count, current_generation, agent_profile_id, agent_profile_snapshot_id,
+          created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, 0, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(
+        newSessionId,
+        spaceId,
+        this.userId,
+        channel,
+        accountId,
+        nativeContextId,
+        peerId,
+        dshSessionId,
+        spaceExecutionMode,
+        title,
+        spaceRow.agent_profile_id ?? null,
+        spaceRow.agent_profile_snapshot_id ?? null
+      );
+
+      const genId = generateGenerationId();
+      this.db.prepare(`
+        INSERT INTO session_generations (
+          id, user_id, route_id, generation_number, dsh_session_id, agent_profile_snapshot_id, reset_reason, created_at
+        )
+        VALUES (?, ?, ?, 1, ?, ?, 'initial', CURRENT_TIMESTAMP)
+      `).run(
+        genId,
+        this.userId,
+        newSessionId,
+        dshSessionId,
+        initialGenSnapshotId ?? null
+      );
+
+      // Persist as canonical_session_id on spaces
+      this.db.prepare(
+        'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+      ).run(newSessionId, spaceId, this.userId);
+
+      const routeStmt = this.db.prepare('SELECT * FROM session_routes WHERE id = ? AND user_id = ?');
+      const created = queryOne(routeStmt, parseSessionRouteRow, newSessionId, this.userId);
+      if (!created) {
+        throw new NotFoundError('Failed to retrieve newly created canonical session route');
+      }
+      return created;
+    });
   }
 }
