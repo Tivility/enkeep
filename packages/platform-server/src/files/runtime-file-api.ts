@@ -126,6 +126,38 @@ export interface CanonicalDeleteRequest {
   readonly expectedEtag: string;
 }
 
+export interface CanonicalStageChunkRequest {
+  readonly op: 'stage_chunk';
+  readonly path: string;
+  readonly stageToken?: string;
+  readonly offset?: number;
+  readonly content?: string;
+  readonly encoding?: FileEncoding;
+}
+
+export interface CanonicalCommitStageOpRequest {
+  readonly op: 'commit_stage';
+  readonly path: string;
+  readonly stageToken: string;
+  readonly requireAbsent?: boolean;
+  readonly expectedEtag?: string;
+}
+
+export interface CanonicalAbortStageOpRequest {
+  readonly op: 'abort_stage';
+  readonly path: string;
+  readonly stageToken: string;
+}
+
+export interface CanonicalWriteAttachmentRequest {
+  readonly op: 'write_attachment';
+  readonly path: string;
+  readonly content: string;
+  readonly encoding?: FileEncoding;
+  readonly requireAbsent?: boolean;
+  readonly expectedEtag?: string;
+}
+
 export type CanonicalFileOperationRequest =
   | CanonicalListRequest
   | CanonicalReadRequest
@@ -135,7 +167,11 @@ export type CanonicalFileOperationRequest =
   | CanonicalDeleteRequest
   | CanonicalStatRequest
   | CanonicalSniffRequest
-  | CanonicalCopyRequest;
+  | CanonicalCopyRequest
+  | CanonicalStageChunkRequest
+  | CanonicalCommitStageOpRequest
+  | CanonicalAbortStageOpRequest
+  | CanonicalWriteAttachmentRequest;
 
 export interface CanonicalListResult {
   readonly op: 'list';
@@ -221,6 +257,38 @@ export interface CanonicalDeleteResult {
   readonly etag: string;
 }
 
+export interface CanonicalStageChunkResult {
+  readonly op: 'stage_chunk';
+  readonly path: string;
+  readonly stageToken: string;
+  readonly bytesWritten: number;
+  readonly currentSize: number;
+}
+
+export interface CanonicalCommitStageOpResult {
+  readonly op: 'commit_stage';
+  readonly path: string;
+  readonly size: number;
+  readonly written: boolean;
+  readonly etag: string;
+  readonly sha256: string;
+}
+
+export interface CanonicalAbortStageOpResult {
+  readonly op: 'abort_stage';
+  readonly path: string;
+  readonly aborted: boolean;
+}
+
+export interface CanonicalWriteAttachmentResult {
+  readonly op: 'write_attachment';
+  readonly path: string;
+  readonly size: number;
+  readonly written: boolean;
+  readonly etag: string;
+  readonly sha256: string;
+}
+
 export type CanonicalFileOperationResult =
   | CanonicalListResult
   | CanonicalReadResult
@@ -230,7 +298,11 @@ export type CanonicalFileOperationResult =
   | CanonicalDeleteResult
   | CanonicalStatResult
   | CanonicalSniffResult
-  | CanonicalCopyResult;
+  | CanonicalCopyResult
+  | CanonicalStageChunkResult
+  | CanonicalCommitStageOpResult
+  | CanonicalAbortStageOpResult
+  | CanonicalWriteAttachmentResult;
 
 export interface CanonicalStreamingWriteRequest {
   readonly op: 'write';
@@ -1164,6 +1236,137 @@ export class RuntimeFileApiService {
         }
 
         return this.validateCopyResult(result, srcNorm, dstNorm);
+      }
+
+      case 'stage_chunk': {
+        validateUnknownKeys(request, ['op', 'path', 'stageToken', 'offset', 'content', 'encoding']);
+        const { normalizedPath } = validateRelativeFilePath(request.path, { allowRoot: false });
+        if (!normalizedPath.startsWith('.attachments/')) {
+          throw new ValidationError('Attachment operations are only permitted within .attachments/');
+        }
+
+        const offset = request.offset !== undefined ? request.offset : 0;
+        if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0) {
+          throw new ValidationError('offset must be a non-negative integer');
+        }
+
+        const encoding: FileEncoding = request.encoding ?? 'base64';
+        if (encoding !== 'utf8' && encoding !== 'base64') {
+          throw new ValidationError('Encoding must be either "utf8" or "base64"');
+        }
+
+        if (request.content !== undefined && typeof request.content !== 'string') {
+          throw new ValidationError('content must be a string if provided');
+        }
+
+        const canonicalReq: CanonicalStageChunkRequest = {
+          op: 'stage_chunk',
+          path: normalizedPath,
+          ...(request.stageToken ? { stageToken: request.stageToken } : {}),
+          offset,
+          content: request.content ?? '',
+          encoding,
+        };
+
+        let result: CanonicalFileOperationResult;
+        try {
+          result = await this.fileProvider.execute(cleanUserId, cleanSpaceId, canonicalReq);
+        } catch (err) {
+          throw mapFileOpError(err);
+        }
+
+        return this.validateStageChunkResult(result, normalizedPath);
+      }
+
+      case 'commit_stage': {
+        validateUnknownKeys(request, ['op', 'path', 'stageToken', 'requireAbsent', 'expectedEtag']);
+        const { normalizedPath } = validateRelativeFilePath(request.path, { allowRoot: false });
+        if (!normalizedPath.startsWith('.attachments/')) {
+          throw new ValidationError('Attachment operations are only permitted within .attachments/');
+        }
+
+        if (typeof request.stageToken !== 'string' || !request.stageToken) {
+          throw new ValidationError('stageToken is required for commit_stage');
+        }
+
+        const canonicalReq: CanonicalCommitStageOpRequest = {
+          op: 'commit_stage',
+          path: normalizedPath,
+          stageToken: request.stageToken,
+          ...(request.requireAbsent !== undefined ? { requireAbsent: request.requireAbsent } : {}),
+          ...(request.expectedEtag ? { expectedEtag: validateEtag(request.expectedEtag) } : {}),
+        };
+
+        let result: CanonicalFileOperationResult;
+        try {
+          result = await this.fileProvider.execute(cleanUserId, cleanSpaceId, canonicalReq);
+        } catch (err) {
+          throw mapFileOpError(err);
+        }
+
+        return this.validateCommitStageResult(result, normalizedPath);
+      }
+
+      case 'abort_stage': {
+        validateUnknownKeys(request, ['op', 'path', 'stageToken']);
+        const { normalizedPath } = validateRelativeFilePath(request.path, { allowRoot: false });
+        if (!normalizedPath.startsWith('.attachments/')) {
+          throw new ValidationError('Attachment operations are only permitted within .attachments/');
+        }
+
+        if (typeof request.stageToken !== 'string' || !request.stageToken) {
+          throw new ValidationError('stageToken is required for abort_stage');
+        }
+
+        const canonicalReq: CanonicalAbortStageOpRequest = {
+          op: 'abort_stage',
+          path: normalizedPath,
+          stageToken: request.stageToken,
+        };
+
+        let result: CanonicalFileOperationResult;
+        try {
+          result = await this.fileProvider.execute(cleanUserId, cleanSpaceId, canonicalReq);
+        } catch (err) {
+          throw mapFileOpError(err);
+        }
+
+        return this.validateAbortStageResult(result, normalizedPath);
+      }
+
+      case 'write_attachment': {
+        validateUnknownKeys(request, ['op', 'path', 'content', 'encoding', 'requireAbsent', 'expectedEtag']);
+        const { normalizedPath } = validateRelativeFilePath(request.path, { allowRoot: false });
+        if (!normalizedPath.startsWith('.attachments/')) {
+          throw new ValidationError('Attachment operations are only permitted within .attachments/');
+        }
+
+        if (typeof request.content !== 'string') {
+          throw new ValidationError('content must be a string');
+        }
+
+        const encoding: FileEncoding = request.encoding ?? 'base64';
+        if (encoding !== 'utf8' && encoding !== 'base64') {
+          throw new ValidationError('Encoding must be either "utf8" or "base64"');
+        }
+
+        const canonicalReq: CanonicalWriteAttachmentRequest = {
+          op: 'write_attachment',
+          path: normalizedPath,
+          content: request.content,
+          encoding,
+          ...(request.requireAbsent !== undefined ? { requireAbsent: request.requireAbsent } : {}),
+          ...(request.expectedEtag ? { expectedEtag: validateEtag(request.expectedEtag) } : {}),
+        };
+
+        let result: CanonicalFileOperationResult;
+        try {
+          result = await this.fileProvider.execute(cleanUserId, cleanSpaceId, canonicalReq);
+        } catch (err) {
+          throw mapFileOpError(err);
+        }
+
+        return this.validateWriteAttachmentResult(result, normalizedPath);
       }
 
       default: {
@@ -2395,6 +2598,106 @@ export class RuntimeFileApiService {
       size: result.size,
       mtimeMs: result.mtimeMs,
       etag: result.etag,
+    };
+  }
+
+  private validateStageChunkResult(
+    result: CanonicalFileOperationResult,
+    expectedPath: string
+  ): CanonicalStageChunkResult {
+    if (!result || typeof result !== 'object') {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    if (result.op !== 'stage_chunk' || result.path !== expectedPath) {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    if (
+      typeof result.stageToken !== 'string' ||
+      !result.stageToken ||
+      typeof result.bytesWritten !== 'number' ||
+      typeof result.currentSize !== 'number'
+    ) {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    return {
+      op: 'stage_chunk',
+      path: expectedPath,
+      stageToken: result.stageToken,
+      bytesWritten: result.bytesWritten,
+      currentSize: result.currentSize,
+    };
+  }
+
+  private validateCommitStageResult(
+    result: CanonicalFileOperationResult,
+    expectedPath: string
+  ): CanonicalCommitStageOpResult {
+    if (!result || typeof result !== 'object') {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    if (result.op !== 'commit_stage' || result.path !== expectedPath) {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    if (
+      typeof result.size !== 'number' ||
+      typeof result.etag !== 'string' ||
+      typeof result.sha256 !== 'string' ||
+      result.written !== true
+    ) {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    return {
+      op: 'commit_stage',
+      path: expectedPath,
+      size: result.size,
+      written: true,
+      etag: result.etag,
+      sha256: result.sha256,
+    };
+  }
+
+  private validateAbortStageResult(
+    result: CanonicalFileOperationResult,
+    expectedPath: string
+  ): CanonicalAbortStageOpResult {
+    if (!result || typeof result !== 'object') {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    if (result.op !== 'abort_stage' || result.path !== expectedPath || typeof result.aborted !== 'boolean') {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    return {
+      op: 'abort_stage',
+      path: expectedPath,
+      aborted: result.aborted,
+    };
+  }
+
+  private validateWriteAttachmentResult(
+    result: CanonicalFileOperationResult,
+    expectedPath: string
+  ): CanonicalWriteAttachmentResult {
+    if (!result || typeof result !== 'object') {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    if (result.op !== 'write_attachment' || result.path !== expectedPath) {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    if (
+      typeof result.size !== 'number' ||
+      typeof result.etag !== 'string' ||
+      typeof result.sha256 !== 'string' ||
+      result.written !== true
+    ) {
+      throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+    }
+    return {
+      op: 'write_attachment',
+      path: expectedPath,
+      size: result.size,
+      written: true,
+      etag: result.etag,
+      sha256: result.sha256,
     };
   }
 }

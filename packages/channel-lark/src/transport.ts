@@ -23,6 +23,57 @@ import {
 } from './types.js';
 import { optimizeMarkdownStyle, chunkMarkdown } from './markdown-card.js';
 
+export const SAFE_RESOURCE_ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
+export const MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-image cap
+export const IMAGE_DOWNLOAD_TIMEOUT_MS = 15000; // 15 seconds
+export const MAX_FILE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-file cap
+export const FILE_DOWNLOAD_TIMEOUT_MS = 15000; // 15 seconds
+
+/**
+ * Validates strict PDF byte signature (%PDF-).
+ * Rejects masquerades, truncated buffers, and non-PDF files.
+ */
+export function isPdfBuffer(buffer: Buffer): boolean {
+  return (
+    Buffer.isBuffer(buffer) &&
+    buffer.length >= 5 &&
+    buffer[0] === 0x25 && // %
+    buffer[1] === 0x50 && // P
+    buffer[2] === 0x44 && // D
+    buffer[3] === 0x46 && // F
+    buffer[4] === 0x2d    // -
+  );
+}
+
+/**
+ * Sniffs authoritative image MIME type from binary buffer header magic bytes.
+ * Rejects unsupported file masquerades (e.g. executables, archives).
+ */
+export function sniffSupportedImageMime(buffer: Buffer): string | null {
+  if (!buffer || buffer.length < 4) return null;
+  // PNG: 89 50 4E 47
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
+    return 'image/png';
+  }
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  // GIF: GIF87a or GIF89a (47 49 46 38)
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) {
+    return 'image/gif';
+  }
+  // WebP: RIFF....WEBP
+  if (
+    buffer.length >= 12 &&
+    buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+    buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  return null;
+}
+
 /**
  * Sanitized safe logger for Lark SDK.
  * Strips sensitive Authorization headers, appSecrets, and suppresses raw Axios config/request objects.
@@ -189,8 +240,14 @@ export class FakeLarkTransport implements LarkTransport {
   private readonly _addedReactions: FakeReactionRecord[] = [];
   private readonly _removedReactions: FakeRemovedReactionRecord[] = [];
   private readonly _streamingCalls: FakeStreamingCallRecord[] = [];
+  private readonly _mockImages = new Map<string, { buffer: Buffer; mimeType: string }>();
+  private readonly _mockFiles = new Map<string, { buffer: Buffer; mimeType: string }>();
   public failNextSend = false;
   public failNextSendReason = 'Simulated network timeout';
+  public failDownloadImage = false;
+  public failDownloadImageReason = 'Simulated image download failure';
+  public failDownloadFile = false;
+  public failDownloadFileReason = 'Simulated file download failure';
   public botOpenId?: string;
   public streamingCardsEnabled = true;
   public failStreamingCard = false;
@@ -262,6 +319,77 @@ export class FakeLarkTransport implements LarkTransport {
   clearReactions(): void {
     this._addedReactions.length = 0;
     this._removedReactions.length = 0;
+  }
+
+  registerMockImage(fileKey: string, buffer: Buffer, mimeType?: string, messageId?: string): void {
+    const effectiveMime = mimeType || sniffSupportedImageMime(buffer) || 'image/png';
+    this._mockImages.set(fileKey, { buffer, mimeType: effectiveMime });
+    if (messageId) {
+      this._mockImages.set(`${messageId}:${fileKey}`, { buffer, mimeType: effectiveMime });
+    }
+  }
+
+  clearMockImages(): void {
+    this._mockImages.clear();
+  }
+
+  registerMockFile(fileKey: string, buffer: Buffer, mimeType?: string, messageId?: string): void {
+    const effectiveMime = mimeType || (isPdfBuffer(buffer) ? 'application/pdf' : 'application/octet-stream');
+    this._mockFiles.set(fileKey, { buffer, mimeType: effectiveMime });
+    if (messageId) {
+      this._mockFiles.set(`${messageId}:${fileKey}`, { buffer, mimeType: effectiveMime });
+    }
+  }
+
+  clearMockFiles(): void {
+    this._mockFiles.clear();
+  }
+
+  async downloadFileResource(
+    messageId: string,
+    fileKey: string
+  ): Promise<{ buffer: Buffer; mimeType: string } | null> {
+    if (!this._connected) {
+      throw new Error('FakeLarkTransport is not connected');
+    }
+    if (this.failDownloadFile) {
+      throw new Error(this.failDownloadFileReason);
+    }
+    if (!SAFE_RESOURCE_ID_REGEX.test(messageId) || !SAFE_RESOURCE_ID_REGEX.test(fileKey)) {
+      throw new Error('Invalid resource identifier format or path traversal detected');
+    }
+    const found = this._mockFiles.get(`${messageId}:${fileKey}`) || this._mockFiles.get(fileKey);
+    if (!found) {
+      return null;
+    }
+    if (found.buffer.length > MAX_FILE_DOWNLOAD_BYTES) {
+      throw new Error(`File exceeds maximum allowed size of ${MAX_FILE_DOWNLOAD_BYTES} bytes`);
+    }
+    return { buffer: found.buffer, mimeType: found.mimeType || 'application/octet-stream' };
+  }
+
+  async downloadImageResource(
+    messageId: string,
+    fileKey: string
+  ): Promise<{ buffer: Buffer; mimeType: string } | null> {
+    if (!this._connected) {
+      throw new Error('FakeLarkTransport is not connected');
+    }
+    if (this.failDownloadImage) {
+      throw new Error(this.failDownloadImageReason);
+    }
+    if (!SAFE_RESOURCE_ID_REGEX.test(messageId) || !SAFE_RESOURCE_ID_REGEX.test(fileKey)) {
+      throw new Error('Invalid resource identifier format or path traversal detected');
+    }
+    const found = this._mockImages.get(`${messageId}:${fileKey}`) || this._mockImages.get(fileKey);
+    if (!found) {
+      return null;
+    }
+    const sniffed = sniffSupportedImageMime(found.buffer);
+    if (!sniffed) {
+      throw new Error('Unsupported image format or invalid image magic bytes');
+    }
+    return { buffer: found.buffer, mimeType: sniffed };
   }
 
   async sendReply(params: {
@@ -674,6 +802,198 @@ export class CredentialedLarkTransport implements LarkTransport {
     } catch {
       // Best-effort; ignore errors
     }
+  }
+
+  private async downloadBoundedResourceStream(
+    resourceApi: any,
+    messageId: string,
+    fileKey: string,
+    type: 'image' | 'file',
+    timeoutMs: number,
+    maxBytes: number
+  ): Promise<Buffer | null> {
+    const overallDeadline = Date.now() + timeoutMs;
+
+    let preHeadersTimer: NodeJS.Timeout | undefined;
+    const preHeadersPromise = resourceApi.get({
+      path: {
+        message_id: messageId,
+        file_key: fileKey,
+      },
+      params: {
+        type,
+      },
+    });
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      preHeadersTimer = setTimeout(() => {
+        reject(new Error(`${type === 'image' ? 'Image' : 'File'} resource download timed out waiting for headers`));
+      }, timeoutMs);
+    });
+
+    let res: any;
+    try {
+      res = await Promise.race([preHeadersPromise, timeoutPromise]);
+    } finally {
+      if (preHeadersTimer) clearTimeout(preHeadersTimer);
+    }
+
+    if (!res) {
+      return null;
+    }
+
+    let buffer: Buffer;
+    let activeStream: any = null;
+    let streamTimer: NodeJS.Timeout | undefined;
+
+    try {
+      if (typeof res.getReadableStream === 'function') {
+        const stream = res.getReadableStream();
+        activeStream = stream;
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+
+        const remainingMs = Math.max(500, overallDeadline - Date.now());
+
+        await new Promise<void>((resolve, reject) => {
+          streamTimer = setTimeout(() => {
+            const timeoutErr = new Error(`${type === 'image' ? 'Image' : 'File'} resource download body stream timed out`);
+            if (typeof stream.destroy === 'function') {
+              stream.destroy(timeoutErr);
+            }
+            reject(timeoutErr);
+          }, remainingMs);
+
+          const onData = (chunk: any) => {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            totalBytes += buf.length;
+            if (totalBytes > maxBytes) {
+              cleanup();
+              const sizeErr = new Error(`${type === 'image' ? 'Image' : 'File'} exceeds maximum allowed size of ${maxBytes} bytes`);
+              if (typeof stream.destroy === 'function') {
+                stream.destroy(sizeErr);
+              }
+              reject(sizeErr);
+              return;
+            }
+            chunks.push(buf);
+          };
+
+          const onError = (err: any) => {
+            cleanup();
+            reject(err);
+          };
+
+          const onEnd = () => {
+            cleanup();
+            resolve();
+          };
+
+          const cleanup = () => {
+            if (streamTimer) clearTimeout(streamTimer);
+            stream.removeListener('data', onData);
+            stream.removeListener('end', onEnd);
+            stream.on('error', () => {});
+            stream.removeListener('error', onError);
+          };
+
+          stream.on('data', onData);
+          stream.on('error', onError);
+          stream.on('end', onEnd);
+        });
+
+        buffer = Buffer.concat(chunks);
+      } else if (Buffer.isBuffer(res)) {
+        buffer = res;
+      } else if (Buffer.isBuffer((res as any).data)) {
+        buffer = (res as any).data;
+      } else {
+        throw new Error('Unsupported response format from messageResource.get');
+      }
+
+      if (buffer.length > maxBytes) {
+        throw new Error(`${type === 'image' ? 'Image' : 'File'} exceeds maximum allowed size of ${maxBytes} bytes`);
+      }
+
+      return buffer;
+    } catch (streamErr) {
+      if (activeStream && typeof activeStream.destroy === 'function' && !activeStream.destroyed) {
+        activeStream.destroy(streamErr);
+      }
+      throw streamErr;
+    } finally {
+      if (streamTimer) clearTimeout(streamTimer);
+    }
+  }
+
+  async downloadImageResource(
+    messageId: string,
+    fileKey: string
+  ): Promise<{ buffer: Buffer; mimeType: string } | null> {
+    if (!this.apiClient) {
+      return null;
+    }
+    if (!SAFE_RESOURCE_ID_REGEX.test(messageId) || !SAFE_RESOURCE_ID_REGEX.test(fileKey)) {
+      throw new Error('Invalid resource identifier format or path traversal detected');
+    }
+
+    const resourceApi =
+      this.apiClient.im?.v1?.messageResource || (this.apiClient.im as any)?.messageResource;
+    if (!resourceApi || typeof resourceApi.get !== 'function') {
+      throw new Error('Feishu/Lark SDK im.messageResource API not available');
+    }
+
+    const buffer = await this.downloadBoundedResourceStream(
+      resourceApi,
+      messageId,
+      fileKey,
+      'image',
+      IMAGE_DOWNLOAD_TIMEOUT_MS,
+      MAX_IMAGE_DOWNLOAD_BYTES
+    );
+    if (!buffer) {
+      return null;
+    }
+
+    const mimeType = sniffSupportedImageMime(buffer);
+    if (!mimeType) {
+      throw new Error('Unsupported image format or invalid image magic bytes');
+    }
+
+    return { buffer, mimeType };
+  }
+
+  async downloadFileResource(
+    messageId: string,
+    fileKey: string
+  ): Promise<{ buffer: Buffer; mimeType: string } | null> {
+    if (!this.apiClient) {
+      return null;
+    }
+    if (!SAFE_RESOURCE_ID_REGEX.test(messageId) || !SAFE_RESOURCE_ID_REGEX.test(fileKey)) {
+      throw new Error('Invalid resource identifier format or path traversal detected');
+    }
+
+    const resourceApi =
+      this.apiClient.im?.v1?.messageResource || (this.apiClient.im as any)?.messageResource;
+    if (!resourceApi || typeof resourceApi.get !== 'function') {
+      throw new Error('Feishu/Lark SDK im.messageResource API not available');
+    }
+
+    const buffer = await this.downloadBoundedResourceStream(
+      resourceApi,
+      messageId,
+      fileKey,
+      'file',
+      FILE_DOWNLOAD_TIMEOUT_MS,
+      MAX_FILE_DOWNLOAD_BYTES
+    );
+    if (!buffer) {
+      return null;
+    }
+
+    const mimeType = isPdfBuffer(buffer) ? 'application/pdf' : 'application/octet-stream';
+    return { buffer, mimeType };
   }
 
   /**
