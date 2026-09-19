@@ -495,18 +495,18 @@ describe('Lark Channel Closed-Loop Communication', () => {
 
       await runtimeGateway.drain();
 
-      // Verify all 3 sessions are distinct
-      expect(resA.sessionRouteId).not.toBe(resB.sessionRouteId);
-      expect(resA.sessionRouteId).not.toBe(resRoot.sessionRouteId);
-      expect(resB.sessionRouteId).not.toBe(resRoot.sessionRouteId);
+      // Under workspace single-session architecture, turns within the same workspace converge to the canonical session route
+      expect(resA.sessionRouteId).toBe(resB.sessionRouteId);
+      expect(resA.sessionRouteId).toBe(resRoot.sessionRouteId);
 
-      const routeAlpha = await sessionRouteRepo.findById(resA.sessionRouteId!);
-      const routeBeta = await sessionRouteRepo.findById(resB.sessionRouteId!);
-      const routeRoot = await sessionRouteRepo.findById(resRoot.sessionRouteId!);
-
-      expect(routeAlpha?.nativeContextId).toBe('oc_parent_group_1:om_root_alpha');
-      expect(routeBeta?.nativeContextId).toBe('oc_parent_group_1:om_root_beta');
-      expect(routeRoot?.nativeContextId).toBe('oc_parent_group_1');
+      // Verify that each turn's distinct thread targets were preserved across outbox replies
+      expect(transport.sentReplies.length).toBe(3);
+      const replyAlpha = transport.sentReplies.find((r) => r.rootId === 'om_root_alpha');
+      const replyBeta = transport.sentReplies.find((r) => r.rootId === 'om_root_beta');
+      const replyRoot = transport.sentReplies.find((r) => !r.rootId && !r.threadId);
+      expect(replyAlpha).toBeDefined();
+      expect(replyBeta).toBeDefined();
+      expect(replyRoot).toBeDefined();
     });
   });
 
@@ -1176,6 +1176,56 @@ describe('Lark Channel Closed-Loop Communication', () => {
       expect(res3).not.toBeNull();
       expect(res3?.id).toBe((res1 || res2)?.id);
       expect(streamTransport.sentReplies.length).toBe(0);
+    });
+  });
+
+  describe('9. Proactive Message Delivery (Scheduled Task IM Output)', () => {
+    it('creates streaming-card-less final markdown card, records delivered channel_outbox row, and gracefully handles transport error', async () => {
+      const chatId = 'oc_proactive_chat_123';
+      const text = '## Task Summary\n- All jobs finished successfully.';
+
+      const res = await gateway.sendProactiveMessage({
+        chatId,
+        text,
+        title: 'Daily Digest',
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.messageId).toBeDefined();
+
+      // Verify streaming calls: card_create and finalize with completed
+      const streamCalls = transport.streamingCalls;
+      const createCall = streamCalls.find((c) => c.type === 'card_create');
+      expect(createCall).toBeDefined();
+      expect(createCall?.params.chatId).toBe(chatId);
+      expect(createCall?.params.replyToMessageId).toBeUndefined();
+
+      const finalizeCall = streamCalls.find((c) => c.type === 'finalize');
+      expect(finalizeCall).toBeDefined();
+      expect(finalizeCall?.status).toBe('completed');
+      expect(finalizeCall?.content).toBe(text);
+
+      // Verify channel_outbox row in SQLite marked delivered
+      const outboxRows = db.prepare('SELECT * FROM channel_outbox WHERE account_id = ? AND native_context_id = ?').all(gateway.accountId, chatId) as Array<{
+        status: string;
+        payload_json: string;
+      }>;
+      expect(outboxRows.length).toBe(1);
+      expect(outboxRows[0].status).toBe('delivered');
+      const payload = JSON.parse(outboxRows[0].payload_json);
+      expect(payload.format).toBe('markdown');
+      expect(payload.text).toBe(text);
+      expect(payload.chatId).toBe(chatId);
+
+      // Verify error resilience: when transport fails, returns error object without throwing
+      transport.failNextSend = true;
+      transport.failStreamingCard = true;
+      const failRes = await gateway.sendProactiveMessage({
+        chatId: 'oc_fail_chat',
+        text: 'Will fail gracefully',
+      });
+      expect(failRes.success).toBe(false);
+      expect(failRes.error).toBeDefined();
     });
   });
 });

@@ -262,6 +262,24 @@ function resolvePostText(parsed: any): string {
   return title ? `${title}\n${body}` : body;
 }
 
+export function sanitizeClaimedFileName(raw: string): string | undefined {
+  // Strip ANSI escape codes, control chars, null bytes, normalize NFC
+  let cleaned = raw
+    .normalize('NFC')
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+    .trim();
+  // Strip path traversal or separators (/ and \)
+  cleaned = cleaned.replace(/.*[/\\]/, '');
+  if (cleaned === '.' || cleaned === '..' || cleaned.length === 0) {
+    return undefined;
+  }
+  if (cleaned.length > 255) {
+    cleaned = cleaned.slice(0, 255);
+  }
+  return cleaned;
+}
+
 export function extractTextAndResources(
   msgType: string,
   rawContent: string,
@@ -298,7 +316,6 @@ export function extractTextAndResources(
                 type: 'image',
                 key: node.image_key,
                 name: `${node.image_key}.jpg`,
-                unsupported: true,
               });
             } else if (node?.tag === 'file' && node.file_key) {
               resources.push({
@@ -321,23 +338,25 @@ export function extractTextAndResources(
           type: 'image',
           key: parsed.image_key,
           name: `${parsed.image_key}.jpg`,
-          unsupported: true,
         });
       }
-      return { text: '[图片 (附件下载未实现)]', resources };
+      return { text: '[图片]', resources };
     }
 
     if (msgType === 'file') {
       const parsed = JSON.parse(rawContent);
       if (parsed.file_key) {
+        const rawName = typeof parsed.file_name === 'string' ? parsed.file_name : undefined;
+        const sanitizedName = rawName ? sanitizeClaimedFileName(rawName) : undefined;
+        const displayName = sanitizedName || parsed.file_key;
         resources.push({
           type: 'file',
           key: parsed.file_key,
-          name: parsed.file_name ?? parsed.file_key,
-          unsupported: true,
+          name: displayName,
         });
+        return { text: `[文件: ${displayName}]`, resources };
       }
-      return { text: parsed.file_name ? `[文件: ${parsed.file_name} (附件下载未实现)]` : '[文件 (附件下载未实现)]', resources };
+      return { text: '[文件]', resources };
     }
 
     return { text: rawContent, resources };
