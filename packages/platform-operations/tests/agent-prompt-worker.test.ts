@@ -521,4 +521,106 @@ describe('AgentPromptTaskWorker (Single-Process Worker, Concurrency=1, Heartbeat
     expect(errorCaptured[0].ctx.stage).toBe('settlement');
     expect(errorCaptured[0].err.message).toBe(TASK_PROTOCOL_ERROR_CODES.SETTLEMENT_FAILED);
   });
+
+  it('a task with lark delivery → fake gateway sendProactiveMessage called once with the reply text; delivery failure does not fail the task', async () => {
+    const ops = service.forTenant('user_test');
+
+    // 1. Successful Lark proactive delivery
+    const { task: task1 } = await ops.tasks.createTask({
+      title: 'Lark Proactive Delivery Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Generate daily report',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+        delivery: {
+          channel: 'lark',
+          accountId: 'acc_lark_123',
+          nativeContextId: 'oc_chat_report_999',
+        },
+      },
+    });
+
+    const proactiveCalls: any[] = [];
+    const fakeGateway = {
+      sendProactiveMessage: vi.fn().mockImplementation(async (params: any) => {
+        proactiveCalls.push(params);
+        return { success: true, messageId: 'om_proactive_1' };
+      }),
+    };
+
+    const fakeChannelRuntimeManager = {
+      getActiveGateway: vi.fn().mockImplementation((userId: string, accountId: string) => {
+        if (userId === 'user_test' && accountId === 'acc_lark_123') {
+          return fakeGateway;
+        }
+        return undefined;
+      }),
+    };
+
+    const worker1 = new AgentPromptTaskWorker({
+      workerId: 'worker_lark_success',
+      tenantEnumerator: () => ['user_test'],
+      getTenantOperations: (tenantId) => service.forTenant(tenantId),
+      dispatcher: async () => ({
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        replyText: 'Daily report: All systems operational.',
+      }),
+      channelRuntimeManager: fakeChannelRuntimeManager,
+    });
+    activeWorkers.push(worker1);
+
+    const result1 = await worker1.runNow({ taskId: task1.id, tenantId: 'user_test' });
+    expect(result1?.status).toBe('completed');
+    expect(fakeGateway.sendProactiveMessage).toHaveBeenCalledTimes(1);
+    expect(proactiveCalls.length).toBe(1);
+    expect(proactiveCalls[0].chatId).toBe('oc_chat_report_999');
+    expect(proactiveCalls[0].text).toBe('Daily report: All systems operational.');
+    expect(proactiveCalls[0].title).toBe('Lark Proactive Delivery Task');
+
+    // 2. Delivery failure does not fail the task
+    const { task: task2 } = await ops.tasks.createTask({
+      title: 'Lark Delivery Failure Resilience Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Task with failing Lark gateway',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+        delivery: {
+          channel: 'lark',
+          accountId: 'acc_lark_broken',
+          nativeContextId: 'oc_chat_broken_888',
+        },
+      },
+    });
+
+    const brokenGateway = {
+      sendProactiveMessage: vi.fn().mockRejectedValue(new Error('Network connection timeout to Lark API')),
+    };
+
+    const fakeBrokenCrm = {
+      getActiveGateway: vi.fn().mockReturnValue(brokenGateway),
+    };
+
+    const worker2 = new AgentPromptTaskWorker({
+      workerId: 'worker_lark_failure',
+      tenantEnumerator: () => ['user_test'],
+      getTenantOperations: (tenantId) => service.forTenant(tenantId),
+      dispatcher: async () => ({
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        replyText: 'Output for failing channel delivery',
+      }),
+      channelRuntimeManager: fakeBrokenCrm,
+    });
+    activeWorkers.push(worker2);
+
+    const result2 = await worker2.runNow({ taskId: task2.id, tenantId: 'user_test' });
+    expect(result2?.status).toBe('completed');
+    expect(brokenGateway.sendProactiveMessage).toHaveBeenCalledTimes(1);
+
+    const completedTask2 = await ops.tasks.getTask(task2.id);
+    expect(completedTask2?.status).toBe('completed');
+  });
 });

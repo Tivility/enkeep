@@ -513,12 +513,24 @@ export function projectCanonicalWebMessages(
       if (!data || !data.message) continue;
 
       const text = extractVisibleTextFromContentBlocks(data.message.content);
-      // If assistant message has NO visible text (e.g., purely tool calls), it is not a final user-visible response
-      if (!text || text.trim() === '') {
+      const rawId = data.message.id || (data as unknown as { id?: string }).id;
+
+      // Filter out intermediate tool-call step messages that have tool-calls but no user-visible text
+      const hasToolCall =
+        Array.isArray(data.message.content) &&
+        data.message.content.some(
+          (b: any) => b && typeof b === 'object' && b.type === 'tool-call'
+        );
+
+      if (hasToolCall && (!text || text.trim() === '')) {
         continue;
       }
 
-      const rawId = data.message.id || (data as unknown as { id?: string }).id;
+      // If assistant message has NO visible text AND no explicit message id, it is not a standalone message
+      if ((!text || text.trim() === '') && (!rawId || !rawId.trim())) {
+        continue;
+      }
+
       const id = rawId && typeof rawId === 'string' && rawId.trim()
         ? rawId
         : generateDeterministicMessageId(sessionId, event.seq, 'assistant', text);

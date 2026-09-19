@@ -25,3 +25,4 @@ export * from './repos/task-notification-repo.js';
 export * from './repos/permission-preset-repo.js';
 export * from './repos/space-mount-repo.js';
 export * from './repos/channel-repo.js';
+export * from './repos/turn-origin-repo.js';

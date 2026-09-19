@@ -51,6 +51,11 @@ export const EXTENSION_MIME_MAP: Record<string, string> = {
   '.ico': 'image/x-icon',
   '.pdf': 'application/pdf',
   '.zip': 'application/zip',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.doc': 'application/msword',
+  '.xls': 'application/vnd.ms-excel',
   '.tar': 'application/x-tar',
   '.gz': 'application/gzip',
   '.mp3': 'audio/mpeg',
@@ -67,40 +72,88 @@ export const EXTENSION_MIME_MAP: Record<string, string> = {
 
 /**
  * Sniffs MIME type from header magic bytes, falling back to extension registry and generic octet-stream.
+ * Strictly prevents type inflation: forged filenames (e.g. forged.exe.pdf) without matching magic bytes
+ * fail closed to application/octet-stream.
  */
 export function sniffMimeType(filename: string, magicHeader?: Buffer): string {
-  if (magicHeader && magicHeader.length >= 4) {
-    // PNG: 89 50 4E 47
-    if (magicHeader[0] === 0x89 && magicHeader[1] === 0x50 && magicHeader[2] === 0x4e && magicHeader[3] === 0x47) {
-      return 'image/png';
-    }
-    // JPEG: FF D8 FF
-    if (magicHeader[0] === 0xff && magicHeader[1] === 0xd8 && magicHeader[2] === 0xff) {
-      return 'image/jpeg';
-    }
-    // GIF: GIF87a or GIF89a
-    if (magicHeader[0] === 0x47 && magicHeader[1] === 0x49 && magicHeader[2] === 0x46 && magicHeader[3] === 0x38) {
-      return 'image/gif';
-    }
-    // PDF: %PDF
-    if (magicHeader[0] === 0x25 && magicHeader[1] === 0x50 && magicHeader[2] === 0x44 && magicHeader[3] === 0x46) {
-      return 'application/pdf';
-    }
-    // WebP: RIFF....WEBP
+  const ext = path.extname(filename).toLowerCase();
+
+  if (magicHeader && magicHeader.length >= 2) {
+    // Executables: MZ (Windows DOS/PE), ELF (\x7fELF), Mach-O (\xfe\xed\xfa\xce/cf, \xca\xfe\xba\xbe)
     if (
-      magicHeader.length >= 12 &&
-      magicHeader[0] === 0x52 && magicHeader[1] === 0x49 && magicHeader[2] === 0x46 && magicHeader[3] === 0x46 &&
-      magicHeader[8] === 0x57 && magicHeader[9] === 0x45 && magicHeader[10] === 0x42 && magicHeader[11] === 0x50
+      (magicHeader[0] === 0x4d && magicHeader[1] === 0x5a) ||
+      (magicHeader.length >= 4 && magicHeader[0] === 0x7f && magicHeader[1] === 0x45 && magicHeader[2] === 0x4c && magicHeader[3] === 0x46) ||
+      (magicHeader.length >= 4 && (
+        (magicHeader[0] === 0xfe && magicHeader[1] === 0xed && magicHeader[2] === 0xfa && (magicHeader[3] === 0xce || magicHeader[3] === 0xcf)) ||
+        (magicHeader[0] === 0xcf && magicHeader[1] === 0xfa && magicHeader[2] === 0xed && magicHeader[3] === 0xfe) ||
+        (magicHeader[0] === 0xce && magicHeader[1] === 0xfa && magicHeader[2] === 0xed && magicHeader[3] === 0xfe) ||
+        (magicHeader[0] === 0xca && magicHeader[1] === 0xfe && magicHeader[2] === 0xba && magicHeader[3] === 0xbe)
+      ))
     ) {
-      return 'image/webp';
+      return 'application/octet-stream';
     }
-    // ZIP / JAR / DOCX: PK\x03\x04
-    if (magicHeader[0] === 0x50 && magicHeader[1] === 0x4b && magicHeader[2] === 0x03 && magicHeader[3] === 0x04) {
-      return 'application/zip';
+
+    if (magicHeader.length >= 4) {
+      // PNG: 89 50 4E 47
+      if (magicHeader[0] === 0x89 && magicHeader[1] === 0x50 && magicHeader[2] === 0x4e && magicHeader[3] === 0x47) {
+        return 'image/png';
+      }
+      // JPEG: FF D8 FF
+      if (magicHeader[0] === 0xff && magicHeader[1] === 0xd8 && magicHeader[2] === 0xff) {
+        return 'image/jpeg';
+      }
+      // GIF: GIF87a or GIF89a
+      if (magicHeader[0] === 0x47 && magicHeader[1] === 0x49 && magicHeader[2] === 0x46 && magicHeader[3] === 0x38) {
+        return 'image/gif';
+      }
+      // PDF: %PDF
+      if (magicHeader[0] === 0x25 && magicHeader[1] === 0x50 && magicHeader[2] === 0x44 && magicHeader[3] === 0x46) {
+        return 'application/pdf';
+      }
+      // WebP: RIFF....WEBP
+      if (
+        magicHeader.length >= 12 &&
+        magicHeader[0] === 0x52 && magicHeader[1] === 0x49 && magicHeader[2] === 0x46 && magicHeader[3] === 0x46 &&
+        magicHeader[8] === 0x57 && magicHeader[9] === 0x45 && magicHeader[10] === 0x42 && magicHeader[11] === 0x50
+      ) {
+        return 'image/webp';
+      }
+      // ZIP / JAR / DOCX / XLSX: PK\x03\x04 or PK\x05\x06 or PK\x07\x08
+      if (magicHeader[0] === 0x50 && magicHeader[1] === 0x4b && (magicHeader[2] === 0x03 || magicHeader[2] === 0x05 || magicHeader[2] === 0x07)) {
+        if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        if (ext === '.xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        if (ext === '.pptx') return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+        return 'application/zip';
+      }
+    }
+
+    // Guard against type inflation: if claimed extension expects specific magic bytes but header failed to match
+    if (ext === '.pdf') {
+      return 'application/octet-stream';
+    }
+    if (ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.gif' || ext === '.webp') {
+      return 'application/octet-stream';
+    }
+    if (ext === '.zip' || ext === '.docx' || ext === '.xlsx' || ext === '.pptx') {
+      return 'application/octet-stream';
+    }
+
+    // Text detection: check first bytes for absence of null bytes and high ratio of valid ASCII/UTF-8
+    let hasNull = false;
+    for (let i = 0; i < Math.min(magicHeader.length, 512); i++) {
+      if (magicHeader[i] === 0x00) {
+        hasNull = true;
+        break;
+      }
+    }
+    if (!hasNull) {
+      if (ext && EXTENSION_MIME_MAP[ext]) {
+        return EXTENSION_MIME_MAP[ext];
+      }
+      return 'text/plain; charset=utf-8';
     }
   }
 
-  const ext = path.extname(filename).toLowerCase();
   if (ext && EXTENSION_MIME_MAP[ext]) {
     return EXTENSION_MIME_MAP[ext];
   }

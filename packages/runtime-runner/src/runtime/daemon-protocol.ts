@@ -11,6 +11,7 @@
  */
 
 import { Transform, type TransformCallback } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import type { AgentProfileSnapshot } from './agent-profile.js';
 import type { SessionSeedReceipt } from './dsh-boot.js';
@@ -733,18 +734,25 @@ export function encodeDaemonMessage(message: DaemonMessage): Buffer {
 export class DaemonRpcDecoder extends Transform {
   private buffer = '';
   private isClosed = false;
+  private readonly stringDecoder = new StringDecoder('utf8');
 
   constructor() {
     super({ readableObjectMode: true });
   }
 
-  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+  _transform(chunk: Buffer | string, encoding: BufferEncoding, callback: TransformCallback): void {
     if (this.isClosed) {
       callback();
       return;
     }
 
-    const chunkStr = chunk.toString('utf8');
+    const chunkStr = Buffer.isBuffer(chunk)
+      ? this.stringDecoder.write(chunk)
+      : typeof chunk === 'string'
+        ? (encoding && encoding !== 'utf8' && (encoding as string) !== 'buffer'
+            ? this.stringDecoder.write(Buffer.from(chunk, encoding))
+            : this.stringDecoder.write(Buffer.from(chunk, 'utf8')))
+        : '';
     this.buffer += chunkStr;
 
     if (Buffer.byteLength(this.buffer, 'utf8') > MAX_DAEMON_FRAME_SIZE) {
@@ -788,12 +796,34 @@ export class DaemonRpcDecoder extends Transform {
   }
 
   _flush(callback: TransformCallback): void {
-    if (this.buffer.trim().length > 0 && !this.isClosed) {
+    if (this.isClosed) {
+      callback();
+      return;
+    }
+
+    const trailing = this.stringDecoder.end();
+    if (trailing) {
+      this.buffer += trailing;
+    }
+
+    if (Buffer.byteLength(this.buffer, 'utf8') > MAX_DAEMON_FRAME_SIZE) {
+      const err = new DaemonProtocolError(
+        DAEMON_ERROR_CODES.FRAME_SIZE_EXCEEDED,
+        `Stream buffer exceeded maximum frame size of ${MAX_DAEMON_FRAME_SIZE} bytes without newline delimiter`
+      );
+      this.isClosed = true;
+      this.destroy(err);
+      callback(err);
+      return;
+    }
+
+    if (this.buffer.trim().length > 0) {
       try {
         const msg = decodeDaemonMessage(this.buffer.trim());
         this.push(msg);
         callback();
       } catch (err: unknown) {
+        this.isClosed = true;
         const protocolErr =
           err instanceof DaemonProtocolError
             ? err
@@ -807,6 +837,13 @@ export class DaemonRpcDecoder extends Transform {
     } else {
       callback();
     }
+  }
+
+  override _destroy(error: Error | null, callback: (error: Error | null) => void): void {
+    this.isClosed = true;
+    this.buffer = '';
+    this.stringDecoder.end();
+    callback(error);
   }
 }
 

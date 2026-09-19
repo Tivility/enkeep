@@ -78,6 +78,10 @@ import {
   createPlatformServerTaskWorker,
 } from '../tasks/agent-prompt-worker.js';
 import {
+  PipelineTaskInputPreparerService,
+} from '../tasks/pipeline-input-preparer.js';
+import type { TaskInputPreparer } from '@enkeep/platform-operations';
+import {
   type AgentProfileApi,
   createProfileService,
 } from '../profiles/profile-service.js';
@@ -239,6 +243,10 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'larkEncryptedCredentialStore',
   'larkCredentialKeyFilePath',
   'streamEventSource',
+  'dataRoot',
+  'pipelineManifestPath',
+  'pipelineTaskPreparer',
+  'prepareTaskInput',
 ]);
 
 const ALLOWED_LIMITS_OPTIONS = new Set([
@@ -302,6 +310,12 @@ export interface PlatformServerOptions {
   quotaProvider?: TenantQuotaProvider;
   /** Optional flag to enable background AgentPromptTaskWorker */
   enableWorker?: boolean;
+  /** Optional private pipeline tasks manifest path */
+  pipelineManifestPath?: string;
+  /** Optional pre-dispatch task input preparer */
+  pipelineTaskPreparer?: PipelineTaskInputPreparerService;
+  /** Optional general task input preparer hook */
+  prepareTaskInput?: TaskInputPreparer;
   /** Optional explicit worker ID */
   workerId?: string;
   /** Optional run ID used to derive worker ID */
@@ -338,6 +352,8 @@ export interface PlatformServerOptions {
   instructionsRoutes?: InstructionsRoutes;
   /** Optional DSH home directory for skill resolution */
   dshHome?: string;
+  /** Optional data root directory containing host-runtimes and tenant memory */
+  dataRoot?: string;
   /** Optional spaces directory for skill resolution */
   spacesDir?: string;
   /** Optional bundled skills directory */
@@ -455,6 +471,8 @@ export class PlatformServer {
   public readonly spaceMountService?: SpaceMountService;
   public readonly browserService?: BrowserService;
   public readonly mcpService?: PlatformProxyMcpService;
+  public readonly dshHome: string;
+  public readonly dataRoot?: string;
 
   private activeSockets = new Set<import('node:net').Socket>();
 
@@ -534,26 +552,6 @@ export class PlatformServer {
     });
     this.operationsProvider = createManagementOperationsAdapter(this.operationsService);
     this.quotaProvider = options.quotaProvider ?? createOperationsTenantQuotaProvider(this.operationsService);
-
-    // 7. Initialize Task Worker if requested or injected
-    if (options.taskWorker) {
-      this.taskWorker = options.taskWorker;
-    } else if (options.enableWorker) {
-      if (this.runtimeGateway instanceof DeliveryRuntimeGateway) {
-        const dispatcher = createAgentPromptDeliveryDispatcher({
-          gateway: this.runtimeGateway,
-          storage: this.storage,
-          database: db,
-        });
-        this.taskWorker = createPlatformServerTaskWorker({
-          db,
-          dispatcher,
-          operationsStorage: this.operationsStorage,
-          runId: options.runId,
-          workerId: options.workerId,
-        });
-      }
-    }
 
     if (options.consoleDataSource) {
       this.consoleDataSource = options.consoleDataSource;
@@ -676,10 +674,14 @@ export class PlatformServer {
       this.csrfToken
     );
 
+    const effectiveDshHome = options.dshHome ?? (process.env.DSH_HOME || path.join(os.homedir(), '.dsh'));
+    this.dshHome = effectiveDshHome;
+    this.dataRoot = options.dataRoot ?? options.dshHome;
+
     const extensionService =
       options.extensionService ??
       new ExtensionService(this.storage, db, {
-        dshHome: options.dshHome ?? (process.env.DSH_HOME || path.join(os.homedir(), '.dsh')),
+        dshHome: effectiveDshHome,
         spacesDir: options.spacesDir ?? (process.env.ENKEEP_SPACES_DIR || path.join(os.homedir(), '.enkeep', 'spaces')),
         bundledSkillDir: options.bundledSkillDir ?? (process.env.DSH_BUNDLED_SKILL_DIR || undefined),
         gitSourcePolicy: options.gitSourcePolicy,
@@ -835,9 +837,50 @@ export class PlatformServer {
           })
         : undefined);
 
-    // Re-bind runtimeManager to channelService and larkOnboardingService
+    // 7. Initialize Task Worker if requested or injected (placed after providers, dshHome, dataRoot, and channelRuntimeManager)
+    if (options.taskWorker) {
+      this.taskWorker = options.taskWorker;
+    } else if (options.enableWorker) {
+      if (this.runtimeGateway instanceof DeliveryRuntimeGateway) {
+        const dispatcher = createAgentPromptDeliveryDispatcher({
+          gateway: this.runtimeGateway,
+          storage: this.storage,
+          database: db,
+        });
+        const effectiveManifestPath = options.pipelineManifestPath ?? process.env.ENKEEP_PIPELINE_MANIFEST;
+        let taskPreparerHook = options.prepareTaskInput;
+        if (!taskPreparerHook && (options.pipelineTaskPreparer || effectiveManifestPath)) {
+          const preparer = options.pipelineTaskPreparer ?? new PipelineTaskInputPreparerService({
+            database: db,
+            fileService: () => this.fileService ?? this.fileProvider,
+            manifestPath: effectiveManifestPath,
+            dataRoot: this.dataRoot,
+            dshHome: this.dshHome,
+          });
+          taskPreparerHook = preparer.asPreparerHook();
+        }
+
+        this.taskWorker = createPlatformServerTaskWorker({
+          db,
+          dispatcher,
+          operationsStorage: this.operationsStorage,
+          runId: options.runId,
+          workerId: options.workerId,
+          channelRuntimeManager: options.channelRuntimeManager ?? this.channelRuntimeManager,
+          prepareTaskInput: taskPreparerHook,
+          fileService: () => this.fileService ?? this.fileProvider,
+          dataRoot: this.dataRoot,
+          dshHome: this.dshHome,
+        });
+      }
+    }
+
+    // Re-bind runtimeManager to channelService, larkOnboardingService, and taskWorker
     (this.channelService as any).runtimeManager = this.channelRuntimeManager;
     (this.larkOnboardingService as any).runtimeManager = this.channelRuntimeManager;
+    if (this.taskWorker) {
+      this.taskWorker.channelRuntimeManager = this.channelRuntimeManager;
+    }
 
     this.channelRoutes =
       options.channelRoutes ??
@@ -874,6 +917,7 @@ export class PlatformServer {
       spaceMountService: this.spaceMountService,
       browserService: this.browserService,
       mcpService: this.mcpService,
+      dshHome: this.dshHome,
     });
   }
 

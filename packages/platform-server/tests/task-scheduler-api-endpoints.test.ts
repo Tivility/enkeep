@@ -256,7 +256,7 @@ describe('Task Scheduler Management APIs (Cron, Interval, Pause/Resume, Runs, Ru
       });
       expect(resQueue.status).toBe(400);
 
-      // Reject non-UTC timezone
+      // Reject invalid timezone
       const res3 = await fetch(`${baseUrl}/api/manage/tasks`, {
         method: 'POST',
         headers: {
@@ -264,15 +264,35 @@ describe('Task Scheduler Management APIs (Cron, Interval, Pause/Resume, Runs, Ru
           'Idempotency-Key': '44444444-5555-4666-8777-888888888891',
         },
         body: JSON.stringify({
-          title: 'Non-UTC Timezone Task',
+          title: 'Invalid Timezone Task',
           prompt: 'Run task',
           sessionId: sessionRouteId,
           scheduleType: 'cron',
           cronExpression: '0 * * * *',
-          timezone: 'America/New_York',
+          timezone: 'Mars/Olympus',
         }),
       });
       expect(res3.status).toBe(400);
+
+      // Accepts valid IANA timezone (Asia/Shanghai)
+      const res4 = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '44444444-5555-4666-8777-888888888893',
+        },
+        body: JSON.stringify({
+          title: 'Asia/Shanghai Timezone Task',
+          prompt: 'Run task',
+          sessionId: sessionRouteId,
+          scheduleType: 'cron',
+          cronExpression: '0 * * * *',
+          timezone: 'Asia/Shanghai',
+        }),
+      });
+      expect(res4.status).toBe(201);
+      const json4 = await res4.json();
+      expect(json4.data.task.schedule.timezone).toBe('Asia/Shanghai');
     });
 
     it('accepts supported misfirePolicy (coalesce, skip) and overlapPolicy (skip)', async () => {
@@ -338,6 +358,54 @@ describe('Task Scheduler Management APIs (Cron, Interval, Pause/Resume, Runs, Ru
       expect(resumeRes.status).toBe(200);
       const resumeJson = await resumeRes.json();
       expect(resumeJson.data.resumed).toBe(true);
+      expect(resumeJson.data.task.schedule.enabled).toBe(true);
+    });
+
+    it('pauses and resumes a migrated task with task_hpc_<24hex> format', async () => {
+      const migratedTaskId = 'task_hpc_0123456789abcdef01234567';
+      const nowIso = new Date().toISOString();
+      server.db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, idempotency_key, title, status, payload, lease_duration_ms, max_retries,
+          schedule_type, cron_expression, timezone, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'pending', ?, 60000, 3, 'cron', '0 * * * *', 'UTC', ?, ?)
+      `).run(
+        migratedTaskId,
+        tenant1Id,
+        'hpc_task_test_migrated_1',
+        'Migrated HPC Task',
+        JSON.stringify({ type: 'agent_prompt', prompt: 'Migrated prompt', sessionId: sessionRouteId, sessionPolicy: 'existing_session' }),
+        nowIso,
+        nowIso
+      );
+      server.db.prepare(`
+        INSERT INTO task_schedules (
+          id, task_id, user_id, schedule_type, cron_expression, timezone, enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, 'cron', '0 * * * *', 'UTC', 1, ?, ?)
+      `).run(
+        'sched_hpc_0123456789abcdef01234567',
+        migratedTaskId,
+        tenant1Id,
+        nowIso,
+        nowIso
+      );
+
+      // Pause migrated task via API
+      const pauseRes = await fetch(`${baseUrl}/api/manage/tasks/${migratedTaskId}/pause`, {
+        method: 'POST',
+        headers: getHeaders(tenant1Cookie),
+      });
+      expect(pauseRes.status).toBe(200);
+      const pauseJson = await pauseRes.json();
+      expect(pauseJson.data.task.schedule.enabled).toBe(false);
+
+      // Resume migrated task via API
+      const resumeRes = await fetch(`${baseUrl}/api/manage/tasks/${migratedTaskId}/resume`, {
+        method: 'POST',
+        headers: getHeaders(tenant1Cookie),
+      });
+      expect(resumeRes.status).toBe(200);
+      const resumeJson = await resumeRes.json();
       expect(resumeJson.data.task.schedule.enabled).toBe(true);
     });
   });

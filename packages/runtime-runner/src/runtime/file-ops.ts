@@ -19,6 +19,7 @@ export const MAX_GLOBAL_INSTRUCTIONS_BYTES = 20 * 1024; // 20 KiB (20,480 bytes)
 export const MAX_SPACE_INSTRUCTIONS_BYTES = 64 * 1024; // 64 KiB (65,536 bytes)
 export const MAX_DIR_ENTRIES = 500; // Maximum directory listing entries
 export const MAX_LOCK_OWNER_BYTES = 4096; // Maximum lock owner metadata payload size
+export const MAX_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB (20,971,520 bytes) attachment cap
 
 /**
  * Strict canonical request keys permitted at container runtime.
@@ -36,9 +37,27 @@ const ALLOWED_REQUEST_KEYS = new Set([
   'requireAbsent',
   'requireTargetAbsent',
   'maxBytes',
+  'stageToken',
+  'offset',
+  'totalSize',
+  'maxSizeBytes',
+  'rollbackToken',
 ]);
 
-export type FileOpType = 'list' | 'read' | 'write' | 'mkdir' | 'delete' | 'rename' | 'stat' | 'sniff' | 'copy';
+export type FileOpType =
+  | 'list'
+  | 'read'
+  | 'write'
+  | 'mkdir'
+  | 'delete'
+  | 'rename'
+  | 'stat'
+  | 'sniff'
+  | 'copy'
+  | 'stage_chunk'
+  | 'commit_stage'
+  | 'abort_stage'
+  | 'write_attachment';
 
 export interface FileStatRequest {
   readonly op: 'stat';
@@ -253,6 +272,9 @@ export interface FileOperationResult {
   readonly created?: boolean;
   readonly deleted?: boolean;
   readonly renamed?: boolean;
+  readonly aborted?: boolean;
+  readonly bytesWritten?: number;
+  readonly currentSize?: number;
   readonly headerBytesBase64?: string;
   readonly stageToken?: string;
   readonly sha256?: string;
@@ -398,6 +420,15 @@ export function getProcessStartTicks(
     } catch (err: unknown) {
       if (err instanceof FileOpError) throw err;
       throw new FileOpError('BUSY');
+    }
+  }
+
+  if (filesystem === fs && process.platform !== 'linux') {
+    try {
+      process.kill(pid, 0);
+      return { starttime: '12345' };
+    } catch {
+      return null;
     }
   }
 
@@ -1309,7 +1340,11 @@ export function executeFileOperation(
     op !== 'rename' &&
     op !== 'stat' &&
     op !== 'sniff' &&
-    op !== 'copy'
+    op !== 'copy' &&
+    op !== 'stage_chunk' &&
+    op !== 'commit_stage' &&
+    op !== 'abort_stage' &&
+    op !== 'write_attachment'
   ) {
     throw new FileOpError('INVALID_OP');
   }
@@ -1322,7 +1357,13 @@ export function executeFileOperation(
     options.expectedUid ??
     (process.env.NODE_ENV === 'test' && typeof process.getuid === 'function' ? process.getuid() : 1000);
 
-  const allowCreate = op === 'mkdir' || op === 'write' || op === 'rename';
+  const allowCreate =
+    op === 'mkdir' ||
+    op === 'write' ||
+    op === 'rename' ||
+    op === 'stage_chunk' ||
+    op === 'commit_stage' ||
+    op === 'write_attachment';
   const { spaceRoot, targetPath } = verifyNoSymlinksInPath(
     spacesDir,
     space,
@@ -1439,6 +1480,7 @@ export function executeFileOperation(
           op: 'read',
           space,
           path: normalizedPath,
+          type: 'file',
           content,
           encoding,
           size: finalBuf.length,
@@ -1927,6 +1969,7 @@ export function executeFileOperation(
           space,
           path: normalizedPath,
           targetPath: destNormalizedPath,
+          type: stat.isDirectory() ? 'directory' : 'file',
           renamed: true,
           etag: finalEtag,
           size: finalSize,
@@ -2163,6 +2206,7 @@ export function executeFileOperation(
             space,
             path: normalizedPath,
             targetPath: destNormalizedPath,
+            type: sourceStat.isDirectory() ? 'directory' : 'file',
             renamed: true,
             etag: finalEtag,
             size: finalSize,
@@ -2219,6 +2263,7 @@ export function executeFileOperation(
             op: 'mkdir',
             space,
             path: '.',
+            type: 'directory',
             created: true,
             etag: emptyDirEtag,
             size,
@@ -2294,6 +2339,7 @@ export function executeFileOperation(
           op: 'mkdir',
           space,
           path: normalizedPath,
+          type: 'directory',
           created: true,
           etag: emptyDirEtag,
           size,
@@ -2780,6 +2826,354 @@ export function executeFileOperation(
         }
       }
     }
+
+    case 'stage_chunk': {
+      if (
+        reqObj.targetPath !== undefined ||
+        reqObj.expectedEtag !== undefined ||
+        reqObj.expectedTargetEtag !== undefined ||
+        reqObj.requireAbsent !== undefined ||
+        reqObj.requireTargetAbsent !== undefined
+      ) {
+        throw new FileOpError('INVALID_REQUEST');
+      }
+
+      if (segments.length === 0 || normalizedPath === '.') {
+        throw new FileOpError('INVALID_TARGET');
+      }
+
+      if (!normalizedPath.startsWith('.attachments/')) {
+        throw new FileOpError('INVALID_TARGET');
+      }
+
+      const offset = typeof reqObj.offset === 'number' && Number.isInteger(reqObj.offset) && reqObj.offset >= 0
+        ? reqObj.offset
+        : 0;
+
+      const encoding = reqObj.encoding === 'base64' ? 'base64' : 'utf8';
+      let payloadBuffer: Buffer;
+      if (reqObj.content === undefined || reqObj.content === null) {
+        payloadBuffer = Buffer.alloc(0);
+      } else if (typeof reqObj.content !== 'string') {
+        throw new FileOpError('INVALID_PAYLOAD');
+      } else if (encoding === 'base64') {
+        if (!/^[A-Za-z0-9+/]*={0,2}$/.test(reqObj.content)) {
+          throw new FileOpError('INVALID_PAYLOAD');
+        }
+        try {
+          payloadBuffer = Buffer.from(reqObj.content, 'base64');
+        } catch {
+          throw new FileOpError('INVALID_PAYLOAD');
+        }
+      } else {
+        payloadBuffer = Buffer.from(reqObj.content, 'utf8');
+      }
+
+      // Single chunk transport cap strictly enforced to 1 MiB
+      if (payloadBuffer.length > MAX_FILE_OP_BYTES) {
+        throw new FileOpError('PAYLOAD_TOO_LARGE');
+      }
+
+      // Cumulative attachment limit strictly enforced to 20 MiB
+      if (offset + payloadBuffer.length > MAX_ATTACHMENT_IMAGE_BYTES) {
+        throw new FileOpError('PAYLOAD_TOO_LARGE');
+      }
+
+      const parentDir = path.dirname(targetPath);
+      filesystem.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+
+      let stageToken: string;
+      if (reqObj.stageToken !== undefined) {
+        stageToken = validateStageToken(reqObj.stageToken);
+      } else {
+        stageToken = `.${path.basename(targetPath)}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
+      }
+
+      const tempPath = path.join(parentDir, stageToken);
+      const nofollow = getNoFollowFlag();
+
+      if (offset === 0) {
+        let fd: number | undefined;
+        try {
+          fd = filesystem.openSync(
+            tempPath,
+            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | nofollow,
+            0o600
+          );
+          if (payloadBuffer.length > 0) {
+            filesystem.writeSync(fd, payloadBuffer, 0, payloadBuffer.length, 0);
+          }
+        } finally {
+          if (fd !== undefined) {
+            try { filesystem.closeSync(fd); } catch {}
+          }
+        }
+      } else {
+        let st: fs.Stats;
+        try {
+          st = filesystem.lstatSync(tempPath);
+        } catch {
+          throw new FileOpError('INVALID_REQUEST');
+        }
+        if (st.isSymbolicLink() || !st.isFile()) {
+          throw new FileOpError('SYMLINK_FORBIDDEN');
+        }
+        verifyOwnership(st, expectedUid);
+        if (st.size !== offset) {
+          throw new FileOpError('PRECONDITION_FAILED');
+        }
+
+        let fd: number | undefined;
+        try {
+          fd = filesystem.openSync(
+            tempPath,
+            fs.constants.O_WRONLY | fs.constants.O_APPEND | nofollow,
+            0o600
+          );
+          if (payloadBuffer.length > 0) {
+            filesystem.writeSync(fd, payloadBuffer, 0, payloadBuffer.length, null);
+          }
+        } finally {
+          if (fd !== undefined) {
+            try { filesystem.closeSync(fd); } catch {}
+          }
+        }
+      }
+
+      const currentSize = offset + payloadBuffer.length;
+      return {
+        op: 'stage_chunk',
+        space,
+        path: normalizedPath,
+        stageToken,
+        bytesWritten: payloadBuffer.length,
+        currentSize,
+      };
+    }
+
+    case 'commit_stage': {
+      if (
+        reqObj.content !== undefined ||
+        reqObj.encoding !== undefined ||
+        reqObj.targetPath !== undefined
+      ) {
+        throw new FileOpError('INVALID_REQUEST');
+      }
+      if (segments.length === 0 || normalizedPath === '.') {
+        throw new FileOpError('INVALID_TARGET');
+      }
+      if (!normalizedPath.startsWith('.attachments/')) {
+        throw new FileOpError('INVALID_TARGET');
+      }
+      const stageToken = validateStageToken(reqObj.stageToken);
+      const expectedPrefix = `.${path.basename(targetPath)}.`;
+      if (!stageToken.startsWith(expectedPrefix)) {
+        throw new FileOpError('INVALID_REQUEST');
+      }
+      const expectedEtag = typeof reqObj.expectedEtag === 'string' ? reqObj.expectedEtag : undefined;
+      const requireAbsent = reqObj.requireAbsent === true || (reqObj.expectedEtag === undefined);
+
+      return withPathLocks([{ space, path: normalizedPath }], options, () => {
+        const parentDir = path.dirname(targetPath);
+        const tempPath = path.join(parentDir, stageToken);
+
+        let tempStat: fs.Stats;
+        try {
+          tempStat = filesystem.lstatSync(tempPath);
+          if (tempStat.isSymbolicLink() || !tempStat.isFile()) {
+            throw new FileOpError('INVALID_REQUEST');
+          }
+          verifyOwnership(tempStat, expectedUid);
+        } catch {
+          throw new FileOpError('INVALID_REQUEST');
+        }
+
+        if (tempStat.size > MAX_ATTACHMENT_IMAGE_BYTES) {
+          try { filesystem.unlinkSync(tempPath); } catch {}
+          throw new FileOpError('PAYLOAD_TOO_LARGE');
+        }
+
+        let initialTargetStat: fs.Stats | undefined;
+        let targetExists = false;
+        try {
+          initialTargetStat = filesystem.lstatSync(targetPath);
+          targetExists = true;
+          if (initialTargetStat.isSymbolicLink() || initialTargetStat.isDirectory() || !initialTargetStat.isFile()) {
+            throw new FileOpError('INVALID_TARGET');
+          }
+          verifyOwnership(initialTargetStat, expectedUid);
+        } catch (err: unknown) {
+          if (err instanceof FileOpError) throw err;
+          const code = (err as { code?: string })?.code;
+          if (code === 'ENOENT') {
+            targetExists = false;
+          } else {
+            throw new FileOpError('WRITE_FAILED');
+          }
+        }
+
+        if (requireAbsent && targetExists) {
+          throw new FileOpError('PRECONDITION_FAILED');
+        }
+
+        const hasher = crypto.createHash('sha256');
+        const chunkBuf = Buffer.alloc(64 * 1024);
+        let readTotal = 0;
+        const nofollow = getNoFollowFlag();
+        let fd: number | undefined;
+        try {
+          fd = filesystem.openSync(tempPath, fs.constants.O_RDONLY | nofollow);
+          while (readTotal < tempStat.size) {
+            const bytesRead = filesystem.readSync(fd, chunkBuf, 0, Math.min(chunkBuf.length, tempStat.size - readTotal), readTotal);
+            if (bytesRead === 0) break;
+            hasher.update(chunkBuf.subarray(0, bytesRead));
+            readTotal += bytesRead;
+          }
+        } finally {
+          if (fd !== undefined) {
+            try { filesystem.closeSync(fd); } catch {}
+          }
+        }
+
+        const sha256 = hasher.digest('hex').toLowerCase();
+        const etag = `"${sha256}"`;
+
+        if (expectedEtag && !matchETag(etag, expectedEtag)) {
+          throw new FileOpError('PRECONDITION_FAILED');
+        }
+
+        filesystem.renameSync(tempPath, targetPath);
+
+        return {
+          op: 'commit_stage',
+          space,
+          path: normalizedPath,
+          size: tempStat.size,
+          written: true,
+          etag,
+          sha256,
+        };
+      });
+    }
+
+    case 'abort_stage': {
+      if (segments.length === 0 || normalizedPath === '.') {
+        throw new FileOpError('INVALID_TARGET');
+      }
+      if (!normalizedPath.startsWith('.attachments/')) {
+        throw new FileOpError('INVALID_TARGET');
+      }
+      const stageToken = validateStageToken(reqObj.stageToken);
+      const expectedPrefix = `.${path.basename(targetPath)}.`;
+      if (!stageToken.startsWith(expectedPrefix)) {
+        throw new FileOpError('INVALID_REQUEST');
+      }
+      const parentDir = path.dirname(targetPath);
+      const tempPath = path.join(parentDir, stageToken);
+
+      try {
+        if (filesystem.existsSync(tempPath)) {
+          const st = filesystem.lstatSync(tempPath);
+          if (!st.isSymbolicLink() && st.isFile()) {
+            verifyOwnership(st, expectedUid);
+            filesystem.unlinkSync(tempPath);
+          }
+        }
+      } catch {}
+
+      return {
+        op: 'abort_stage',
+        space,
+        path: normalizedPath,
+        aborted: true,
+      };
+    }
+
+    case 'write_attachment': {
+      if (
+        reqObj.targetPath !== undefined ||
+        reqObj.expectedTargetEtag !== undefined ||
+        reqObj.requireTargetAbsent !== undefined
+      ) {
+        throw new FileOpError('INVALID_REQUEST');
+      }
+      if (segments.length === 0 || normalizedPath === '.') {
+        throw new FileOpError('INVALID_TARGET');
+      }
+      if (!normalizedPath.startsWith('.attachments/')) {
+        throw new FileOpError('INVALID_TARGET');
+      }
+
+      const hasExpectedEtag = reqObj.expectedEtag !== undefined;
+      const hasRequireAbsent = reqObj.requireAbsent !== undefined;
+      if (hasExpectedEtag && hasRequireAbsent) throw new FileOpError('INVALID_REQUEST');
+      if (hasExpectedEtag && !isValidETag(reqObj.expectedEtag)) throw new FileOpError('INVALID_REQUEST');
+      const expectedEtag = reqObj.expectedEtag as string | undefined;
+      const requireAbsent = reqObj.requireAbsent === true || !hasExpectedEtag;
+
+      return withPathLocks([{ space, path: normalizedPath }], options, () => {
+        const encoding = reqObj.encoding === 'base64' ? 'base64' : 'utf8';
+        let payloadBuffer: Buffer;
+        if (reqObj.content === undefined || reqObj.content === null) {
+          payloadBuffer = Buffer.alloc(0);
+        } else if (typeof reqObj.content !== 'string') {
+          throw new FileOpError('INVALID_PAYLOAD');
+        } else if (encoding === 'base64') {
+          if (!/^[A-Za-z0-9+/]*={0,2}$/.test(reqObj.content)) {
+            throw new FileOpError('INVALID_PAYLOAD');
+          }
+          try {
+            payloadBuffer = Buffer.from(reqObj.content, 'base64');
+          } catch {
+            throw new FileOpError('INVALID_PAYLOAD');
+          }
+        } else {
+          payloadBuffer = Buffer.from(reqObj.content, 'utf8');
+        }
+
+        if (payloadBuffer.length > MAX_ATTACHMENT_IMAGE_BYTES) {
+          throw new FileOpError('PAYLOAD_TOO_LARGE');
+        }
+
+        const parentDir = path.dirname(targetPath);
+        filesystem.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+
+        if (requireAbsent && filesystem.existsSync(targetPath)) {
+          throw new FileOpError('PRECONDITION_FAILED');
+        }
+
+        const tempPath = `${targetPath}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+        const nofollow = getNoFollowFlag();
+        let fd: number | undefined;
+        try {
+          fd = filesystem.openSync(tempPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | nofollow, 0o600);
+          filesystem.writeSync(fd, payloadBuffer, 0, payloadBuffer.length, 0);
+          filesystem.fsyncSync(fd);
+        } finally {
+          if (fd !== undefined) {
+            try { filesystem.closeSync(fd); } catch {}
+          }
+        }
+
+        filesystem.renameSync(tempPath, targetPath);
+        const sha256 = crypto.createHash('sha256').update(payloadBuffer).digest('hex').toLowerCase();
+        const etag = `"${sha256}"`;
+
+        if (expectedEtag && !matchETag(etag, expectedEtag)) {
+          throw new FileOpError('PRECONDITION_FAILED');
+        }
+
+        return {
+          op: 'write_attachment',
+          space,
+          path: normalizedPath,
+          size: payloadBuffer.length,
+          written: true,
+          etag,
+          sha256,
+        };
+      });
+    }
   }
 }
 
@@ -2826,7 +3220,7 @@ const STAGE_TOKEN_REGEX = /^\.[a-zA-Z0-9_.-]+\.[0-9a-f]{16}\.stage\.tmp$/;
 const ROLLBACK_TOKEN_REGEX = /^\.[a-zA-Z0-9_.-]+\.[0-9a-f]{16}\.rollback\.tmp$/;
 
 export function validateStageToken(token: unknown): string {
-  if (typeof token !== 'string' || !STAGE_TOKEN_REGEX.test(token)) {
+  if (typeof token !== 'string' || token.includes('/') || token.includes('\\') || !STAGE_TOKEN_REGEX.test(token)) {
     throw new FileOpError('INVALID_REQUEST');
   }
   return token;

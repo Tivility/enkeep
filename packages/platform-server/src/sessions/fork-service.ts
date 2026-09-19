@@ -96,6 +96,7 @@ export class ForkService {
     return {
       id: route.id,
       spaceId: route.spaceId,
+      channel: route.channel,
       title: route.title ?? null,
       status: route.status,
       currentGeneration: route.currentGeneration,

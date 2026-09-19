@@ -308,7 +308,9 @@ const MANAGEMENT_LOCALES = {
     'reconcile.kpiScanned': 'Total Sessions Scanned',
     'reconcile.kpiMatched': 'Matched Sessions',
     'reconcile.kpiDrift': 'Drift Detected',
-    'reconcile.kpiMissing': 'Missing in SQLite',
+    'reconcile.kpiMissing': 'Runtime History Missing',
+    'reconcile.kpiArchived': 'Archived Sessions',
+    'reconcile.statusMergedArchive': 'Merged Archive',
     'reconcile.sectionReports': 'Session Reconciliation Reports',
     'reconcile.colSessionId': 'Session ID',
     'reconcile.colStatus': 'Consistency Status',
@@ -327,6 +329,7 @@ const MANAGEMENT_LOCALES = {
     'reconcile.scanBaselineFailed': 'Failed to scan storage baseline: {error}',
     'reconcile.btnPreviewRepair': 'Repair',
     'reconcile.btnConfirmRepair': 'Execute Repair',
+    'reconcile.btnGoToCanonical': 'Go to Canonical',
     'reconcile.btnCancel': 'Cancel',
     'reconcile.repairing': 'Repairing...',
     'reconcile.previewModalTitle': 'Storage Repair Preview & Confirmation',
@@ -339,6 +342,7 @@ const MANAGEMENT_LOCALES = {
     'reconcile.repairSuccess': 'Storage repaired successfully ({count} records reconciled).',
     'reconcile.repairFailed': 'Failed to repair storage: {error}',
     'reconcile.discConsistent': 'Consistent',
+    'reconcile.discMergedArchive': 'Merged into Canonical',
     'reconcile.discMissing': '{count} Missing in SQLite',
     'reconcile.discOrphan': '{count} Orphan in SQLite',
     'reconcile.discContent': '{count} Content Mismatch',
@@ -522,6 +526,7 @@ const MANAGEMENT_LOCALES = {
     'models.overrideSectionTitle': 'Override Default Model',
     'models.labelProvider': 'Provider *',
     'models.labelModel': 'Model *',
+    'models.labelReasoningEffort': 'Reasoning effort',
     'models.labelRevision': 'Revision: {revision}',
     'models.labelApplyMode': 'Apply Mode',
     'models.applyModeRestartAll': 'Save & Rolling Restart All Runtimes (Recommended)',
@@ -833,7 +838,9 @@ const MANAGEMENT_LOCALES = {
     'reconcile.kpiScanned': '已扫描会话总数',
     'reconcile.kpiMatched': '一致会话数',
     'reconcile.kpiDrift': '偏差会话数',
-    'reconcile.kpiMissing': 'SQLite 缺失数',
+    'reconcile.kpiMissing': '运行时未对账数',
+    'reconcile.kpiArchived': '已归档会话',
+    'reconcile.statusMergedArchive': '已合并归档',
     'reconcile.sectionReports': '会话对账报告',
     'reconcile.colSessionId': '会话 ID',
     'reconcile.colStatus': '一致性状态',
@@ -852,6 +859,7 @@ const MANAGEMENT_LOCALES = {
     'reconcile.scanBaselineFailed': '扫描存储基准失败: {error}',
     'reconcile.btnPreviewRepair': '修复',
     'reconcile.btnConfirmRepair': '执行修复',
+    'reconcile.btnGoToCanonical': '跳转主会话',
     'reconcile.btnCancel': '取消',
     'reconcile.repairing': '正在修复...',
     'reconcile.previewModalTitle': '存储对账修复预览与确认',
@@ -864,6 +872,7 @@ const MANAGEMENT_LOCALES = {
     'reconcile.repairSuccess': '存储一致性修复成功 (共修复 {count} 条记录)。',
     'reconcile.repairFailed': '存储对账修复失败: {error}',
     'reconcile.discConsistent': '一致',
+    'reconcile.discMergedArchive': '已合并至主会话',
     'reconcile.discMissing': '{count} 条 SQLite 缺失',
     'reconcile.discOrphan': '{count} 条 SQLite 孤立',
     'reconcile.discContent': '{count} 条内容不一致',
@@ -1047,6 +1056,7 @@ const MANAGEMENT_LOCALES = {
     'models.overrideSectionTitle': '覆盖默认模型设置',
     'models.labelProvider': '提供商 *',
     'models.labelModel': '模型 *',
+    'models.labelReasoningEffort': '推理深度 (Reasoning effort)',
     'models.labelRevision': '配置版本: {revision}',
     'models.labelApplyMode': '生效策略',
     'models.applyModeRestartAll': '保存并滚动重启所有运行时容器 (推荐)',
@@ -1360,7 +1370,13 @@ const state = {
   isSendingMessage: false,
   isPollingInFlight: false,
   isTurnSyncInFlight: false,
-  showArchivedSessions: false,
+  showArchivedSessions: (function() {
+    try {
+      return typeof sessionStorage !== 'undefined' && sessionStorage.getItem("enkeep_show_archived") === "true";
+    } catch (e) {
+      return false;
+    }
+  })(),
   sessionSearchQuery: '',
   forceScrollBottom: false,
   isSidebarCollapsed: false,
@@ -2761,6 +2777,9 @@ async function renderStorageReconcileView(container) {
   kpiGrid.appendChild(createKpiCard('reconcile.kpiMatched', String(reconcileData.matchedCount ?? 0), getLocale() === 'zh-CN' ? '一致记录' : 'Consistent records'));
   kpiGrid.appendChild(createKpiCard('reconcile.kpiDrift', String(reconcileData.driftCount ?? 0), getLocale() === 'zh-CN' ? '数量或顺序偏差' : 'Count or ordering drift'));
   kpiGrid.appendChild(createKpiCard('reconcile.kpiMissing', String(reconcileData.missingCount ?? 0), getLocale() === 'zh-CN' ? '未索引记录' : 'Unindexed records'));
+  if (reconcileData.archivedCount !== undefined) {
+    kpiGrid.appendChild(createKpiCard('reconcile.kpiArchived', String(reconcileData.archivedCount ?? 0), getLocale() === 'zh-CN' ? '已归档历史' : 'Archived history'));
+  }
   container.appendChild(kpiGrid);
 
   const reports = Array.isArray(reconcileData.reports) ? reconcileData.reports : [];
@@ -2800,9 +2819,13 @@ async function renderStorageReconcileView(container) {
       tdId.textContent = rep.sessionId || '-';
       tr.appendChild(tdId);
 
+      const isMergedArchive = rep.status === 'merged_archive';
       const tdStatus = document.createElement('td');
-      const badgeVariant = rep.status === 'matched' ? 'success' : (rep.status === 'drift' ? 'warning' : 'danger');
-      tdStatus.appendChild(createBadgeElement(rep.status || 'unknown', badgeVariant));
+      const badgeVariant = isMergedArchive ? 'info' : (rep.status === 'matched' ? 'success' : (rep.status === 'drift' ? 'warning' : 'danger'));
+      const statusLabel = isMergedArchive
+        ? t('reconcile.statusMergedArchive', null, 'Merged Archive')
+        : (rep.status || 'unknown');
+      tdStatus.appendChild(createBadgeElement(statusLabel, badgeVariant));
       tr.appendChild(tdStatus);
 
       const dshCount = rep.dshMessageCount ?? rep.dshMessagesCount ?? 0;
@@ -2835,7 +2858,16 @@ async function renderStorageReconcileView(container) {
       }
 
       const tdDiff = document.createElement('td');
-      if (rep.status === 'matched' && missingCount === 0 && orphanCount === 0 && contentCount === 0 && roleCount === 0) {
+      if (isMergedArchive) {
+        const diffList = document.createElement('div');
+        diffList.className = 'flex-row-wrap';
+        const b = createBadgeElement(t('reconcile.discMergedArchive', null, 'Merged into Canonical'), 'info');
+        if (rep.details?.retentionInfo) {
+          b.title = String(rep.details.retentionInfo);
+        }
+        diffList.appendChild(b);
+        tdDiff.appendChild(diffList);
+      } else if (rep.status === 'matched' && missingCount === 0 && orphanCount === 0 && contentCount === 0 && roleCount === 0) {
         tdDiff.appendChild(createBadgeElement(t('reconcile.discConsistent', null, 'Consistent'), 'success'));
       } else {
         const diffList = document.createElement('div');
@@ -2867,18 +2899,89 @@ async function renderStorageReconcileView(container) {
       tdTime.textContent = rep.checkedAt ? formatDate(rep.checkedAt) : '-';
       tr.appendChild(tdTime);
 
-      // Actions: Repair Button for drifted/missing sessions
+      // Actions: Repair Button for drifted/missing sessions, or Go to Canonical for merged archives
       const tdActions = document.createElement('td');
       tdActions.className = 'file-actions-cell';
 
-      if (rep.status !== 'matched' || discrepancies.length > 0) {
+      if (isMergedArchive) {
+        const canonId = rep.canonicalSessionId || rep.details?.canonicalSessionId;
+        const btnCanonical = document.createElement('button');
+        btnCanonical.type = 'button';
+        btnCanonical.className = 'btn btn-secondary btn-xs btn-go-to-canonical';
+        btnCanonical.textContent = t('reconcile.btnGoToCanonical', null, 'Go to Canonical');
+        btnCanonical.title = canonId ? `Open canonical session: ${canonId}` : 'Open canonical history';
+        if (!canonId) {
+          btnCanonical.disabled = true;
+        } else {
+          btnCanonical.addEventListener('click', async (e) => {
+            e.preventDefault();
+
+            // 1. Resolve canonical session and target space
+            const targetSpaceId = rep.spaceId || rep.details?.spaceId ||
+              (Array.isArray(state.spaces) && state.spaces.find((s) => s.canonicalSessionId === canonId || (rep.spaceId && s.id === rep.spaceId))?.id) ||
+              state.currentSpaceId;
+
+            // 2. Halt any active polling from old route/session before transition
+            if (typeof stopPolling === 'function') {
+              stopPolling();
+            }
+
+            // 3. Route via actual router hash convention and ensure workspace routing
+            if (window.location.hash !== '#workspace') {
+              window.location.hash = '#workspace';
+            }
+            if (typeof handleRouteHash === 'function') {
+              handleRouteHash();
+            }
+
+            // 4. Pre-seed target session in state and storage so existing workspace selection resolves it
+            state.currentSessionId = canonId;
+            try {
+              sessionStorage.setItem('enkeep_active_session', canonId);
+            } catch {}
+
+            // 5. Route via EXISTING workspace selection method (selectSpace)
+            // This ensures space, dropdown, lifecycle controls, and epoch are properly synchronized
+            if (targetSpaceId && typeof selectSpace === 'function') {
+              selectSpace(targetSpaceId);
+            }
+
+            // 6. Explicitly select canonical session with await guard to prevent old response overwrite
+            if (typeof selectSession === 'function') {
+              await selectSession(canonId);
+            }
+          });
+        }
+        tdActions.appendChild(btnCanonical);
+      } else if ((rep.status !== 'matched' && rep.status !== 'uninitialized') || discrepancies.length > 0) {
         const btnRepair = document.createElement('button');
         btnRepair.type = 'button';
         btnRepair.className = 'btn btn-primary btn-xs btn-storage-repair';
         btnRepair.textContent = t('reconcile.btnPreviewRepair', null, 'Repair');
         btnRepair.setAttribute('data-session-id', rep.sessionId);
 
+        const isUntrustedRead =
+          rep.status === 'unavailable' ||
+          rep.status === 'parse_error' ||
+          rep.dshReadStatus === 'UNAVAILABLE' ||
+          rep.dshReadStatus === 'PARSE_ERROR' ||
+          rep.dshReadStatus === 'MISSING' ||
+          rep.details?.reason === 'dsh_jsonl_missing' ||
+          rep.details?.reason === 'dsh_runtime_unavailable' ||
+          rep.details?.reason === 'dsh_jsonl_parse_error' ||
+          (dshCount === 0 && sqliteCount > 0);
+
+        if (isUntrustedRead) {
+          btnRepair.disabled = true;
+          btnRepair.title =
+            getLocale() === 'zh-CN'
+              ? '运行时会话数据缺失、损坏或不可读，已禁用修复以防止数据丢失'
+              : 'Runtime session source is missing, unreadable, or corrupted; repair disabled to prevent data loss';
+          btnRepair.classList.add('disabled');
+        }
+
         btnRepair.addEventListener('click', async () => {
+          if (btnRepair.disabled) return;
           try {
             btnRepair.disabled = true;
             btnRepair.textContent = t('reconcile.repairing', null, 'Repairing...');
@@ -3016,9 +3119,12 @@ async function renderUserModelConfigView(container) {
   }
 
   const providersMap = modelData.providers || {};
+  const activeDefSuffix = (userOverrideData && userOverrideData.reasoningEffort)
+    ? ` · effort: ${userOverrideData.reasoningEffort}`
+    : (modelData.defaultModel && modelData.defaultModel.reasoningEffort ? ` · effort: ${modelData.defaultModel.reasoningEffort}` : '');
   const activeDef = userOverrideData && userOverrideData.provider
-    ? `${userOverrideData.provider} / ${userOverrideData.model}`
-    : (modelData.defaultModel ? `${modelData.defaultModel.provider} / ${modelData.defaultModel.model}` : (getLocale() === 'zh-CN' ? '未配置' : 'Unconfigured'));
+    ? `${userOverrideData.provider} / ${userOverrideData.model}${activeDefSuffix}`
+    : (modelData.defaultModel ? `${modelData.defaultModel.provider} / ${modelData.defaultModel.model}${activeDefSuffix}` : (getLocale() === 'zh-CN' ? '未配置' : 'Unconfigured'));
 
   const kpiGrid = document.createElement('div');
   kpiGrid.className = 'kpi-grid';
@@ -3066,6 +3172,43 @@ async function renderUserModelConfigView(container) {
   const selPrefModel = document.createElement('select');
   selPrefModel.className = 'form-select';
 
+  const grpPrefEffort = document.createElement('div');
+  grpPrefEffort.className = 'form-group';
+  const lblPrefEffort = document.createElement('label');
+  lblPrefEffort.textContent = t('models.labelReasoningEffort', null, 'Reasoning effort');
+  const selPrefEffort = document.createElement('select');
+  selPrefEffort.className = 'form-select';
+
+  function populateUserEfforts(pkey, mid) {
+    selPrefEffort.replaceChildren();
+    const p = providersMap[pkey];
+    const models = (p && Array.isArray(p.models)) ? p.models : [];
+    const foundModel = models.find((m) => m.id === mid);
+    const effortKeys = (foundModel && foundModel.reasoningEfforts && typeof foundModel.reasoningEfforts === 'object')
+      ? Object.keys(foundModel.reasoningEfforts)
+      : [];
+
+    if (effortKeys.length > 0) {
+      selPrefEffort.disabled = false;
+      const optDefault = document.createElement('option');
+      optDefault.value = '';
+      optDefault.textContent = '(default)';
+      selPrefEffort.appendChild(optDefault);
+      effortKeys.forEach((key) => {
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = key;
+        selPrefEffort.appendChild(opt);
+      });
+    } else {
+      selPrefEffort.disabled = true;
+      const optNone = document.createElement('option');
+      optNone.value = '';
+      optNone.textContent = 'no effort options';
+      selPrefEffort.appendChild(optNone);
+    }
+  }
+
   function populateUserModels(pkey) {
     selPrefModel.replaceChildren();
     const p = providersMap[pkey];
@@ -3084,7 +3227,14 @@ async function renderUserModelConfigView(container) {
     }
   }
 
-  selPrefProvider.addEventListener('change', () => populateUserModels(selPrefProvider.value));
+  selPrefProvider.addEventListener('change', () => {
+    populateUserModels(selPrefProvider.value);
+    populateUserEfforts(selPrefProvider.value, selPrefModel.value);
+  });
+  selPrefModel.addEventListener('change', () => {
+    populateUserEfforts(selPrefProvider.value, selPrefModel.value);
+  });
+
   if (userOverrideData && userOverrideData.provider) {
     selPrefProvider.value = userOverrideData.provider;
   } else if (modelData.defaultModel && modelData.defaultModel.provider) {
@@ -3096,13 +3246,20 @@ async function renderUserModelConfigView(container) {
   } else if (modelData.defaultModel && modelData.defaultModel.model) {
     selPrefModel.value = modelData.defaultModel.model;
   }
+  populateUserEfforts(selPrefProvider.value, selPrefModel.value);
+  if (userOverrideData && userOverrideData.reasoningEffort) {
+    selPrefEffort.value = userOverrideData.reasoningEffort;
+  }
 
   grpPrefProvider.appendChild(lblPrefProvider);
   grpPrefProvider.appendChild(selPrefProvider);
   grpPrefModel.appendChild(lblPrefModel);
   grpPrefModel.appendChild(selPrefModel);
+  grpPrefEffort.appendChild(lblPrefEffort);
+  grpPrefEffort.appendChild(selPrefEffort);
   formPref.appendChild(grpPrefProvider);
   formPref.appendChild(grpPrefModel);
+  formPref.appendChild(grpPrefEffort);
 
   const actRow = document.createElement('div');
   actRow.className = 'form-actions';
@@ -3137,11 +3294,13 @@ async function renderUserModelConfigView(container) {
     e.preventDefault();
     try {
       btnSavePref.disabled = true;
+      const effortVal = selPrefEffort.value ? selPrefEffort.value : null;
       await apiRequest('/api/account/model-override', {
         method: 'PUT',
         body: JSON.stringify({
           provider: selPrefProvider.value,
           model: selPrefModel.value,
+          reasoningEffort: effortVal,
         }),
       });
       showToast(getLocale() === 'zh-CN' ? '个人模型偏好已保存' : 'Model preference saved successfully', 'success');
@@ -8410,7 +8569,7 @@ async function renderEffectiveModelPreview(container, spaceId, sessionId) {
 
     const primaryNode = document.createElement('span');
     primaryNode.className = 'fallback-node';
-    primaryNode.textContent = `${eff.provider} / ${eff.model}${eff.reasoningEffort ? ` (${eff.reasoningEffort})` : ''}`;
+    primaryNode.textContent = `${eff.provider} / ${eff.model}${eff.reasoningEffort ? ` · effort: ${eff.reasoningEffort}` : ''}`;
     flowDiv.appendChild(primaryNode);
 
     if (Array.isArray(eff.fallbackChain) && eff.fallbackChain.length > 0) {
@@ -8422,7 +8581,7 @@ async function renderEffectiveModelPreview(container, spaceId, sessionId) {
 
         const fbNode = document.createElement('span');
         fbNode.className = 'fallback-node';
-        fbNode.textContent = `${fb.provider} / ${fb.model}${fb.reasoningEffort ? ` (${fb.reasoningEffort})` : ''}`;
+        fbNode.textContent = `${fb.provider} / ${fb.model}${fb.reasoningEffort ? ` · effort: ${fb.reasoningEffort}` : ''}`;
         flowDiv.appendChild(fbNode);
       });
     }
@@ -13897,6 +14056,23 @@ const CHAT_I18N_EN = {
   'chat.replyTitle': 'Quote and reply to this message',
   'chat.replyingTo': 'Replying to {name}',
   'chat.cancelReply': 'Cancel reply',
+  'chat.channelConversation': 'Conversation',
+  'chat.channelConversationAria': 'Source: Conversation',
+  'chat.channelDiscord': 'Discord',
+  'chat.channelDiscordAria': 'Source: Discord',
+  'chat.channelGeneric': 'Channel',
+  'chat.channelGenericAria': 'Source: Channel',
+  'chat.channelLark': 'Lark',
+  'chat.channelLarkAria': 'Source: Lark',
+  'chat.channelQQ': 'QQ',
+  'chat.channelQQAria': 'Source: QQ',
+  'chat.channelSession': 'Session',
+  'chat.channelSessionAria': 'Source: Session',
+  'chat.channelWeb': 'Web',
+  'chat.channelWebAria': 'Source: Web',
+  'chat.channelWeChat': 'WeChat',
+  'chat.channelWeChatAria': 'Source: WeChat',
+  'chat.imagePreviewAlt': 'Image attachment: {name}',
   'chat.quotedMessage': 'Quoted message',
   'chat.regenerateConfirm': 'Regenerate creates a new session branch. Do you want to continue?',
   'chat.editConfirm': 'Editing creates a new session branch. Do you want to continue?',
@@ -14109,6 +14285,23 @@ const CHAT_I18N_ZH = {
   'chat.replyTitle': '引用此条消息进行回复',
   'chat.replyingTo': '正在回复 {name}',
   'chat.cancelReply': '取消引用',
+  'chat.channelConversation': '主会话',
+  'chat.channelConversationAria': '来源：主会话',
+  'chat.channelDiscord': 'Discord',
+  'chat.channelDiscordAria': '来源：Discord',
+  'chat.channelGeneric': '渠道',
+  'chat.channelGenericAria': '来源：渠道',
+  'chat.channelLark': '飞书',
+  'chat.channelLarkAria': '来源：飞书',
+  'chat.channelQQ': 'QQ',
+  'chat.channelQQAria': '来源：QQ',
+  'chat.channelSession': '会话',
+  'chat.channelSessionAria': '来源：会话',
+  'chat.channelWeb': 'Web',
+  'chat.channelWebAria': '来源：Web',
+  'chat.channelWeChat': '微信',
+  'chat.channelWeChatAria': '来源：微信',
+  'chat.imagePreviewAlt': '图片附件：{name}',
   'chat.quotedMessage': '引用消息',
   'chat.regenerateConfirm': '重新生成将创建新的会话分支，是否继续？',
   'chat.editConfirm': '编辑历史消息将创建新的会话分支，是否继续？',
@@ -15147,13 +15340,24 @@ async function handleCreateSpace(e) {
 // Session Management & Lifecycle
 // ----------------------------------------------------
 
+let sessionLoadEpoch = 0;
+
 async function loadSessions(spaceId) {
+  sessionLoadEpoch += 1;
+  const currentEpoch = sessionLoadEpoch;
+
   try {
     const incParam = state.showArchivedSessions ? '&includeArchived=true' : '';
     const url = spaceId
       ? `/api/sessions?spaceId=${encodeURIComponent(spaceId)}${incParam}`
       : `/api/sessions${state.showArchivedSessions ? '?includeArchived=true' : ''}`;
     const res = await apiRequest(url);
+
+    // Sequence / space race check after await
+    if (currentEpoch !== sessionLoadEpoch || state.currentSpaceId !== spaceId) {
+      return;
+    }
+
     if (res && res.data && Array.isArray(res.data.sessions)) {
       state.sessions = res.data.sessions;
     } else if (res && Array.isArray(res.data)) {
@@ -15174,6 +15378,9 @@ async function loadSessions(spaceId) {
       }
     }
 
+    const curSpace = state.spaces.find((s) => s.id === spaceId);
+    const canonicalId = curSpace && curSpace.canonicalSessionId;
+
     if (state.sessions.length > 0) {
       let savedSessionId = null;
       try {
@@ -15182,24 +15389,164 @@ async function loadSessions(spaceId) {
         // Ignore sessionStorage access error in restricted environment
       }
 
-      const currentActive = (savedSessionId && state.sessions.find((s) => s.id === savedSessionId)) ||
-        (state.currentSessionId && state.sessions.find((s) => s.id === state.currentSessionId)) ||
-        state.sessions[0];
+      // Preserve user choice (active or archived) valid in selected space; canonical first ONLY on normal initial open
+      const userChoiceSession = (state.currentSessionId && state.sessions.find((s) => s.id === state.currentSessionId)) ||
+        (savedSessionId && state.sessions.find((s) => s.id === savedSessionId));
 
-      selectSession(currentActive.id);
+      const canonicalSession = canonicalId ? state.sessions.find((s) => s.id === canonicalId) : null;
+      const targetSession = userChoiceSession || canonicalSession || state.sessions[0];
+
+      selectSession(targetSession.id);
+    } else if (spaceId && !state.showArchivedSessions && !state.currentSessionId) {
+      // If workspace active session list is empty and no session is being selected, POST /api/sessions inheriting space executionMode
+      const postBody = { spaceId };
+      if (curSpace && curSpace.executionMode) {
+        postBody.executionMode = curSpace.executionMode;
+      }
+      try {
+        const createRes = await apiRequest("/api/sessions", {
+          method: "POST",
+          body: postBody,
+        });
+
+        // Sequence / space race check after second await
+        if (currentEpoch !== sessionLoadEpoch || state.currentSpaceId !== spaceId) {
+          return;
+        }
+
+        if (createRes && createRes.data && createRes.data.id) {
+          if (curSpace && !curSpace.canonicalSessionId) {
+            curSpace.canonicalSessionId = createRes.data.id;
+          }
+          state.sessions = [createRes.data];
+          renderSessionList();
+          selectSession(createRes.data.id);
+        } else {
+          deselectSession();
+        }
+      } catch {
+        if (currentEpoch === sessionLoadEpoch && state.currentSpaceId === spaceId) {
+          deselectSession();
+        }
+      }
     } else {
       deselectSession();
     }
   } catch (err) {
-    showToast(getSafeErrorMessage(err, tr("toast.failedLoadSessions", null, "Failed to load sessions.")), "error");
+    if (currentEpoch === sessionLoadEpoch && state.currentSpaceId === spaceId) {
+      showToast(getSafeErrorMessage(err, tr("toast.failedLoadSessions", null, "Failed to load sessions.")), "error");
+    }
   }
 }
 
 function toggleArchivedSessions() {
   state.showArchivedSessions = !state.showArchivedSessions;
+  try {
+    sessionStorage.setItem("enkeep_show_archived", state.showArchivedSessions ? "true" : "false");
+  } catch (storageErr) {
+    // Ignore sessionStorage access error in restricted environment
+  }
   if (state.currentSpaceId) {
     loadSessions(state.currentSpaceId);
   }
+}
+
+function getSessionSourceBadgeInfo(session) {
+  if (!session || typeof session !== 'object') {
+    return {
+      type: 'default',
+      label: tr('chat.channelSession', null, 'Session'),
+      ariaLabel: tr('chat.channelSessionAria', null, 'Source: Session'),
+    };
+  }
+
+  // 1. Authoritative canonical session check using active space contract
+  const curSpace = (typeof state !== 'undefined' && state.currentSpaceId && Array.isArray(state.spaces))
+    ? state.spaces.find((s) => s.id === state.currentSpaceId)
+    : null;
+  const isCanonical = Boolean(curSpace && curSpace.canonicalSessionId && session.id === curSpace.canonicalSessionId);
+
+  if (isCanonical) {
+    return {
+      type: 'canonical',
+      label: tr('chat.channelConversation', null, 'Conversation'),
+      ariaLabel: tr('chat.channelConversationAria', null, 'Source: Conversation'),
+    };
+  }
+
+  // 2. Check explicit channel field or source field
+  const rawChannel = (typeof session.channel === 'string' && session.channel.trim())
+    ? session.channel.trim().toLowerCase()
+    : ((typeof session.source === 'string' && session.source.trim())
+        ? session.source.trim().toLowerCase()
+        : null);
+
+  if (rawChannel) {
+    if (rawChannel === 'web') {
+      return {
+        type: 'web',
+        label: tr('chat.channelWeb', null, 'Web'),
+        ariaLabel: tr('chat.channelWebAria', null, 'Source: Web'),
+      };
+    }
+    if (rawChannel === 'lark' || rawChannel === 'feishu') {
+      return {
+        type: 'lark',
+        label: tr('chat.channelLark', null, 'Lark'),
+        ariaLabel: tr('chat.channelLarkAria', null, 'Source: Lark'),
+      };
+    }
+    if (rawChannel === 'wechat' || rawChannel === 'weixin' || rawChannel === 'wx') {
+      return {
+        type: 'wechat',
+        label: tr('chat.channelWeChat', null, 'WeChat'),
+        ariaLabel: tr('chat.channelWeChatAria', null, 'Source: WeChat'),
+      };
+    }
+    if (rawChannel === 'qq') {
+      return {
+        type: 'qq',
+        label: tr('chat.channelQQ', null, 'QQ'),
+        ariaLabel: tr('chat.channelQQAria', null, 'Source: QQ'),
+      };
+    }
+    if (rawChannel === 'discord') {
+      return {
+        type: 'discord',
+        label: tr('chat.channelDiscord', null, 'Discord'),
+        ariaLabel: tr('chat.channelDiscordAria', null, 'Source: Discord'),
+      };
+    }
+    // Fallback generic channel if unknown
+    return {
+      type: 'generic',
+      label: tr('chat.channelGeneric', null, 'Channel'),
+      ariaLabel: tr('chat.channelGenericAria', { channel: rawChannel }, `Source: ${rawChannel}`),
+    };
+  }
+
+  // 2. Channel missing: default only when known Web semantics; otherwise neutral '会话/Session' not fabricated provider.
+  const hasKnownWebSemantics = Boolean(
+    session.isWeb === true ||
+    session.sourceType === 'web' ||
+    session.provider === 'web' ||
+    session.origin === 'web' ||
+    session.client === 'web'
+  );
+
+  if (hasKnownWebSemantics) {
+    return {
+      type: 'web',
+      label: tr('chat.channelWeb', null, 'Web'),
+      ariaLabel: tr('chat.channelWebAria', null, 'Source: Web'),
+    };
+  }
+
+  return {
+    type: 'default',
+    label: tr('chat.channelSession', null, 'Session'),
+    ariaLabel: tr('chat.channelSessionAria', null, 'Source: Session'),
+  };
 }
 
 function renderSessionList() {
@@ -15240,16 +15587,33 @@ function renderSessionList() {
     titleDiv.textContent = session.title || tr("chat.untitledSession", null, "Untitled");
     item.appendChild(titleDiv);
 
+    const badgesDiv = document.createElement("div");
+    badgesDiv.className = "session-badges";
+
+    const sourceInfo = getSessionSourceBadgeInfo(session);
+    if (sourceInfo) {
+      const srcBadge = document.createElement("span");
+      srcBadge.className = `badge badge-xs badge-channel badge-channel-${sourceInfo.type}`;
+      srcBadge.textContent = sourceInfo.label;
+      srcBadge.setAttribute("aria-label", sourceInfo.ariaLabel);
+      srcBadge.title = sourceInfo.ariaLabel;
+      badgesDiv.appendChild(srcBadge);
+    }
+
     if (session.status === "archived") {
       const archBadge = document.createElement("span");
       archBadge.className = "badge badge-disabled badge-xs";
       archBadge.textContent = tr("chat.archivedBadge", null, "Archived");
-      item.appendChild(archBadge);
+      badgesDiv.appendChild(archBadge);
     } else if (typeof session.currentGeneration === "number" && session.currentGeneration >= 1) {
       const genBadge = document.createElement("span");
       genBadge.className = "badge badge-generation badge-xs";
       genBadge.textContent = tr("chat.genBadge", { number: formatNumber(session.currentGeneration) }, `Gen ${session.currentGeneration}`);
-      item.appendChild(genBadge);
+      badgesDiv.appendChild(genBadge);
+    }
+
+    if (badgesDiv.hasChildNodes()) {
+      item.appendChild(badgesDiv);
     }
 
     container.appendChild(item);
@@ -15334,7 +15698,15 @@ function deselectSession() {
   renderMessages();
 }
 
+let sessionSelectEpoch = 0;
+
 async function selectSession(sessionId) {
+  sessionSelectEpoch += 1;
+  const currentEpoch = sessionSelectEpoch;
+
+  // Immediately abort old poll timer / requests on session change
+  stopPolling();
+
   if (state.currentSessionId && state.currentSessionId !== sessionId) {
     const input = document.getElementById("chat-input");
     state.drafts[state.currentSessionId] = {
@@ -15390,6 +15762,12 @@ async function selectSession(sessionId) {
 
   try {
     const res = await apiRequest(`/api/sessions/${sessionId}`);
+
+    // Sequence / epoch / session race check after apiRequest
+    if (currentEpoch !== sessionSelectEpoch || state.currentSessionId !== sessionId || state.currentRoute !== "workspace") {
+      return;
+    }
+
     state.currentSessionRoute = res.data;
 
     const titleEl = document.getElementById("current-session-title");
@@ -15473,15 +15851,27 @@ async function selectSession(sessionId) {
     // Load initial messages
     await loadMessages(sessionId);
 
+    // Sequence / epoch / session race check after loadMessages
+    if (currentEpoch !== sessionSelectEpoch || state.currentSessionId !== sessionId || state.currentRoute !== "workspace") {
+      return;
+    }
+
     // Synchronize active cancellable turn status
     await syncActiveTurnStatus(sessionId);
+
+    // Sequence / epoch / session race check after syncActiveTurnStatus
+    if (currentEpoch !== sessionSelectEpoch || state.currentSessionId !== sessionId || state.currentRoute !== "workspace") {
+      return;
+    }
 
     // Start live polling if in workspace view and not archived
     if (state.currentRoute === "workspace" && !isArchived) {
       startPolling(sessionId);
     }
   } catch (err) {
-    showToast(getSafeErrorMessage(err, tr("toast.failedSelectSession", null, "Failed to select session.")), "error");
+    if (currentEpoch === sessionSelectEpoch && state.currentSessionId === sessionId) {
+      showToast(getSafeErrorMessage(err, tr("toast.failedSelectSession", null, "Failed to select session.")), "error");
+    }
   }
 }
 
@@ -16817,6 +17207,38 @@ function sanitizeClientFilename(name) {
   return name.normalize('NFC').replace(/[\/\\\0]/g, '_').trim() || 'attachment.bin';
 }
 
+const ALLOWED_IMAGE_MIMES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/gif',
+]);
+
+const SAFE_DOWNLOAD_URL_PATTERN = /^\/api\/spaces\/[a-zA-Z0-9_-]+\/files\/download\?path=[a-zA-Z0-9_.\-%/]+$/;
+
+function isAllowedImageAttachment(att) {
+  if (!att || typeof att !== 'object') return false;
+
+  // 1. mediaType must be exact public field
+  const mediaType = typeof att.mediaType === 'string' ? att.mediaType.trim().toLowerCase() : '';
+  if (!ALLOWED_IMAGE_MIMES.has(mediaType)) {
+    return false;
+  }
+
+  // 2. downloadUrl must match exact space files download route with valid safe path parameter
+  const url = att.downloadUrl;
+  if (typeof url !== 'string') return false;
+  if (url.includes('://') || url.startsWith('//') || url.includes('\0') || url.includes('..')) {
+    return false;
+  }
+  if (!SAFE_DOWNLOAD_URL_PATTERN.test(url)) {
+    return false;
+  }
+
+  return true;
+}
+
 function renderMessageAttachments(parentCard, attachments) {
   if (!Array.isArray(attachments) || attachments.length === 0) return;
 
@@ -16829,6 +17251,58 @@ function renderMessageAttachments(parentCard, attachments) {
     const card = document.createElement('div');
     card.className = 'message-attachment-card';
 
+    const displayName = att.displayName || (att.relativePath ? att.relativePath.split('/').pop() : 'attachment');
+
+    // Authenticated image thumbnail candidate check
+    const isImage = isAllowedImageAttachment(att);
+
+    if (isImage) {
+      card.classList.add('message-attachment-card-image');
+
+      const previewDiv = document.createElement('div');
+      previewDiv.className = 'message-attachment-preview';
+
+      const previewLink = document.createElement('a');
+      previewLink.className = 'message-attachment-preview-link';
+      previewLink.href = att.downloadUrl;
+      previewLink.target = '_blank';
+      previewLink.rel = 'noopener noreferrer';
+      previewLink.setAttribute('title', t('chat.attachmentDownloadAria', { name: displayName }, `Download ${displayName}`));
+
+      const img = document.createElement('img');
+      img.className = 'message-attachment-thumbnail';
+      img.loading = 'lazy';
+      img.alt = t('chat.imagePreviewAlt', { name: displayName }, `Image attachment: ${displayName}`);
+      img.src = att.downloadUrl;
+
+      // Safe non-looping error fallback
+      img.addEventListener('error', function onThumbnailError() {
+        img.removeEventListener('error', onThumbnailError);
+        previewDiv.classList.add('hidden');
+        card.classList.remove('message-attachment-card-image');
+        card.classList.add('preview-failed');
+      }, { once: true });
+
+      // Maintain scroll anchor on lazy image decode/load
+      img.addEventListener('load', function onThumbnailLoad() {
+        img.removeEventListener('load', onThumbnailLoad);
+        const container = document.getElementById('messages-container');
+        if (container) {
+          const anchor = captureScrollAnchor(container);
+          if (anchor) {
+            restoreScrollAnchor(container, anchor);
+          }
+        }
+      }, { once: true });
+
+      previewLink.appendChild(img);
+      previewDiv.appendChild(previewLink);
+      card.appendChild(previewDiv);
+    }
+
+    const metaDiv = document.createElement('div');
+    metaDiv.className = 'message-attachment-meta';
+
     const iconSpan = document.createElement('span');
     iconSpan.className = 'message-attachment-icon';
     iconSpan.textContent = getFileIcon(att.mediaType || att.displayName || att.relativePath);
@@ -16838,7 +17312,6 @@ function renderMessageAttachments(parentCard, attachments) {
 
     const nameSpan = document.createElement('span');
     nameSpan.className = 'message-attachment-name';
-    const displayName = att.displayName || (att.relativePath ? att.relativePath.split('/').pop() : 'attachment');
     nameSpan.textContent = displayName;
 
     const sizeSpan = document.createElement('span');
@@ -16848,8 +17321,8 @@ function renderMessageAttachments(parentCard, attachments) {
     details.appendChild(nameSpan);
     details.appendChild(sizeSpan);
 
-    card.appendChild(iconSpan);
-    card.appendChild(details);
+    metaDiv.appendChild(iconSpan);
+    metaDiv.appendChild(details);
 
     // Safe download link verification: must be relative starting with /api/spaces/
     if (typeof att.downloadUrl === 'string' && att.downloadUrl.startsWith('/api/spaces/')) {
@@ -16862,9 +17335,10 @@ function renderMessageAttachments(parentCard, attachments) {
       downloadLink.textContent = t('chat.attachmentDownload', null, 'Download');
       downloadLink.setAttribute('aria-label', t('chat.attachmentDownloadAria', { name: displayName }, `Download ${displayName}`));
       downloadLink.setAttribute('title', t('chat.attachmentDownloadAria', { name: displayName }, `Download ${displayName}`));
-      card.appendChild(downloadLink);
+      metaDiv.appendChild(downloadLink);
     }
 
+    card.appendChild(metaDiv);
     container.appendChild(card);
   });
 
@@ -17647,12 +18121,46 @@ async function loadMessages(sessionId) {
     state.messages = res.data.messages;
     state.olderMessagesCursor = res.data.olderCursor || null;
     state.hasMoreMessages = Boolean(res.data.hasMore && state.olderMessagesCursor);
+
+    // Authoritative cursor boundary: initialize eventCursor ONLY on initial load
+    if (res.data.latestEventCursor !== undefined) {
+      state.eventCursor = res.data.latestEventCursor;
+    }
+
     renderMessages();
   } catch (err) {
     if (state.currentSessionId === sessionId) {
       showSafeError('load_messages');
       renderMessages();
     }
+  }
+}
+
+function captureScrollAnchor(container) {
+  if (!container) return null;
+  const containerRect = container.getBoundingClientRect();
+  const cards = container.querySelectorAll('.message-card');
+  for (const card of cards) {
+    const rect = card.getBoundingClientRect();
+    // Anchor on the first message card that is visible in the container viewport
+    if (rect.bottom > containerRect.top + 1) {
+      return {
+        id: card.id,
+        offset: rect.top - containerRect.top,
+      };
+    }
+  }
+  return null;
+}
+
+function restoreScrollAnchor(container, anchor) {
+  if (!container || !anchor || !anchor.id) return;
+  const card = document.getElementById(anchor.id);
+  if (card) {
+    const containerRect = container.getBoundingClientRect();
+    const rect = card.getBoundingClientRect();
+    const currentOffset = rect.top - containerRect.top;
+    container.scrollTop += (currentOffset - anchor.offset);
   }
 }
 
@@ -17665,10 +18173,23 @@ async function loadOlderMessages(sessionId) {
   state.loadOlderError = null;
 
   const container = document.getElementById('messages-container');
+  const anchor = captureScrollAnchor(container);
   const prevScrollHeight = container ? container.scrollHeight : 0;
   const prevScrollTop = container ? container.scrollTop : 0;
 
-  renderMessages(true);
+  // Single render: show spinner in existing pagination bar without full DOM recreation
+  const paginationBar = document.getElementById('chat-pagination-bar');
+  if (paginationBar) {
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'chat-pagination-loading';
+    const spinner = document.createElement('span');
+    spinner.className = 'chat-pagination-spinner';
+    const loadingText = document.createElement('span');
+    loadingText.textContent = tr('chat.loadingOlder', null, 'Loading older messages...');
+    loadingDiv.appendChild(spinner);
+    loadingDiv.appendChild(loadingText);
+    paginationBar.replaceChildren(loadingDiv);
+  }
 
   const requestCursor = cursor;
   try {
@@ -17700,10 +18221,14 @@ async function loadOlderMessages(sessionId) {
 
     renderMessages(true);
 
-    // Scroll anchor: maintain exact visual position by delta
+    // Scroll anchor: maintain exact visual position by anchor id + offset, with fallback to scrollHeight delta
     if (container) {
-      const newScrollHeight = container.scrollHeight;
-      container.scrollTop = (newScrollHeight - prevScrollHeight) + prevScrollTop;
+      if (anchor) {
+        restoreScrollAnchor(container, anchor);
+      } else {
+        const newScrollHeight = container.scrollHeight;
+        container.scrollTop = (newScrollHeight - prevScrollHeight) + prevScrollTop;
+      }
     }
   } catch (err) {
     if (state.currentSessionId === sessionId) {
@@ -17719,6 +18244,7 @@ function renderMessages(preserveScroll = false) {
   if (!container) return;
 
   const wasNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= 80;
+  const anchor = captureScrollAnchor(container);
   const prevScrollTop = container.scrollTop;
 
   container.replaceChildren();
@@ -17846,6 +18372,24 @@ function renderMessages(preserveScroll = false) {
       const label = (st === 'failed' && msg.failureCode) ? formatStatus(msg.failureCode) : formatStatus(st);
       statusBadge.textContent = label;
       meta.appendChild(statusBadge);
+    }
+
+    // Preserve original channel metadata message-level if present in data (do not invent)
+    const rawMsgChannel = (typeof msg.channel === 'string' && msg.channel.trim())
+      ? msg.channel.trim().toLowerCase()
+      : ((typeof msg.source?.channel === 'string' && msg.source.channel.trim())
+          ? msg.source.channel.trim().toLowerCase()
+          : null);
+    if (rawMsgChannel) {
+      const msgChanInfo = getSessionSourceBadgeInfo({ channel: rawMsgChannel });
+      if (msgChanInfo) {
+        const chanBadge = document.createElement('span');
+        chanBadge.className = `badge badge-xs badge-channel badge-channel-${msgChanInfo.type} message-channel-badge`;
+        chanBadge.textContent = msgChanInfo.label;
+        chanBadge.setAttribute('aria-label', msgChanInfo.ariaLabel);
+        chanBadge.title = msgChanInfo.ariaLabel;
+        meta.appendChild(chanBadge);
+      }
     }
 
     card.appendChild(meta);
@@ -18107,12 +18651,18 @@ function renderMessages(preserveScroll = false) {
     container.appendChild(card);
   }
 
-  // Sticky auto-scroll vs preserved scroll
-  if (!preserveScroll) {
-    if (wasNearBottom || state.forceScrollBottom) {
-      container.scrollTop = container.scrollHeight;
-      state.forceScrollBottom = false;
+  // Sticky auto-scroll vs preserved scroll: autoscroll ONLY if user already near bottom or explicit user send/open latest
+  if (state.forceScrollBottom) {
+    container.scrollTop = container.scrollHeight;
+    state.forceScrollBottom = false;
+  } else if (preserveScroll || !wasNearBottom) {
+    if (anchor) {
+      restoreScrollAnchor(container, anchor);
+    } else {
+      container.scrollTop = prevScrollTop;
     }
+  } else if (wasNearBottom) {
+    container.scrollTop = container.scrollHeight;
   }
 }
 
@@ -18571,7 +19121,7 @@ async function pollEvents(sessionId) {
     const cursorQuery = state.eventCursor ? `?cursor=${encodeURIComponent(state.eventCursor)}` : '';
     const res = await apiRequest(`/api/sessions/${sessionId}/events${cursorQuery}`);
 
-    if (state.currentSessionId !== sessionId) return;
+    if (state.currentSessionId !== sessionId || state.currentRoute !== 'workspace') return;
 
     // Reset failure counter on successful request
     state.consecutivePollingFailures = 0;
@@ -18610,10 +19160,23 @@ async function pollEvents(sessionId) {
 
             if (msg && msg.id) {
               const existingIdx = state.messages.findIndex((m) => m.id === msg.id);
-              if (existingIdx === -1) {
-                state.messages.push(msg);
+              if (existingIdx !== -1) {
+                // Update existing message in place (status, content, replyReference, attachments)
+                state.messages[existingIdx] = { ...state.messages[existingIdx], ...msg };
               } else {
-                state.messages[existingIdx] = msg;
+                // Authoritative sorted insertion by createdAt ASC with id ASC tiebreaker
+                // Never blindly push April after September!
+                const msgTime = new Date(msg.createdAt || 0).getTime();
+                let insertIdx = state.messages.length;
+                for (let i = state.messages.length - 1; i >= 0; i--) {
+                  const itemTime = new Date(state.messages[i].createdAt || 0).getTime();
+                  if (itemTime > msgTime || (itemTime === msgTime && String(state.messages[i].id) > String(msg.id))) {
+                    insertIdx = i;
+                  } else {
+                    break;
+                  }
+                }
+                state.messages.splice(insertIdx, 0, msg);
               }
               if (msg.role === 'assistant') {
                 state.streamingState = null;
@@ -19229,6 +19792,8 @@ if (typeof window !== 'undefined') {
   window.updateApprovalBadges = updateApprovalBadges;
   window.updateComposerControlsState = updateComposerControlsState;
   window.renderSessionList = renderSessionList;
+  window.getSessionSourceBadgeInfo = getSessionSourceBadgeInfo;
+  window.isAllowedImageAttachment = isAllowedImageAttachment;
   window.renderSpaceSelect = renderSpaceSelect;
   window.renderAttachmentTray = renderAttachmentTray;
   window.handleFilesSelected = handleFilesSelected;
@@ -19427,7 +19992,34 @@ document.addEventListener('DOMContentLoaded', () => {
   if (editMessageForm) editMessageForm.addEventListener('submit', handleEditMessage);
 
   const newSessionBtn = document.getElementById('btn-new-session');
-  if (newSessionBtn) newSessionBtn.addEventListener('click', () => openModal('modal-session'));
+  if (newSessionBtn) {
+    newSessionBtn.addEventListener('click', async () => {
+      if (state.currentSpaceId) {
+        // Open/focus workspace conversation or get/create canonical session
+        const canonical = state.sessions.find((s) => s.isCanonical || s.channel === 'canonical') ||
+          state.sessions.find((s) => s.status === 'active') ||
+          state.sessions[0];
+        if (canonical) {
+          selectSession(canonical.id);
+        } else {
+          try {
+            const res = await apiRequest('/api/sessions', {
+              method: 'POST',
+              body: { spaceId: state.currentSpaceId, executionMode: 'container' },
+            });
+            if (res && res.data && res.data.id) {
+              await loadSessions(state.currentSpaceId);
+              selectSession(res.data.id);
+            }
+          } catch {
+            openModal('modal-session');
+          }
+        }
+      } else {
+        openModal('modal-session');
+      }
+    });
+  }
 
   const forkSessionBtn = document.getElementById('btn-fork-session');
   if (forkSessionBtn) forkSessionBtn.addEventListener('click', () => openForkSessionModal());

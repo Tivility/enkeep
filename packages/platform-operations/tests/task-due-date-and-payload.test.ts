@@ -372,6 +372,109 @@ describe('Task Payload Contract (agent_prompt) & Due Date Hardening', () => {
       expect(ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS.has('context')).toBe(false);
       expect(ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS.has('metadata')).toBe(false);
       expect(ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS.has('sessionPolicy')).toBe(true);
+      expect(ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS.has('spaceFolder')).toBe(true);
+      expect(ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS.has('silent')).toBe(true);
+
+      // Rejects legacy HappyClaw keys
+      for (const legacyKey of ['chatJid', 'groupFolder', 'executionMode', 'executionType', 'originalTaskId', 'status']) {
+        expect(() =>
+          validateAgentPromptPayload({
+            type: 'agent_prompt',
+            prompt: 'Valid prompt',
+            sessionId: validSessionId,
+            sessionPolicy: 'existing_session',
+            [legacyKey]: 'legacy_val',
+          })
+        ).toThrow(ValidationError);
+      }
+    });
+
+    it('validates spaceFolder and silent contract invariants strictly', () => {
+      // Valid payload with spaceFolder and silent=true
+      const validSilent = validateAgentPromptPayload({
+        type: 'agent_prompt',
+        prompt: 'Valid silent prompt',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+        spaceFolder: 'main--host',
+        silent: true,
+      });
+      expect(validSilent.spaceFolder).toBe('main--host');
+      expect(validSilent.silent).toBe(true);
+
+      // Valid payload with synthetic delivery and silent=false
+      const validDelivery = validateAgentPromptPayload({
+        type: 'agent_prompt',
+        prompt: 'Valid delivery prompt',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+        spaceFolder: 'flow-mmr36fue-k6f4',
+        delivery: {
+          channel: 'lark',
+          accountId: 'acc_synth_test_1',
+          nativeContextId: 'oc_synth_chat_1',
+        },
+      });
+      expect(validDelivery.spaceFolder).toBe('flow-mmr36fue-k6f4');
+      expect(validDelivery.delivery?.channel).toBe('lark');
+
+      // Rejects conflicting silent=true and delivery
+      expect(() =>
+        validateAgentPromptPayload({
+          type: 'agent_prompt',
+          prompt: 'Conflicting prompt',
+          sessionId: validSessionId,
+          sessionPolicy: 'existing_session',
+          silent: true,
+          delivery: {
+            channel: 'lark',
+            accountId: 'acc_synth_test_1',
+            nativeContextId: 'oc_synth_chat_1',
+          },
+        })
+      ).toThrow(/cannot specify both silent=true and a delivery target/i);
+
+      // Rejects non-boolean silent
+      expect(() =>
+        validateAgentPromptPayload({
+          type: 'agent_prompt',
+          prompt: 'Bad silent type',
+          sessionId: validSessionId,
+          sessionPolicy: 'existing_session',
+          silent: 'true' as any,
+        })
+      ).toThrow(ValidationError);
+
+      // Rejects invalid spaceFolder (traversal, slashes, empty)
+      expect(() =>
+        validateAgentPromptPayload({
+          type: 'agent_prompt',
+          prompt: 'Bad folder',
+          sessionId: validSessionId,
+          sessionPolicy: 'existing_session',
+          spaceFolder: '../secret',
+        })
+      ).toThrow(/Invalid space folder format/i);
+
+      expect(() =>
+        validateAgentPromptPayload({
+          type: 'agent_prompt',
+          prompt: 'Bad folder',
+          sessionId: validSessionId,
+          sessionPolicy: 'existing_session',
+          spaceFolder: 'dir/nested',
+        })
+      ).toThrow(/Invalid space folder format/i);
+
+      expect(() =>
+        validateAgentPromptPayload({
+          type: 'agent_prompt',
+          prompt: 'Bad folder',
+          sessionId: validSessionId,
+          sessionPolicy: 'existing_session',
+          spaceFolder: '   ',
+        })
+      ).toThrow(/Invalid space folder format/i);
     });
 
     it('permits natural language prompt containing the words "bash", "script", "command" without false positives', async () => {

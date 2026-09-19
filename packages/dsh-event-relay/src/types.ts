@@ -68,6 +68,7 @@ export interface ContainerStreamingEventFrame {
   readonly id?: string;
   readonly sessionId: string;
   readonly turnId?: string;
+  readonly originTurnId?: string;
   readonly type:
     | 'turn_started'
     | 'assistant_delta'
@@ -176,6 +177,21 @@ export interface IEventRelayService {
    * Get current operational streaming diagnostics.
    */
   getDiagnostics(): EventRelayDiagnostics;
+
+  /**
+   * Bind active platform turn context for streaming event frame stamping.
+   */
+  bindTurnContext(sessionId: string, context: { turnId: string; originTurnId?: string }): () => void;
+
+  /**
+   * Records initiation of a child process (subagent or job) from a parent platform turn for provenance tracking.
+   */
+  recordChildInitiation(childId: string, originatingTurnId: string): void;
+
+  /**
+   * Resolves the originating platform turn ID for a child process.
+   */
+  resolveOriginTurnId(childId: string): string | undefined;
 
   /**
    * Flush all buffered streaming event frames to platform immediately.

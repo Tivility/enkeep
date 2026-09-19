@@ -480,6 +480,7 @@ export class DeterministicDemoLlmAdapter extends LlmAdapter {
       name: `Deterministic Demo Model (${model})`,
       context: { contextWindow: this.contextWindow },
       defaultMaxTokens: this.defaultMaxTokens,
+      inputModalities: ['text', 'image'],
       reasoning: {
         efforts: [
           { id: ReasoningEffortId('low'), name: 'Low' },

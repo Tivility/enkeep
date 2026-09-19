@@ -1533,6 +1533,49 @@ UPDATE quota_limits SET limit_amount = -1, updated_at = CURRENT_TIMESTAMP;
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_036_SPACE_CANONICAL_SESSION_SQL = `
+-- Migration 36: Space canonical session pointer for single-session-per-workspace consolidation
+ALTER TABLE spaces ADD COLUMN canonical_session_id TEXT REFERENCES session_routes(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_spaces_canonical_session ON spaces(canonical_session_id);
+
+PRAGMA foreign_key_check;
+`;
+
+export const MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL = `
+-- Migration 37: Immutable channel turn origin persistence for reply ownership & continuation correlation
+CREATE TABLE IF NOT EXISTS channel_turn_origins (
+  turn_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES session_routes(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES channel_accounts(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  native_context_id TEXT NOT NULL,
+  native_event_id TEXT,
+  reply_to_message_id TEXT,
+  root_id TEXT,
+  thread_id TEXT,
+  origin_turn_id TEXT,
+  created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_turn_origins_session ON channel_turn_origins(session_id);
+CREATE INDEX IF NOT EXISTS idx_channel_turn_origins_user ON channel_turn_origins(user_id);
+CREATE INDEX IF NOT EXISTS idx_channel_turn_origins_origin ON channel_turn_origins(origin_turn_id);
+
+CREATE TABLE IF NOT EXISTS session_child_origins (
+  session_id TEXT NOT NULL REFERENCES session_routes(id) ON DELETE CASCADE,
+  child_id TEXT NOT NULL,
+  origin_turn_id TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+  PRIMARY KEY (session_id, child_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_child_origins_turn ON session_child_origins(session_id, origin_turn_id);
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

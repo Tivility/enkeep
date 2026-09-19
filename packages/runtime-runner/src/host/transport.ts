@@ -415,6 +415,8 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
     const submitPromise = new Promise<AgentFollowupResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.turnWaiters.delete(turnId);
+        // Actively cancel the exact timed-out turn in the host daemon to prevent orphaned execution
+        this.cancelTurn(turnId, `Followup turn execution timed out after ${timeoutMs}ms`).catch(() => {});
         reject(new HostDaemonError(`Followup turn execution timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 

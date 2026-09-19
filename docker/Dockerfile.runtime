@@ -36,6 +36,7 @@ COPY packages/dsh-external-interaction/ ./packages/dsh-external-interaction/
 COPY packages/dsh-affinity-policy/ ./packages/dsh-affinity-policy/
 COPY packages/dsh-tool-browser/ ./packages/dsh-tool-browser/
 COPY packages/dsh-mcp-governance/ ./packages/dsh-mcp-governance/
+COPY packages/dsh-memory/ ./packages/dsh-memory/
 COPY packages/dsh-tool-cli/ ./packages/dsh-tool-cli/
 COPY packages/dsh-enkeep-bundle/ ./packages/dsh-enkeep-bundle/
 COPY packages/runtime-runner/ ./packages/runtime-runner/
@@ -60,6 +61,7 @@ RUN pnpm --filter '@enkeep/protocol' \
          --filter '@enkeep/dsh-affinity-policy' \
          --filter '@enkeep/dsh-tool-browser' \
          --filter '@enkeep/dsh-mcp-governance' \
+         --filter '@enkeep/dsh-memory' \
          --filter '@enkeep/dsh-tool-cli' \
          --filter '@enkeep/dsh-enkeep-bundle' \
          --filter '@enkeep/runtime-runner' \

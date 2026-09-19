@@ -15,7 +15,7 @@ import {
   toError,
 } from './errors.js';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const MIGRATION_001_SQL = `
 CREATE TABLE IF NOT EXISTS _dsh_migrations (
@@ -84,6 +84,22 @@ CREATE INDEX IF NOT EXISTS idx_dsh_seed_import_receipts_session
   ON dsh_seed_import_receipts (user_id, session_id);
 `.trim();
 
+export const MIGRATION_003_SQL = `
+CREATE TABLE IF NOT EXISTS dsh_child_origins (
+  user_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  child_id TEXT NOT NULL,
+  origin_turn_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, session_id, child_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dsh_child_origins_session
+  ON dsh_child_origins (user_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_dsh_child_origins_origin
+  ON dsh_child_origins (user_id, origin_turn_id);
+`.trim();
+
 export interface MigrationStep {
   version: number;
   sql: string;
@@ -104,6 +120,11 @@ export const MIGRATIONS: readonly MigrationStep[] = [
     version: 2,
     sql: MIGRATION_002_SQL,
     checksum: computeSqlChecksum(MIGRATION_002_SQL),
+  },
+  {
+    version: 3,
+    sql: MIGRATION_003_SQL,
+    checksum: computeSqlChecksum(MIGRATION_003_SQL),
   },
 ];
 

@@ -108,6 +108,25 @@ export function validateOverlapPolicy(policy: unknown): TaskScheduleOverlapPolic
   return policy as TaskScheduleOverlapPolicy;
 }
 
+/**
+ * Validates IANA timezone string using Intl.DateTimeFormat.
+ * Defaults to 'UTC' if undefined, null, or empty string.
+ */
+export function validateTimezone(tz: unknown): string {
+  if (tz === undefined || tz === null || tz === '') {
+    return 'UTC';
+  }
+  if (typeof tz !== 'string') {
+    throw new ValidationError(`Invalid timezone "${String(tz)}". Must be a valid IANA timezone identifier.`);
+  }
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+  } catch {
+    throw new ValidationError(`Invalid timezone "${String(tz)}". Must be a valid IANA timezone identifier.`);
+  }
+  return tz;
+}
+
 export interface ScheduleCalculationParams {
   scheduleType: TaskScheduleType;
   cronExpression?: string | null;
@@ -116,11 +135,12 @@ export interface ScheduleCalculationParams {
   lastRunAt?: string | null;
   pausedAt?: string | null;
   enabled?: boolean;
+  timezone?: string | null;
 }
 
 /**
  * Deterministic calculation of next_run_at with clock injection.
- * DST-free UTC evaluation.
+ * DST-aware evaluation based on schedule timezone (defaults to UTC).
  */
 export function computeNextRun(
   params: ScheduleCalculationParams,
@@ -157,9 +177,10 @@ export function computeNextRun(
         return null;
       }
       try {
+        const tz = params.timezone ? validateTimezone(params.timezone) : 'UTC';
         const interval = CronExpressionParser.parse(params.cronExpression, {
           currentDate: clock,
-          tz: 'UTC',
+          tz,
         });
         const nextDate = interval.next();
         return nextDate.toISOString();

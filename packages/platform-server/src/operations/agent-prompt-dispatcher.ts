@@ -57,7 +57,7 @@ interface AuthoritativeAssistantMessageRow {
   created_at: string;
 }
 
-const CANONICAL_TASK_ID_PATTERN = /^task_[0-9a-f]{32}$/;
+const CANONICAL_TASK_ID_PATTERN = /^(?:task_[0-9a-f]{32}|task_hpc_[0-9a-f]{24})$/;
 const VALID_SESSION_ID_PATTERN = /^(?:ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
 const VALID_SPACE_ID_PATTERN = /^(?:spc_[0-9a-f]{32}|impsp_[0-9a-f]{64})$/;
 
@@ -178,6 +178,32 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new ValidationError('[INVALID_TASK] Task id is required and must match canonical task format');
     }
 
+    // Execution budget validation (strictly server-owned, optional)
+    let effectiveMaxWaitMs = this.maxWaitMs;
+    if (context.executionBudget !== undefined) {
+      if (
+        !context.executionBudget ||
+        typeof context.executionBudget !== 'object' ||
+        Array.isArray(context.executionBudget)
+      ) {
+        throw new ValidationError('[INVALID_EXECUTION_BUDGET] Execution budget must be a plain object');
+      }
+      for (const key of Object.keys(context.executionBudget)) {
+        if (key !== 'maxWaitMs') {
+          throw new ValidationError('[INVALID_EXECUTION_BUDGET] Execution budget contains unrecognized field');
+        }
+      }
+      if (context.executionBudget.maxWaitMs !== undefined) {
+        const wait = context.executionBudget.maxWaitMs;
+        if (typeof wait !== 'number' || !Number.isSafeInteger(wait) || wait <= 0 || wait > 900_000) {
+          throw new ValidationError(
+            '[INVALID_EXECUTION_BUDGET] Execution budget maxWaitMs must be a finite integer between 1 and 900000'
+          );
+        }
+        effectiveMaxWaitMs = wait;
+      }
+    }
+
     // 1. Validate exact AgentPromptTaskPayload contract (context.payload strictly required, no task.payload fallback)
     const payload: AgentPromptTaskPayload = validateAgentPromptPayload(context.payload);
 
@@ -217,21 +243,27 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new ValidationError('[INVALID_SESSION_ROUTE] Session route is not active');
     }
 
-    if (targetRoute.channel !== 'web') {
-      throw new ValidationError('[INVALID_SESSION_ROUTE] Session route channel must be web');
+    if (
+      typeof targetRoute.channel !== 'string' ||
+      !targetRoute.channel.trim() ||
+      targetRoute.channel.length > 64
+    ) {
+      throw new ValidationError('[INVALID_SESSION_ROUTE] Session route channel is missing or invalid');
     }
-    if (targetRoute.accountId !== 'web-demo') {
-      throw new ValidationError('[INVALID_SESSION_ROUTE] Session route accountId must be web-demo');
+    if (
+      typeof targetRoute.accountId !== 'string' ||
+      !targetRoute.accountId.trim() ||
+      targetRoute.accountId.length > 128
+    ) {
+      throw new ValidationError('[INVALID_SESSION_ROUTE] Session route accountId is missing or invalid');
     }
     if (
       !targetRoute.nativeContextId ||
       typeof targetRoute.nativeContextId !== 'string' ||
-      !targetRoute.nativeContextId.trim()
+      !targetRoute.nativeContextId.trim() ||
+      targetRoute.nativeContextId.length > 256
     ) {
-      throw new ValidationError('[INVALID_SESSION_ROUTE] Session route nativeContextId is missing or empty');
-    }
-    if (targetRoute.nativeContextId !== targetRoute.id) {
-      throw new ValidationError('[INVALID_SESSION_ROUTE] Session route nativeContextId must match route id');
+      throw new ValidationError('[INVALID_SESSION_ROUTE] Session route nativeContextId is missing or invalid');
     }
     if (
       typeof targetRoute.peerId !== 'string' ||
@@ -250,7 +282,7 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new ValidationError('[INVALID_SESSION_ROUTE] Session route spaceId format is invalid');
     }
 
-    // Validate Space ownership and active container status
+    // Validate Space ownership and active status
     const targetSpace: Space | null = await tenantStorage.spaces.findById(targetRoute.spaceId);
     if (!targetSpace || targetSpace.userId !== tenantId) {
       throw new NotFoundError('[SPACE_NOT_FOUND] Space not found for tenant');
@@ -258,13 +290,51 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     if (targetSpace.status !== 'active') {
       throw new ValidationError('[INVALID_SPACE] Space is not active');
     }
-    if (targetSpace.executionMode !== 'container') {
-      throw new ValidationError('[INVALID_SPACE] Space execution mode must be container');
+    // Authoritative executionMode derived from space: must be 'container' or 'host'
+    if (targetSpace.executionMode !== 'container' && targetSpace.executionMode !== 'host') {
+      throw new ValidationError('[INVALID_SPACE] Space execution mode must be container or host');
     }
 
     // Validate optional payload.spaceId matches route.spaceId exactly
     if (payload.spaceId !== undefined && payload.spaceId !== targetRoute.spaceId) {
       throw new ValidationError('[SPACE_MISMATCH] Task payload spaceId does not match session route spaceId');
+    }
+
+    // Validate optional payload.spaceFolder matches space.folder exactly
+    if (payload.spaceFolder !== undefined && payload.spaceFolder !== targetSpace.folder) {
+      throw new ValidationError('[SPACE_FOLDER_MISMATCH] Task payload spaceFolder does not match target space folder');
+    }
+
+    // Authoritative canonical session validation
+    const spaceRow = this.db
+      .prepare('SELECT canonical_session_id FROM spaces WHERE id = ? AND user_id = ? LIMIT 1')
+      .get(targetSpace.id, tenantId) as { canonical_session_id: string | null } | undefined;
+
+    const currentCanonicalId = spaceRow?.canonical_session_id ?? null;
+    if (currentCanonicalId && currentCanonicalId !== targetRoute.id) {
+      const canonRoute = this.db
+        .prepare('SELECT id, status FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? LIMIT 1')
+        .get(currentCanonicalId, targetSpace.id, tenantId) as { id: string; status: string } | undefined;
+
+      if (canonRoute && canonRoute.status === 'active') {
+        throw new ValidationError('[NON_CANONICAL_SESSION] Specified session is not the canonical session for space');
+      }
+      // Stale or archived canonical session: rebind space canonical_session_id to active targetRoute
+      this.db
+        .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+        .run(targetRoute.id, targetSpace.id, tenantId);
+    } else if (!currentCanonicalId) {
+      // First active session: set as canonical_session_id to preserve onecanonical invariant
+      this.db
+        .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+        .run(targetRoute.id, targetSpace.id, tenantId);
+    }
+
+    // Sync session_routes executionMode with authoritative space executionMode if divergent
+    if (targetRoute.executionMode !== targetSpace.executionMode) {
+      this.db
+        .prepare('UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+        .run(targetSpace.executionMode, targetRoute.id, tenantId);
     }
 
     // 3. Construct InboundEnvelope strictly authoritative from route
@@ -287,9 +357,11 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new Error('[TASK_ABORTED] Task execution was aborted');
     }
 
-    // 4. Dispatch through DeliveryRuntimeGateway
-    // Note: If dispatch fails before turnId is produced, no cancel is called.
-    const dispatchRes = await this.gateway.dispatchInbound(envelope);
+    // 4. Dispatch through DeliveryRuntimeGateway with server-owned execution budget option
+    const dispatchOptions = context.executionBudget?.maxWaitMs !== undefined
+      ? { timeoutMs: effectiveMaxWaitMs }
+      : undefined;
+    const dispatchRes = await this.gateway.dispatchInbound(envelope, dispatchOptions);
     if (!dispatchRes.accepted || !dispatchRes.turnId) {
       if (dispatchRes.isDuplicate) {
         throw new PlatformError(
@@ -313,6 +385,7 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       routeId: targetRoute.id,
       sessionId: platformSessionId,
       signal,
+      maxWaitMs: effectiveMaxWaitMs,
     });
   }
 
@@ -325,8 +398,9 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     routeId: string;
     sessionId: string;
     signal: AbortSignal;
+    maxWaitMs: number;
   }): Promise<AgentPromptDispatchResult> {
-    const { tenantId, turnId, routeId, sessionId, signal } = params;
+    const { tenantId, turnId, routeId, sessionId, signal, maxWaitMs } = params;
 
     let cancelPromise: Promise<boolean> | null = null;
 
@@ -389,7 +463,7 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     const timeoutPromise = new Promise<{ type: 'timeout' }>((resolve) => {
       timeoutHandle = setTimeout(() => {
         resolve({ type: 'timeout' });
-      }, this.maxWaitMs);
+      }, maxWaitMs);
     });
 
     const pollingPromise = (async (): Promise<{ type: 'completed'; result: AgentPromptDispatchResult }> => {

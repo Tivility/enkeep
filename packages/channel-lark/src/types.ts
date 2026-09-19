@@ -6,6 +6,7 @@
  */
 
 import type * as lark from '@larksuiteoapi/node-sdk';
+import type { ChannelTurnOrigin } from '@enkeep/platform-core';
 
 export const REAL_LARK_CREDENTIAL_ACCEPTANCE = 'SKIPPED' as const;
 export const REAL_LARK_CREDENTIAL_SKIP_REASON =
@@ -123,25 +124,30 @@ export interface OutboundReplyPayload {
   readonly messageId?: string;
 }
 
+export interface StreamAssistantEvent {
+  rowId: number;
+  type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status';
+  delta?: string;
+  streamId?: string;
+  status?: string;
+  toolName?: string;
+  turnId?: string;
+  originTurnId?: string;
+}
+
 export interface StreamEventSource {
   getLatestRowId?(sessionRouteId: string): Promise<number>;
   listAssistantEvents(
     sessionRouteId: string,
     afterRowId: number,
     limit?: number
-  ): Promise<Array<{
-    rowId: number;
-    type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status';
-    delta?: string;
-    streamId?: string;
-    status?: string;
-    toolName?: string;
-  }>>;
+  ): Promise<StreamAssistantEvent[]>;
   getPlatformTurnState?(
     sessionRouteId: string,
     turnId: string
   ): Promise<'queued' | 'running' | 'completed' | 'failed' | 'unknown'>;
   hasPendingPlatformTurn?(sessionRouteId: string): Promise<boolean>;
+  resolveTurnOrigin?(turnId: string): Promise<ChannelTurnOrigin | null>;
 }
 
 export interface OutboundReplyResult {
@@ -183,6 +189,44 @@ export interface LarkTransport {
   }): Promise<LarkStreamingCardSession | null>;
   addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
+  downloadImageResource?(
+    messageId: string,
+    fileKey: string
+  ): Promise<{ buffer: Buffer; mimeType: string } | null>;
+  downloadFileResource?(
+    messageId: string,
+    fileKey: string
+  ): Promise<{ buffer: Buffer; mimeType: string } | null>;
+}
+
+export interface LarkImageAttachmentIngestor {
+  ingestImage(params: {
+    userId: string;
+    spaceId: string;
+    messageId: string;
+    fileKey: string;
+    buffer: Buffer;
+    contentType?: string;
+  }): Promise<{
+    path: string;
+    etag: string;
+    mediaType: string;
+    displayName: string;
+  }>;
+  ingestFile?(params: {
+    userId: string;
+    spaceId: string;
+    messageId: string;
+    fileKey: string;
+    fileName?: string;
+    buffer: Buffer;
+    contentType?: string;
+  }): Promise<{
+    path: string;
+    etag: string;
+    mediaType: string;
+    displayName: string;
+  }>;
 }
 
 export interface LarkAccountConfig {
@@ -225,6 +269,19 @@ export interface ILarkApiClient {
       create: (req: any, options?: any) => Promise<any>;
       patch?: (req: any, options?: any) => Promise<any>;
     };
+    messageResource?: {
+      get: (
+        payload?: {
+          path: { message_id: string; file_key: string };
+          params: { type: string };
+        },
+        options?: any
+      ) => Promise<{
+        writeFile: (filePath: string) => Promise<unknown>;
+        getReadableStream: () => NodeJS.ReadableStream;
+        headers?: any;
+      }>;
+    };
     messageReaction?: {
       create: (req: any, options?: any) => Promise<any>;
       delete: (req: any, options?: any) => Promise<any>;
@@ -234,6 +291,19 @@ export interface ILarkApiClient {
         reply?: (req: any, options?: any) => Promise<any>;
         create?: (req: any, options?: any) => Promise<any>;
         patch?: (req: any, options?: any) => Promise<any>;
+      };
+      messageResource?: {
+        get: (
+          payload?: {
+            path: { message_id: string; file_key: string };
+            params: { type: string };
+          },
+          options?: any
+        ) => Promise<{
+          writeFile: (filePath: string) => Promise<unknown>;
+          getReadableStream: () => NodeJS.ReadableStream;
+          headers?: any;
+        }>;
       };
       messageReaction?: {
         create: (req: any, options?: any) => Promise<any>;

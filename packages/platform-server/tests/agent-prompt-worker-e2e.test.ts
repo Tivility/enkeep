@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import {
   PlatformServerMigrationRunner,
@@ -359,5 +359,103 @@ describe('AgentPromptTaskWorker & Platform Operations End-to-End Integration', (
       dispatcher: async () => {},
     });
     expect(defaultWorker.workerId).toMatch(/^server_worker_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+  });
+
+  it('a task with lark delivery → fake gateway sendProactiveMessage called once with the reply text; delivery failure does not fail the task', async () => {
+    const taskOps = operationsService.forTenant(tenantAlice).tasks;
+
+    // 1. Successful Lark delivery with reply text from web_messages
+    const proactiveCalls: any[] = [];
+    const fakeGateway = {
+      sendProactiveMessage: vi.fn().mockImplementation(async (params: any) => {
+        proactiveCalls.push(params);
+        return { success: true, messageId: 'om_proactive_e2e_1' };
+      }),
+    };
+
+    const fakeCrm = {
+      getActiveGateway: vi.fn().mockImplementation((userId: string, accountId: string) => {
+        if (userId === tenantAlice && accountId === 'acc_lark_alice') {
+          return fakeGateway;
+        }
+        return undefined;
+      }),
+    };
+
+    const dispatcher = createAgentPromptDeliveryDispatcher({
+      gateway: deliveryGateway,
+      storage,
+      database: db,
+    });
+
+    const larkWorker = createPlatformServerTaskWorker({
+      db,
+      dispatcher,
+      operationsStorage,
+      channelRuntimeManager: fakeCrm,
+    });
+
+    const { task: task1 } = await taskOps.createTask({
+      title: 'Alice Lark Scheduled Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Lark scheduled task run',
+        sessionId: aliceSessionId,
+        sessionPolicy: 'existing_session',
+        delivery: {
+          channel: 'lark',
+          accountId: 'acc_lark_alice',
+          nativeContextId: 'oc_alice_chat_42',
+        },
+      },
+      idempotencyKey: '44444444-5555-4666-8777-888888888899',
+    });
+
+    const runResult1 = await larkWorker.runOnce();
+    expect(runResult1?.status).toBe('completed');
+    expect(runResult1?.taskId).toBe(task1.id);
+    expect(fakeGateway.sendProactiveMessage).toHaveBeenCalledTimes(1);
+    expect(proactiveCalls.length).toBe(1);
+    expect(proactiveCalls[0].chatId).toBe('oc_alice_chat_42');
+    expect(proactiveCalls[0].text).toContain('[DSH-Agent] Processed prompt: Lark scheduled task run');
+
+    // 2. Delivery failure does not fail the task
+    const brokenGateway = {
+      sendProactiveMessage: vi.fn().mockRejectedValue(new Error('Simulated Lark gateway timeout')),
+    };
+    const brokenCrm = {
+      getActiveGateway: vi.fn().mockReturnValue(brokenGateway),
+    };
+
+    const brokenWorker = createPlatformServerTaskWorker({
+      db,
+      dispatcher,
+      operationsStorage,
+      channelRuntimeManager: brokenCrm,
+    });
+
+    const { task: task2 } = await taskOps.createTask({
+      title: 'Alice Failing Lark Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Failing Lark delivery run',
+        sessionId: aliceSessionId,
+        sessionPolicy: 'existing_session',
+        delivery: {
+          channel: 'lark',
+          accountId: 'acc_broken',
+          nativeContextId: 'oc_broken_chat',
+        },
+      },
+      idempotencyKey: '44444444-5555-4666-8777-888888888898',
+    });
+
+    const runResult2 = await brokenWorker.runOnce();
+    expect(runResult2?.status).toBe('completed');
+    expect(runResult2?.taskId).toBe(task2.id);
+    expect(brokenGateway.sendProactiveMessage).toHaveBeenCalledTimes(1);
+
+    const completedTask2 = await taskOps.getTask(task2.id);
+    expect(completedTask2?.status).toBe('completed');
   });
 });
