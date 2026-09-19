@@ -324,6 +324,7 @@ export class ChannelRuntimeManager {
     idempotencyKey: string;
     executionResult: { replyText: string };
     tokenUsage: { tokens: number };
+    executionMode?: 'runtime' | 'command';
   }): Promise<void> {
     if (!this.isRunning || this.isDisposing) return;
 
@@ -425,6 +426,7 @@ export class ChannelRuntimeManager {
       threadId,
       chatId,
       nativeEventId,
+      executionMode: event.executionMode,
     });
   }
 

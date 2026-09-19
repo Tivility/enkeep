@@ -166,7 +166,7 @@ export class LarkChannelGateway {
    * Starts or extends a continuation watcher for the given session route.
    * Bound to at most 50 watchers per gateway, evicting the oldest.
    */
-  startOrExtendContinuationWatcher(routeId: string, cursor?: number): void {
+  async startOrExtendContinuationWatcher(routeId: string, cursor?: number): Promise<void> {
     if (this.isDisposed || !this.streamEventSource) return;
 
     const target = this.lastInboundTargets.get(routeId);
@@ -174,8 +174,18 @@ export class LarkChannelGateway {
 
     const existing = this.continuationWatchers.get(routeId);
     if (existing) {
-      existing.extend(cursor, target);
+      const extendCursor = cursor !== undefined && cursor > 0 ? cursor : undefined;
+      existing.extend(extendCursor, target);
       return;
+    }
+
+    let initialCursor: number | undefined;
+    if (cursor !== undefined && cursor > 0) {
+      initialCursor = cursor;
+    } else if (typeof this.streamEventSource.getLatestRowId === 'function') {
+      try {
+        initialCursor = await this.streamEventSource.getLatestRowId(routeId);
+      } catch {}
     }
 
     while (this.continuationWatchers.size >= 50) {
@@ -195,7 +205,7 @@ export class LarkChannelGateway {
       transport: this.transport,
       channelRepo: this.channelRepo,
       replyTarget: target,
-      initialCursor: cursor,
+      initialCursor,
       hasActiveInboundTracker: (rId) => this.hasActiveTrackerForRoute(rId),
       deriveOutboxId: (tId) => this.deriveOutboxId(tId),
       onStopped: () => {
@@ -1119,7 +1129,7 @@ export class LarkChannelGateway {
       turnId = dispatchResult.turnId || platformIdempotencyKey;
       inboxItem = await this.channelRepo.updateInboxStatus(inboxItem.id, 'delivered');
 
-      if (this.streamEventSource && typeof this.transport.createStreamingCard === 'function') {
+      if (dispatchResult.executionMode !== 'command' && this.streamEventSource && typeof this.transport.createStreamingCard === 'function') {
         let initialCursor: number | undefined;
         if (typeof this.streamEventSource.getLatestRowId === 'function') {
           try {
@@ -1170,6 +1180,7 @@ export class LarkChannelGateway {
     threadId?: string;
     chatId?: string;
     nativeEventId?: string;
+    executionMode?: 'runtime' | 'command';
   }): Promise<ChannelOutboxItem | null> {
     if (this.isDisposed) return null;
 
@@ -1337,7 +1348,9 @@ export class LarkChannelGateway {
     }
 
     // Start or extend continuation watcher on this route to monitor autonomous continuation turns
-    this.startOrExtendContinuationWatcher(route.id, tracker?.getCursor());
+    if (params.executionMode !== 'command') {
+      await this.startOrExtendContinuationWatcher(route.id, tracker?.getCursor());
+    }
 
     return outboxItem;
     } finally {
