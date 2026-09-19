@@ -51,6 +51,7 @@ import {
 } from '@deepseek-ai/dsh-fs';
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local';
 import * as FsObservationPolicyPlugin from '@deepseek-ai/dsh-fs-observation-policy';
+import { WorkspaceAttachmentStore } from './workspace-attachments.js';
 import * as ToolFsPlugin from '@deepseek-ai/dsh-tool-fs';
 import LocalSubprocess, { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local';
 import type { SubprocessSpawnSpec, SubprocessHandle } from '@deepseek-ai/dsh-subprocess';
@@ -267,7 +268,7 @@ export function findMatchingMount(
  * Isolates workspace service symbols in a Cordis context so each agent has private instances.
  */
 export function isolateWorkspaceRealms(ctx: Context): void {
-  const services = ['fs', 'subprocess', 'shell', 'shellEnv', 'jobs', 'spillStore', 'permissionPresets'];
+  const services = ['fs', 'subprocess', 'shell', 'shellEnv', 'jobs', 'spillStore', 'permissionPresets', 'attachments'];
   const isolateSym = Symbol.for('cordis.isolate');
   for (const name of services) {
     (ctx as any)[isolateSym] = { ...(ctx as any)[isolateSym], [name]: Symbol(name) };
@@ -760,11 +761,21 @@ export async function mountWorkspaceTools(
     } as any);
     fibers.push(fsFiber);
 
+    // Allow inner nested injection contexts (e.g. ToolFs read_image imageCtx) to access space-isolated fs
+    agentCtx.on('internal/get', (ctx, prop, error, next) => {
+      if (prop === 'fs') return agentCtx.get('fs');
+      return next();
+    });
+
     // 2. FsObservationPolicy (enforces read-before-write/edit)
     const fsPolicyFiber = await agentCtx.plugin(FsObservationPolicyPlugin);
     fibers.push(fsPolicyFiber);
 
-    // 3. ToolFs (model-facing read, write, edit)
+    // 2.5 Attachments capability scoped to agentCtx (enables read_image in ToolFsPlugin with space fs)
+    const attFiber = await agentCtx.plugin(WorkspaceAttachmentStore, { dshHome, spacePath });
+    fibers.push(attFiber);
+
+    // 3. ToolFs (model-facing read, write, edit, read_image)
     const toolFsFiber = await agentCtx.plugin(ToolFsPlugin, {
       readLimit: options.fs?.readLimit ?? 2000,
       readMaxLineLength: options.fs?.readMaxLineLength ?? 4000,
@@ -1342,7 +1353,7 @@ export async function mountOfficialPlugins(
       const toolName = exec.name;
 
       // 1. Safe read/inspection tools are unconditionally allowed in any mode
-      if (['read', 'glob', 'grep', 'list_agents', 'check_quota'].includes(toolName)) {
+      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'check_quota'].includes(toolName)) {
         return await next();
       }
 

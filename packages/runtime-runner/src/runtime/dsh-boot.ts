@@ -36,6 +36,8 @@ import { AgentLoop } from '@deepseek-ai/dsh-agent-loop';
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model';
 import SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
+import { MemoryService } from '@enkeep/dsh-memory';
+import { WorkspaceAttachmentStore } from './workspace-attachments.js';
 import { DshPlatformClient } from '@enkeep/dsh-platform-client';
 
 import type { EventRelayService } from '@enkeep/dsh-event-relay';
@@ -775,6 +777,91 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     root: sessionsDir,
     compression: 'none', // Raw JSONL for transparent auditability
   });
+  await ctx.plugin(MemoryService);
+  await ctx.plugin(WorkspaceAttachmentStore, {
+    dshHome,
+    spacesDir,
+  });
+
+  function mountAgentMemoryFailClosed(
+    memoryService: MemoryService,
+    agentCtx: Context,
+    options: { dshHome: string; spacePath?: string; spaceId?: string; userId: string }
+  ) {
+    const memHandle = memoryService.mountAgentMemory(agentCtx, options as any);
+    if (!options.spacePath) {
+      const tools = agentCtx.tools ?? (agentCtx.get ? agentCtx.get('tools') : undefined);
+      const agentObj = (agentCtx as any).agent ?? agentCtx;
+      const view = (tools as any)?.view?.(agentObj);
+      for (const name of ['memory_write', 'memory_read', 'memory_search']) {
+        const tool = view?.visible?.get(name);
+        if (tool && typeof tool.execute === 'function') {
+          const origExec = tool.execute.bind(tool);
+          tool.execute = async (args: any, execCtx: any) => {
+            if (args?.scope === 'space') {
+              throw new Error('Space memory operation rejected: no space context available');
+            }
+            return origExec(args, execCtx);
+          };
+        }
+      }
+    }
+    return memHandle;
+  }
+
+  // Ensure child/subagent instances mount memory tools via official agent/created lifecycle hook
+  ctx.on('agent/created', ({ agent }) => {
+    const toolsService = agent.ctx.tools ?? (agent.ctx.get ? agent.ctx.get('tools') : undefined);
+    if (!toolsService) return;
+    const view = (toolsService as any).view?.(agent);
+    if (view?.visible?.has('memory_write')) return;
+
+    let sessionCwd = ((agent.session as any)?.header)?.cwd || ((agent.session as any)?.meta)?.cwd;
+    const isValidSpace = (p: unknown): p is string =>
+      typeof p === 'string' &&
+      isNormalizedAbsolutePath(p) &&
+      p !== spacesDir &&
+      isPathInside(p, spacesDir);
+
+    if (!isValidSpace(sessionCwd)) {
+      const parentSessionId = ((agent.session as any)?.header)?.parentSession || ((agent.session as any)?.meta)?.parentSession;
+      const parentAgent = parentSessionId
+        ? (ctx.agents?.get?.(parentSessionId) as Agent | undefined)
+        : (ctx.agents as any)?.store?.get?.(agent.id)?.owner;
+      const parentCwd = ((parentAgent?.session as any)?.header)?.cwd || ((parentAgent?.session as any)?.meta)?.cwd;
+      if (isValidSpace(parentCwd)) {
+        sessionCwd = parentCwd;
+      } else {
+        sessionCwd = undefined;
+      }
+    }
+
+    const spacePath = sessionCwd;
+    const spaceId = spacePath ? path.relative(spacesDir, spacePath) : undefined;
+
+    const memoryService = ctx.memory ?? (ctx.get ? ctx.get('memory') : undefined);
+    if (!memoryService || typeof memoryService.mountAgentMemory !== 'function') {
+      const err = new Error(`MemoryService unavailable when mounting memory on agent ${agent.id}`);
+      ctx.logger?.error?.(err.message);
+      throw err;
+    }
+
+    const memHandle = mountAgentMemoryFailClosed(memoryService, agent.ctx, {
+      dshHome,
+      spacePath,
+      spaceId: spaceId && spaceId.length > 0 ? spaceId : undefined,
+      userId,
+    });
+    agent.ctx.effect(() => {
+      return () => {
+        try {
+          memHandle.dispose();
+        } catch (err: unknown) {
+          ctx.logger?.warn?.(`Memory disposer failed on agent ${agent.id}:`, err);
+        }
+      };
+    }, 'memory.agentCreatedScope()');
+  });
 
   try {
     (Context as any).service?.('platformClient');
@@ -829,6 +916,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-claude`,
           defaultContextWindow: 1000000,
           defaultMaxTokens: 128000,
+          defaultInput: ['text', 'image'],
           models: [
             { id: 'claude-opus-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
             { id: 'claude-sonnet-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
@@ -1381,6 +1469,26 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         });
         sessionWorkspaceHandles.set(sessionIdStr, wsHandle);
         officialPluginsHandle.registerWorkspace(wsHandle);
+
+        const memoryService = ctx.memory ?? (ctx.get ? ctx.get('memory') : undefined);
+        if (memoryService && typeof memoryService.mountAgentMemory === 'function') {
+          const isExplicitSpace = typeof spacePath === 'string' && spacePath !== spacesDir && isPathInside(spacePath, spacesDir);
+          const resolvedSpacePath = isExplicitSpace ? spacePath : undefined;
+          const resolvedSpaceId = isExplicitSpace ? (sessionWorkspaces.get(sessionIdStr) ?? path.relative(spacesDir, spacePath)) : undefined;
+          const memHandle = mountAgentMemoryFailClosed(memoryService, agentCtx, {
+            dshHome,
+            spacePath: resolvedSpacePath,
+            spaceId: resolvedSpaceId,
+            userId,
+          });
+          agentCtx.effect(() => {
+            return () => {
+              try {
+                memHandle.dispose();
+              } catch {}
+            };
+          }, 'memory.agentScope()');
+        }
       };
     };
 
@@ -2419,6 +2527,26 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           subagents: validConfig.subagents,
         });
         officialPluginsHandle.registerWorkspace(wsHandle);
+
+        const memoryService = ctx.memory ?? (ctx.get ? ctx.get('memory') : undefined);
+        if (memoryService && typeof memoryService.mountAgentMemory === 'function') {
+          const isExplicitSpace = typeof spacePath === 'string' && spacePath !== spacesDir && isPathInside(spacePath, spacesDir);
+          const resolvedSpacePath = isExplicitSpace ? spacePath : undefined;
+          const resolvedSpaceId = isExplicitSpace ? (workspaceFolder ?? sessionWorkspaces.get(sessionIdStr) ?? path.relative(spacesDir, spacePath)) : undefined;
+          const memHandle = mountAgentMemoryFailClosed(memoryService, agentCtx, {
+            dshHome,
+            spacePath: resolvedSpacePath,
+            spaceId: resolvedSpaceId,
+            userId,
+          });
+          agentCtx.effect(() => {
+            return () => {
+              try {
+                memHandle.dispose();
+              } catch {}
+            };
+          }, 'memory.agentScope()');
+        }
       },
     });
 
@@ -2581,6 +2709,19 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       currentAgent.cancel({ kind: 'user' });
     }
 
+    const eventRelay = ctx.eventRelay ?? (ctx.get ? ctx.get('eventRelay') : undefined);
+    let unbindTurnCtx: (() => void) | undefined;
+    if (eventRelay && typeof eventRelay.bindTurnContext === 'function') {
+      const currentIntTurn = typeof (currentAgent.session as any)?.turnCount === 'number'
+        ? (currentAgent.session as any).turnCount + 1
+        : undefined;
+      unbindTurnCtx = eventRelay.bindTurnContext(effSessionId, {
+        turnId: assignedTurnId,
+        originTurnId: (requestOrPrompt as any)?.originTurnId,
+        dshIntTurn: currentIntTurn,
+      });
+    }
+
     try {
       // 0. Update dynamic per-turn model selection on live agent if specified
       if (effModelSelection && effModelSelection.provider && effModelSelection.model) {
@@ -2665,7 +2806,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           return `- ${a.snapshotPath}${namePart} (media: ${a.mediaType}, size: ${a.size} bytes, etag: ${a.etag})`;
         }).join('\n');
 
-        const attachmentGuidance = `Workspace attachments:\n${attachmentLines}\n\nPaths prefixed with @ are files explicitly referenced by the user. Use the read tool when their contents are needed; do not claim to have inspected a file before reading it.`;
+        const attachmentGuidance = `Workspace attachments:\n${attachmentLines}\n\nPaths prefixed with @ are files explicitly referenced by the user. Use the read_image tool for images or the read tool for text files when their contents are needed; do not claim to have inspected a file before reading it.`;
 
         const contextMsg = createUserMessage({
           content: [{ type: 'text', text: attachmentGuidance }],
@@ -2813,6 +2954,11 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         persisted: Boolean(persistence),
       };
     } finally {
+      if (unbindTurnCtx) {
+        try {
+          unbindTurnCtx();
+        } catch {}
+      }
       activeTurns.delete(assignedTurnId);
     }
   }
