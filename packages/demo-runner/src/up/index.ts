@@ -925,6 +925,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         content,
         attachments,
         profile,
+        timeoutMs,
       } = request;
 
       if (!dshSessionId || typeof dshSessionId !== 'string' || dshSessionId.trim().length === 0) {
@@ -989,6 +990,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         modelSelection: request.modelSelection ?? null,
         mounts: spaceMountSpecs,
         extensionPlan: request.extensionPlan ?? null,
+        timeoutMs,
       });
       if (typeof res.replyText !== 'string' || res.replyText.trim().length === 0) {
         throw new Error('FAIL-CLOSED: DSH runtime returned empty or invalid replyText');
@@ -2578,6 +2580,7 @@ fs.appendFileSync(p, corruptData);
       webhookSecurityOptions: options.webhookSecurityOptions ?? { allowTestLoopback: true, enforceHttps: false },
       spacesDir: options.spacesDir ?? paths.spacesDir,
       dshHome: options.dshHome ?? paths.dataRoot,
+      dataRoot: paths.dataRoot,
       bundledSkillDir: options.bundledSkillDir,
       enableWorker: true,
       runId: demoRunId,

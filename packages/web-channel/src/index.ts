@@ -24,6 +24,7 @@ export type {
   InboundEnvelope,
   TurnExecutionStatus,
   InternalRuntimeDispatchResult,
+  DeliveryDispatchOptions,
   RuntimeGateway,
   LifecycleStatus,
   AuthContext,
