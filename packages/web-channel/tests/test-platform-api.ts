@@ -195,7 +195,9 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
     return {
       id: space.id,
       name: space.name,
+      executionMode: space.executionMode,
       status: space.status as PublicSpace['status'],
+      canonicalSessionId: space.canonicalSessionId ?? null,
       createdAt: space.createdAt,
       updatedAt: space.updatedAt,
       profileBinding: space.agentProfileId
@@ -208,6 +210,7 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
     return {
       id: route.id,
       spaceId: route.spaceId,
+      channel: route.channel,
       title: route.title ?? null,
       status: route.status as PublicSession['status'],
       currentGeneration: route.currentGeneration ?? 1,
@@ -809,7 +812,7 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
     userId: string,
     sessionId: string,
     options?: { limit?: number; before?: string; after?: string; cursor?: string }
-  ): Promise<{ messages: PublicMessage[]; hasMore: boolean; olderCursor: string | null; newerCursor: string | null }> {
+  ): Promise<{ messages: PublicMessage[]; hasMore: boolean; olderCursor: string | null; newerCursor: string | null; latestEventCursor?: string | null }> {
     this.ensureSessionAccess(userId, sessionId);
 
     const list = this.messages.get(sessionId) || [];
@@ -817,6 +820,7 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
 
     let slice: PublicMessage[];
     let hasMore = false;
+    const isInitial = !options?.before && !options?.after;
 
     if (options?.before) {
       const cursorIdx = list.findIndex((m) => m.id === options.before);
@@ -839,11 +843,18 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
     const olderCursor = slice.length > 0 ? slice[0].id : null;
     const newerCursor = slice.length > 0 ? slice[slice.length - 1].id : null;
 
+    let latestEventCursor: string | null | undefined = undefined;
+    if (isInitial) {
+      const eventList = this.events.get(sessionId) || [];
+      latestEventCursor = eventList.length > 0 ? eventList[eventList.length - 1].id : null;
+    }
+
     return {
       messages: slice,
       hasMore,
       olderCursor,
       newerCursor,
+      ...(isInitial ? { latestEventCursor } : {}),
     };
   }
 

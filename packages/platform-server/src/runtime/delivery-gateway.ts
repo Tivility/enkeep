@@ -18,6 +18,7 @@ import type {
   InternalRuntimeDispatchResult,
   TurnExecutionStatus,
   PublicEventCode,
+  DeliveryDispatchOptions,
 } from '@enkeep/web-channel';
 import {
   SqliteWebMessageStore,
@@ -30,6 +31,8 @@ import type { RuntimeFileApiService, TenantRuntimeFileProvider } from '../files/
 import { sniffMimeType } from '../files/file-transport-utils.js';
 import type { CanonicalAttachment, PublicMessageAttachment } from '@enkeep/protocol';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
+import { ModelSelectionService as ModelSelectionServiceImpl } from '../models/model-selection-service.js';
+import { parseChatCommand, ChatCommandService } from '../chat/chat-command-service.js';
 import { DELIVERY_ID_REGEX } from '@enkeep/platform-operations';
 
 export interface TurnExecutionResult {
@@ -71,7 +74,10 @@ export interface DeliveryExecutionRequest {
   readonly executionMode?: ExecutionMode;
   readonly mounts?: readonly RuntimeMountSpec[];
   readonly extensionPlan?: ExtensionActivationPlan | null;
+  readonly timeoutMs?: number;
 }
+
+export type { DeliveryDispatchOptions };
 
 export type InspectedTurnErrorCode =
   | 'EXECUTION_FAILED'
@@ -431,6 +437,7 @@ export interface DeliveryRuntimeGatewayOptions {
   fileService?: RuntimeFileApiService;
   fileProvider?: TenantRuntimeFileProvider;
   modelSelectionService?: ModelSelectionService;
+  chatCommandService?: ChatCommandService;
   externalInteractionService?: {
     listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
@@ -492,6 +499,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   private readonly fileService?: RuntimeFileApiService;
   private readonly fileProvider?: TenantRuntimeFileProvider;
   private readonly modelSelectionService?: ModelSelectionService;
+  private readonly chatCommandService?: ChatCommandService;
   private readonly externalInteractionService?: {
     listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
@@ -503,6 +511,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
   private readonly workerBootId: string;
   private readonly activeTasks = new Map<string, ActiveTurnTask>();
+  private readonly turnTimeouts = new Map<string, number>();
   private readonly settledErrors: Error[] = [];
   private readonly turnCompletedListeners = new Set<(event: {
     userId: string;
@@ -513,6 +522,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     idempotencyKey: string;
     executionResult: TurnExecutionResult;
     tokenUsage: { tokens: number };
+    executionMode?: 'runtime' | 'command';
   }) => Promise<void> | void>();
   private readonly turnFailedListeners = new Set<(event: {
     userId: string;
@@ -585,7 +595,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     this.profileResolver = options.profileResolver;
     this.fileService = options.fileService;
     this.fileProvider = options.fileProvider;
-    this.modelSelectionService = options.modelSelectionService;
+    this.modelSelectionService = options.modelSelectionService ?? (this.db ? new ModelSelectionServiceImpl({ db: this.db }) : undefined);
+    this.chatCommandService = options.chatCommandService ?? (this.modelSelectionService ? new ChatCommandService(this.modelSelectionService) : undefined);
     this.externalInteractionService = options.externalInteractionService;
     this.mountResolver = options.mountResolver;
 
@@ -628,6 +639,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
   public setExtensionResolver(resolver: ExtensionPlanResolver): void {
     this.extensionResolver = resolver;
+  }
+
+  public getFileProvider(): TenantRuntimeFileProvider | undefined {
+    return this.fileProvider;
   }
 
   private initLeaseTables(): void {
@@ -714,6 +729,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       idempotencyKey: string;
       executionResult: TurnExecutionResult;
       tokenUsage: { tokens: number };
+      executionMode?: 'runtime' | 'command';
     }) => Promise<void> | void
   ): void {
     this.turnCompletedListeners.add(listener);
@@ -729,6 +745,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       idempotencyKey: string;
       executionResult: TurnExecutionResult;
       tokenUsage: { tokens: number };
+      executionMode?: 'runtime' | 'command';
     }) => Promise<void> | void
   ): void {
     this.turnCompletedListeners.delete(listener);
@@ -772,13 +789,42 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     }
   }
 
-  async dispatchInbound(envelope: InboundEnvelope): Promise<InternalRuntimeDispatchResult> {
+  async dispatchInbound(
+    envelope: InboundEnvelope,
+    options?: DeliveryDispatchOptions
+  ): Promise<InternalRuntimeDispatchResult> {
     if (this.isDisposing) {
       throw new PlatformError(
         'Gateway is shutting down and cannot accept new turns.',
         'SHUTDOWN_IN_PROGRESS',
         503
       );
+    }
+
+    // Validate server-owned options if provided (failzero on invalid)
+    let requestedTimeoutMs: number | undefined;
+    if (options !== undefined) {
+      if (!options || typeof options !== 'object' || Array.isArray(options)) {
+        throw new ValidationError('Dispatch options must be a plain object');
+      }
+      for (const key of Object.keys(options)) {
+        if (key !== 'timeoutMs') {
+          throw new ValidationError(`Unrecognized dispatch option "${key}"`);
+        }
+      }
+      if (options.timeoutMs !== undefined) {
+        if (
+          typeof options.timeoutMs !== 'number' ||
+          !Number.isSafeInteger(options.timeoutMs) ||
+          options.timeoutMs <= 0 ||
+          options.timeoutMs > 900_000
+        ) {
+          throw new ValidationError(
+            'Dispatch timeoutMs must be a finite integer between 1 and 900000'
+          );
+        }
+        requestedTimeoutMs = options.timeoutMs;
+      }
     }
 
     if (!envelope || typeof envelope !== 'object') {
@@ -869,6 +915,19 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
     // Profile resolution pre-check: fail closed if profile snapshot is tampered/corrupted
     await this.profileResolver.resolve(userId, sessionId, currentGen);
+
+    // Chat command interception hook (before attachments, idempotency, and runtime dispatch)
+    const chatCmd = parseChatCommand(envelope.content);
+    if (chatCmd && this.chatCommandService) {
+      return await this.dispatchChatCommand({
+        envelope,
+        userId,
+        sessionId,
+        spaceId: authoritativeSpaceId,
+        idempotencyKey,
+        timestamp,
+      });
+    }
 
     // 0a. Process and validate attachments
     const canonicalAttachments = await this.processInboundAttachments(
@@ -995,6 +1054,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       timestamp,
       attachments: canonicalAttachments,
       replyToMessageId: envelope.replyToMessageId,
+      channelContext: envelope.channelContext,
     });
 
     const turnId = ingestResult.turnId;
@@ -1007,6 +1067,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         message: ingestResult.message,
         isDuplicate: true,
       };
+    }
+
+    if (requestedTimeoutMs !== undefined) {
+      this.turnTimeouts.set(turnId, requestedTimeoutMs);
     }
 
     // Compute queue position for this route in SQLite
@@ -1028,6 +1092,315 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       message: ingestResult.message,
       isDuplicate: false,
       queuePosition,
+      executionMode: 'runtime',
+    };
+  }
+
+  private async dispatchChatCommand(params: {
+    envelope: InboundEnvelope;
+    userId: string;
+    sessionId: string;
+    spaceId: string;
+    idempotencyKey: string;
+    timestamp: string;
+  }): Promise<InternalRuntimeDispatchResult> {
+    const { envelope, userId, sessionId, spaceId, idempotencyKey, timestamp } = params;
+    const incomingHash = computeCanonicalRequestHash(sessionId, envelope.content, undefined, envelope.replyToMessageId);
+
+    // 1. Preflight Idempotency Check
+    const existingIdemRow = this.db.prepare(`
+      SELECT session_id, request_hash, turn_id
+      FROM idempotency_records
+      WHERE user_id = ? AND idempotency_key = ?
+      LIMIT 1
+    `).get(userId, idempotencyKey) as {
+      session_id: string;
+      request_hash: string;
+      turn_id: string;
+    } | undefined;
+
+    if (existingIdemRow) {
+      if (existingIdemRow.session_id !== sessionId || existingIdemRow.request_hash !== incomingHash) {
+        throw new PlatformError(
+          'Idempotency-Key was already used with different request parameters or session.',
+          'IDEMPOTENCY_CONFLICT',
+          409
+        );
+      }
+
+      const msgRow = this.db.prepare(`
+        SELECT id, role, content, status, created_at
+        FROM web_messages
+        WHERE user_id = ? AND turn_id = ? AND role = 'user'
+        LIMIT 1
+      `).get(userId, existingIdemRow.turn_id) as {
+        id: string;
+        role: string;
+        content: string;
+        status: string;
+        created_at: string;
+      } | undefined;
+
+      if (!msgRow) {
+        throw new PlatformError(
+          'Database invariant violation: idempotency record exists without matching user message',
+          'INVARIANT_VIOLATION',
+          500
+        );
+      }
+
+      const userMessage: WebMessageRecord = {
+        id: msgRow.id,
+        role: 'user',
+        content: msgRow.content,
+        status: msgRow.status === 'delivered' ? 'delivered' : 'pending',
+        createdAt: msgRow.created_at,
+      };
+
+      return {
+        accepted: true,
+        turnId: existingIdemRow.turn_id,
+        message: userMessage,
+        isDuplicate: true,
+        executionMode: 'command',
+      };
+    }
+
+    // 2. Execute command
+    const { replyText } = await this.chatCommandService!.execute({
+      userId,
+      sessionId,
+      spaceId,
+      content: envelope.content,
+    });
+
+    // 3. Atomically persist synthetic turn in SQLite transaction
+    const turnId = generate32HexId('turn');
+    const userMessageId = generate32HexId('msg');
+    const assistantMessageId = generate32HexId('msg');
+    const userEventId = generate32HexId('evt');
+    const assistantEventId = generate32HexId('evt');
+    const deliveryId = envelope.id && DELIVERY_ID_REGEX.test(envelope.id)
+      ? envelope.id
+      : generate32HexId('deliv');
+    const idemId = generate32HexId('idem');
+    const inboxId = generate32HexId('inbox');
+    const runId = generate32HexId('run');
+    const routeKey = `${userId}:web:${spaceId}:${sessionId}`;
+    const nowIso = new Date().toISOString();
+    const userCreatedAt = timestamp || nowIso;
+    const assistantCreatedAt = new Date(Math.max(Date.now(), new Date(userCreatedAt).getTime() + 1)).toISOString();
+
+    const userMessageRecord: WebMessageRecord = {
+      id: userMessageId,
+      role: 'user',
+      content: envelope.content,
+      status: 'delivered',
+      createdAt: userCreatedAt,
+    };
+
+    const assistantMessageRecord: WebMessageRecord = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: replyText,
+      status: 'delivered',
+      createdAt: assistantCreatedAt,
+    };
+
+    let inTx = false;
+    this.db.exec('BEGIN IMMEDIATE');
+    inTx = true;
+    try {
+      // 3a. Insert completed idempotency record
+      this.db.prepare(`
+        INSERT INTO idempotency_records (
+          id, user_id, idempotency_key, session_id, delivery_id, turn_id, request_hash, state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+      `).run(
+        idemId,
+        userId,
+        idempotencyKey,
+        sessionId,
+        deliveryId,
+        turnId,
+        incomingHash,
+        userCreatedAt,
+        assistantCreatedAt
+      );
+
+      // 3b. Insert delivered inbox row
+      this.db.prepare(`
+        INSERT INTO delivery_inbox (
+          id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at, processed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'delivered', ?, ?, ?, ?)
+      `).run(
+        inboxId,
+        userId,
+        sessionId,
+        userMessageId,
+        deliveryId,
+        JSON.stringify({ content: envelope.content, timestamp: userCreatedAt }),
+        turnId,
+        userCreatedAt,
+        assistantCreatedAt,
+        assistantCreatedAt
+      );
+
+      // 3c. Insert completed turn_runs row with execution_mode = 'command'
+      this.db.prepare(`
+        INSERT INTO turn_runs (
+          id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, 'command', 'completed', ?, ?, ?)
+      `).run(
+        runId,
+        turnId,
+        spaceId,
+        sessionId,
+        userId,
+        userCreatedAt,
+        assistantCreatedAt,
+        assistantCreatedAt
+      );
+
+      // 3d. Insert user message into web_messages
+      this.db.prepare(`
+        INSERT INTO web_messages (
+          id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at
+        ) VALUES (?, ?, ?, 'user', ?, 'delivered', ?, ?, NULL, ?)
+      `).run(
+        userMessageId,
+        sessionId,
+        userId,
+        envelope.content,
+        routeKey,
+        turnId,
+        userCreatedAt
+      );
+
+      // 3e. Insert user message event into web_events
+      this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'message', ?, ?)
+      `).run(
+        userEventId,
+        sessionId,
+        userId,
+        JSON.stringify({ message: userMessageRecord }),
+        userCreatedAt
+      );
+
+      // 3f. Insert assistant message into web_messages
+      this.db.prepare(`
+        INSERT INTO web_messages (
+          id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at
+        ) VALUES (?, ?, ?, 'assistant', ?, 'delivered', ?, ?, NULL, ?)
+      `).run(
+        assistantMessageId,
+        sessionId,
+        userId,
+        replyText,
+        routeKey,
+        turnId,
+        assistantCreatedAt
+      );
+
+      // 3g. Insert assistant message event into web_events
+      this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'message', ?, ?)
+      `).run(
+        assistantEventId,
+        sessionId,
+        userId,
+        JSON.stringify({ message: assistantMessageRecord }),
+        assistantCreatedAt
+      );
+
+      // 3h. If channelContext provided (e.g. Lark), insert channel_turn_origins
+      if (envelope.channelContext) {
+        const {
+          channel,
+          accountId,
+          chatId,
+          nativeContextId,
+          nativeEventId,
+          replyToMessageId: originReplyToMessageId,
+          rootId,
+          threadId,
+          originTurnId,
+        } = envelope.channelContext;
+
+        this.db.prepare(`
+          INSERT INTO channel_turn_origins (
+            turn_id, user_id, session_id, account_id, channel, chat_id,
+            native_context_id, native_event_id, reply_to_message_id, root_id, thread_id, origin_turn_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          turnId,
+          userId,
+          sessionId,
+          accountId,
+          channel,
+          chatId,
+          nativeContextId,
+          nativeEventId ?? null,
+          originReplyToMessageId ?? null,
+          rootId ?? null,
+          threadId ?? null,
+          originTurnId ?? null,
+          userCreatedAt
+        );
+      }
+
+      this.db.exec('COMMIT');
+      inTx = false;
+    } catch (txErr) {
+      if (inTx) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch (rbErr) {
+          throw new AggregateError([txErr, rbErr], 'Transaction rollback failed in dispatchChatCommand');
+        }
+      }
+      throw txErr;
+    }
+
+    // 4. Notify turnCompletedListeners safely outside transaction (e.g. Lark outbound)
+    const executionResult: TurnExecutionResult = {
+      replyText,
+      usage: { totalTokens: 0 },
+    };
+    const tokenUsage = { tokens: 0 };
+
+    for (const listener of this.turnCompletedListeners) {
+      try {
+        const res = listener({
+          userId,
+          sessionId,
+          spaceId,
+          turnId,
+          deliveryId,
+          idempotencyKey,
+          executionResult,
+          tokenUsage,
+          executionMode: 'command',
+        });
+        if (res && typeof (res as Promise<void>).catch === 'function') {
+          (res as Promise<void>).catch((listenerErr) => {
+            this.recordSettledError(listenerErr);
+          });
+        }
+      } catch (listenerErr) {
+        this.recordSettledError(listenerErr);
+      }
+    }
+
+    return {
+      accepted: true,
+      turnId,
+      message: userMessageRecord,
+      isDuplicate: false,
+      executionMode: 'command',
     };
   }
 
@@ -1653,6 +2026,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
           }
 
+          const timeoutMs = this.turnTimeouts.get(turnId) ?? 300_000;
           const executionRequest: DeliveryExecutionRequest = {
             userId,
             platformSpaceId: spaceId,
@@ -1667,6 +2041,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             executionMode: spaceExecutionMode,
             mounts: spaceMounts,
             extensionPlan: spaceExtensionPlan,
+            timeoutMs,
           };
 
           executionResult = await this.executor.execute(executionRequest);
@@ -1684,6 +2059,18 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             throw new ValidationError('Assistant replyText exceeds maximum allowed size (64 KiB)');
           }
         } catch (execErr) {
+          // Explicitly signal cancel to the executor for this exact turn to terminate orphaned daemon/host processes
+          try {
+            await Promise.race([
+              this.executor.cancel(userId, turnId),
+              new Promise((resolve) => setTimeout(resolve, 5000)),
+            ]);
+          } catch (cancelErr) {
+            console.warn('[delivery-gateway] failed to cancel turn on executor execution failure', {
+              turnId,
+              error: cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
+            });
+          }
           await this.persistExecutionFailure({
             userId,
             sessionId,
@@ -1767,6 +2154,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           clearInterval(heartbeatTimer);
         }
         this.activeTasks.delete(turnId);
+        this.turnTimeouts.delete(turnId);
         // Wake scheduler to claim next turn in line
         this.notifyScheduler();
       }
@@ -1997,6 +2385,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             idempotencyKey,
             executionResult,
             tokenUsage,
+            executionMode: 'runtime',
           });
           if (res && typeof (res as Promise<void>).catch === 'function') {
             (res as Promise<void>).catch((listenerErr) => {
@@ -2647,6 +3036,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         this.db.exec('COMMIT');
         inTx = false;
 
+        this.turnTimeouts.delete(turnId);
         this.notifyScheduler();
         return true;
       } catch (err) {
@@ -2746,6 +3136,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         this.db.exec('COMMIT');
         inTx = false;
 
+        this.turnTimeouts.delete(turnId);
         this.notifyScheduler();
         return true;
       } catch (err) {
@@ -3212,6 +3603,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       this.schedulerLoopTimer = undefined;
     }
     await this.drain(5000);
+    this.turnTimeouts.clear();
   }
 
   private queryAttachmentsByMessageId(

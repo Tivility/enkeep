@@ -14,13 +14,13 @@ export type TaskPriority = typeof TASK_PRIORITIES[number];
 
 export type AgentPromptSessionPolicy = 'existing_session';
 
-export const TASK_ID_REGEX = /^task_[0-9a-f]{32}$/;
+export const TASK_ID_REGEX = /^(?:task_[0-9a-f]{32}|task_hpc_[0-9a-f]{24})$/;
 export const SCHEDULE_ID_REGEX = /^sched_[0-9a-f]{32}$/;
 export const RUN_ID_REGEX = /^run_[0-9a-f]{32}$/;
 export const TURN_ID_REGEX = /^turn_[0-9a-f]{32}$/;
 export const MESSAGE_ID_REGEX = /^msg_[0-9a-f]{32}$/;
 export const SESSION_ID_REGEX = /^(?:ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
-export const SPACE_ID_REGEX = /^spc_[0-9a-f]{32}$/;
+export const SPACE_ID_REGEX = /^(?:spc_[0-9a-f]{32}|impsp_[0-9a-f]{64})$/;
 export const IDEMPOTENCY_KEY_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -52,6 +52,9 @@ export const ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS = new Set([
   'sessionId',
   'sessionPolicy',
   'spaceId',
+  'spaceFolder',
+  'delivery',
+  'silent',
 ]);
 
 export const ALLOWED_AGENT_PROMPT_RESULT_KEYS = new Set([
@@ -202,12 +205,39 @@ export function validateTaskPriority(priority: unknown): TaskPriority {
   return priority as TaskPriority;
 }
 
+export interface TaskDeliveryTarget {
+  channel: 'lark' | string;
+  accountId: string;
+  nativeContextId: string;
+}
+
 export interface AgentPromptTaskPayload {
   type: 'agent_prompt';
   prompt: string;
   sessionId: string;
   sessionPolicy: 'existing_session';
   spaceId?: string;
+  spaceFolder?: string;
+  delivery?: TaskDeliveryTarget;
+  silent?: boolean;
+}
+
+export const SPACE_FOLDER_REGEX = /^[a-zA-Z0-9._-]+$/;
+
+export function validateSpaceFolder(folder: unknown): string {
+  if (
+    typeof folder !== 'string' ||
+    folder.length === 0 ||
+    folder !== folder.trim() ||
+    folder.length > 128 ||
+    !SPACE_FOLDER_REGEX.test(folder) ||
+    folder === '.' ||
+    folder === '..' ||
+    folder.includes('..')
+  ) {
+    throw new ValidationError('Invalid space folder format');
+  }
+  return folder;
 }
 
 export function validateAgentPromptPayload(payload: unknown): AgentPromptTaskPayload {
@@ -249,12 +279,53 @@ export function validateAgentPromptPayload(payload: unknown): AgentPromptTaskPay
     spaceId = validateSpaceId(obj.spaceId);
   }
 
+  let spaceFolder: string | undefined;
+  if (obj.spaceFolder !== undefined) {
+    spaceFolder = validateSpaceFolder(obj.spaceFolder);
+  }
+
+  let silent: boolean | undefined;
+  if (obj.silent !== undefined) {
+    if (typeof obj.silent !== 'boolean') {
+      throw new ValidationError('Task payload silent must be a boolean');
+    }
+    silent = obj.silent;
+  }
+
+  let delivery: TaskDeliveryTarget | undefined;
+  if (obj.delivery !== undefined && obj.delivery !== null) {
+    if (silent === true) {
+      throw new ValidationError('Task payload cannot specify both silent=true and a delivery target');
+    }
+    if (typeof obj.delivery !== 'object' || Array.isArray(obj.delivery)) {
+      throw new ValidationError('Task payload delivery must be an object');
+    }
+    const del = obj.delivery as Record<string, unknown>;
+    if (typeof del.channel !== 'string' || !del.channel.trim()) {
+      throw new ValidationError('Task payload delivery channel must be a non-empty string');
+    }
+    if (typeof del.accountId !== 'string' || !del.accountId.trim()) {
+      throw new ValidationError('Task payload delivery accountId must be a non-empty string');
+    }
+    if (typeof del.nativeContextId !== 'string' || !del.nativeContextId.trim()) {
+      throw new ValidationError('Task payload delivery nativeContextId must be a non-empty string');
+    }
+    delivery = {
+      channel: del.channel.trim(),
+      accountId: del.accountId.trim(),
+      nativeContextId: del.nativeContextId.trim(),
+    };
+  }
+
   return {
     type: 'agent_prompt',
     prompt: obj.prompt,
     sessionId,
     sessionPolicy: 'existing_session',
     ...(spaceId !== undefined ? { spaceId } : {}),
+    ...(spaceFolder !== undefined ? { spaceFolder } : {}),
+    ...(delivery !== undefined ? { delivery } : {}),
+    ...(silent !== undefined ? { silent } : {}),
   };
 }
 

@@ -868,6 +868,9 @@ importers:
       '@deepseek-ai/dsh-agent-loop':
         specifier: 0.1.2-rc.1
         version: 0.1.2-rc.1(b439f35cbe316bcb469bc5c5afd8b06f)
+      '@deepseek-ai/dsh-attachment':
+        specifier: 0.1.2-rc.1
+        version: 0.1.2-rc.1(@deepseek-ai/cordis@4.0.2)(@deepseek-ai/dsh-brand@0.1.2-rc.1(@deepseek-ai/cordis@4.0.2))
       '@deepseek-ai/dsh-bash-local':
         specifier: 0.1.2-rc.1
         version: 0.1.2-rc.1(bc13a0a8cb6e26511125726b5aa577a7)
@@ -1021,6 +1024,9 @@ importers:
       '@enkeep/dsh-mcp-governance':
         specifier: workspace:*
         version: link:../dsh-mcp-governance
+      '@enkeep/dsh-memory':
+        specifier: workspace:*
+        version: link:../dsh-memory
       '@enkeep/dsh-platform-client':
         specifier: workspace:*
         version: link:../dsh-platform-client

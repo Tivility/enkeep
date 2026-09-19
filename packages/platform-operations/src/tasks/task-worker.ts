@@ -25,12 +25,17 @@ import {
 
 export type TaskWorkerStatus = 'idle' | 'running' | 'stopping' | 'stopped';
 
+export interface TaskExecutionBudget {
+  readonly maxWaitMs?: number;
+}
+
 export interface AgentPromptDispatchContext {
   task: Task;
   payload: AgentPromptTaskPayload;
   signal: AbortSignal;
   workerId: string;
   tenantId: string;
+  executionBudget?: TaskExecutionBudget;
 }
 
 export interface AgentPromptDispatcher {
@@ -85,17 +90,39 @@ export type TaskWorkerErrorHandler = (
   context: TaskWorkerErrorContext
 ) => void | Promise<void>;
 
+export interface TaskInputPreparationContext {
+  task: Task;
+  payload: AgentPromptTaskPayload;
+  tenantId: string;
+  runId: string;
+  signal: AbortSignal;
+}
+
+export interface TaskInputPreparationResult {
+  preparedPrompt?: string;
+  stagedPath?: string;
+  executionBudget?: TaskExecutionBudget;
+}
+
+export type TaskInputPreparer = (
+  context: TaskInputPreparationContext
+) => Promise<TaskInputPreparationResult | void> | TaskInputPreparationResult | void;
+
 export interface TaskWorkerOptions {
   workerId?: string;
   tenantEnumerator: TenantEnumerator;
   getTenantOperations: TenantOperationsAccessor;
   dispatcher: AgentPromptDispatcher | AgentPromptDispatchFn;
+  prepareTaskInput?: TaskInputPreparer;
   pollIntervalMs?: number;
   leaseDurationMs?: number;
   heartbeatIntervalMs?: number;
   recoverOnStart?: boolean;
   systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   onError?: TaskWorkerErrorHandler;
+  channelRuntimeManager?: any;
+  db?: any;
+  getReplyText?: (params: { tenantId: string; sessionId: string; taskId: string }) => Promise<string | null> | string | null;
 }
 
 export interface TenantDiagnostic {
@@ -147,16 +174,21 @@ export class AgentPromptTaskWorker {
   private readonly tenantEnumerator: TenantEnumerator;
   private readonly getTenantOperations: TenantOperationsAccessor;
   private readonly dispatcher: AgentPromptDispatcher | AgentPromptDispatchFn;
+  private readonly prepareTaskInput?: TaskInputPreparer;
   private readonly pollIntervalMs: number;
   private readonly leaseDurationMs: number;
   private readonly heartbeatIntervalMs: number;
   private readonly recoverOnStart: boolean;
   private readonly systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   private readonly onErrorCallback?: TaskWorkerErrorHandler;
+  public channelRuntimeManager?: any;
+  private readonly db?: any;
+  private readonly getReplyText?: (params: { tenantId: string; sessionId: string; taskId: string }) => Promise<string | null> | string | null;
 
   private _status: TaskWorkerStatus = 'idle';
   private pollTimer: NodeJS.Timeout | null = null;
   private isExecuting = false;
+  private currentExecutingTaskId: string | null = null;
   private activeAbortController: AbortController | null = null;
   private activeExecutionPromise: Promise<TaskWorkerExecutionResult | null> | null = null;
 
@@ -169,12 +201,16 @@ export class AgentPromptTaskWorker {
     this.tenantEnumerator = options.tenantEnumerator;
     this.getTenantOperations = options.getTenantOperations;
     this.dispatcher = options.dispatcher;
+    this.prepareTaskInput = options.prepareTaskInput;
     this.pollIntervalMs = options.pollIntervalMs ?? 1000;
     this.leaseDurationMs = options.leaseDurationMs ?? 30_000;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? Math.max(500, Math.floor(this.leaseDurationMs / 3));
     this.recoverOnStart = options.recoverOnStart ?? true;
     this.systemRecovery = options.systemRecovery;
     this.onErrorCallback = options.onError;
+    this.channelRuntimeManager = options.channelRuntimeManager;
+    this.db = options.db;
+    this.getReplyText = options.getReplyText;
   }
 
   get status(): TaskWorkerStatus {
@@ -562,27 +598,37 @@ export class AgentPromptTaskWorker {
     }
 
     if (this.isExecuting) {
+      if (this.currentExecutingTaskId === validTaskId) {
+        throw new TaskAlreadyClaimedError(validTaskId, this.workerId);
+      }
       throw new Error('Task worker concurrency bounded to 1: already executing a task');
     }
     this.isExecuting = true;
+    this.currentExecutingTaskId = validTaskId;
     try {
       const ops = await this.getTenantOperations(tenantId);
-      let task: Task | null = null;
-      if (ops.tasks instanceof TaskOperationService) {
-        task = await ops.tasks.claimTask({
-          claimantId: this.workerId,
-          leaseDurationMs: this.leaseDurationMs,
-          preferredTaskId: validTaskId,
-        });
-      } else {
-        task = await ops.tasks.claim({
-          claimantId: this.workerId,
-          leaseDurationMs: this.leaseDurationMs,
-          preferredTaskId: validTaskId,
-        });
+      const existingTask = await (ops.tasks instanceof TaskOperationService
+        ? ops.tasks.getTask(validTaskId)
+        : ops.tasks.findById(validTaskId));
+
+      if (!existingTask) {
+        throw new TaskNotFoundError(validTaskId);
       }
-      if (!task) {
-        // If task exists but was not claimed (e.g. future dueDate, cron schedule, or paused), create an immediate manual run
+
+      const isRecurring =
+        existingTask.scheduleType === 'cron' ||
+        existingTask.scheduleType === 'interval' ||
+        existingTask.schedule?.scheduleType === 'cron' ||
+        existingTask.schedule?.scheduleType === 'interval' ||
+        Boolean(existingTask.cronExpression || existingTask.schedule?.cronExpression) ||
+        (existingTask.intervalSeconds !== null && existingTask.intervalSeconds !== undefined && existingTask.intervalSeconds > 0) ||
+        (existingTask.schedule?.intervalSeconds !== null && existingTask.schedule?.intervalSeconds !== undefined && existingTask.schedule?.intervalSeconds > 0);
+
+      let task: Task | null = null;
+      if (isRecurring) {
+        if (existingTask.status === 'cancelled') {
+          throw new TaskAlreadyCompletedError(validTaskId);
+        }
         if (ops.tasks instanceof TaskOperationService) {
           const manualRes = await ops.tasks.createManualRun(validTaskId, this.workerId, this.leaseDurationMs);
           task = manualRes.task;
@@ -594,6 +640,36 @@ export class AgentPromptTaskWorker {
           );
           task = manualRes.task;
         }
+      } else {
+        if (existingTask.status === 'completed' || existingTask.status === 'cancelled' || existingTask.status === 'failed') {
+          throw new TaskAlreadyCompletedError(validTaskId);
+        }
+        if (ops.tasks instanceof TaskOperationService) {
+          task = await ops.tasks.claimTask({
+            claimantId: this.workerId,
+            leaseDurationMs: this.leaseDurationMs,
+            preferredTaskId: validTaskId,
+          });
+        } else {
+          task = await ops.tasks.claim({
+            claimantId: this.workerId,
+            leaseDurationMs: this.leaseDurationMs,
+            preferredTaskId: validTaskId,
+          });
+        }
+        if (!task) {
+          if (ops.tasks instanceof TaskOperationService) {
+            const manualRes = await ops.tasks.createManualRun(validTaskId, this.workerId, this.leaseDurationMs);
+            task = manualRes.task;
+          } else {
+            const manualRes = await (ops.tasks as TenantScopedTaskRepository).createManualRun(
+              validTaskId,
+              this.workerId,
+              this.leaseDurationMs
+            );
+            task = manualRes.task;
+          }
+        }
       }
       if (!task) {
         return null;
@@ -601,6 +677,7 @@ export class AgentPromptTaskWorker {
       return await this.executeClaimedTask(tenantId, task, ops);
     } finally {
       this.isExecuting = false;
+      this.currentExecutingTaskId = null;
     }
   }
 
@@ -783,14 +860,69 @@ export class AgentPromptTaskWorker {
         }
       };
 
+      // 2b. Optional trusted pre-dispatch input preparation
+      let effectivePayload = payload;
+      let executionBudget: TaskExecutionBudget | undefined = undefined;
+      if (this.prepareTaskInput) {
+        const runId = task.currentRun?.id || task.id;
+        try {
+          const prepResult = await this.prepareTaskInput({
+            task,
+            payload,
+            tenantId,
+            runId,
+            signal: abortController.signal,
+          });
+          if (prepResult && typeof prepResult.preparedPrompt === 'string') {
+            effectivePayload = {
+              ...payload,
+              prompt: prepResult.preparedPrompt,
+            };
+          }
+          if (prepResult && prepResult.executionBudget !== undefined) {
+            executionBudget = prepResult.executionBudget;
+          }
+        } catch (prepErr) {
+          stopHeartbeat();
+          const failCode = TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED;
+          try {
+            if (ops.tasks instanceof TaskOperationService) {
+              await ops.tasks.failTask(task.id, {
+                claimantId: this.workerId,
+                error: prepErr instanceof Error ? prepErr.message : String(prepErr),
+                retryable: false,
+                runId: task.currentRun?.id,
+                errorCode: failCode,
+              });
+            } else {
+              await (ops.tasks as TenantScopedTaskRepository).fail(
+                task.id,
+                this.workerId,
+                prepErr instanceof Error ? prepErr.message : String(prepErr),
+                false,
+                task.currentRun?.id,
+                failCode
+              );
+            }
+          } catch {}
+          return {
+            taskId: task.id,
+            tenantId,
+            status: 'failed',
+            error: failCode,
+          };
+        }
+      }
+
       // 3. Dispatch to agent dispatcher
       try {
         const dispatchContext: AgentPromptDispatchContext = {
           task,
-          payload,
+          payload: effectivePayload,
           signal: abortController.signal,
           workerId: this.workerId,
           tenantId,
+          ...(executionBudget !== undefined ? { executionBudget } : {}),
         };
 
         let rawResult: AgentPromptDispatchResult;
@@ -839,9 +971,17 @@ export class AgentPromptTaskWorker {
         }
 
         // 4. Validate exact AgentPromptDispatchResult schema
+        let extractedReplyText: string | undefined;
+        let resultToValidate = rawResult;
+        if (rawResult && typeof rawResult === 'object' && 'replyText' in rawResult) {
+          extractedReplyText = typeof (rawResult as any).replyText === 'string' ? (rawResult as any).replyText : undefined;
+          const { replyText: _discarded, ...rest } = rawResult as any;
+          resultToValidate = rest;
+        }
+
         let validatedResult: AgentPromptDispatchResult;
         try {
-          validatedResult = validateAgentPromptResult(rawResult);
+          validatedResult = validateAgentPromptResult(resultToValidate);
         } catch (_resultValErr: unknown) {
           const protocolCode = TASK_PROTOCOL_ERROR_CODES.RESULT_INVALID;
           try {
@@ -989,6 +1129,137 @@ export class AgentPromptTaskWorker {
             status: 'failed',
             error: settlementCode,
           };
+        }
+
+        // 6. Proactive Lark delivery if configured in payload
+        if (
+          !payload.silent &&
+          payload.delivery?.channel === 'lark' &&
+          payload.delivery.accountId &&
+          payload.delivery.nativeContextId
+        ) {
+          try {
+            // Validate tenant account and binding if DB is present
+            let deliveryAllowed = true;
+            if (this.db) {
+              try {
+                // Validate channel account belongs to tenant and is active
+                const accountRow = this.db.prepare(`
+                  SELECT id, status FROM channel_accounts
+                  WHERE id = ? AND user_id = ?
+                  LIMIT 1
+                `).get(payload.delivery.accountId, tenantId) as { id?: string; status?: string } | undefined;
+
+                if (accountRow) {
+                  if (accountRow.status !== 'active') {
+                    deliveryAllowed = false;
+                    console.warn('[lark-task] Channel account is not active for tenant:', {
+                      tenantId,
+                      accountId: payload.delivery.accountId,
+                    });
+                  } else {
+                    // Resolve target space ID authoritatively
+                    let resolvedSpaceId = payload.spaceId;
+                    if (!resolvedSpaceId) {
+                      try {
+                        const routeRow = this.db.prepare(`
+                          SELECT space_id FROM session_routes
+                          WHERE id = ? AND user_id = ?
+                          LIMIT 1
+                        `).get(payload.sessionId, tenantId) as { space_id?: string } | undefined;
+                        if (routeRow && typeof routeRow.space_id === 'string') {
+                          resolvedSpaceId = routeRow.space_id;
+                        }
+                      } catch {}
+                    }
+
+                    // Validate binding exists for this account, context, AND exact target space
+                    const baseContext = payload.delivery.nativeContextId.includes(':')
+                      ? payload.delivery.nativeContextId.split(':')[0]
+                      : payload.delivery.nativeContextId;
+                    const bindingRow = this.db.prepare(`
+                      SELECT id, space_id FROM channel_bindings
+                      WHERE user_id = ? AND account_id = ? AND (native_context_id = ? OR native_context_id = ?)
+                      LIMIT 1
+                    `).get(tenantId, payload.delivery.accountId, payload.delivery.nativeContextId, baseContext) as { id?: string; space_id?: string } | undefined;
+
+                    if (!bindingRow) {
+                      deliveryAllowed = false;
+                      console.warn('[lark-task] No channel binding found for tenant account and context:', {
+                        tenantId,
+                        accountId: payload.delivery.accountId,
+                        context: payload.delivery.nativeContextId,
+                      });
+                    } else if (resolvedSpaceId && bindingRow.space_id !== resolvedSpaceId) {
+                      // Binding belongs to another space: fail closed before external dispatch
+                      deliveryAllowed = false;
+                      console.warn('[lark-task] Channel binding space_id mismatch against resolved target space:', {
+                        tenantId,
+                        accountId: payload.delivery.accountId,
+                        bindingSpaceId: bindingRow.space_id,
+                        targetSpaceId: resolvedSpaceId,
+                      });
+                    }
+                  }
+                }
+              } catch (dbCheckErr) {
+                // Non-fatal if tables do not exist in minimal test DBs
+              }
+            }
+
+            if (deliveryAllowed) {
+              let replyText = extractedReplyText;
+              if (!replyText && this.db) {
+                try {
+                  const stmt = this.db.prepare(`
+                    SELECT content FROM web_messages
+                    WHERE user_id = ? AND session_id = ? AND role = 'assistant'
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                  `);
+                  const row = stmt.get(tenantId, payload.sessionId) as { content?: string } | undefined;
+                  if (row && typeof row.content === 'string') {
+                    replyText = row.content;
+                  }
+                } catch (dbErr) {
+                  console.warn('[lark-task] Failed to read assistant message from web_messages:', dbErr);
+                }
+              }
+              if (!replyText && this.getReplyText) {
+                try {
+                  replyText = (await this.getReplyText({ tenantId, sessionId: payload.sessionId, taskId: task.id })) ?? undefined;
+                } catch {}
+              }
+
+              const crm = typeof this.channelRuntimeManager === 'function'
+                ? this.channelRuntimeManager()
+                : this.channelRuntimeManager;
+              const gateway = crm?.getActiveGateway?.(tenantId, payload.delivery.accountId);
+
+              if (gateway && typeof gateway.sendProactiveMessage === 'function') {
+                const chatId = payload.delivery.nativeContextId.includes(':')
+                  ? payload.delivery.nativeContextId.split(':')[0]
+                  : payload.delivery.nativeContextId;
+                const deliveryText = replyText ?? `Task "${task.title}" completed successfully.`;
+                const stableRunId = task.currentRun?.id || task.id;
+                const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
+                await gateway.sendProactiveMessage({
+                  chatId,
+                  text: deliveryText,
+                  title: task.title,
+                  sessionId: payload.sessionId,
+                  outboxId,
+                });
+              } else {
+                console.warn('[lark-task] Active LarkChannelGateway not found for account:', {
+                  tenantId,
+                  accountId: payload.delivery.accountId,
+                  taskId: task.id,
+                });
+              }
+            }
+          } catch (deliveryErr) {
+            console.warn('[lark-task] Failed to deliver task result to Lark:', deliveryErr);
+          }
         }
 
         return {

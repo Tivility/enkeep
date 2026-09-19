@@ -491,6 +491,7 @@ describe('Enkeep Space and Session Lifecycle Platform Service Tests', () => {
       // Reusing same Idempotency-Key on a DIFFERENT session throws 409 Conflict
       const session2 = await adapter.createSession(tenantAlice, {
         spaceId: space.id,
+        forceNew: true,
       });
 
       await expect(

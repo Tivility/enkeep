@@ -23,8 +23,10 @@ import {
   type LarkSdkClientFactory,
   type LarkTransport,
   type StreamEventSource,
+  type LarkImageAttachmentIngestor,
 } from '@enkeep/channel-lark';
 import { SqliteStreamEventSource } from './sqlite-stream-event-source.js';
+import { TenantScopedLarkImageIngestor } from './lark-image-ingestor.js';
 
 export type LarkTransportFactory = (
   account: ChannelAccount,
@@ -44,6 +46,7 @@ export interface ChannelRuntimeManagerOptions {
   transportFactory?: LarkTransportFactory;
   defaultSpaceResolver?: LarkDefaultSpaceResolver;
   streamEventSource?: StreamEventSource;
+  imageAttachmentIngestor?: LarkImageAttachmentIngestor;
   autoStart?: boolean;
   workerIntervalMs?: number;
 }
@@ -56,6 +59,7 @@ export class ChannelRuntimeManager {
   private readonly transportFactory?: LarkTransportFactory;
   private readonly defaultSpaceResolver?: LarkDefaultSpaceResolver;
   private readonly streamEventSource?: StreamEventSource;
+  private readonly imageAttachmentIngestor?: LarkImageAttachmentIngestor;
   private readonly workerIntervalMs: number;
   private readonly activeGateways = new Map<string, LarkChannelGateway>(); // key: `${userId}:${accountId}`
   private readonly activeAccounts = new Map<string, ChannelAccount>(); // key: `${userId}:${accountId}`
@@ -94,6 +98,14 @@ export class ChannelRuntimeManager {
     this.defaultSpaceResolver = options.defaultSpaceResolver;
     this.streamEventSource = options.streamEventSource;
     this.workerIntervalMs = options.workerIntervalMs ?? 2500;
+    if (options.imageAttachmentIngestor) {
+      this.imageAttachmentIngestor = options.imageAttachmentIngestor;
+    } else {
+      const fp = this.deliveryGateway.getFileProvider();
+      if (fp) {
+        this.imageAttachmentIngestor = new TenantScopedLarkImageIngestor({ fileProvider: fp });
+      }
+    }
   }
 
   get running(): boolean {
@@ -220,12 +232,17 @@ export class ChannelRuntimeManager {
         } catch {}
 
         // 2. Retry held/failed inbox items (bounded batch 10, ordered by updated_at ASC to rotate)
+        // Exclude items marked terminal in payload_json, and respect transient backoff delay
         try {
           const recoverableInbox = this.db.prepare(`
-            SELECT ci.id, ci.user_id, ci.account_id, ci.native_event_id, ci.native_context_id, ci.payload_json
+            SELECT ci.id, ci.user_id, ci.account_id, ci.native_event_id, ci.native_context_id, ci.payload_json, ci.status
             FROM channel_inbox ci
             JOIN channel_accounts ca ON ca.id = ci.account_id AND ca.status = 'active' AND ca.type = 'lark'
             WHERE ci.status IN ('held', 'failed')
+              AND (
+                json_extract(ci.payload_json, '$.retry.terminal') IS NULL
+                OR json_extract(ci.payload_json, '$.retry.terminal') != 1
+              )
             ORDER BY ci.updated_at ASC
             LIMIT 10
           `).all() as Array<{
@@ -235,17 +252,41 @@ export class ChannelRuntimeManager {
             native_event_id: string;
             native_context_id: string;
             payload_json: string;
+            status: string;
           }>;
 
           for (const item of recoverableInbox) {
             if (!this.isRunning || this.isDisposing) break;
+
+            let parsedPayload: any;
+            try {
+              parsedPayload = JSON.parse(item.payload_json);
+            } catch {
+              continue;
+            }
+
+            // Exclude terminal failed entries and check bounded retry attempts & backoff
+            if (item.status === 'failed') {
+              const retryMeta = parsedPayload?.retry;
+              if (retryMeta) {
+                if (retryMeta.terminal === true || retryMeta.retryable === false) {
+                  continue;
+                }
+                if (typeof retryMeta.attempts === 'number' && retryMeta.attempts >= (retryMeta.maxAttempts ?? 3)) {
+                  continue;
+                }
+                if (retryMeta.nextRetryAt && new Date(retryMeta.nextRetryAt).getTime() > Date.now()) {
+                  continue; // Backoff not elapsed yet
+                }
+              }
+            }
+
             // Touch updated_at to rotate priority and prevent poison pills from starving queue
             this.db.prepare(`UPDATE channel_inbox SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(item.id);
 
             const gateway = this.getActiveGateway(item.user_id, item.account_id);
             if (gateway) {
               try {
-                const parsedPayload = JSON.parse(item.payload_json);
                 const rawEvent = parsedPayload.rawEvent || parsedPayload;
                 await gateway.handleInboundEvent(rawEvent);
               } catch {}
@@ -283,42 +324,58 @@ export class ChannelRuntimeManager {
     idempotencyKey: string;
     executionResult: { replyText: string };
     tokenUsage: { tokens: number };
+    executionMode?: 'runtime' | 'command';
   }): Promise<void> {
     if (!this.isRunning || this.isDisposing) return;
 
     const { userId, sessionId, turnId, idempotencyKey, executionResult } = event;
-
-    // 1. Resolve session route from database to see if it's a channel session
     const tenant = this.storage.forTenant(userId);
     const route = await tenant.sessionRoutes.findById(sessionId);
-    if (!route || route.channel !== 'lark') {
-      // Not a lark channel session; ignore
-      return;
-    }
 
-    const accountId = route.accountId;
-
-    // 2. Turn Origin Check: Verify that this turn is strictly tied to an inbound Lark event
-    const expectedPrefix = `idem_lark_${accountId}_`;
+    // 1. Resolve turn origin: check channel_turn_origins or idempotencyKey prefix
+    let accountId: string | undefined;
     let nativeEventId: string | undefined;
 
-    if (idempotencyKey && idempotencyKey.startsWith(expectedPrefix)) {
-      nativeEventId = idempotencyKey.slice(expectedPrefix.length);
-    }
-
-    // Fallback lookup in idempotency_records if needed
-    if (!nativeEventId && this.db) {
+    if (this.db) {
       try {
-        const row = this.db.prepare(
-          'SELECT idempotency_key FROM idempotency_records WHERE turn_id = ? AND user_id = ? LIMIT 1'
-        ).get(turnId, userId) as { idempotency_key?: string } | undefined;
-        if (row?.idempotency_key && row.idempotency_key.startsWith(expectedPrefix)) {
-          nativeEventId = row.idempotency_key.slice(expectedPrefix.length);
+        const originRow = this.db.prepare(
+          'SELECT account_id, channel, native_event_id FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? LIMIT 1'
+        ).get(turnId, userId) as { account_id?: string; channel?: string; native_event_id?: string } | undefined;
+        if (originRow && originRow.channel === 'lark' && originRow.account_id) {
+          accountId = originRow.account_id;
+          nativeEventId = originRow.native_event_id || undefined;
         }
       } catch {}
     }
 
-    if (!nativeEventId) {
+    if (!accountId && idempotencyKey) {
+      const match = idempotencyKey.match(/^idem_lark_([^_]+)_(.+)$/);
+      if (match) {
+        accountId = match[1];
+        nativeEventId = match[2];
+      }
+    }
+
+    if (!accountId && this.db) {
+      try {
+        const row = this.db.prepare(
+          'SELECT idempotency_key FROM idempotency_records WHERE turn_id = ? AND user_id = ? LIMIT 1'
+        ).get(turnId, userId) as { idempotency_key?: string } | undefined;
+        if (row?.idempotency_key) {
+          const match = row.idempotency_key.match(/^idem_lark_([^_]+)_(.+)$/);
+          if (match) {
+            accountId = match[1];
+            nativeEventId = match[2];
+          }
+        }
+      } catch {}
+    }
+
+    if (!accountId && route && route.channel === 'lark') {
+      accountId = route.accountId;
+    }
+
+    if (!accountId || !nativeEventId) {
       // Not an inbound Lark message turn (e.g. manual Web message in same session); do NOT send to Lark
       return;
     }
@@ -363,12 +420,13 @@ export class ChannelRuntimeManager {
       turnId,
       replyText: executionResult.replyText,
       idempotencyKey: idempotencyKey || `idem_lark_${accountId}_${nativeEventId}`,
-      nativeContextId: route.nativeContextId,
+      nativeContextId: route?.nativeContextId || '',
       replyToMessageId,
       rootId,
       threadId,
       chatId,
       nativeEventId,
+      executionMode: event.executionMode,
     });
   }
 
@@ -389,37 +447,53 @@ export class ChannelRuntimeManager {
     if (!this.isRunning || this.isDisposing) return;
 
     const { userId, sessionId, turnId, idempotencyKey, code, reason } = event;
-
-    // 1. Resolve session route from database to see if it's a channel session
     const tenant = this.storage.forTenant(userId);
     const route = await tenant.sessionRoutes.findById(sessionId);
-    if (!route || route.channel !== 'lark') {
-      return;
-    }
 
-    const accountId = route.accountId;
-
-    // 2. Turn Origin Check: Verify that this turn is strictly tied to an inbound Lark event
-    const expectedPrefix = `idem_lark_${accountId}_`;
+    // 1. Resolve turn origin: check channel_turn_origins or idempotencyKey prefix
+    let accountId: string | undefined;
     let nativeEventId: string | undefined;
 
-    if (idempotencyKey && idempotencyKey.startsWith(expectedPrefix)) {
-      nativeEventId = idempotencyKey.slice(expectedPrefix.length);
-    }
-
-    // Fallback lookup in idempotency_records if needed
-    if (!nativeEventId && this.db) {
+    if (this.db) {
       try {
-        const row = this.db.prepare(
-          'SELECT idempotency_key FROM idempotency_records WHERE turn_id = ? AND user_id = ? LIMIT 1'
-        ).get(turnId, userId) as { idempotency_key?: string } | undefined;
-        if (row?.idempotency_key && row.idempotency_key.startsWith(expectedPrefix)) {
-          nativeEventId = row.idempotency_key.slice(expectedPrefix.length);
+        const originRow = this.db.prepare(
+          'SELECT account_id, channel, native_event_id FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? LIMIT 1'
+        ).get(turnId, userId) as { account_id?: string; channel?: string; native_event_id?: string } | undefined;
+        if (originRow && originRow.channel === 'lark' && originRow.account_id) {
+          accountId = originRow.account_id;
+          nativeEventId = originRow.native_event_id || undefined;
         }
       } catch {}
     }
 
-    if (!nativeEventId) {
+    if (!accountId && idempotencyKey) {
+      const match = idempotencyKey.match(/^idem_lark_([^_]+)_(.+)$/);
+      if (match) {
+        accountId = match[1];
+        nativeEventId = match[2];
+      }
+    }
+
+    if (!accountId && this.db) {
+      try {
+        const row = this.db.prepare(
+          'SELECT idempotency_key FROM idempotency_records WHERE turn_id = ? AND user_id = ? LIMIT 1'
+        ).get(turnId, userId) as { idempotency_key?: string } | undefined;
+        if (row?.idempotency_key) {
+          const match = row.idempotency_key.match(/^idem_lark_([^_]+)_(.+)$/);
+          if (match) {
+            accountId = match[1];
+            nativeEventId = match[2];
+          }
+        }
+      } catch {}
+    }
+
+    if (!accountId && route && route.channel === 'lark') {
+      accountId = route.accountId;
+    }
+
+    if (!accountId || !nativeEventId) {
       return;
     }
 
@@ -462,7 +536,7 @@ export class ChannelRuntimeManager {
       code,
       reason,
       idempotencyKey: idempotencyKey || `idem_lark_${accountId}_${nativeEventId}`,
-      nativeContextId: route.nativeContextId,
+      nativeContextId: route?.nativeContextId || '',
       replyToMessageId,
       rootId,
       threadId,
@@ -673,6 +747,7 @@ export class ChannelRuntimeManager {
       defaultSpaceId,
       groupActivationMode: (account as ChannelAccount).groupActivationMode,
       streamEventSource,
+      imageAttachmentIngestor: this.imageAttachmentIngestor,
     });
 
     // 3. Start transport AFTER gateway listeners are registered

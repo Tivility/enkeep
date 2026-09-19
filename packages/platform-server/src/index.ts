@@ -343,6 +343,14 @@ export {
 } from './tasks/agent-prompt-worker.js';
 
 export {
+  PipelineTaskInputPreparerService,
+  type PipelineTaskPreparerOptions,
+  type PipelinePreparationRegistration,
+  type PipelineCapabilityType,
+  type StagedPipelineInputEnvelope,
+} from './tasks/pipeline-input-preparer.js';
+
+export {
   SqlitePlatformOperationsStorage,
 } from '@enkeep/platform-storage-sqlite';
 
@@ -583,6 +591,10 @@ export {
   type LarkTransportFactory,
   type LarkDefaultSpaceResolver,
 } from './channels/channel-runtime-manager.js';
+export {
+  TenantScopedLarkImageIngestor,
+  type TenantScopedLarkImageIngestorOptions,
+} from './channels/lark-image-ingestor.js';
 export {
   SqliteStreamEventSource,
 } from './channels/sqlite-stream-event-source.js';

@@ -9,6 +9,7 @@ export interface Space {
   folder: string;
   executionMode: ExecutionMode;
   status: LifecycleStatus;
+  canonicalSessionId?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
   createdAt: string;
@@ -22,6 +23,7 @@ export interface CreateSpaceInput {
   folder: string;
   executionMode?: ExecutionMode;
   status?: LifecycleStatus;
+  canonicalSessionId?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
 }
@@ -31,6 +33,7 @@ export interface UpdateSpaceInput {
   folder?: string;
   executionMode?: ExecutionMode;
   status?: LifecycleStatus;
+  canonicalSessionId?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
 }

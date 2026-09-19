@@ -3,6 +3,7 @@ import type {
   AuthContext,
   UserLocale,
   UserTheme,
+  ChannelType,
 } from '@enkeep/platform-core';
 import type {
   PublicMessageAttachment,
@@ -50,18 +51,22 @@ export interface PublicSpace {
   readonly name: string;
   readonly executionMode?: 'container' | 'host';
   readonly status: PublicLifecycleStatus;
+  readonly canonicalSessionId?: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly profileBinding?: PublicProfileBinding | null;
 }
 
+export type { ChannelType };
+
 /**
  * Public Session contract exposed over HTTP/Web.
- * Exactly id, spaceId, title (null | string), status, currentGeneration, times.
+ * Exactly id, spaceId, channel, title (null | string), status, currentGeneration, times.
  */
 export interface PublicSession {
   readonly id: string;
   readonly spaceId: string;
+  readonly channel?: ChannelType | string;
   readonly title: string | null;
   readonly status: PublicLifecycleStatus;
   readonly currentGeneration: number;
@@ -231,6 +236,7 @@ export interface CreateSessionInput {
   readonly spaceId: string;
   readonly title?: string | null;
   readonly executionMode?: 'container' | 'host';
+  readonly forceNew?: boolean;
 }
 
 /**
@@ -299,6 +305,7 @@ export interface PlatformWebApi {
     readonly hasMore: boolean;
     readonly olderCursor: string | null;
     readonly newerCursor: string | null;
+    readonly latestEventCursor?: string | null;
   }>;
   getMessage(userId: string, sessionId: string, messageId: string): Promise<PublicMessage | null>;
 
@@ -313,6 +320,26 @@ export interface PlatformWebApi {
   }>;
 }
 
+export interface InboundEnvelopeAttachmentItem {
+  readonly path: string;
+  readonly etag: string;
+  readonly mediaType?: string;
+  readonly mimeType?: string;
+  readonly displayName?: string;
+}
+
+export interface InboundEnvelopeChannelContext {
+  readonly channel: string;
+  readonly accountId: string;
+  readonly chatId: string;
+  readonly nativeContextId: string;
+  readonly nativeEventId?: string | null;
+  readonly replyToMessageId?: string | null;
+  readonly rootId?: string | null;
+  readonly threadId?: string | null;
+  readonly originTurnId?: string | null;
+}
+
 /**
  * Inbound envelope for Web Channel dispatch.
  * Exact internal contract: id, userId, sessionId, content, timestamp, optional attachments.
@@ -323,8 +350,9 @@ export interface InboundEnvelope {
   readonly sessionId: string;
   readonly content: string;
   readonly timestamp: string;
-  readonly attachments?: readonly CanonicalAttachment[];
+  readonly attachments?: readonly (CanonicalAttachment | InboundEnvelopeAttachmentItem)[];
   readonly replyToMessageId?: string;
+  readonly channelContext?: InboundEnvelopeChannelContext;
 }
 
 /**
@@ -337,6 +365,15 @@ export interface InternalRuntimeDispatchResult {
   readonly message: PublicMessage;
   readonly isDuplicate: boolean;
   readonly queuePosition?: number;
+  readonly executionMode?: 'runtime' | 'command';
+}
+
+/**
+ * Server-owned options passed to runtime gateway dispatch.
+ * Strictly internal / server-side; not deserializable from external user payload.
+ */
+export interface DeliveryDispatchOptions {
+  readonly timeoutMs?: number;
 }
 
 /**
@@ -344,7 +381,10 @@ export interface InternalRuntimeDispatchResult {
  * Public methods strictly limited to dispatchInbound, getCurrentTurnStatus, and cancelCurrentTurn.
  */
 export interface RuntimeGateway {
-  dispatchInbound(envelope: InboundEnvelope): Promise<InternalRuntimeDispatchResult>;
+  dispatchInbound(
+    envelope: InboundEnvelope,
+    options?: DeliveryDispatchOptions
+  ): Promise<InternalRuntimeDispatchResult>;
   getCurrentTurnStatus(userId: string, sessionId: string): Promise<{
     readonly status: TurnExecutionStatus;
     readonly code?: PublicEventCode;

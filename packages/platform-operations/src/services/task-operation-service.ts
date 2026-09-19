@@ -35,6 +35,7 @@ import {
   validateIntervalSeconds,
   validateMisfirePolicy,
   validateOverlapPolicy,
+  validateTimezone,
 } from '../tasks/schedule-calculator.js';
 import { ValidationError } from '../errors/index.js';
 import type { TenantScopedTaskRepository } from '../ports/task-port.js';
@@ -158,7 +159,7 @@ export class TaskOperationService {
       scheduleType,
       cronExpression,
       intervalSeconds,
-      timezone: input.timezone ?? 'UTC',
+      timezone: validateTimezone(input.timezone),
       misfirePolicy,
       overlapPolicy,
     });

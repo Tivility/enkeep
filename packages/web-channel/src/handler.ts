@@ -1165,6 +1165,16 @@ export function createWebChannelHandler(options: WebChannelHandlerOptions): Http
 
         if (method === 'GET') {
           const cursor = parsedUrl.searchParams.get('cursor') || undefined;
+          const before = parsedUrl.searchParams.get('before') || undefined;
+          const after = parsedUrl.searchParams.get('after') || undefined;
+          if (before && after) {
+            sendJson(res, 400, createErrorEnvelope({
+              code: ProtocolErrorCode.BAD_REQUEST,
+              message: "Cannot specify both 'before' and 'after' query parameters",
+              status: 400,
+            }));
+            return;
+          }
           const rawLimit = parsedUrl.searchParams.get('limit');
           let limit: number | undefined = undefined;
           if (rawLimit) {
@@ -1182,6 +1192,8 @@ export function createWebChannelHandler(options: WebChannelHandlerOptions): Http
 
           const listResult = await platformApi.listMessages(currentUserId, sessionId, {
             cursor,
+            before,
+            after,
             limit,
           });
 

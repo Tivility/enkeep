@@ -94,7 +94,7 @@ describe('SqliteReceiptStore Migration Runner Tests', () => {
 
       runner.run();
 
-      expect(runner.getCurrentVersion()).toBe(2);
+      expect(runner.getCurrentVersion()).toBe(3);
 
       // Verify tables exist
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name ASC").all() as Array<{ name: string }>;
@@ -104,16 +104,17 @@ describe('SqliteReceiptStore Migration Runner Tests', () => {
       expect(tableNames).toContain('dsh_session_sources');
       expect(tableNames).toContain('dsh_event_cursors');
       expect(tableNames).toContain('dsh_seed_import_receipts');
+      expect(tableNames).toContain('dsh_child_origins');
     });
 
     it('is idempotent when run multiple times on same database', () => {
       const runner = new SqliteReceiptStoreMigrationRunner(db);
       runner.run();
-      expect(runner.getCurrentVersion()).toBe(2);
+      expect(runner.getCurrentVersion()).toBe(3);
 
       // Second run is a no-op
       expect(() => runner.run()).not.toThrow();
-      expect(runner.getCurrentVersion()).toBe(2);
+      expect(runner.getCurrentVersion()).toBe(3);
     });
 
     it('detects schema downgrade when applied version is higher than manifest', () => {

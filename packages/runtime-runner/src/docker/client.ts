@@ -642,11 +642,15 @@ function parseFileResult(raw: unknown): FileOperationResult | undefined {
     throw new DockerDaemonError('Exec envelope fileResult renamed must be a boolean when present');
   }
 
+  const resolvedType =
+    (raw.type as 'file' | 'directory' | undefined) ??
+    (op === 'read' ? 'file' : op === 'mkdir' ? 'directory' : undefined);
+
   return {
     op: op as FileOpType,
     space: raw.space,
     path: raw.path,
-    type: raw.type as 'file' | 'directory' | undefined,
+    type: resolvedType,
     targetPath: (raw.targetPath ?? raw.newPath) as string | undefined,
     entries,
     truncated: raw.truncated as boolean | undefined,

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   AgentPromptTaskWorker,
   TASK_PROTOCOL_ERROR_CODES,
+  computeNextRun,
 } from '../src/index.js';
 import { FakePlatformOperationsStorage } from './support/index.js';
 import { PlatformOperationsService } from '../src/services/platform-operations-service.js';
@@ -231,6 +232,63 @@ describe('Task Scheduler Worker Engine (Cron, Interval, Pause/Resume, Overlap & 
       const recoveredTask = await tenantOps.tasks.getTask(task.id);
       expect(recoveredTask?.status).toBe('pending');
       expect(recoveredTask?.claimantId).toBeNull();
+    });
+  });
+
+  describe('6. Timezone-Aware Schedule Calculation (America/Los_Angeles vs UTC)', () => {
+    it('0 4 * * * with America/Los_Angeles from a fixed date yields 11:00Z (PDT) and stays 04:00 local across a run boundary; UTC default unchanged', () => {
+      // Fixed date during PDT (Daylight Saving Time, UTC-7): 2026-06-01T00:00:00.000Z
+      const fixedStart = '2026-06-01T00:00:00.000Z';
+
+      // 1. America/Los_Angeles: 04:00 local PDT is 11:00 UTC
+      const nextRun1 = computeNextRun({
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        timezone: 'America/Los_Angeles',
+        enabled: true,
+      }, fixedStart);
+
+      expect(nextRun1).toBe('2026-06-01T11:00:00.000Z');
+
+      // 2. Across run boundary (clock at or just after first run: 2026-06-01T11:00:00.000Z)
+      const nextRun2 = computeNextRun({
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        timezone: 'America/Los_Angeles',
+        enabled: true,
+      }, nextRun1!);
+
+      expect(nextRun2).toBe('2026-06-02T11:00:00.000Z');
+
+      // Check local time representation in America/Los_Angeles is indeed 04:00:00
+      const localStr1 = new Date(nextRun1!).toLocaleTimeString('en-US', {
+        timeZone: 'America/Los_Angeles',
+        hour12: false,
+      });
+      const localStr2 = new Date(nextRun2!).toLocaleTimeString('en-US', {
+        timeZone: 'America/Los_Angeles',
+        hour12: false,
+      });
+      expect(localStr1).toMatch(/^04:00:00/);
+      expect(localStr2).toMatch(/^04:00:00/);
+
+      // 3. UTC default unchanged: yields 04:00Z
+      const nextRunUtc = computeNextRun({
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        enabled: true,
+      }, fixedStart);
+
+      expect(nextRunUtc).toBe('2026-06-01T04:00:00.000Z');
+
+      const nextRunUtcExplicit = computeNextRun({
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        timezone: 'UTC',
+        enabled: true,
+      }, fixedStart);
+
+      expect(nextRunUtcExplicit).toBe('2026-06-01T04:00:00.000Z');
     });
   });
 });

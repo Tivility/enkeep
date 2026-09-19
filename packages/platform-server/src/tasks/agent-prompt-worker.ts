@@ -12,12 +12,16 @@ import {
   type TaskWorkerExecutionResult,
   type TenantDiagnostic,
   type AgentPromptTaskPayload,
+  type TaskExecutionBudget,
 } from '@enkeep/platform-operations';
 import {
   SqlitePlatformOperationsStorage,
   SqliteUserRepository,
 } from '@enkeep/platform-storage-sqlite';
 import type { TaskNotificationService } from '../notifications/task-notification-service.js';
+import {
+  PipelineTaskInputPreparerService,
+} from './pipeline-input-preparer.js';
 
 export {
   AgentPromptTaskWorker,
@@ -31,6 +35,7 @@ export {
   type TaskWorkerExecutionResult,
   type TenantDiagnostic,
   type AgentPromptTaskPayload,
+  type TaskExecutionBudget,
 };
 
 export interface PlatformServerTaskWorkerOptions {
@@ -43,6 +48,13 @@ export interface PlatformServerTaskWorkerOptions {
   heartbeatIntervalMs?: number;
   operationsStorage?: SqlitePlatformOperationsStorage;
   taskNotificationService?: TaskNotificationService;
+  channelRuntimeManager?: any;
+  prepareTaskInput?: TaskWorkerOptions['prepareTaskInput'];
+  pipelineTaskPreparer?: PipelineTaskInputPreparerService;
+  pipelineManifestPath?: string;
+  fileService?: any;
+  dataRoot?: string;
+  dshHome?: string;
 }
 
 /**
@@ -145,6 +157,19 @@ export function createPlatformServerTaskWorker(
       : `server_worker_${randomUUID()}`
   );
 
+  const effectiveManifestPath = options.pipelineManifestPath ?? process.env.ENKEEP_PIPELINE_MANIFEST;
+  let taskPreparerHook = options.prepareTaskInput;
+  if (!taskPreparerHook && (options.pipelineTaskPreparer || effectiveManifestPath)) {
+    const preparer = options.pipelineTaskPreparer ?? new PipelineTaskInputPreparerService({
+      database: options.db,
+      fileService: options.fileService,
+      manifestPath: effectiveManifestPath,
+      dataRoot: options.dataRoot,
+      dshHome: options.dshHome,
+    });
+    taskPreparerHook = preparer.asPreparerHook();
+  }
+
   return new AgentPromptTaskWorker({
     workerId: resolvedWorkerId,
     tenantEnumerator,
@@ -154,5 +179,8 @@ export function createPlatformServerTaskWorker(
     leaseDurationMs: options.leaseDurationMs,
     heartbeatIntervalMs: options.heartbeatIntervalMs,
     systemRecovery: () => operationsStorage.recoverAfterRestart(),
+    channelRuntimeManager: options.channelRuntimeManager,
+    prepareTaskInput: taskPreparerHook,
+    db: options.db,
   });
 }

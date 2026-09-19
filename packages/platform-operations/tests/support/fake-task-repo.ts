@@ -105,6 +105,8 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     const now = new Date();
     const nowIso = now.toISOString();
 
+    const timezone = input.timezone ?? 'UTC';
+
     const nextRunAt = computeNextRun(
       {
         scheduleType,
@@ -112,6 +114,7 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
         intervalSeconds,
         dueDate: normalizedDueDate,
         enabled: true,
+        timezone,
       },
       now
     );
@@ -125,7 +128,7 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       intervalSeconds,
       nextRunAt,
       lastRunAt: null,
-      timezone: input.timezone ?? 'UTC',
+      timezone,
       enabled: true,
       pausedAt: null,
       misfirePolicy: input.misfirePolicy ? validateMisfirePolicy(input.misfirePolicy) : 'coalesce',
@@ -207,11 +210,25 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       if (!preferred || preferred.userId !== this.userId) {
         throw new TaskNotFoundError(preferredTaskId);
       }
-      if (preferred.status === 'completed' || preferred.status === 'failed' || preferred.status === 'cancelled') {
+      const schedule = this.schedules.get(preferredTaskId);
+      const isRecurring =
+        preferred.scheduleType === 'cron' ||
+        preferred.scheduleType === 'interval' ||
+        schedule?.scheduleType === 'cron' ||
+        schedule?.scheduleType === 'interval' ||
+        Boolean(preferred.cronExpression || schedule?.cronExpression) ||
+        (preferred.intervalSeconds !== null && preferred.intervalSeconds !== undefined && preferred.intervalSeconds > 0) ||
+        (schedule?.intervalSeconds !== null && schedule?.intervalSeconds !== undefined && schedule.intervalSeconds > 0);
+
+      if (preferred.status === 'cancelled') {
         throw new TaskAlreadyCompletedError(preferredTaskId);
       }
-
-      const schedule = this.schedules.get(preferredTaskId);
+      if (!isRecurring && (preferred.status === 'completed' || preferred.status === 'failed')) {
+        throw new TaskAlreadyCompletedError(preferredTaskId);
+      }
+      if (isRecurring && (preferred.status === 'completed' || preferred.status === 'failed')) {
+        return null;
+      }
       if (schedule && (!schedule.enabled || schedule.pausedAt)) {
         return null;
       }
@@ -251,12 +268,14 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
 
       let subsequentNextRunAt: string | null = null;
       if (preferred.scheduleType === 'cron' || preferred.scheduleType === 'interval') {
+        const timezone = schedule?.timezone ?? preferred.timezone ?? 'UTC';
         subsequentNextRunAt = computeNextRun(
           {
             scheduleType: preferred.scheduleType,
             cronExpression: preferred.cronExpression,
             intervalSeconds: preferred.intervalSeconds,
             enabled: true,
+            timezone,
           },
           clock
         );
@@ -559,6 +578,7 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
           intervalSeconds: schedule.intervalSeconds,
           dueDate: existing.dueDate,
           enabled: true,
+          timezone: schedule.timezone,
         },
         clock
       );
@@ -677,6 +697,36 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     const clock = now ? (typeof now === 'string' ? new Date(now) : now) : new Date();
     const nowIso = clock.toISOString();
     const leaseExpiresAt = new Date(clock.getTime() + leaseDurationMs).toISOString();
+
+    const schedule = this.schedules.get(validTaskId);
+    const isRecurring =
+      existing.scheduleType === 'cron' ||
+      existing.scheduleType === 'interval' ||
+      schedule?.scheduleType === 'cron' ||
+      schedule?.scheduleType === 'interval' ||
+      Boolean(existing.cronExpression || schedule?.cronExpression) ||
+      (existing.intervalSeconds !== null && existing.intervalSeconds !== undefined && existing.intervalSeconds > 0) ||
+      (schedule?.intervalSeconds !== null && schedule?.intervalSeconds !== undefined && schedule.intervalSeconds > 0);
+
+    if (existing.status === 'cancelled') {
+      throw new TaskAlreadyCompletedError(validTaskId);
+    }
+    if (!isRecurring && (existing.status === 'completed' || existing.status === 'failed')) {
+      throw new TaskAlreadyCompletedError(validTaskId);
+    }
+    if ((existing.status === 'claimed' || existing.status === 'running') && existing.leaseExpiresAt && new Date(existing.leaseExpiresAt).getTime() > clock.getTime()) {
+      throw new TaskAlreadyClaimedError(validTaskId, existing.claimantId || 'unknown');
+    }
+    const activeRun = Array.from(this.runs.values()).find(
+      (r) =>
+        r.taskId === validTaskId &&
+        (r.status === 'claimed' || r.status === 'running') &&
+        r.leaseExpiresAt &&
+        new Date(r.leaseExpiresAt).getTime() > clock.getTime()
+    );
+    if (activeRun) {
+      throw new TaskAlreadyClaimedError(validTaskId, activeRun.claimantId || existing.claimantId || 'unknown');
+    }
 
     const priorRuns = Array.from(this.runs.values()).filter((r) => r.taskId === validTaskId);
     const runId = generateRunId();

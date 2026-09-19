@@ -128,5 +128,16 @@ export interface IReceiptStore {
   getSeedImportReceipt(sessionId: string): Promise<SeedImportReceipt | null>;
   recordSeedImportReceipt(input: RecordSeedImportReceiptInput): Promise<SeedImportReceipt>;
 
+  recordChildOrigin(sessionId: string, childId: string, originTurnId: string): Promise<void>;
+  getChildOrigin(sessionId: string, childId: string): Promise<string | null>;
+  listChildOrigins(sessionId: string): Promise<readonly ChildOriginRecord[]>;
+
   recoverAfterRestart(): Promise<RestartRecoverySummary>;
+}
+
+export interface ChildOriginRecord {
+  readonly sessionId: string;
+  readonly childId: string;
+  readonly originTurnId: string;
+  readonly createdAt: string;
 }

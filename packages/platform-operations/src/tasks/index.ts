@@ -13,6 +13,10 @@ export {
   type WorkerTenantOperations,
   type TaskWorkerDiagnostics,
   type TaskWorkerErrorHandler,
+  type TaskInputPreparationContext,
+  type TaskInputPreparationResult,
+  type TaskInputPreparer,
+  type TaskExecutionBudget,
 } from './task-worker.js';
 
 export {
@@ -23,6 +27,7 @@ export {
   validateIntervalSeconds,
   validateMisfirePolicy,
   validateOverlapPolicy,
+  validateTimezone,
   computeNextRun,
   type ScheduleCalculationParams,
 } from './schedule-calculator.js';
