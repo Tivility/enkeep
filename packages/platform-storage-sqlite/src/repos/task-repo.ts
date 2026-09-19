@@ -31,6 +31,7 @@ import {
   validateIntervalSeconds,
   validateMisfirePolicy,
   validateOverlapPolicy,
+  validateTimezone,
   computeNextRun,
   TASK_PROTOCOL_ERROR_CODES,
   TaskNotFoundError,
@@ -143,7 +144,7 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
 
     const misfirePolicy = input.misfirePolicy ? validateMisfirePolicy(input.misfirePolicy) : 'coalesce';
     const overlapPolicy = input.overlapPolicy ? validateOverlapPolicy(input.overlapPolicy) : 'skip';
-    const timezone = input.timezone ?? 'UTC';
+    const timezone = validateTimezone(input.timezone);
 
     const now = new Date();
     const nowIso = now.toISOString();
@@ -155,6 +156,7 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
         intervalSeconds,
         dueDate: normalizedDueDate,
         enabled: true,
+        timezone,
       },
       now
     );
@@ -306,7 +308,9 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
           row = this.db.prepare(`
             SELECT t.id, t.status, t.claimant_id, t.lease_expires_at, t.claim_count, t.max_retries,
                    t.due_date, t.schedule_type, t.cron_expression, t.interval_seconds, t.next_run_at,
-                   s.enabled as schedule_enabled, s.paused_at as schedule_paused_at, s.overlap_policy
+                   s.enabled as schedule_enabled, s.paused_at as schedule_paused_at, s.overlap_policy,
+                   s.schedule_type as s_schedule_type, s.cron_expression as s_cron_expression,
+                   s.interval_seconds as s_interval_seconds
             FROM platform_tasks t
             LEFT JOIN task_schedules s ON t.id = s.task_id
             WHERE t.id = ? AND t.user_id = ?
@@ -325,8 +329,25 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
         }
 
         const taskStatus = String(row.status);
-        if (taskStatus === 'completed' || taskStatus === 'failed' || taskStatus === 'cancelled') {
+        const schedType = (row.schedule_type as string) || (row.s_schedule_type as string) || 'once';
+        const cronExpr = row.cron_expression || row.s_cron_expression;
+        const intervalSec = row.interval_seconds || row.s_interval_seconds;
+        const isRecurring =
+          schedType === 'cron' ||
+          schedType === 'interval' ||
+          Boolean(cronExpr) ||
+          (typeof intervalSec === 'number' && intervalSec > 0);
+
+        if (taskStatus === 'cancelled') {
           throw new TaskAlreadyCompletedError(preferredTaskId);
+        }
+
+        if (!isRecurring && (taskStatus === 'completed' || taskStatus === 'failed')) {
+          throw new TaskAlreadyCompletedError(preferredTaskId);
+        }
+
+        if (isRecurring && (taskStatus === 'completed' || taskStatus === 'failed')) {
+          return null;
         }
 
         // If schedule is explicitly paused
@@ -503,12 +524,17 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
         if (scheduleType === 'cron' || scheduleType === 'interval') {
           const cronExpr = getNullableString(taskRow, 'cron_expression');
           const intervalSec = getNullableNumber(taskRow, 'interval_seconds');
+          const timezone =
+            (schedRow ? getNullableString(schedRow, 'timezone') : null) ??
+            getNullableString(taskRow, 'timezone') ??
+            'UTC';
           subsequentNextRunAt = computeNextRun(
             {
               scheduleType,
               cronExpression: cronExpr,
               intervalSeconds: intervalSec,
               enabled: true,
+              timezone,
             },
             clock
           );
@@ -675,8 +701,21 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
         throw new TaskNotFoundError(validId);
       }
 
-      const scheduleType = hasSched ? ((getString(taskRow, 'schedule_type') as TaskScheduleType) ?? 'once') : 'once';
-      const isRecurring = scheduleType === 'cron' || scheduleType === 'interval';
+      let isRecurring = false;
+      if (hasSched) {
+        const schedRow = this.db.prepare('SELECT * FROM task_schedules WHERE task_id = ? AND user_id = ?').get(validId, this.userId) as DbRow | undefined;
+        const rawSchedType = (getString(taskRow, 'schedule_type') as TaskScheduleType) ?? 'once';
+        const tableSchedType = schedRow ? getNullableString(schedRow, 'schedule_type') : null;
+        const cronExpr = schedRow ? getNullableString(schedRow, 'cron_expression') : getNullableString(taskRow, 'cron_expression');
+        const intervalSec = schedRow ? getNullableNumber(schedRow, 'interval_seconds') : getNullableNumber(taskRow, 'interval_seconds');
+        isRecurring =
+          rawSchedType === 'cron' ||
+          rawSchedType === 'interval' ||
+          tableSchedType === 'cron' ||
+          tableSchedType === 'interval' ||
+          Boolean(cronExpr) ||
+          (intervalSec !== null && intervalSec !== undefined && intervalSec > 0);
+      }
 
       // For once tasks: final status is completed
       // For recurring tasks: task returns to 'pending' (schedulable for next recurrence), lease is cleared
@@ -802,8 +841,21 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
         throw new TaskNotFoundError(validId);
       }
 
-      const scheduleType = hasSched ? ((getString(taskRow, 'schedule_type') as TaskScheduleType) ?? 'once') : 'once';
-      const isRecurring = scheduleType === 'cron' || scheduleType === 'interval';
+      let isRecurring = false;
+      if (hasSched) {
+        const schedRow = this.db.prepare('SELECT * FROM task_schedules WHERE task_id = ? AND user_id = ?').get(validId, this.userId) as DbRow | undefined;
+        const rawSchedType = (getString(taskRow, 'schedule_type') as TaskScheduleType) ?? 'once';
+        const tableSchedType = schedRow ? getNullableString(schedRow, 'schedule_type') : null;
+        const cronExpr = schedRow ? getNullableString(schedRow, 'cron_expression') : getNullableString(taskRow, 'cron_expression');
+        const intervalSec = schedRow ? getNullableNumber(schedRow, 'interval_seconds') : getNullableNumber(taskRow, 'interval_seconds');
+        isRecurring =
+          rawSchedType === 'cron' ||
+          rawSchedType === 'interval' ||
+          tableSchedType === 'cron' ||
+          tableSchedType === 'interval' ||
+          Boolean(cronExpr) ||
+          (intervalSec !== null && intervalSec !== undefined && intervalSec > 0);
+      }
 
       const finalStatusExpr = isRecurring
         ? `'pending'`
@@ -986,10 +1038,21 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
       }
 
       if (this.hasScheduleSchema()) {
-        const scheduleType = (getString(taskRow, 'schedule_type') as TaskScheduleType) ?? 'once';
-        const cronExpr = getNullableString(taskRow, 'cron_expression');
-        const intervalSec = getNullableNumber(taskRow, 'interval_seconds');
+        const schedRow = this.db.prepare('SELECT * FROM task_schedules WHERE task_id = ? AND user_id = ?').get(validId, this.userId) as DbRow | undefined;
+        const scheduleType =
+          (schedRow ? (getNullableString(schedRow, 'schedule_type') as TaskScheduleType | null) : null) ??
+          ((getString(taskRow, 'schedule_type') as TaskScheduleType) ?? 'once');
+        const cronExpr =
+          (schedRow ? getNullableString(schedRow, 'cron_expression') : null) ??
+          getNullableString(taskRow, 'cron_expression');
+        const intervalSec =
+          (schedRow ? getNullableNumber(schedRow, 'interval_seconds') : null) ??
+          getNullableNumber(taskRow, 'interval_seconds');
         const dueDate = getNullableString(taskRow, 'due_date');
+        const timezone =
+          (schedRow ? getNullableString(schedRow, 'timezone') : null) ??
+          getNullableString(taskRow, 'timezone') ??
+          'UTC';
 
         const nextRunAt = computeNextRun(
           {
@@ -998,6 +1061,7 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
             intervalSeconds: intervalSec,
             dueDate,
             enabled: true,
+            timezone,
           },
           clock
         );
@@ -1200,6 +1264,49 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
 
       if (hasSched) {
         schedRow = this.db.prepare('SELECT * FROM task_schedules WHERE task_id = ? AND user_id = ?').get(validTaskId, this.userId) as DbRow | undefined;
+      }
+
+      const rawSchedType = (getString(taskRow, 'schedule_type') as TaskScheduleType) ?? 'once';
+      const tableSchedType = schedRow ? getNullableString(schedRow, 'schedule_type') : null;
+      const cronExpr = schedRow ? getNullableString(schedRow, 'cron_expression') : getNullableString(taskRow, 'cron_expression');
+      const intervalSec = schedRow ? getNullableNumber(schedRow, 'interval_seconds') : getNullableNumber(taskRow, 'interval_seconds');
+      const isRecurring =
+        rawSchedType === 'cron' ||
+        rawSchedType === 'interval' ||
+        tableSchedType === 'cron' ||
+        tableSchedType === 'interval' ||
+        Boolean(cronExpr) ||
+        (intervalSec !== null && intervalSec !== undefined && intervalSec > 0);
+
+      const taskStatus = String(taskRow.status);
+
+      if (taskStatus === 'cancelled') {
+        throw new TaskAlreadyCompletedError(validTaskId);
+      }
+
+      if (!isRecurring && (taskStatus === 'completed' || taskStatus === 'failed')) {
+        throw new TaskAlreadyCompletedError(validTaskId);
+      }
+
+      const leaseExp = taskRow.lease_expires_at ? String(taskRow.lease_expires_at) : null;
+      const isLeaseActive = leaseExp && new Date(leaseExp).getTime() > clock.getTime();
+      if ((taskStatus === 'claimed' || taskStatus === 'running') && isLeaseActive) {
+        throw new TaskAlreadyClaimedError(validTaskId, String(taskRow.claimant_id || 'unknown'));
+      }
+
+      if (hasSched) {
+        const activeRun = this.db.prepare(`
+          SELECT id, claimant_id FROM task_runs
+          WHERE task_id = ? AND user_id = ?
+            AND status IN ('claimed', 'running')
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > ?
+          LIMIT 1
+        `).get(validTaskId, this.userId, nowIso) as DbRow | undefined;
+        if (activeRun) {
+          throw new TaskAlreadyClaimedError(validTaskId, String(activeRun.claimant_id || taskRow.claimant_id || 'unknown'));
+        }
+
         const countRow = this.db.prepare('SELECT COUNT(*) as count FROM task_runs WHERE task_id = ? AND user_id = ?').get(validTaskId, this.userId) as { count: number };
         attemptNumber = (countRow ? Number(countRow.count) : 0) + 1;
 

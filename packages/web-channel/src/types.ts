@@ -337,6 +337,15 @@ export interface InternalRuntimeDispatchResult {
   readonly message: PublicMessage;
   readonly isDuplicate: boolean;
   readonly queuePosition?: number;
+  readonly executionMode?: 'runtime' | 'command';
+}
+
+/**
+ * Server-owned options passed to runtime gateway dispatch.
+ * Strictly internal / server-side; not deserializable from external user payload.
+ */
+export interface DeliveryDispatchOptions {
+  readonly timeoutMs?: number;
 }
 
 /**
@@ -344,7 +353,10 @@ export interface InternalRuntimeDispatchResult {
  * Public methods strictly limited to dispatchInbound, getCurrentTurnStatus, and cancelCurrentTurn.
  */
 export interface RuntimeGateway {
-  dispatchInbound(envelope: InboundEnvelope): Promise<InternalRuntimeDispatchResult>;
+  dispatchInbound(
+    envelope: InboundEnvelope,
+    options?: DeliveryDispatchOptions
+  ): Promise<InternalRuntimeDispatchResult>;
   getCurrentTurnStatus(userId: string, sessionId: string): Promise<{
     readonly status: TurnExecutionStatus;
     readonly code?: PublicEventCode;

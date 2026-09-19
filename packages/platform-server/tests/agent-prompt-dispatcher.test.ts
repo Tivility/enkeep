@@ -332,22 +332,99 @@ describe('AgentPromptDeliveryDispatcher', () => {
       await expect(dispatcher.dispatch(nonCanonicalCtx)).rejects.toThrow(/\[INVALID_TASK\]/i);
     });
 
-    it('rejects route with non-web channel or invalid accountId', async () => {
-      db.prepare(`UPDATE session_routes SET channel = 'slack' WHERE id = ?`).run(validAliceSessionId);
+    it('rejects route with empty channel, accountId, or nativeContextId', async () => {
+      db.prepare(`UPDATE session_routes SET channel = '' WHERE id = ?`).run(validAliceSessionId);
       const ctx = createDispatchContext();
-      await expect(dispatcher.dispatch(ctx)).rejects.toThrow(/channel must be web/i);
+      await expect(dispatcher.dispatch(ctx)).rejects.toThrow(/channel is missing or invalid/i);
+
+      db.prepare(`UPDATE session_routes SET channel = 'web', account_id = '   ' WHERE id = ?`).run(validAliceSessionId);
+      await expect(dispatcher.dispatch(ctx)).rejects.toThrow(/accountId is missing or invalid/i);
+
+      db.prepare(`UPDATE session_routes SET account_id = 'web-demo', native_context_id = '' WHERE id = ?`).run(validAliceSessionId);
+      await expect(dispatcher.dispatch(ctx)).rejects.toThrow(/nativeContextId is missing or invalid/i);
     });
 
-    it('rejects route with invalid accountId', async () => {
-      db.prepare(`UPDATE session_routes SET account_id = 'custom-account' WHERE id = ?`).run(validAliceSessionId);
+    it('accepts canonical Lark-origin route without web or web-demo constraints', async () => {
+      db.prepare(`UPDATE session_routes SET channel = 'lark', account_id = 'acc_synth_lark_1', native_context_id = 'oc_synth_chat_1' WHERE id = ?`).run(validAliceSessionId);
       const ctx = createDispatchContext();
-      await expect(dispatcher.dispatch(ctx)).rejects.toThrow(/accountId must be web-demo/i);
+      const result = await dispatcher.dispatch(ctx);
+      expect(result.status).toBe('completed');
     });
 
-    it('rejects route with nativeContextId not matching route id', async () => {
-      db.prepare(`UPDATE session_routes SET native_context_id = 'different_id' WHERE id = ?`).run(validAliceSessionId);
+    it('accepts host canonical space and updates route executionMode to host', async () => {
+      db.prepare(`UPDATE spaces SET execution_mode = 'host' WHERE id = ?`).run(validAliceSpaceId);
+      db.prepare(`UPDATE session_routes SET execution_mode = 'container' WHERE id = ?`).run(validAliceSessionId);
+
       const ctx = createDispatchContext();
-      await expect(dispatcher.dispatch(ctx)).rejects.toThrow(/nativeContextId must match route id/i);
+      const result = await dispatcher.dispatch(ctx);
+      expect(result.status).toBe('completed');
+
+      const updatedRoute = db.prepare(`SELECT execution_mode FROM session_routes WHERE id = ?`).get(validAliceSessionId) as { execution_mode: string };
+      expect(updatedRoute.execution_mode).toBe('host');
+    });
+
+    it('accepts container canonical space and preserves container mode', async () => {
+      db.prepare(`UPDATE spaces SET execution_mode = 'container' WHERE id = ?`).run(validAliceSpaceId);
+      const ctx = createDispatchContext();
+      const result = await dispatcher.dispatch(ctx);
+      expect(result.status).toBe('completed');
+    });
+
+    it('rejects non-canonical active session route when another active canonical exists', async () => {
+      const secondSessionId = 'ses_22222222222222222222222222222222';
+      await storage.forTenant(tenantAlice).sessionRoutes.create({
+        id: secondSessionId,
+        spaceId: validAliceSpaceId,
+        channel: 'web',
+        accountId: 'web-default',
+        nativeContextId: secondSessionId,
+        peerId: 'alice_peer_2',
+        dshSessionId: 'ses_second_dsh_session_id_12345',
+        executionMode: 'container',
+      });
+
+      // validAliceSessionId is the canonical session on space
+      db.prepare(`UPDATE spaces SET canonical_session_id = ? WHERE id = ?`).run(validAliceSessionId, validAliceSpaceId);
+
+      // Try to dispatch using secondSessionId
+      const nonCanonCtx = createDispatchContext({
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Hello from non-canonical',
+          sessionId: secondSessionId,
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      await expect(dispatcher.dispatch(nonCanonCtx)).rejects.toThrow(/\[NON_CANONICAL_SESSION\]/i);
+    });
+
+    it('rebinds canonical_session_id if previous canonical session was archived', async () => {
+      const staleCanonicalId = 'ses_33333333333333333333333333333333';
+      await storage.forTenant(tenantAlice).sessionRoutes.create({
+        id: staleCanonicalId,
+        spaceId: validAliceSpaceId,
+        channel: 'web',
+        accountId: 'web-default',
+        nativeContextId: staleCanonicalId,
+        peerId: 'alice_peer_stale',
+        dshSessionId: 'ses_stale_dsh_session_id_12345',
+        executionMode: 'container',
+      });
+      // Archive the stale route
+      await storage.forTenant(tenantAlice).sessionRoutes.update(staleCanonicalId, { status: 'archived' });
+
+      // Point space to stale route
+      db.prepare(`UPDATE spaces SET canonical_session_id = ? WHERE id = ?`).run(staleCanonicalId, validAliceSpaceId);
+
+      // Now dispatch with active validAliceSessionId
+      const ctx = createDispatchContext();
+      const result = await dispatcher.dispatch(ctx);
+      expect(result.status).toBe('completed');
+
+      // Canonical session on space should now be rebound to validAliceSessionId
+      const spaceRow = db.prepare(`SELECT canonical_session_id FROM spaces WHERE id = ?`).get(validAliceSpaceId) as { canonical_session_id: string };
+      expect(spaceRow.canonical_session_id).toBe(validAliceSessionId);
     });
 
     it('passes route peerId authoritatively without fabricating fallback', async () => {
@@ -369,7 +446,7 @@ describe('AgentPromptDeliveryDispatcher', () => {
       await expect(dispatcher.dispatch(ctx)).rejects.toThrow(/\[INVALID_SPACE\]/i);
     });
 
-    it('rejects non-container executionMode space', async () => {
+    it('rejects non-container non-host executionMode space', async () => {
       db.prepare(`UPDATE spaces SET execution_mode = 'native' WHERE id = ?`).run(validAliceSpaceId);
 
       const ctx = createDispatchContext();

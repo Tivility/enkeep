@@ -304,6 +304,96 @@ describe('Task Schedules, Recurrences and Execution Runs Storage', () => {
       // Next run should be top of next hour: 15:00:00
       expect(resumed.schedule?.nextRunAt).toBe('2026-05-01T15:00:00.000Z');
     });
+
+    it('resumes migrated cron task where platform_tasks row has schedule_type=once, null cron_expression but task_schedules has schedule_type=cron', async () => {
+      const taskId = 'task_0123456789abcdef0123456789abcdef';
+      const scheduleId = 'sched_0123456789abcdef0123456789abcdef';
+      const nowIso = '2026-05-01T00:00:00.000Z';
+      const payloadJson = JSON.stringify({
+        type: 'agent_prompt',
+        prompt: 'Run migrated task',
+        sessionId: 'ses_0123456789abcdef0123456789abcdef',
+        sessionPolicy: 'existing_session',
+      });
+
+      // Insert platform_tasks with stale 'once' values
+      db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, title, status, payload, schedule_type, cron_expression, interval_seconds,
+          due_date, timezone, created_at, updated_at
+        ) VALUES (
+          ?, ?, 'Migrated Cron Task', 'pending', ?, 'once', NULL, NULL,
+          NULL, 'UTC', ?, ?
+        )
+      `).run(taskId, user1, payloadJson, nowIso, nowIso);
+
+      // Insert task_schedules with cron schedule
+      db.prepare(`
+        INSERT INTO task_schedules (
+          id, task_id, user_id, schedule_type, cron_expression, interval_seconds,
+          timezone, enabled, misfire_policy, overlap_policy, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, 'cron', '0 4 * * *', NULL,
+          'UTC', 0, 'coalesce', 'skip', ?, ?
+        )
+      `).run(scheduleId, taskId, user1, nowIso, nowIso);
+
+      const fixedNow = new Date('2026-05-01T01:30:00.000Z');
+      const resumed = await repo1.resume(taskId, fixedNow);
+
+      expect(resumed.schedule?.enabled).toBe(true);
+      expect(resumed.schedule?.nextRunAt).toBe('2026-05-01T04:00:00.000Z');
+      expect(resumed.nextRunAt).toBe('2026-05-01T04:00:00.000Z');
+
+      const schedRow = db.prepare('SELECT * FROM task_schedules WHERE task_id = ?').get(taskId) as any;
+      expect(schedRow.enabled).toBe(1);
+      expect(schedRow.next_run_at).toBe('2026-05-01T04:00:00.000Z');
+    });
+
+    it('resumes migrated interval task where platform_tasks row has schedule_type=once, null interval_seconds but task_schedules has schedule_type=interval', async () => {
+      const taskId = 'task_abcdef0123456789abcdef0123456789';
+      const scheduleId = 'sched_abcdef0123456789abcdef0123456789';
+      const nowIso = '2026-05-01T00:00:00.000Z';
+      const payloadJson = JSON.stringify({
+        type: 'agent_prompt',
+        prompt: 'Run migrated task',
+        sessionId: 'ses_0123456789abcdef0123456789abcdef',
+        sessionPolicy: 'existing_session',
+      });
+
+      // Insert platform_tasks with stale 'once' values
+      db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, title, status, payload, schedule_type, cron_expression, interval_seconds,
+          due_date, timezone, created_at, updated_at
+        ) VALUES (
+          ?, ?, 'Migrated Interval Task', 'pending', ?, 'once', NULL, NULL,
+          NULL, 'UTC', ?, ?
+        )
+      `).run(taskId, user1, payloadJson, nowIso, nowIso);
+
+      // Insert task_schedules with interval schedule (e.g. every 3600 seconds)
+      db.prepare(`
+        INSERT INTO task_schedules (
+          id, task_id, user_id, schedule_type, cron_expression, interval_seconds,
+          timezone, enabled, misfire_policy, overlap_policy, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, 'interval', NULL, 3600,
+          'UTC', 0, 'coalesce', 'skip', ?, ?
+        )
+      `).run(scheduleId, taskId, user1, nowIso, nowIso);
+
+      const fixedNow = new Date('2026-05-01T01:30:00.000Z');
+      const resumed = await repo1.resume(taskId, fixedNow);
+
+      expect(resumed.schedule?.enabled).toBe(true);
+      expect(resumed.schedule?.nextRunAt).toBe('2026-05-01T02:30:00.000Z');
+      expect(resumed.nextRunAt).toBe('2026-05-01T02:30:00.000Z');
+
+      const schedRow = db.prepare('SELECT * FROM task_schedules WHERE task_id = ?').get(taskId) as any;
+      expect(schedRow.enabled).toBe(1);
+      expect(schedRow.next_run_at).toBe('2026-05-01T02:30:00.000Z');
+    });
   });
 
   describe('5. Task Claiming, Run Rows Creation, and Overlap Prevention', () => {

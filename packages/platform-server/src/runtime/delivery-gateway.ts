@@ -18,6 +18,7 @@ import type {
   InternalRuntimeDispatchResult,
   TurnExecutionStatus,
   PublicEventCode,
+  DeliveryDispatchOptions,
 } from '@enkeep/web-channel';
 import {
   SqliteWebMessageStore,
@@ -71,7 +72,10 @@ export interface DeliveryExecutionRequest {
   readonly executionMode?: ExecutionMode;
   readonly mounts?: readonly RuntimeMountSpec[];
   readonly extensionPlan?: ExtensionActivationPlan | null;
+  readonly timeoutMs?: number;
 }
+
+export type { DeliveryDispatchOptions };
 
 export type InspectedTurnErrorCode =
   | 'EXECUTION_FAILED'
@@ -503,6 +507,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
   private readonly workerBootId: string;
   private readonly activeTasks = new Map<string, ActiveTurnTask>();
+  private readonly turnTimeouts = new Map<string, number>();
   private readonly settledErrors: Error[] = [];
   private readonly turnCompletedListeners = new Set<(event: {
     userId: string;
@@ -628,6 +633,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
   public setExtensionResolver(resolver: ExtensionPlanResolver): void {
     this.extensionResolver = resolver;
+  }
+
+  public getFileProvider(): TenantRuntimeFileProvider | undefined {
+    return this.fileProvider;
   }
 
   private initLeaseTables(): void {
@@ -772,13 +781,42 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     }
   }
 
-  async dispatchInbound(envelope: InboundEnvelope): Promise<InternalRuntimeDispatchResult> {
+  async dispatchInbound(
+    envelope: InboundEnvelope,
+    options?: DeliveryDispatchOptions
+  ): Promise<InternalRuntimeDispatchResult> {
     if (this.isDisposing) {
       throw new PlatformError(
         'Gateway is shutting down and cannot accept new turns.',
         'SHUTDOWN_IN_PROGRESS',
         503
       );
+    }
+
+    // Validate server-owned options if provided (failzero on invalid)
+    let requestedTimeoutMs: number | undefined;
+    if (options !== undefined) {
+      if (!options || typeof options !== 'object' || Array.isArray(options)) {
+        throw new ValidationError('Dispatch options must be a plain object');
+      }
+      for (const key of Object.keys(options)) {
+        if (key !== 'timeoutMs') {
+          throw new ValidationError(`Unrecognized dispatch option "${key}"`);
+        }
+      }
+      if (options.timeoutMs !== undefined) {
+        if (
+          typeof options.timeoutMs !== 'number' ||
+          !Number.isSafeInteger(options.timeoutMs) ||
+          options.timeoutMs <= 0 ||
+          options.timeoutMs > 900_000
+        ) {
+          throw new ValidationError(
+            'Dispatch timeoutMs must be a finite integer between 1 and 900000'
+          );
+        }
+        requestedTimeoutMs = options.timeoutMs;
+      }
     }
 
     if (!envelope || typeof envelope !== 'object') {
@@ -1007,6 +1045,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         message: ingestResult.message,
         isDuplicate: true,
       };
+    }
+
+    if (requestedTimeoutMs !== undefined) {
+      this.turnTimeouts.set(turnId, requestedTimeoutMs);
     }
 
     // Compute queue position for this route in SQLite
@@ -1653,6 +1695,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
           }
 
+          const timeoutMs = this.turnTimeouts.get(turnId) ?? 300_000;
           const executionRequest: DeliveryExecutionRequest = {
             userId,
             platformSpaceId: spaceId,
@@ -1667,6 +1710,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             executionMode: spaceExecutionMode,
             mounts: spaceMounts,
             extensionPlan: spaceExtensionPlan,
+            timeoutMs,
           };
 
           executionResult = await this.executor.execute(executionRequest);
@@ -1767,6 +1811,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           clearInterval(heartbeatTimer);
         }
         this.activeTasks.delete(turnId);
+        this.turnTimeouts.delete(turnId);
         // Wake scheduler to claim next turn in line
         this.notifyScheduler();
       }
@@ -2647,6 +2692,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         this.db.exec('COMMIT');
         inTx = false;
 
+        this.turnTimeouts.delete(turnId);
         this.notifyScheduler();
         return true;
       } catch (err) {
@@ -2746,6 +2792,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         this.db.exec('COMMIT');
         inTx = false;
 
+        this.turnTimeouts.delete(turnId);
         this.notifyScheduler();
         return true;
       } catch (err) {
@@ -3212,6 +3259,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       this.schedulerLoopTimer = undefined;
     }
     await this.drain(5000);
+    this.turnTimeouts.clear();
   }
 
   private queryAttachmentsByMessageId(
