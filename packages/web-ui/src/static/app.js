@@ -526,6 +526,7 @@ const MANAGEMENT_LOCALES = {
     'models.overrideSectionTitle': 'Override Default Model',
     'models.labelProvider': 'Provider *',
     'models.labelModel': 'Model *',
+    'models.labelReasoningEffort': 'Reasoning effort',
     'models.labelRevision': 'Revision: {revision}',
     'models.labelApplyMode': 'Apply Mode',
     'models.applyModeRestartAll': 'Save & Rolling Restart All Runtimes (Recommended)',
@@ -1055,6 +1056,7 @@ const MANAGEMENT_LOCALES = {
     'models.overrideSectionTitle': '覆盖默认模型设置',
     'models.labelProvider': '提供商 *',
     'models.labelModel': '模型 *',
+    'models.labelReasoningEffort': '推理深度 (Reasoning effort)',
     'models.labelRevision': '配置版本: {revision}',
     'models.labelApplyMode': '生效策略',
     'models.applyModeRestartAll': '保存并滚动重启所有运行时容器 (推荐)',
@@ -3117,9 +3119,12 @@ async function renderUserModelConfigView(container) {
   }
 
   const providersMap = modelData.providers || {};
+  const activeDefSuffix = (userOverrideData && userOverrideData.reasoningEffort)
+    ? ` · effort: ${userOverrideData.reasoningEffort}`
+    : (modelData.defaultModel && modelData.defaultModel.reasoningEffort ? ` · effort: ${modelData.defaultModel.reasoningEffort}` : '');
   const activeDef = userOverrideData && userOverrideData.provider
-    ? `${userOverrideData.provider} / ${userOverrideData.model}`
-    : (modelData.defaultModel ? `${modelData.defaultModel.provider} / ${modelData.defaultModel.model}` : (getLocale() === 'zh-CN' ? '未配置' : 'Unconfigured'));
+    ? `${userOverrideData.provider} / ${userOverrideData.model}${activeDefSuffix}`
+    : (modelData.defaultModel ? `${modelData.defaultModel.provider} / ${modelData.defaultModel.model}${activeDefSuffix}` : (getLocale() === 'zh-CN' ? '未配置' : 'Unconfigured'));
 
   const kpiGrid = document.createElement('div');
   kpiGrid.className = 'kpi-grid';
@@ -3167,6 +3172,43 @@ async function renderUserModelConfigView(container) {
   const selPrefModel = document.createElement('select');
   selPrefModel.className = 'form-select';
 
+  const grpPrefEffort = document.createElement('div');
+  grpPrefEffort.className = 'form-group';
+  const lblPrefEffort = document.createElement('label');
+  lblPrefEffort.textContent = t('models.labelReasoningEffort', null, 'Reasoning effort');
+  const selPrefEffort = document.createElement('select');
+  selPrefEffort.className = 'form-select';
+
+  function populateUserEfforts(pkey, mid) {
+    selPrefEffort.replaceChildren();
+    const p = providersMap[pkey];
+    const models = (p && Array.isArray(p.models)) ? p.models : [];
+    const foundModel = models.find((m) => m.id === mid);
+    const effortKeys = (foundModel && foundModel.reasoningEfforts && typeof foundModel.reasoningEfforts === 'object')
+      ? Object.keys(foundModel.reasoningEfforts)
+      : [];
+
+    if (effortKeys.length > 0) {
+      selPrefEffort.disabled = false;
+      const optDefault = document.createElement('option');
+      optDefault.value = '';
+      optDefault.textContent = '(default)';
+      selPrefEffort.appendChild(optDefault);
+      effortKeys.forEach((key) => {
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = key;
+        selPrefEffort.appendChild(opt);
+      });
+    } else {
+      selPrefEffort.disabled = true;
+      const optNone = document.createElement('option');
+      optNone.value = '';
+      optNone.textContent = 'no effort options';
+      selPrefEffort.appendChild(optNone);
+    }
+  }
+
   function populateUserModels(pkey) {
     selPrefModel.replaceChildren();
     const p = providersMap[pkey];
@@ -3185,7 +3227,14 @@ async function renderUserModelConfigView(container) {
     }
   }
 
-  selPrefProvider.addEventListener('change', () => populateUserModels(selPrefProvider.value));
+  selPrefProvider.addEventListener('change', () => {
+    populateUserModels(selPrefProvider.value);
+    populateUserEfforts(selPrefProvider.value, selPrefModel.value);
+  });
+  selPrefModel.addEventListener('change', () => {
+    populateUserEfforts(selPrefProvider.value, selPrefModel.value);
+  });
+
   if (userOverrideData && userOverrideData.provider) {
     selPrefProvider.value = userOverrideData.provider;
   } else if (modelData.defaultModel && modelData.defaultModel.provider) {
@@ -3197,13 +3246,20 @@ async function renderUserModelConfigView(container) {
   } else if (modelData.defaultModel && modelData.defaultModel.model) {
     selPrefModel.value = modelData.defaultModel.model;
   }
+  populateUserEfforts(selPrefProvider.value, selPrefModel.value);
+  if (userOverrideData && userOverrideData.reasoningEffort) {
+    selPrefEffort.value = userOverrideData.reasoningEffort;
+  }
 
   grpPrefProvider.appendChild(lblPrefProvider);
   grpPrefProvider.appendChild(selPrefProvider);
   grpPrefModel.appendChild(lblPrefModel);
   grpPrefModel.appendChild(selPrefModel);
+  grpPrefEffort.appendChild(lblPrefEffort);
+  grpPrefEffort.appendChild(selPrefEffort);
   formPref.appendChild(grpPrefProvider);
   formPref.appendChild(grpPrefModel);
+  formPref.appendChild(grpPrefEffort);
 
   const actRow = document.createElement('div');
   actRow.className = 'form-actions';
@@ -3238,11 +3294,13 @@ async function renderUserModelConfigView(container) {
     e.preventDefault();
     try {
       btnSavePref.disabled = true;
+      const effortVal = selPrefEffort.value ? selPrefEffort.value : null;
       await apiRequest('/api/account/model-override', {
         method: 'PUT',
         body: JSON.stringify({
           provider: selPrefProvider.value,
           model: selPrefModel.value,
+          reasoningEffort: effortVal,
         }),
       });
       showToast(getLocale() === 'zh-CN' ? '个人模型偏好已保存' : 'Model preference saved successfully', 'success');
@@ -8511,7 +8569,7 @@ async function renderEffectiveModelPreview(container, spaceId, sessionId) {
 
     const primaryNode = document.createElement('span');
     primaryNode.className = 'fallback-node';
-    primaryNode.textContent = `${eff.provider} / ${eff.model}${eff.reasoningEffort ? ` (${eff.reasoningEffort})` : ''}`;
+    primaryNode.textContent = `${eff.provider} / ${eff.model}${eff.reasoningEffort ? ` · effort: ${eff.reasoningEffort}` : ''}`;
     flowDiv.appendChild(primaryNode);
 
     if (Array.isArray(eff.fallbackChain) && eff.fallbackChain.length > 0) {
@@ -8523,7 +8581,7 @@ async function renderEffectiveModelPreview(container, spaceId, sessionId) {
 
         const fbNode = document.createElement('span');
         fbNode.className = 'fallback-node';
-        fbNode.textContent = `${fb.provider} / ${fb.model}${fb.reasoningEffort ? ` (${fb.reasoningEffort})` : ''}`;
+        fbNode.textContent = `${fb.provider} / ${fb.model}${fb.reasoningEffort ? ` · effort: ${fb.reasoningEffort}` : ''}`;
         flowDiv.appendChild(fbNode);
       });
     }

@@ -74,6 +74,7 @@ export class ContinuationWatcher {
     this.pollIntervalMs = options.pollIntervalMs ?? 500;
     this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60 * 1000;
     this.onStopped = options.onStopped;
+    this.lastActivityTime = Date.now();
 
     if (options.initialCursor !== undefined) {
       this.cursor = options.initialCursor;
@@ -113,7 +114,7 @@ export class ContinuationWatcher {
   extend(newCursor?: number, newReplyTarget?: ContinuationTarget): void {
     if (this.isStopped) return;
     this.lastActivityTime = Date.now();
-    if (newCursor !== undefined) {
+    if (newCursor !== undefined && newCursor > 0) {
       this.cursorInitialized = true;
       if (newCursor > this.cursor) {
         this.cursor = newCursor;
@@ -177,24 +178,6 @@ export class ContinuationWatcher {
         this.lastActivityTime = Date.now();
       }
 
-      // Guard against double delivery: if an inbound tracker is currently handling this route,
-      // do not open a continuation card. Advance cursor past any events and return.
-      if (this.hasActiveInboundTracker(this.sessionRouteId)) {
-        const events = await this.streamEventSource.listAssistantEvents(
-          this.sessionRouteId,
-          this.cursor
-        );
-        if (events.length > 0) {
-          for (const evt of events) {
-            if (evt.rowId > this.cursor) {
-              this.cursor = evt.rowId;
-            }
-          }
-          this.lastActivityTime = Date.now();
-        }
-        return;
-      }
-
       const events = await this.streamEventSource.listAssistantEvents(
         this.sessionRouteId,
         this.cursor
@@ -215,8 +198,41 @@ export class ContinuationWatcher {
 
       this.lastActivityTime = Date.now();
 
+      // Guard against double delivery: if an inbound tracker is currently handling this route,
+      // do not open a continuation card. Advance cursor past events to avoid double-processing.
+      if (this.hasActiveInboundTracker(this.sessionRouteId)) {
+        this.cursor = events[events.length - 1].rowId;
+        return;
+      }
+
       const runningEvt = events.find((e) => e.type === 'turn_status' && e.status === 'running');
       if (runningEvt) {
+        // 1. Turn ownership verification: if turnId belongs to a known platform turn (running, queued, or completed),
+        // it must NOT be replayed as an autonomous continuation.
+        if (runningEvt.turnId && typeof this.streamEventSource.getPlatformTurnState === 'function') {
+          let platformState: string | undefined;
+          try {
+            platformState = await this.streamEventSource.getPlatformTurnState(this.sessionRouteId, runningEvt.turnId);
+          } catch {}
+          if (this.isStopped) return;
+          if (platformState === 'running' || platformState === 'queued' || platformState === 'completed') {
+            console.info('[lark-cont] turn belongs to platform turn ownership, skipping continuation replay', {
+              turnId: runningEvt.turnId,
+              platformState,
+            });
+            // Advance cursor past this turn's terminal event if completed to prevent leftover deltas
+            const turnTerminal = events.find(
+              (e) => e.turnId === runningEvt.turnId && e.type === 'turn_status' && (e.status === 'completed' || e.status === 'failed')
+            );
+            const skipToRowId = turnTerminal ? turnTerminal.rowId : runningEvt.rowId;
+            if (skipToRowId > this.cursor) {
+              this.cursor = skipToRowId;
+            }
+            return;
+          }
+        }
+
+        // Fallback platform turn check if turnId was not stamped on event
         if (typeof this.streamEventSource.hasPendingPlatformTurn === 'function') {
           let hasPending = false;
           try {
@@ -232,20 +248,57 @@ export class ContinuationWatcher {
           }
         }
 
+        // 2. Causal origin resolution: autonomous turns must route only to their causal initiating turn
+        let targetCardParams = {
+          chatId: this.replyTarget.chatId,
+          replyToMessageId: this.replyTarget.replyToMessageId,
+          rootId: this.replyTarget.rootId,
+          threadId: this.replyTarget.threadId,
+        };
+
+        if (runningEvt.originTurnId) {
+          if (typeof this.streamEventSource.resolveTurnOrigin === 'function') {
+            const origin = await this.streamEventSource.resolveTurnOrigin(runningEvt.originTurnId);
+            if (!origin) {
+              console.warn('[lark-cont] unknown causal origin for autonomous turn, aborting delivery to prevent wrong target send', {
+                originTurnId: runningEvt.originTurnId,
+                routeId: this.sessionRouteId,
+              });
+              if (runningEvt.rowId > this.cursor) {
+                this.cursor = runningEvt.rowId;
+              }
+              return;
+            }
+            targetCardParams = {
+              chatId: origin.chatId,
+              replyToMessageId: origin.replyToMessageId || undefined,
+              rootId: origin.rootId || undefined,
+              threadId: origin.threadId || undefined,
+            };
+          }
+        } else if (runningEvt.turnId) {
+          // Autonomous turn detected without causal origin metadata: fail explicitly, do not send to wrong target
+          console.warn('[lark-cont] autonomous turn missing originTurnId causal metadata, aborting delivery to prevent wrong target send', {
+            turnId: runningEvt.turnId,
+            routeId: this.sessionRouteId,
+          });
+          if (runningEvt.rowId > this.cursor) {
+            this.cursor = runningEvt.rowId;
+          }
+          return;
+        }
+
         console.info('[lark-cont] running detected -> tracker created', {
           routeId: this.sessionRouteId,
           rowId: runningEvt.rowId,
+          originTurnId: runningEvt.originTurnId,
         });
+        const runningRowId = runningEvt.rowId;
         const tracker = new StreamingReplyTracker({
           transport: this.transport,
           streamEventSource: this.streamEventSource,
           sessionRouteId: this.sessionRouteId,
-          cardParams: {
-            chatId: this.replyTarget.chatId,
-            replyToMessageId: this.replyTarget.replyToMessageId,
-            rootId: this.replyTarget.rootId,
-            threadId: this.replyTarget.threadId,
-          },
+          cardParams: targetCardParams,
           initialCursor: this.cursor,
           pollIntervalMs: this.pollIntervalMs,
           detached: true,
@@ -255,7 +308,7 @@ export class ContinuationWatcher {
               status,
               messageId,
             });
-            await this.recordOutboxDelivery(finalText, status, messageId);
+            await this.recordOutboxDelivery(finalText, status, messageId, runningRowId, targetCardParams);
             if (!this.isStopped) {
               void this.pollTick();
             }
@@ -284,10 +337,15 @@ export class ContinuationWatcher {
   private async recordOutboxDelivery(
     finalText: string,
     status: 'completed' | 'failed',
-    messageId?: string
+    messageId?: string,
+    eventRowId?: number,
+    targetOverride?: ContinuationTarget
   ): Promise<void> {
     try {
-      const turnKey = `cont_${messageId || randomUUID().replace(/-/g, '').slice(0, 16)}`;
+      const target = targetOverride ?? this.replyTarget;
+      const turnKey = eventRowId
+        ? `cont_row_${eventRowId}`
+        : `cont_${messageId || randomUUID().replace(/-/g, '').slice(0, 16)}`;
       let outboxId: string;
       if (this.deriveOutboxId) {
         outboxId = this.deriveOutboxId(turnKey);
@@ -302,10 +360,10 @@ export class ContinuationWatcher {
       const payload: OutboundReplyPayload = {
         text: finalText,
         format: 'markdown',
-        chatId: this.replyTarget.chatId,
-        rootId: this.replyTarget.rootId,
-        threadId: this.replyTarget.threadId,
-        replyToMessageId: this.replyTarget.replyToMessageId,
+        chatId: target.chatId,
+        rootId: target.rootId,
+        threadId: target.threadId,
+        replyToMessageId: target.replyToMessageId,
         turnId: turnKey,
         messageId,
       };
@@ -314,8 +372,8 @@ export class ContinuationWatcher {
         id: outboxId,
         accountId: this.accountId,
         sessionId: this.sessionRouteId,
-        nativeContextId: this.replyTarget.nativeContextId || this.nativeContextId,
-        replyToNativeId: this.replyTarget.replyToMessageId ?? null,
+        nativeContextId: target.nativeContextId || target.chatId,
+        replyToNativeId: target.replyToMessageId ?? null,
         payloadJson: JSON.stringify(payload),
         status: 'delivered',
       });
