@@ -745,9 +745,17 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
       fileOperation: async (request: FileOperationRequest) => {
         try {
           const res = await transport.fileOperation(request);
+          let fileResult = res.fileResult;
+          if (fileResult && typeof fileResult === 'object') {
+            if (fileResult.op === 'read' && !fileResult.type) {
+              fileResult = { ...fileResult, type: 'file' };
+            } else if (fileResult.op === 'mkdir' && !fileResult.type) {
+              fileResult = { ...fileResult, type: 'directory' };
+            }
+          }
           return {
             status: res.ok ? 'ok' : 'error',
-            fileResult: res.fileResult,
+            fileResult,
             error: res.error?.message,
           };
         } catch (err: unknown) {

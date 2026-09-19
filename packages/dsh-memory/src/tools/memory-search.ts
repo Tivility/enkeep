@@ -221,7 +221,10 @@ export function createMemorySearchTool(options: MemorySearchToolOptions): ToolDe
         }
       }
 
-      // 2. Search Space Memory if scope includes space and spacePath is set
+      // 2. Search Space Memory if scope includes space
+      if (scope === 'space' && (!spacePath || spacePath.trim().length === 0)) {
+        throw new Error('Space memory operation rejected: no space context available');
+      }
       if ((scope === 'all' || scope === 'space') && spacePath) {
         const spaceMemDir = path.join(spacePath, 'memory');
         if (fs.existsSync(spaceMemDir)) {

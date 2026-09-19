@@ -1337,8 +1337,14 @@ export class PlatformProxyHandler implements StreamHandler {
     if (this.db) {
       const nowIso = new Date().toISOString();
       const insertStmt = this.db.prepare(`
-        INSERT OR REPLACE INTO web_events (id, session_id, user_id, type, payload, created_at)
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          session_id = excluded.session_id,
+          user_id = excluded.user_id,
+          type = excluded.type,
+          payload = excluded.payload,
+          created_at = excluded.created_at
       `);
 
       let lastTimeMs = 0;
@@ -1497,6 +1503,20 @@ export class PlatformProxyHandler implements StreamHandler {
             }
             default:
               continue;
+          }
+
+          const rawTurnId = typeof raw['turnId'] === 'string' && raw['turnId'].trim().length > 0
+            ? raw['turnId'].trim()
+            : (typeof p['turnId'] === 'string' && p['turnId'].trim().length > 0 ? p['turnId'].trim() : undefined);
+          const rawOriginTurnId = typeof raw['originTurnId'] === 'string' && raw['originTurnId'].trim().length > 0
+            ? raw['originTurnId'].trim()
+            : (typeof p['originTurnId'] === 'string' && p['originTurnId'].trim().length > 0 ? p['originTurnId'].trim() : undefined);
+
+          if (rawTurnId && !sanitizedPayload['turnId']) {
+            sanitizedPayload['turnId'] = rawTurnId;
+          }
+          if (rawOriginTurnId && !sanitizedPayload['originTurnId']) {
+            sanitizedPayload['originTurnId'] = rawOriginTurnId;
           }
 
           insertStmt.run(

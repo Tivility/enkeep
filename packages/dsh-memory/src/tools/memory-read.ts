@@ -40,9 +40,15 @@ export function resolveSafeMemoryPath(
   dshHome: string,
   spacePath?: string
 ): { targetPath: string; relPath: string; memoryRoot: string } {
+  if (scope === 'space') {
+    if (!spacePath || spacePath.trim().length === 0) {
+      throw new Error('Space memory operation rejected: no space context available');
+    }
+  }
+
   const memoryRoot = scope === 'global'
     ? path.join(dshHome, 'memory')
-    : (spacePath ? path.join(spacePath, 'memory') : path.join(dshHome, 'memory'));
+    : path.join(spacePath!, 'memory');
 
   const normalizedInput = (relOrAbsPath && relOrAbsPath.trim().length > 0)
     ? relOrAbsPath.trim()

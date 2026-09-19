@@ -548,6 +548,8 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
     const completionPromise = new Promise<AgentFollowupResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.turnWaiters.delete(turnId);
+        // Actively cancel the exact timed-out turn in the daemon to prevent orphaned execution
+        this.cancelTurn(turnId, `Followup turn execution timed out after ${timeoutMs}ms`).catch(() => {});
         reject(
           new RuntimeProtocolError(RUNTIME_ERROR_CODES.FOLLOWUP_FAILED)
         );
