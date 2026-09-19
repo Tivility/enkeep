@@ -48,6 +48,7 @@ import {
 import { PermissionPresetRepo } from './repos/permission-preset-repo.js';
 import { SqliteTenantScopedSpaceMountRepository } from './repos/space-mount-repo.js';
 import { SqliteTenantScopedChannelRepository } from './repos/channel-repo.js';
+import { SqliteTenantScopedTurnOriginRepository } from './repos/turn-origin-repo.js';
 import {
   type DbParam,
   parseDeliveryInboxRow,
@@ -135,6 +136,7 @@ export class SqlitePlatformStorage implements PlatformStorage {
     readonly permissionPresets: PermissionPresetRepo;
     readonly spaceMounts: TenantScopedSpaceMountRepository;
     readonly channels: SqliteTenantScopedChannelRepository;
+    readonly turnOrigins: SqliteTenantScopedTurnOriginRepository;
   } {
     if (!userId || typeof userId !== 'string' || userId.trim() === '' || userId !== userId.trim()) {
       throw new Error('Tenant user ID must be a non-empty string without leading or trailing whitespace');
@@ -158,6 +160,7 @@ export class SqlitePlatformStorage implements PlatformStorage {
       permissionPresets: new PermissionPresetRepo(this.db, userId),
       spaceMounts: new SqliteTenantScopedSpaceMountRepository(this.db, userId),
       channels: new SqliteTenantScopedChannelRepository(this.db, userId),
+      turnOrigins: new SqliteTenantScopedTurnOriginRepository(this.db, userId),
     };
   }
 

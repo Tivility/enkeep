@@ -22,6 +22,7 @@ import type {
   ChannelBinding,
   ChannelInboxItem,
   ChannelOutboxItem,
+  ChannelTurnOrigin,
 } from '@enkeep/platform-core';
 import type {
   FileMetadata,
@@ -183,6 +184,7 @@ export function parseSpaceRow(row: DbRow): Space {
     folder: getString(row, 'folder'),
     executionMode,
     status,
+    canonicalSessionId: getNullableString(row, 'canonical_session_id'),
     agentProfileId: getNullableString(row, 'agent_profile_id'),
     agentProfileSnapshotId: getNullableString(row, 'agent_profile_snapshot_id'),
     createdAt: getString(row, 'created_at'),
@@ -573,6 +575,24 @@ export function parseChannelOutboxRow(row: DbRow): ChannelOutboxItem {
     attempts: getNumber(row, 'attempts'),
     createdAt: getString(row, 'created_at'),
     updatedAt: getString(row, 'updated_at'),
+  };
+}
+
+export function parseChannelTurnOriginRow(row: DbRow): ChannelTurnOrigin {
+  return {
+    turnId: getString(row, 'turn_id'),
+    userId: getString(row, 'user_id'),
+    sessionId: getString(row, 'session_id'),
+    accountId: getString(row, 'account_id'),
+    channel: getString(row, 'channel'),
+    chatId: getString(row, 'chat_id'),
+    nativeContextId: getString(row, 'native_context_id'),
+    nativeEventId: getNullableString(row, 'native_event_id'),
+    replyToMessageId: getNullableString(row, 'reply_to_message_id'),
+    rootId: getNullableString(row, 'root_id'),
+    threadId: getNullableString(row, 'thread_id'),
+    originTurnId: getNullableString(row, 'origin_turn_id'),
+    createdAt: getString(row, 'created_at'),
   };
 }
 

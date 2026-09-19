@@ -56,9 +56,10 @@ import type {
   SkillStatus,
   SkillOperationStatus,
   TenantScopedChannelRepository,
+  TenantScopedTurnOriginRepository,
 } from '../types/index.js';
 
-export type { TenantScopedChannelRepository };
+export type { TenantScopedChannelRepository, TenantScopedTurnOriginRepository };
 
 export interface UserRepository {
   findById(id: string): Promise<User | null>;
@@ -116,6 +117,17 @@ export interface TenantScopedSessionRouteRepository {
   countBySpaceId(spaceId: string, options?: { status?: LifecycleStatus }): Promise<number>;
   list(options?: { status?: LifecycleStatus; limit?: number; offset?: number }): Promise<SessionRoute[]>;
   resolveAgentProfile(routeId: string): Promise<EffectiveAgentProfile>;
+  getOrCreateCanonicalSession(
+    spaceId: string,
+    options?: {
+      forceNew?: boolean;
+      channel?: string;
+      accountId?: string;
+      nativeContextId?: string;
+      peerId?: string;
+      title?: string;
+    }
+  ): Promise<SessionRoute>;
 }
 
 export interface TenantScopedSessionSourceRepository {

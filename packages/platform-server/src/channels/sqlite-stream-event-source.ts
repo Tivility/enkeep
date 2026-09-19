@@ -7,7 +7,8 @@
  */
 
 import type { DatabaseSync } from 'node:sqlite';
-import type { StreamEventSource } from '@enkeep/channel-lark';
+import type { StreamEventSource, StreamAssistantEvent } from '@enkeep/channel-lark';
+import type { ChannelTurnOrigin } from '@enkeep/platform-core';
 
 interface WebEventRow {
   rowid: number | bigint;
@@ -32,14 +33,7 @@ export class SqliteStreamEventSource implements StreamEventSource {
     sessionRouteId: string,
     afterRowId: number,
     limit = 100
-  ): Promise<Array<{
-    rowId: number;
-    type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status';
-    delta?: string;
-    streamId?: string;
-    status?: string;
-    toolName?: string;
-  }>> {
+  ): Promise<StreamAssistantEvent[]> {
     const stmt = this.db.prepare(
       `SELECT rowid, type, payload FROM web_events WHERE session_id = ? AND rowid > ? AND type IN ('assistant_delta', 'assistant_stream_end', 'turn_status', 'tool_status') ORDER BY rowid ASC LIMIT ?`
     );
@@ -51,9 +45,18 @@ export class SqliteStreamEventSource implements StreamEventSource {
       let streamId: string | undefined;
       let status: string | undefined;
       let toolName: string | undefined;
+      let turnId: string | undefined;
+      let originTurnId: string | undefined;
 
       try {
         const parsed = JSON.parse(row.payload);
+        if (typeof parsed.turnId === 'string' && parsed.turnId.trim().length > 0) {
+          turnId = parsed.turnId.trim();
+        }
+        if (typeof parsed.originTurnId === 'string' && parsed.originTurnId.trim().length > 0) {
+          originTurnId = parsed.originTurnId.trim();
+        }
+
         if (row.type === 'assistant_delta') {
           if (typeof parsed.delta === 'string') delta = parsed.delta;
           if (typeof parsed.streamId === 'string') streamId = parsed.streamId;
@@ -74,8 +77,33 @@ export class SqliteStreamEventSource implements StreamEventSource {
         streamId,
         status,
         toolName,
+        turnId,
+        originTurnId,
       };
     });
+  }
+
+  async resolveTurnOrigin(turnId: string): Promise<ChannelTurnOrigin | null> {
+    if (!turnId || typeof turnId !== 'string') return null;
+    const row = this.db
+      .prepare('SELECT * FROM channel_turn_origins WHERE turn_id = ? LIMIT 1')
+      .get(turnId) as any;
+    if (!row) return null;
+    return {
+      turnId: row.turn_id,
+      userId: row.user_id,
+      sessionId: row.session_id,
+      accountId: row.account_id,
+      channel: row.channel,
+      chatId: row.chat_id,
+      nativeContextId: row.native_context_id,
+      nativeEventId: row.native_event_id ?? null,
+      replyToMessageId: row.reply_to_message_id ?? null,
+      rootId: row.root_id ?? null,
+      threadId: row.thread_id ?? null,
+      originTurnId: row.origin_turn_id ?? null,
+      createdAt: row.created_at,
+    };
   }
 
   async getPlatformTurnState(

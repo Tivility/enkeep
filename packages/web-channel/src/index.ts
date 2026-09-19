@@ -22,12 +22,15 @@ export type {
   PlatformWebApi,
   // Internal routing types
   InboundEnvelope,
+  InboundEnvelopeAttachmentItem,
+  InboundEnvelopeChannelContext,
   TurnExecutionStatus,
   InternalRuntimeDispatchResult,
   DeliveryDispatchOptions,
   RuntimeGateway,
   LifecycleStatus,
   AuthContext,
+  ChannelType,
 } from './types.js';
 
 // Route Key Utilities

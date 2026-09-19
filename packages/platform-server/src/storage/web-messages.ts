@@ -1,7 +1,8 @@
 import { randomBytes, createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { PlatformError, ValidationError } from '@enkeep/platform-core';
+import { PlatformError, ValidationError, NotFoundError } from '@enkeep/platform-core';
 import type { CanonicalAttachment, PublicMessageAttachment } from '@enkeep/protocol';
+import type { InboundEnvelopeChannelContext } from '@enkeep/web-channel';
 
 export interface WebMessageReplyReference {
   messageId: string;
@@ -225,6 +226,7 @@ export interface IngestWebDeliveryParams {
   timestamp: string;
   attachments?: readonly CanonicalAttachment[];
   replyToMessageId?: string;
+  channelContext?: InboundEnvelopeChannelContext;
 }
 
 /**
@@ -298,12 +300,20 @@ interface HeldDeliveryRow {
   created_at: unknown;
 }
 
-export interface OpaqueCursorPayload {
-  v: 1;
-  kind: 'message' | 'event';
-  id: string;
-  createdAt: string;
-}
+export type OpaqueCursorPayload =
+  | {
+      v: 1;
+      kind: 'message' | 'event';
+      id: string;
+      createdAt: string;
+    }
+  | {
+      v: 2;
+      kind: 'event';
+      id: string;
+      seq: number;
+      createdAt: string;
+    };
 
 /**
  * Safe helper to handle SQLite changes / integers without generic Number coercion.
@@ -350,23 +360,56 @@ export function generate32HexId(prefix: string): string {
  * Base64URL encode opaque cursor with exact canonical keys.
  */
 export function encodeOpaqueCursor(payload: OpaqueCursorPayload): string {
-  if (payload.v !== 1 || (payload.kind !== 'message' && payload.kind !== 'event')) {
-    throw new ValidationError('Invalid cursor payload');
-  }
-  if (typeof payload.id !== 'string' || payload.id.length === 0) {
-    throw new ValidationError('Invalid cursor ID');
-  }
-  if (!isValidIsoDate(payload.createdAt)) {
-    throw new ValidationError('Invalid cursor createdAt timestamp');
+  if (payload.v === 1) {
+    if (payload.kind !== 'message' && payload.kind !== 'event') {
+      throw new ValidationError('Invalid cursor payload');
+    }
+    if (typeof payload.id !== 'string' || payload.id.length === 0) {
+      throw new ValidationError('Invalid cursor ID');
+    }
+    if (!isValidIsoDate(payload.createdAt)) {
+      throw new ValidationError('Invalid cursor createdAt timestamp');
+    }
+
+    const json = JSON.stringify({
+      createdAt: payload.createdAt,
+      id: payload.id,
+      kind: payload.kind,
+      v: 1,
+    });
+    return Buffer.from(json, 'utf8').toString('base64url');
   }
 
-  const json = JSON.stringify({
-    createdAt: payload.createdAt,
-    id: payload.id,
-    kind: payload.kind,
-    v: 1,
-  });
-  return Buffer.from(json, 'utf8').toString('base64url');
+  if (payload.v === 2) {
+    if (payload.kind !== 'event') {
+      throw new ValidationError('Invalid cursor payload');
+    }
+    if (typeof payload.id !== 'string' || payload.id.length === 0) {
+      throw new ValidationError('Invalid cursor ID');
+    }
+    if (!isValidIsoDate(payload.createdAt)) {
+      throw new ValidationError('Invalid cursor createdAt timestamp');
+    }
+    if (
+      typeof payload.seq !== 'number' ||
+      !Number.isInteger(payload.seq) ||
+      payload.seq < 1 ||
+      payload.seq > Number.MAX_SAFE_INTEGER
+    ) {
+      throw new ValidationError('Invalid cursor sequence number');
+    }
+
+    const json = JSON.stringify({
+      createdAt: payload.createdAt,
+      id: payload.id,
+      kind: payload.kind,
+      seq: payload.seq,
+      v: 2,
+    });
+    return Buffer.from(json, 'utf8').toString('base64url');
+  }
+
+  throw new ValidationError('Invalid cursor payload');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -376,6 +419,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /**
  * Decodes, strictly validates format/schema/canonical shape, and verifies that the cursor exists
  * in the database under the exact (userId, sessionId, kind) scope.
+ * Supports backward-compatible v1 cursors and monotonic v2 append-sequence cursors.
  * Direct raw IDs are strictly rejected; only opaque base64url JSON cursors are allowed.
  */
 export function decodeAndValidateCursor(
@@ -384,7 +428,7 @@ export function decodeAndValidateCursor(
   expectedKind: 'message' | 'event',
   userId: string,
   sessionId: string
-): { id: string; createdAt: string } {
+): { id: string; createdAt: string; rowid?: number } {
   if (typeof rawCursor !== 'string' || rawCursor.length === 0 || rawCursor.length > 512) {
     throw new ValidationError('Invalid cursor: cursor must be a non-empty string under 512 characters');
   }
@@ -413,23 +457,49 @@ export function decodeAndValidateCursor(
   }
 
   const keys = Object.keys(parsed).sort();
-  const expectedKeys = ['createdAt', 'id', 'kind', 'v'];
-  const altExpectedKeys = ['createdAt', 'id', 'kind', 'version'];
+  const expectedKeysV1 = ['createdAt', 'id', 'kind', 'v'];
+  const altExpectedKeysV1 = ['createdAt', 'id', 'kind', 'version'];
+  const expectedKeysV2 = ['createdAt', 'id', 'kind', 'seq', 'v'];
+  const altExpectedKeysV2 = ['createdAt', 'id', 'kind', 'seq', 'version'];
 
-  const matchesStandard = keys.length === expectedKeys.length && keys.every((k, i) => k === expectedKeys[i]);
-  const matchesAlt = keys.length === altExpectedKeys.length && keys.every((k, i) => k === altExpectedKeys[i]);
+  const matchesV1 = keys.length === expectedKeysV1.length && keys.every((k, i) => k === expectedKeysV1[i]);
+  const matchesAltV1 = keys.length === altExpectedKeysV1.length && keys.every((k, i) => k === altExpectedKeysV1[i]);
+  const matchesV2 = keys.length === expectedKeysV2.length && keys.every((k, i) => k === expectedKeysV2[i]);
+  const matchesAltV2 = keys.length === altExpectedKeysV2.length && keys.every((k, i) => k === altExpectedKeysV2[i]);
 
-  if (!matchesStandard && !matchesAlt) {
+  if (!matchesV1 && !matchesAltV1 && !matchesV2 && !matchesAltV2) {
     throw new ValidationError('Invalid cursor: canonical shape mismatch');
   }
 
-  const versionVal = matchesStandard ? parsed['v'] : parsed['version'];
-  if (versionVal !== 1) {
-    throw new ValidationError('Invalid cursor: unsupported cursor version');
+  const isV2 = matchesV2 || matchesAltV2;
+  const versionVal = isV2
+    ? (matchesV2 ? parsed['v'] : parsed['version'])
+    : (matchesV1 ? parsed['v'] : parsed['version']);
+
+  if (isV2) {
+    if (versionVal !== 2) {
+      throw new ValidationError('Invalid cursor: unsupported cursor version');
+    }
+    if (expectedKind !== 'event' || parsed['kind'] !== 'event') {
+      throw new ValidationError('Invalid cursor: cursor kind mismatch');
+    }
+    if (
+      typeof parsed['seq'] !== 'number' ||
+      !Number.isInteger(parsed['seq']) ||
+      parsed['seq'] < 1 ||
+      parsed['seq'] > Number.MAX_SAFE_INTEGER
+    ) {
+      throw new ValidationError('Invalid cursor: invalid sequence in cursor');
+    }
+  } else {
+    if (versionVal !== 1) {
+      throw new ValidationError('Invalid cursor: unsupported cursor version');
+    }
+    if (parsed['kind'] !== expectedKind) {
+      throw new ValidationError('Invalid cursor: cursor kind mismatch');
+    }
   }
-  if (parsed['kind'] !== expectedKind) {
-    throw new ValidationError('Invalid cursor: cursor kind mismatch');
-  }
+
   if (typeof parsed['id'] !== 'string' || parsed['id'].length === 0 || parsed['id'].length > 128) {
     throw new ValidationError('Invalid cursor: invalid id format in cursor');
   }
@@ -439,21 +509,49 @@ export function decodeAndValidateCursor(
 
   const cursorId = parsed['id'];
 
-  const tableName = expectedKind === 'message' ? 'web_messages' : 'web_events';
+  if (expectedKind === 'message') {
+    const verifyStmt = db.prepare(`
+      SELECT id, created_at FROM web_messages
+      WHERE id = ? AND user_id = ? AND session_id = ?
+      LIMIT 1
+    `);
+    const row = verifyStmt.get(cursorId, userId, sessionId) as { id: unknown; created_at: unknown } | undefined;
+
+    if (!row || typeof row.id !== 'string' || typeof row.created_at !== 'string' || !isValidIsoDate(row.created_at)) {
+      throw new ValidationError('Invalid cursor: cursor row not found or does not belong to the requested tenant/session');
+    }
+
+    return {
+      id: row.id,
+      createdAt: row.created_at,
+    };
+  }
+
+  // expectedKind === 'event'
+  // Resolves to known SQLite append rowid ordering
   const verifyStmt = db.prepare(`
-    SELECT id, created_at FROM ${tableName}
+    SELECT rowid, id, created_at FROM web_events
     WHERE id = ? AND user_id = ? AND session_id = ?
     LIMIT 1
   `);
-  const row = verifyStmt.get(cursorId, userId, sessionId) as { id: unknown; created_at: unknown } | undefined;
+  const row = verifyStmt.get(cursorId, userId, sessionId) as
+    | { rowid: unknown; id: unknown; created_at: unknown }
+    | undefined;
 
-  if (!row || typeof row.id !== 'string' || typeof row.created_at !== 'string' || !isValidIsoDate(row.created_at)) {
+  if (
+    !row ||
+    (typeof row.rowid !== 'number' && typeof row.rowid !== 'bigint') ||
+    typeof row.id !== 'string' ||
+    typeof row.created_at !== 'string' ||
+    !isValidIsoDate(row.created_at)
+  ) {
     throw new ValidationError('Invalid cursor: cursor row not found or does not belong to the requested tenant/session');
   }
 
   return {
     id: row.id,
     createdAt: row.created_at,
+    rowid: Number(row.rowid),
   };
 }
 
@@ -999,6 +1097,85 @@ export class SqliteWebMessageStore {
         timestamp
       );
 
+      // 2f. If channelContext provided, validate and atomically insert into channel_turn_origins BEFORE execution
+      if (params.channelContext) {
+        const {
+          channel,
+          accountId,
+          chatId,
+          nativeContextId,
+          nativeEventId,
+          replyToMessageId: originReplyToMessageId,
+          rootId,
+          threadId,
+          originTurnId,
+        } = params.channelContext;
+
+        if (!channel || typeof channel !== 'string' || channel.trim().length === 0) {
+          this.rollbackSafe();
+          inTransaction = false;
+          throw new ValidationError('Mandatory channel missing or empty in channelContext');
+        }
+        if (channel.toLowerCase() === 'web') {
+          this.rollbackSafe();
+          inTransaction = false;
+          throw new ValidationError('Turn origin is channel-only; web channel is not permitted');
+        }
+        if (channel.toLowerCase() === 'lark') {
+          if (!nativeEventId || typeof nativeEventId !== 'string' || nativeEventId.trim().length === 0) {
+            this.rollbackSafe();
+            inTransaction = false;
+            throw new ValidationError('Lark channel turn origin requires nativeEventId');
+          }
+        }
+        if (!accountId || typeof accountId !== 'string' || accountId.trim().length === 0) {
+          this.rollbackSafe();
+          inTransaction = false;
+          throw new ValidationError('Mandatory accountId missing or empty in channelContext');
+        }
+        if (!chatId || typeof chatId !== 'string' || chatId.trim().length === 0) {
+          this.rollbackSafe();
+          inTransaction = false;
+          throw new ValidationError('Mandatory chatId missing or empty in channelContext');
+        }
+        if (!nativeContextId || typeof nativeContextId !== 'string' || nativeContextId.trim().length === 0) {
+          this.rollbackSafe();
+          inTransaction = false;
+          throw new ValidationError('Mandatory nativeContextId missing or empty in channelContext');
+        }
+
+        // Validate account belongs to same tenant user
+        const accountCheck = this.db.prepare(
+          'SELECT id FROM channel_accounts WHERE id = ? AND user_id = ? LIMIT 1'
+        ).get(accountId, userId);
+        if (!accountCheck) {
+          this.rollbackSafe();
+          inTransaction = false;
+          throw new NotFoundError(`Channel account "${accountId}" not found for user "${userId}"`);
+        }
+
+        this.db.prepare(`
+          INSERT INTO channel_turn_origins (
+            turn_id, user_id, session_id, account_id, channel, chat_id,
+            native_context_id, native_event_id, reply_to_message_id, root_id, thread_id, origin_turn_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          turnId,
+          userId,
+          sessionId,
+          accountId,
+          channel,
+          chatId,
+          nativeContextId,
+          nativeEventId ?? null,
+          originReplyToMessageId ?? null,
+          rootId ?? null,
+          threadId ?? null,
+          originTurnId ?? null,
+          timestamp
+        );
+      }
+
       this.db.exec('COMMIT');
       inTransaction = false;
 
@@ -1233,8 +1410,20 @@ export class SqliteWebMessageStore {
   async listMessages(
     userId: string,
     sessionId: string,
-    options: { limit?: number; before?: string; after?: string; cursor?: string } = {}
-  ): Promise<{ messages: WebMessageRecord[]; hasMore: boolean; olderCursor: string | null; newerCursor: string | null }> {
+    options: {
+      limit?: number;
+      before?: string;
+      after?: string;
+      cursor?: string;
+      _interleavingHook?: () => void;
+    } = {}
+  ): Promise<{
+    messages: WebMessageRecord[];
+    hasMore: boolean;
+    olderCursor: string | null;
+    newerCursor: string | null;
+    latestEventCursor?: string | null;
+  }> {
     if (typeof userId !== 'string' || userId.length === 0 || userId.length > 128) {
       throw new ValidationError('Invalid userId format');
     }
@@ -1250,119 +1439,182 @@ export class SqliteWebMessageStore {
       throw new ValidationError("Cannot specify both 'before' and 'after' options");
     }
 
+    const isInitial = options.before === undefined && options.after === undefined;
     const limitNum = typeof options.limit === 'number' && Number.isInteger(options.limit) ? options.limit : 50;
     const limit = Math.min(Math.max(limitNum, 1), 100);
 
-    let rows: WebMessageRow[];
-    let shouldReverse = false;
-
-    if (options.before !== undefined) {
-      const decoded = decodeAndValidateCursor(this.db, options.before, 'message', userId, sessionId);
-      const query = `
-        SELECT id, session_id, user_id, role, content, status, route_key, turn_id, created_at
-        FROM web_messages
-        WHERE session_id = ? AND user_id = ?
-          AND (created_at < ? OR (created_at = ? AND id < ?))
-        ORDER BY created_at DESC, id DESC
-        LIMIT ?
-      `;
-      const stmt = this.db.prepare(query);
-      rows = stmt.all(sessionId, userId, decoded.createdAt, decoded.createdAt, decoded.id, limit + 1) as unknown as WebMessageRow[];
-      shouldReverse = true;
-    } else if (options.after !== undefined) {
-      const decoded = decodeAndValidateCursor(this.db, options.after, 'message', userId, sessionId);
-      const query = `
-        SELECT id, session_id, user_id, role, content, status, route_key, turn_id, created_at
-        FROM web_messages
-        WHERE session_id = ? AND user_id = ?
-          AND (created_at > ? OR (created_at = ? AND id > ?))
-        ORDER BY created_at ASC, id ASC
-        LIMIT ?
-      `;
-      const stmt = this.db.prepare(query);
-      rows = stmt.all(sessionId, userId, decoded.createdAt, decoded.createdAt, decoded.id, limit + 1) as unknown as WebMessageRow[];
-      shouldReverse = false;
-    } else {
-      // Initial: latest messages
-      const query = `
-        SELECT id, session_id, user_id, role, content, status, route_key, turn_id, created_at
-        FROM web_messages
-        WHERE session_id = ? AND user_id = ?
-        ORDER BY created_at DESC, id DESC
-        LIMIT ?
-      `;
-      const stmt = this.db.prepare(query);
-      rows = stmt.all(sessionId, userId, limit + 1) as unknown as WebMessageRow[];
-      shouldReverse = true;
+    let startedTx = false;
+    try {
+      this.db.exec('BEGIN');
+      startedTx = true;
+    } catch (_txErr: unknown) {
+      // Already in active transaction
     }
 
-    const hasMore = rows.length > limit;
-    const selectedRows = rows.slice(0, limit);
-    if (shouldReverse) {
-      selectedRows.reverse();
-    }
+    try {
+      let latestEventCursor: string | null | undefined = undefined;
 
-    const msgIds = selectedRows.map((r) => String(r.id));
-    const attachmentsMap = queryBatchMessageAttachments(this.db, msgIds);
-    const referencesMap = queryBatchMessageReferences(this.db, msgIds);
+      // For initial messages snapshot, capture latest event watermark in SAME consistent SQLite read snapshot.
+      // We capture watermark BEFORE or alongside history query with NO await inside.
+      if (isInitial) {
+        const watermarkStmt = this.db.prepare(`
+          SELECT rowid, id, created_at
+          FROM web_events
+          WHERE session_id = ? AND user_id = ?
+          ORDER BY rowid DESC
+          LIMIT 1
+        `);
+        const latestEventRow = watermarkStmt.get(sessionId, userId) as
+          | { rowid: unknown; id: unknown; created_at: unknown }
+          | undefined;
 
-    const records: WebMessageRecord[] = [];
-    for (const r of selectedRows) {
-      if (
-        typeof r.id !== 'string' ||
-        typeof r.content !== 'string' ||
-        typeof r.created_at !== 'string' ||
-        !isValidIsoDate(r.created_at)
-      ) {
-        throw new PlatformError('Corrupted web_messages row in database', 'DATABASE_CORRUPTED', 500);
+        if (
+          latestEventRow &&
+          (typeof latestEventRow.rowid === 'number' || typeof latestEventRow.rowid === 'bigint') &&
+          typeof latestEventRow.id === 'string' &&
+          typeof latestEventRow.created_at === 'string' &&
+          isValidIsoDate(latestEventRow.created_at)
+        ) {
+          latestEventCursor = encodeOpaqueCursor({
+            v: 2,
+            kind: 'event',
+            id: latestEventRow.id,
+            seq: Number(latestEventRow.rowid),
+            createdAt: latestEventRow.created_at,
+          });
+        } else {
+          // Empty-event session: explicit boundary cursor understood by pollEvents as genesis/empty
+          latestEventCursor = null;
+        }
       }
 
-      if (r.role !== 'user' && r.role !== 'assistant' && r.role !== 'system') {
-        throw new PlatformError('Corrupted message role in database', 'DATABASE_CORRUPTED', 500);
-      }
-      if (r.status !== 'pending' && r.status !== 'delivered' && r.status !== 'failed') {
-        throw new PlatformError('Corrupted message status in database', 'DATABASE_CORRUPTED', 500);
+      if (options._interleavingHook) {
+        options._interleavingHook();
       }
 
-      const atts = attachmentsMap.get(String(r.id));
-      const ref = referencesMap.get(String(r.id));
-      records.push({
-        id: r.id,
-        role: r.role,
-        content: r.content,
-        status: r.status,
-        createdAt: r.created_at,
-        ...(atts && atts.length > 0 ? { attachments: atts } : {}),
-        ...(ref ? { replyReference: ref } : {}),
-      });
+      let rows: WebMessageRow[];
+      let shouldReverse = false;
+
+      if (options.before !== undefined) {
+        const decoded = decodeAndValidateCursor(this.db, options.before, 'message', userId, sessionId);
+        const query = `
+          SELECT id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+          FROM web_messages
+          WHERE session_id = ? AND user_id = ?
+            AND (created_at < ? OR (created_at = ? AND id < ?))
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?
+        `;
+        const stmt = this.db.prepare(query);
+        rows = stmt.all(sessionId, userId, decoded.createdAt, decoded.createdAt, decoded.id, limit + 1) as unknown as WebMessageRow[];
+        shouldReverse = true;
+      } else if (options.after !== undefined) {
+        const decoded = decodeAndValidateCursor(this.db, options.after, 'message', userId, sessionId);
+        const query = `
+          SELECT id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+          FROM web_messages
+          WHERE session_id = ? AND user_id = ?
+            AND (created_at > ? OR (created_at = ? AND id > ?))
+          ORDER BY created_at ASC, id ASC
+          LIMIT ?
+        `;
+        const stmt = this.db.prepare(query);
+        rows = stmt.all(sessionId, userId, decoded.createdAt, decoded.createdAt, decoded.id, limit + 1) as unknown as WebMessageRow[];
+        shouldReverse = false;
+      } else {
+        // Initial: latest messages
+        const query = `
+          SELECT id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+          FROM web_messages
+          WHERE session_id = ? AND user_id = ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?
+        `;
+        const stmt = this.db.prepare(query);
+        rows = stmt.all(sessionId, userId, limit + 1) as unknown as WebMessageRow[];
+        shouldReverse = true;
+      }
+
+      const hasMore = rows.length > limit;
+      const selectedRows = rows.slice(0, limit);
+      if (shouldReverse) {
+        selectedRows.reverse();
+      }
+
+      const msgIds = selectedRows.map((r) => String(r.id));
+      const attachmentsMap = queryBatchMessageAttachments(this.db, msgIds);
+      const referencesMap = queryBatchMessageReferences(this.db, msgIds);
+
+      const records: WebMessageRecord[] = [];
+      for (const r of selectedRows) {
+        if (
+          typeof r.id !== 'string' ||
+          typeof r.content !== 'string' ||
+          typeof r.created_at !== 'string' ||
+          !isValidIsoDate(r.created_at)
+        ) {
+          throw new PlatformError('Corrupted web_messages row in database', 'DATABASE_CORRUPTED', 500);
+        }
+
+        if (r.role !== 'user' && r.role !== 'assistant' && r.role !== 'system') {
+          throw new PlatformError('Corrupted message role in database', 'DATABASE_CORRUPTED', 500);
+        }
+        if (r.status !== 'pending' && r.status !== 'delivered' && r.status !== 'failed') {
+          throw new PlatformError('Corrupted message status in database', 'DATABASE_CORRUPTED', 500);
+        }
+
+        const atts = attachmentsMap.get(String(r.id));
+        const ref = referencesMap.get(String(r.id));
+        records.push({
+          id: r.id,
+          role: r.role,
+          content: r.content,
+          status: r.status,
+          createdAt: r.created_at,
+          ...(atts && atts.length > 0 ? { attachments: atts } : {}),
+          ...(ref ? { replyReference: ref } : {}),
+        });
+      }
+
+      let olderCursor: string | null = null;
+      let newerCursor: string | null = null;
+
+      if (records.length > 0) {
+        const firstRecord = records[0];
+        const lastRecord = records[records.length - 1];
+        olderCursor = encodeOpaqueCursor({
+          v: 1,
+          kind: 'message',
+          id: firstRecord.id,
+          createdAt: firstRecord.createdAt,
+        });
+        newerCursor = encodeOpaqueCursor({
+          v: 1,
+          kind: 'message',
+          id: lastRecord.id,
+          createdAt: lastRecord.createdAt,
+        });
+      }
+
+      if (startedTx) {
+        this.db.exec('COMMIT');
+      }
+
+      return {
+        messages: records,
+        hasMore,
+        olderCursor,
+        newerCursor,
+        ...(isInitial ? { latestEventCursor } : {}),
+      };
+    } catch (err: unknown) {
+      if (startedTx) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch {}
+      }
+      throw err;
     }
-
-    let olderCursor: string | null = null;
-    let newerCursor: string | null = null;
-
-    if (records.length > 0) {
-      const firstRecord = records[0];
-      const lastRecord = records[records.length - 1];
-      olderCursor = encodeOpaqueCursor({
-        v: 1,
-        kind: 'message',
-        id: firstRecord.id,
-        createdAt: firstRecord.createdAt,
-      });
-      newerCursor = encodeOpaqueCursor({
-        v: 1,
-        kind: 'message',
-        id: lastRecord.id,
-        createdAt: lastRecord.createdAt,
-      });
-    }
-
-    return {
-      messages: records,
-      hasMore,
-      olderCursor,
-      newerCursor,
-    };
   }
 
   /**
@@ -1789,8 +2041,14 @@ export class SqliteWebMessageStore {
     }
 
     const insertStmt = this.db.prepare(`
-      INSERT OR REPLACE INTO web_events (id, session_id, user_id, type, payload, created_at)
+      INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        session_id = excluded.session_id,
+        user_id = excluded.user_id,
+        type = excluded.type,
+        payload = excluded.payload,
+        created_at = excluded.created_at
     `);
 
     let startedTx = false;
@@ -1846,7 +2104,7 @@ export class SqliteWebMessageStore {
     const limit = Math.min(Math.max(limitNum, 1), 100);
 
     let query = `
-      SELECT id, session_id, user_id, type, payload, created_at
+      SELECT rowid, id, session_id, user_id, type, payload, created_at
       FROM web_events
       WHERE session_id = ? AND user_id = ?
     `;
@@ -1854,15 +2112,20 @@ export class SqliteWebMessageStore {
 
     if (rawCursor) {
       const decoded = decodeAndValidateCursor(this.db, rawCursor, 'event', userId, sessionId);
-      query += ` AND (created_at > ? OR (created_at = ? AND id > ?))`;
-      params.push(decoded.createdAt, decoded.createdAt, decoded.id);
+      if (decoded.rowid !== undefined) {
+        query += ` AND rowid > ?`;
+        params.push(decoded.rowid);
+      } else {
+        query += ` AND (created_at > ? OR (created_at = ? AND id > ?))`;
+        params.push(decoded.createdAt, decoded.createdAt, decoded.id);
+      }
     }
 
-    query += ` ORDER BY created_at ASC, id ASC LIMIT ?`;
+    query += ` ORDER BY rowid ASC LIMIT ?`;
     params.push(limit + 1);
 
     const stmt = this.db.prepare(query);
-    const rows = stmt.all(...params) as unknown as WebEventRow[];
+    const rows = stmt.all(...params) as unknown as Array<WebEventRow & { rowid: number | bigint }>;
 
     const hasMore = rows.length > limit;
     const selectedRows = rows.slice(0, limit);
@@ -1998,12 +2261,14 @@ export class SqliteWebMessageStore {
     }
 
     let nextCursor: string | null = null;
-    if (events.length > 0) {
+    if (selectedRows.length > 0) {
+      const lastRow = selectedRows[selectedRows.length - 1];
       const lastEvent = events[events.length - 1];
       nextCursor = encodeOpaqueCursor({
-        v: 1,
+        v: 2,
         kind: 'event',
         id: lastEvent.id,
+        seq: Number(lastRow.rowid),
         createdAt: lastEvent.createdAt,
       });
     } else if (rawCursor) {

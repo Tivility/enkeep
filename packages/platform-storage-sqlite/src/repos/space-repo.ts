@@ -90,10 +90,17 @@ export class SqliteTenantScopedSpaceRepository implements TenantScopedSpaceRepos
       }
     }
 
-    this.db.prepare(`
-      INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    `).run(id, this.userId, name, folder, executionMode, status, agentProfileId, agentProfileSnapshotId);
+    if (input.canonicalSessionId) {
+      this.db.prepare(`
+        INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId);
+    } else {
+      this.db.prepare(`
+        INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(id, this.userId, name, folder, executionMode, status, agentProfileId, agentProfileSnapshotId);
+    }
 
     const space = await this.findById(id);
     if (!space) {
@@ -132,6 +139,10 @@ export class SqliteTenantScopedSpaceRepository implements TenantScopedSpaceRepos
       }
       updates.push('status = ?');
       params.push(input.status);
+    }
+    if (input.canonicalSessionId !== undefined) {
+      updates.push('canonical_session_id = ?');
+      params.push(input.canonicalSessionId);
     }
     if (input.agentProfileId !== undefined) {
       if (input.agentProfileId !== null) {
