@@ -101,6 +101,7 @@ import {
   type InstructionsMountConfig,
   type SkillsMountConfig,
   type SubagentsMountConfig,
+  type WebMountConfig,
 } from './official-plugins.js';
 import {
   type RuntimeHealthStatus,
@@ -154,7 +155,6 @@ function haveSkillsChanged(
   }
   return false;
 }
-
 
 /**
  * Validates whether a space ID conforms to the safe identifier pattern.
@@ -266,6 +266,12 @@ export interface DshRuntimeBootConfig {
   readonly maxTokens?: number;
   /** Optional mock or custom platform client instance */
   readonly platformClient?: DshPlatformClient | unknown;
+  /** Optional extra readable roots for sandbox boundary allowlist */
+  readonly extraReadableRoots?: string[];
+  /** Optional extra writable roots for sandbox boundary allowlist */
+  readonly extraWritableRoots?: string[];
+  /** Optional web seam configuration */
+  readonly web?: WebMountConfig;
 }
 
 export interface ActiveTurnInfo {
@@ -565,6 +571,9 @@ export interface ValidatedDshRuntimeBootConfig extends DshRuntimeBootConfig {
   readonly contextWindow?: number;
   readonly maxTokens?: number;
   readonly platformClient?: DshPlatformClient | unknown;
+  readonly extraReadableRoots?: string[];
+  readonly extraWritableRoots?: string[];
+  readonly web?: WebMountConfig;
 }
 
 const ALLOWED_BOOT_CONFIG_KEYS = new Set([
@@ -578,6 +587,7 @@ const ALLOWED_BOOT_CONFIG_KEYS = new Set([
   'llmBaseUrl',
   'providers',
   'compaction',
+  'thresholdTokens',
   'instructions',
   'skills',
   'subagents',
@@ -585,6 +595,9 @@ const ALLOWED_BOOT_CONFIG_KEYS = new Set([
   'contextWindow',
   'maxTokens',
   'platformClient',
+  'extraReadableRoots',
+  'extraWritableRoots',
+  'web',
 ]);
 
 /**
@@ -683,7 +696,13 @@ export function validateDshRuntimeBootConfig(rawConfig: unknown): ValidatedDshRu
     if (!isRecord(rawConfig.compaction)) {
       throw new TypeError('Invalid "compaction": must be an object');
     }
-    compaction = rawConfig.compaction as CompactionMountConfig;
+    compaction = { ...(rawConfig.compaction as CompactionMountConfig) };
+  }
+  if ('thresholdTokens' in rawConfig && rawConfig.thresholdTokens !== undefined) {
+    if (typeof rawConfig.thresholdTokens !== 'number' || !Number.isSafeInteger(rawConfig.thresholdTokens) || rawConfig.thresholdTokens <= 0) {
+      throw new TypeError('Invalid "thresholdTokens": must be a positive safe integer');
+    }
+    compaction = { ...compaction, thresholdTokens: rawConfig.thresholdTokens };
   }
 
   let instructions: InstructionsMountConfig | undefined;
@@ -763,6 +782,9 @@ export function validateDshRuntimeBootConfig(rawConfig: unknown): ValidatedDshRu
     contextWindow,
     maxTokens,
     platformClient: rawConfig.platformClient,
+    extraReadableRoots: Array.isArray(rawConfig.extraReadableRoots) ? rawConfig.extraReadableRoots : undefined,
+    extraWritableRoots: Array.isArray(rawConfig.extraWritableRoots) ? rawConfig.extraWritableRoots : undefined,
+    web: isRecord(rawConfig.web) ? (rawConfig.web as WebMountConfig) : undefined,
   };
 }
 
@@ -808,7 +830,9 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   await ctx.plugin(ToolsRegistry);
   await ctx.plugin(AgentRegistry);
   await ctx.plugin(AgentLoop);
-  const subagentScopeDisposer = installSubagentScopeDecorator(ctx);
+  const subagentScopeDisposer = installSubagentScopeDecorator(ctx, {
+    platformClient: validConfig.platformClient,
+  });
   await ctx.plugin(AgentDefaultModel, {
     provider,
     model,
@@ -1094,6 +1118,21 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   }
 
   // 4. Mount official DSH 0.1.1-rc.2 capability plugins (P0 Compaction, P1 Instructions, P1 Skills, P2 Subagents)
+  let resolvedContextWindow = validConfig.contextWindow;
+  if (!resolvedContextWindow) {
+    if (provider === 'cpa-claude' || provider === 'cpa-gemini' || provider === 'cpa-cn') {
+      resolvedContextWindow = 1000000;
+    } else if (provider === 'cpa-gpt') {
+      resolvedContextWindow = 920000;
+    } else if (provider === 'cpa-grok') {
+      resolvedContextWindow = 400000;
+    } else if (llmEnabled) {
+      resolvedContextWindow = 1000000;
+    } else {
+      resolvedContextWindow = 128000;
+    }
+  }
+
   const officialPluginsHandle = await mountOfficialPlugins(ctx, {
     dshHome,
     spacesDir,
@@ -1104,6 +1143,10 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     instructions: validConfig.instructions,
     skills: validConfig.skills,
     subagents: validConfig.subagents,
+    web: validConfig.web,
+    extraReadableRoots: validConfig.extraReadableRoots,
+    extraWritableRoots: validConfig.extraWritableRoots,
+    contextWindow: resolvedContextWindow,
   });
 
   function isFiberActive(fiber: Fiber | undefined): boolean {
@@ -1457,6 +1500,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     if (!isValidSessionId(sessionIdStr)) {
       throw new TypeError('Invalid session ID format: must match canonical session ID pattern');
     }
+    const sid = SessionId(sessionIdStr);
 
     if (isDisposed) {
       throw new Error('DSH Runtime is disposed');
@@ -1559,7 +1603,6 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       }
     }
 
-    const sid = SessionId(sessionIdStr);
     const liveAgent = ctx.agents.get(sid);
     if (liveAgent && agentHandles.has(sessionIdStr)) {
       if (validatedProfile) {
@@ -1633,6 +1676,9 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           skills: validConfig.skills,
           subagents: validConfig.subagents,
           extensionPlan: validatedPlan,
+          web: validConfig.web,
+          extraReadableRoots: validConfig.extraReadableRoots,
+          extraWritableRoots: validConfig.extraWritableRoots,
           onExtensionPlanUpdated: async (newPlan) => {
             const oldPlan = sessionExtensionPlans.get(sessionIdStr);
             if (haveSkillsChanged(oldPlan, newPlan)) {
@@ -2686,60 +2732,63 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         seed,
         agentOptions: { provider, model },
         setup: async (agentCtx: Context) => {
-        installModelSelection(agentCtx, selectionRef!);
-        if (validatedProfile) {
-          installAgentProfile(agentCtx, validatedProfile);
-        }
-        installAgentFallbackRouter(agentCtx, sessionIdStr, selectionRef!);
-        agentCtx.effect(() => {
-          const eventRelay = ctx.eventRelay ?? (ctx.get ? ctx.get('eventRelay') : undefined);
-          if (eventRelay && typeof eventRelay.attachAgent === 'function') {
-            return eventRelay.attachAgent(agentCtx);
+          installModelSelection(agentCtx, selectionRef!);
+          if (validatedProfile) {
+            installAgentProfile(agentCtx, validatedProfile);
           }
-          return () => {};
-        }, 'eventRelay.agentScope()');
-
-        const configMounts = validConfig.mounts;
-        const spaceMountSpecs = typeof configMounts === 'function'
-          ? configMounts(workspaceFolder || 'default')
-          : (configMounts ?? []);
-        const spaceMounts = resolveRuntimeMounts(spaceMountSpecs);
-
-        const wsHandle = await mountWorkspaceTools(agentCtx, {
-          spacePath,
-          dshHome,
-          sessionId: sessionIdStr,
-          mounts: spaceMounts,
-          instructions: validConfig.instructions,
-          skills: validConfig.skills,
-          subagents: validConfig.subagents,
-        });
-        await disposeSessionWorkspace(sessionIdStr);
-        sessionWorkspaceHandles.set(sessionIdStr, wsHandle);
-        const unregisterWs = officialPluginsHandle.registerWorkspace(wsHandle);
-        sessionWorkspaceDisposers.set(sessionIdStr, unregisterWs);
-
-        const memoryService = ctx.memory ?? (ctx.get ? ctx.get('memory') : undefined);
-        if (memoryService && typeof memoryService.mountAgentMemory === 'function') {
-          const isExplicitSpace = typeof spacePath === 'string' && spacePath !== spacesDir && isPathInside(spacePath, spacesDir);
-          const resolvedSpacePath = isExplicitSpace ? spacePath : undefined;
-          const resolvedSpaceId = isExplicitSpace ? (workspaceFolder ?? sessionWorkspaces.get(sessionIdStr) ?? path.relative(spacesDir, spacePath)) : undefined;
-          const memHandle = mountAgentMemoryFailClosed(memoryService, agentCtx, {
-            dshHome,
-            spacePath: resolvedSpacePath,
-            spaceId: resolvedSpaceId,
-            userId,
-          });
+          installAgentFallbackRouter(agentCtx, sessionIdStr, selectionRef!);
           agentCtx.effect(() => {
-            return () => {
-              try {
-                memHandle.dispose();
-              } catch {}
-            };
-          }, 'memory.agentScope()');
-        }
-      },
-    });
+            const eventRelay = ctx.eventRelay ?? (ctx.get ? ctx.get('eventRelay') : undefined);
+            if (eventRelay && typeof eventRelay.attachAgent === 'function') {
+              return eventRelay.attachAgent(agentCtx);
+            }
+            return () => {};
+          }, 'eventRelay.agentScope()');
+
+          const configMounts = validConfig.mounts;
+          const spaceMountSpecs = typeof configMounts === 'function'
+            ? configMounts(workspaceFolder || 'default')
+            : (configMounts ?? []);
+          const spaceMounts = resolveRuntimeMounts(spaceMountSpecs);
+
+          const wsHandle = await mountWorkspaceTools(agentCtx, {
+            spacePath,
+            dshHome,
+            sessionId: sessionIdStr,
+            mounts: spaceMounts,
+            instructions: validConfig.instructions,
+            skills: validConfig.skills,
+            subagents: validConfig.subagents,
+            web: validConfig.web,
+            extraReadableRoots: validConfig.extraReadableRoots,
+            extraWritableRoots: validConfig.extraWritableRoots,
+          });
+          await disposeSessionWorkspace(sessionIdStr);
+          sessionWorkspaceHandles.set(sessionIdStr, wsHandle);
+          const unregisterWs = officialPluginsHandle.registerWorkspace(wsHandle);
+          sessionWorkspaceDisposers.set(sessionIdStr, unregisterWs);
+
+          const memoryService = ctx.memory ?? (ctx.get ? ctx.get('memory') : undefined);
+          if (memoryService && typeof memoryService.mountAgentMemory === 'function') {
+            const isExplicitSpace = typeof spacePath === 'string' && spacePath !== spacesDir && isPathInside(spacePath, spacesDir);
+            const resolvedSpacePath = isExplicitSpace ? spacePath : undefined;
+            const resolvedSpaceId = isExplicitSpace ? (workspaceFolder ?? sessionWorkspaces.get(sessionIdStr) ?? path.relative(spacesDir, spacePath)) : undefined;
+            const memHandle = mountAgentMemoryFailClosed(memoryService, agentCtx, {
+              dshHome,
+              spacePath: resolvedSpacePath,
+              spaceId: resolvedSpaceId,
+              userId,
+            });
+            agentCtx.effect(() => {
+              return () => {
+                try {
+                  memHandle.dispose();
+                } catch {}
+              };
+            }, 'memory.agentScope()');
+          }
+        },
+      });
     } catch (importErr) {
       await disposeSessionWorkspace(sessionIdStr);
       throw importErr;
@@ -3456,6 +3505,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     officialPlugins: officialPluginsHandle,
     officialPluginsHandle,
     agentHandles,
+    activeTurns,
     modelProvider: activeModelProvider,
     getOrCreateAgent,
     removeAgent,
@@ -3467,6 +3517,9 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     importSeed,
     sendFollowup,
     cancelTurn,
+    updateExtensionPlan,
+    isSessionDirty: (sessionIdStr: string) => dirtySessions.has(sessionIdStr),
+    isSessionBusy,
     getHealth,
     getCapabilities: () => officialPluginsHandle.getCapabilities(),
     dispose,

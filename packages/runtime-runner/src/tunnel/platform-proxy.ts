@@ -57,6 +57,17 @@ import type {
   McpServerHealth,
 } from '@enkeep/platform-core';
 import { parseHttp1RequestFromStream, type ParsedHttpRequest } from './llm-proxy.js';
+import {
+  DescendantResolver,
+  type DescendantRouteRecord,
+  type RegisterDescendantOptions,
+} from './descendant-resolver.js';
+
+export {
+  DescendantResolver,
+  type DescendantRouteRecord,
+  type RegisterDescendantOptions,
+};
 
 export type {
   PlatformProxyMcpService,
@@ -128,6 +139,8 @@ export interface PlatformProxyBaseOptions {
   maxBodyBytes?: number;
   /** Maximum file body bytes override */
   maxFileSizeBytes?: number;
+  /** Optional custom descendant resolver instance */
+  descendantResolver?: DescendantResolver;
 }
 
 export interface PlatformProxyBoundOptions extends PlatformProxyBaseOptions {
@@ -196,6 +209,7 @@ export class PlatformProxyHandler implements StreamHandler {
   private readonly browserService?: BrowserService;
   private readonly fileProvider?: PlatformProxyFileProvider;
   private readonly mcpService?: PlatformProxyMcpService;
+  private readonly descendantResolver: DescendantResolver;
   private readonly maxBodyBytes: number;
   private readonly maxFileSizeBytes: number;
 
@@ -263,6 +277,7 @@ export class PlatformProxyHandler implements StreamHandler {
     this.browserService = options.browserService;
     this.fileProvider = options.fileProvider;
     this.mcpService = options.mcpService;
+    this.descendantResolver = options.descendantResolver ?? new DescendantResolver();
     this.maxBodyBytes = options.maxBodyBytes ?? MAX_PLATFORM_BODY_BYTES;
     this.maxFileSizeBytes = options.maxFileSizeBytes ?? MAX_FILE_BODY_BYTES;
   }
@@ -679,6 +694,30 @@ export class PlatformProxyHandler implements StreamHandler {
         return;
       }
       await this.handleMcpHealth(req, stream);
+      return;
+    }
+
+    // 9. Canonical Descendant Route Operations: /api/routes/descendant
+    const isDescendantBase = pathname === '/api/routes/descendant';
+    const isDescendantChild = pathname.startsWith('/api/routes/descendant/');
+
+    if (isDescendantBase) {
+      if (method === 'POST') {
+        await this.handleRegisterDescendant(req, stream);
+        return;
+      }
+      this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
+      return;
+    }
+
+    if (isDescendantChild) {
+      const childId = pathname.slice('/api/routes/descendant/'.length);
+
+      if (method === 'DELETE') {
+        await this.handleUnregisterDescendant(childId, stream);
+        return;
+      }
+      this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
       return;
     }
 
@@ -1840,10 +1879,18 @@ export class PlatformProxyHandler implements StreamHandler {
   /**
    * Resolves session and space identity for the authenticated tenant.
    * Prevents cross-tenant spoofing by strictly filtering by user_id = platformUserId.
+   * Supports both direct session_routes and in-memory registered descendant subagents.
    */
-  private async resolveSessionRoute(
+  public async resolveSessionRoute(
     rawSessionId?: string
-  ): Promise<{ matchedSessionId: string; matchedSpaceId: string; dshSessionId: string } | null> {
+  ): Promise<{
+    matchedSessionId: string;
+    matchedSpaceId: string;
+    dshSessionId: string;
+    parentSessionId?: string;
+    origin?: string;
+    isDescendant?: boolean;
+  } | null> {
     if (!this.platformUserId) return null;
     if (!rawSessionId || typeof rawSessionId !== 'string' || !rawSessionId.trim()) {
       return null;
@@ -1889,7 +1936,189 @@ export class PlatformProxyHandler implements StreamHandler {
       }
     }
 
+    // Check in-memory descendant resolver for subagent route
+    const descendant = this.descendantResolver.resolve(targetId, this.platformUserId);
+    if (descendant) {
+      return {
+        matchedSessionId: descendant.childSessionId,
+        matchedSpaceId: descendant.spaceId,
+        dshSessionId: descendant.childSessionId,
+        parentSessionId: descendant.parentSessionId,
+        origin: descendant.origin,
+        isDescendant: true,
+      };
+    }
+
     return null;
+  }
+
+  public getDescendantResolver(): DescendantResolver {
+    return this.descendantResolver;
+  }
+
+  public async registerDescendantRoute(input: {
+    childSessionId: string;
+    parentSessionId: string;
+    origin?: string;
+    ttlMs?: number;
+    metadata?: Record<string, unknown>;
+  }): Promise<DescendantRouteRecord> {
+    if (!this.platformUserId) {
+      throw new Error('Platform proxy requires authoritative platformUserId binding');
+    }
+    const cleanChildId = input.childSessionId?.trim();
+    const cleanParentId = input.parentSessionId?.trim();
+    if (!cleanChildId) {
+      throw new Error('childSessionId must be a non-empty string');
+    }
+    if (!cleanParentId) {
+      throw new Error('parentSessionId must be a non-empty string');
+    }
+    const parentRoute = await this.resolveSessionRoute(cleanParentId);
+    if (!parentRoute) {
+      throw new Error('Parent session does not belong to authorized tenant or space');
+    }
+    return this.descendantResolver.register({
+      childSessionId: cleanChildId,
+      parentSessionId: parentRoute.matchedSessionId,
+      spaceId: parentRoute.matchedSpaceId,
+      platformUserId: this.platformUserId,
+      origin: input.origin?.trim() || 'subagent',
+      ttlMs: input.ttlMs,
+      metadata: input.metadata,
+    });
+  }
+
+  public unregisterDescendantRoute(childSessionId: string): boolean {
+    if (!this.platformUserId) return false;
+    return this.descendantResolver.unregister(childSessionId.trim(), this.platformUserId);
+  }
+
+  public cleanupByParent(parentSessionId: string): number {
+    if (!this.platformUserId) return 0;
+    return this.descendantResolver.cleanupByParent(parentSessionId.trim(), this.platformUserId);
+  }
+
+  /**
+   * Handles POST /api/routes/descendant
+   */
+  private async handleRegisterDescendant(req: ParsedHttpRequest, stream: Duplex): Promise<void> {
+    if (!this.platformUserId) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding' },
+      });
+      return;
+    }
+
+    if (req.body.length > this.maxBodyBytes) {
+      this.writeJsonResponse(stream, 413, {
+        error: { code: 'PAYLOAD_TOO_LARGE', message: `Payload exceeds maximum limit of ${this.maxBodyBytes} bytes` },
+      });
+      return;
+    }
+
+    let parsedBody: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(req.body.toString('utf8'));
+      if (!isRecord(parsed)) {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Request body must be an object' },
+        });
+        return;
+      }
+      parsedBody = parsed;
+    } catch (_parseErr: unknown) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'INVALID_JSON', message: 'Request body must be valid JSON' },
+      });
+      return;
+    }
+
+    const { childSessionId, parentSessionId, origin, metadata, ttlMs } = parsedBody;
+
+    if (typeof childSessionId !== 'string' || !childSessionId.trim()) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'childSessionId must be a non-empty string' },
+      });
+      return;
+    }
+
+    if (typeof parentSessionId !== 'string' || !parentSessionId.trim()) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'parentSessionId must be a non-empty string' },
+      });
+      return;
+    }
+
+    if (origin !== undefined && (typeof origin !== 'string' || !origin.trim())) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'origin must be a non-empty string if provided' },
+      });
+      return;
+    }
+
+    const cleanChildId = childSessionId.trim();
+    const cleanParentId = parentSessionId.trim();
+    const effectiveOrigin = typeof origin === 'string' && origin.trim() ? origin.trim() : 'subagent';
+
+    // Anti-spoofing: Parent must belong to the authenticated connection/tenant
+    const parentRoute = await this.resolveSessionRoute(cleanParentId);
+    if (!parentRoute) {
+      this.writeJsonResponse(stream, 403, {
+        error: { code: 'FORBIDDEN', message: 'Parent session does not belong to authorized tenant or space' },
+      });
+      return;
+    }
+
+    const record = this.descendantResolver.register({
+      childSessionId: cleanChildId,
+      parentSessionId: parentRoute.matchedSessionId,
+      spaceId: parentRoute.matchedSpaceId,
+      platformUserId: this.platformUserId,
+      origin: effectiveOrigin,
+      ttlMs: typeof ttlMs === 'number' && ttlMs > 0 ? ttlMs : undefined,
+      metadata: isRecord(metadata) ? metadata : undefined,
+    });
+
+    this.writeJsonResponse(stream, 200, {
+      success: true,
+      data: {
+        childSessionId: record.childSessionId,
+        parentSessionId: record.parentSessionId,
+        spaceId: record.spaceId,
+        origin: record.origin,
+        createdAt: record.createdAt,
+      },
+    });
+  }
+
+  /**
+   * Handles DELETE /api/routes/descendant/:childSessionId
+   */
+  private async handleUnregisterDescendant(childId: string, stream: Duplex): Promise<void> {
+    if (!this.platformUserId) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding' },
+      });
+      return;
+    }
+
+    const cleanChildId = decodeURIComponent(childId).trim();
+    if (!cleanChildId) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'childSessionId is required' },
+      });
+      return;
+    }
+
+    const removed = this.descendantResolver.unregister(cleanChildId, this.platformUserId);
+    this.writeJsonResponse(stream, 200, {
+      success: true,
+      data: {
+        childSessionId: cleanChildId,
+        unregistered: removed,
+      },
+    });
   }
 
   /**
