@@ -1825,9 +1825,58 @@ describe('dsh-tools: tool implementations with Operational Truth', () => {
       await expect(toolExtra.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
     });
 
+    it('succeeds when limit and remaining are unlimited (-1) sentinel values', async () => {
+      const mockClientUnlimited: PlatformClientService = {
+        async checkQuota() {
+          return {
+            allowed: true,
+            limit: {
+              tokens: -1,
+              messages: -1,
+              turns: -1,
+              storage_bytes: -1,
+              api_calls: -1,
+            },
+            usage: {
+              tokens: 1500,
+              messages: 10,
+              turns: 5,
+              storage_bytes: 51200,
+              api_calls: 25,
+            },
+            activeReservations: {
+              tokens: 500,
+              messages: 0,
+              turns: 0,
+              storage_bytes: 0,
+              api_calls: 0,
+            },
+            remaining: {
+              tokens: -1,
+              messages: -1,
+              turns: -1,
+              storage_bytes: -1,
+              api_calls: -1,
+            },
+            resetAt: null,
+          };
+        },
+      };
+
+      const tool = createCheckQuotaTool(() => mockClientUnlimited);
+      const res = await tool.execute({ resource: 'all' });
+
+      expect(res.allowed).toBe(true);
+      expect(res.limit.tokens).toBe(-1);
+      expect(res.remaining.tokens).toBe(-1);
+      expect(res.usage.tokens).toBe(1500);
+      expect(res.activeReservations.tokens).toBe(500);
+      expect(res.resetAt).toBeNull();
+    });
+
     it('fails closed when checkQuota returns negative numbers or non-integers or mathematically inconsistent remaining', async () => {
-      // Negative usage
-      const mockNegative: PlatformClientService = {
+      // Negative usage (-5)
+      const mockNegativeUsage: PlatformClientService = {
         async checkQuota() {
           return {
             allowed: true,
@@ -1839,8 +1888,88 @@ describe('dsh-tools: tool implementations with Operational Truth', () => {
           } as any;
         },
       };
-      const toolNegative = createCheckQuotaTool(() => mockNegative);
-      await expect(toolNegative.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
+      const toolNegativeUsage = createCheckQuotaTool(() => mockNegativeUsage);
+      await expect(toolNegativeUsage.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
+
+      // Malformed limit with -2 (not valid unlimited sentinel -1)
+      const mockMalformedLimit: PlatformClientService = {
+        async checkQuota() {
+          return {
+            allowed: true,
+            usage: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            activeReservations: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            limit: { tokens: -2, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            remaining: { tokens: -2, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            resetAt: null,
+          } as any;
+        },
+      };
+      const toolMalformedLimit = createCheckQuotaTool(() => mockMalformedLimit);
+      await expect(toolMalformedLimit.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
+
+      // Malformed remaining with -2
+      const mockMalformedRemaining: PlatformClientService = {
+        async checkQuota() {
+          return {
+            allowed: true,
+            usage: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            activeReservations: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            limit: { tokens: -1, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            remaining: { tokens: -2, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            resetAt: null,
+          } as any;
+        },
+      };
+      const toolMalformedRemaining = createCheckQuotaTool(() => mockMalformedRemaining);
+      await expect(toolMalformedRemaining.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
+
+      // Unlimited limit (-1) but finite remaining (e.g. 100)
+      const mockMismatchedUnlimited: PlatformClientService = {
+        async checkQuota() {
+          return {
+            allowed: true,
+            usage: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            activeReservations: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            limit: { tokens: -1, messages: -1, turns: -1, storage_bytes: -1, api_calls: -1 },
+            remaining: { tokens: 100, messages: -1, turns: -1, storage_bytes: -1, api_calls: -1 },
+            resetAt: null,
+          } as any;
+        },
+      };
+      const toolMismatchedUnlimited = createCheckQuotaTool(() => mockMismatchedUnlimited);
+      await expect(toolMismatchedUnlimited.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
+
+      // Finite limit (100) but unlimited remaining (-1)
+      const mockMismatchedFinite: PlatformClientService = {
+        async checkQuota() {
+          return {
+            allowed: true,
+            usage: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            activeReservations: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            limit: { tokens: 100, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            remaining: { tokens: -1, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            resetAt: null,
+          } as any;
+        },
+      };
+      const toolMismatchedFinite = createCheckQuotaTool(() => mockMismatchedFinite);
+      await expect(toolMismatchedFinite.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
+
+      // Negative activeReservations (-1)
+      const mockNegativeReservations: PlatformClientService = {
+        async checkQuota() {
+          return {
+            allowed: true,
+            usage: { tokens: 0, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            activeReservations: { tokens: -1, messages: 0, turns: 0, storage_bytes: 0, api_calls: 0 },
+            limit: { tokens: 100, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            remaining: { tokens: 100, messages: 100, turns: 100, storage_bytes: 100, api_calls: 100 },
+            resetAt: null,
+          } as any;
+        },
+      };
+      const toolNegativeReservations = createCheckQuotaTool(() => mockNegativeReservations);
+      await expect(toolNegativeReservations.execute({ resource: 'tokens' })).rejects.toThrow(PlatformToolError);
 
       // Remaining does not match limit - (usage + activeReservations) (100 - (10 + 0) = 90, but returns 50)
       const mockInconsistentRemaining: PlatformClientService = {

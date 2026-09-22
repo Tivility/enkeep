@@ -167,10 +167,10 @@ function validateAndSanitizeQuotaNumbers(
     if (
       typeof limitVal !== 'number' ||
       !Number.isSafeInteger(limitVal) ||
-      limitVal < 0
+      (limitVal < 0 && limitVal !== -1)
     ) {
       throw createInvalidPlatformResponseError(
-        'Platform quota telemetry limit must be a non-negative safe integer'
+        'Platform quota telemetry limit must be a non-negative safe integer or -1 (unlimited)'
       );
     }
 
@@ -200,23 +200,31 @@ function validateAndSanitizeQuotaNumbers(
     if (
       typeof remainingVal !== 'number' ||
       !Number.isSafeInteger(remainingVal) ||
-      remainingVal < 0
+      (remainingVal < 0 && remainingVal !== -1)
     ) {
       throw createInvalidPlatformResponseError(
-        'Platform quota telemetry remaining must be a non-negative safe integer'
+        'Platform quota telemetry remaining must be a non-negative safe integer or -1 (unlimited)'
       );
     }
 
     const effectiveUsed = usageVal + resVal;
-    const expectedRemaining = Math.max(0, limitVal - effectiveUsed);
-    if (remainingVal !== expectedRemaining) {
-      throw createInvalidPlatformResponseError(
-        'Platform quota telemetry remaining does not match expected calculated remaining'
-      );
-    }
+    if (limitVal === -1) {
+      if (remainingVal !== -1) {
+        throw createInvalidPlatformResponseError(
+          'Platform quota telemetry remaining does not match expected calculated remaining'
+        );
+      }
+    } else {
+      const expectedRemaining = Math.max(0, limitVal - effectiveUsed);
+      if (remainingVal !== expectedRemaining) {
+        throw createInvalidPlatformResponseError(
+          'Platform quota telemetry remaining does not match expected calculated remaining'
+        );
+      }
 
-    if (effectiveUsed >= limitVal) {
-      computedOverallAllowed = false;
+      if (effectiveUsed >= limitVal) {
+        computedOverallAllowed = false;
+      }
     }
 
     sanitizedLimit[metric] = limitVal;
