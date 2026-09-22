@@ -168,6 +168,7 @@ export interface WorkspaceToolsMountOptions {
   readonly fs?: FsMountConfig;
   readonly defaultPreset?: string;
   readonly extensionPlan?: ExtensionActivationPlan | null;
+  readonly onExtensionPlanUpdated?: (newPlan: ExtensionActivationPlan | null) => Promise<void> | void;
 }
 
 export interface WorkspaceToolsHandle {
@@ -1118,6 +1119,9 @@ export async function mountWorkspaceTools(
     }
 
     const updateExtensionPlan = async (newPlan: ExtensionActivationPlan | null) => {
+      if (typeof options.onExtensionPlanUpdated === 'function') {
+        await options.onExtensionPlanUpdated(newPlan);
+      }
       if (mcpMountHandle && typeof mcpMountHandle.dispose === 'function') {
         try {
           await mcpMountHandle.dispose();
@@ -1205,12 +1209,15 @@ export async function mountWorkspaceTools(
       }
     };
 
+    let isDisposed = false;
     return {
       fibers,
       spacePath,
       context: agentCtx,
       updateExtensionPlan,
       dispose: async () => {
+        if (isDisposed) return;
+        isDisposed = true;
         const errors: Error[] = [];
         for (let i = pluginFibers.length - 1; i >= 0; i--) {
           const pf = pluginFibers[i];
@@ -1229,6 +1236,7 @@ export async function mountWorkspaceTools(
           } catch (err: unknown) {
             errors.push(err instanceof Error ? err : new Error(String(err)));
           }
+          cliMountHandle = undefined;
         }
         if (mcpMountHandle && typeof mcpMountHandle.dispose === 'function') {
           try {
@@ -1236,6 +1244,7 @@ export async function mountWorkspaceTools(
           } catch (err: unknown) {
             errors.push(err instanceof Error ? err : new Error(String(err)));
           }
+          mcpMountHandle = undefined;
         }
         for (let i = fibers.length - 1; i >= 0; i--) {
           const f = fibers[i];

@@ -137,6 +137,32 @@ import {
   validateExtensionActivationPlan,
 } from '@enkeep/protocol';
 
+function haveSkillsChanged(
+  oldPlan: ExtensionActivationPlan | null | undefined,
+  newPlan: ExtensionActivationPlan | null | undefined
+): boolean {
+  if (!oldPlan && !newPlan) return false;
+  const oldSkills = oldPlan?.skills ?? [];
+  const newSkills = newPlan?.skills ?? [];
+  if (oldSkills.length !== newSkills.length) return true;
+  for (let i = 0; i < newSkills.length; i++) {
+    const o = oldSkills[i];
+    const n = newSkills[i];
+    if (
+      o.contributionKey !== n.contributionKey ||
+      o.name !== n.name ||
+      o.version !== n.version ||
+      o.contentHash !== n.contentHash ||
+      o.enabled !== n.enabled ||
+      o.modelInvocable !== n.modelInvocable ||
+      o.userInvocable !== n.userInvocable
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export interface DaemonOptions extends DshRuntimeBootConfig {
   /** Maximum number of active agents held in memory (default: 16, or env DSH_MAX_AGENTS) */
   readonly maxAgents?: number;
@@ -1342,7 +1368,8 @@ export class RuntimeDaemon extends EventEmitter {
       }
     }
 
-    if (profileMismatch || workspaceMismatch || mountMismatch) {
+    const planSkillsChanged = extensionPlanMismatch && haveSkillsChanged(existing.extensionPlan, validatedExtensionPlan);
+    if (profileMismatch || workspaceMismatch || mountMismatch || planSkillsChanged) {
       // If agent is active / has pending turns: drain after current turn
       const queue = this.sessionQueues.get(existing.sessionId);
       const queueLen = queue ? queue.length : 0;
@@ -1351,7 +1378,7 @@ export class RuntimeDaemon extends EventEmitter {
       } else {
         const reason = mountMismatch
           ? 'mount_mismatch'
-          : (profileMismatch ? 'profile_mismatch' : 'space_mismatch');
+          : (profileMismatch || planSkillsChanged ? 'profile_mismatch' : 'space_mismatch');
         await this.evictAgent(existing.sessionId, reason);
         return this.getOrCreateManagedAgent(existing.sessionId, profileSnapshot, workspaceFolder, mounts, extensionPlan);
       }
@@ -1511,8 +1538,9 @@ export class RuntimeDaemon extends EventEmitter {
             request.extensionPlan !== undefined && (existing.extensionPlanHash ?? computeExtensionPlanHash(null)) !== computeExtensionPlanHash(validatedReqPlan)
           );
 
-          if (profileDiffers || workspaceDiffers || mountDiffers) {
-            await this.evictAgent(sessionId, mountDiffers ? 'mount_mismatch' : (profileDiffers ? 'profile_mismatch' : 'space_mismatch'));
+          const planSkillsChanged = planDiffers && haveSkillsChanged(existing.extensionPlan, validatedReqPlan);
+          if (profileDiffers || workspaceDiffers || mountDiffers || planSkillsChanged) {
+            await this.evictAgent(sessionId, mountDiffers ? 'mount_mismatch' : (profileDiffers || planSkillsChanged ? 'profile_mismatch' : 'space_mismatch'));
             entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan);
           } else if (planDiffers) {
             entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan);

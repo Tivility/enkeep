@@ -125,6 +125,37 @@ export const CANONICAL_TURN_ID_PATTERN = /^turn_[0-9a-f]{32}$/;
 export const CHECKSUM_PATTERN = /^[0-9a-f]{64}$/;
 
 /**
+ * Checks whether an updated extension plan modifies skill contributions
+ * compared to the previously active plan.
+ */
+function haveSkillsChanged(
+  oldPlan: ExtensionActivationPlan | null | undefined,
+  newPlan: ExtensionActivationPlan | null | undefined
+): boolean {
+  if (!oldPlan && !newPlan) return false;
+  const oldSkills = oldPlan?.skills ?? [];
+  const newSkills = newPlan?.skills ?? [];
+  if (oldSkills.length !== newSkills.length) return true;
+  for (let i = 0; i < newSkills.length; i++) {
+    const o = oldSkills[i];
+    const n = newSkills[i];
+    if (
+      o.contributionKey !== n.contributionKey ||
+      o.name !== n.name ||
+      o.version !== n.version ||
+      o.contentHash !== n.contentHash ||
+      o.enabled !== n.enabled ||
+      o.modelInvocable !== n.modelInvocable ||
+      o.userInvocable !== n.userInvocable
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+
+/**
  * Validates whether a space ID conforms to the safe identifier pattern.
  */
 export function isValidSpaceId(spaceId: unknown): spaceId is string {
@@ -257,6 +288,7 @@ export interface DshBootedRuntime {
   readonly officialPlugins?: OfficialPluginsHandle;
   readonly officialPluginsHandle?: OfficialPluginsHandle;
   readonly agentHandles?: ReadonlyMap<string, AgentHandle>;
+  readonly activeTurns?: ReadonlyMap<string, ActiveTurnInfo>;
   readonly modelProvider: string;
   getOrCreateAgent(
     sessionIdStr: string,
@@ -314,6 +346,12 @@ export interface DshBootedRuntime {
     startIndex?: number
   ): DerivedTurnResult | null;
   cancelTurn(turnId: string): Promise<boolean>;
+  updateExtensionPlan?(
+    sessionIdOrSpace: string,
+    newPlan: ExtensionActivationPlan | null
+  ): Promise<void>;
+  isSessionDirty?(sessionIdStr: string): boolean;
+  isSessionBusy?(sessionIdStr: string): boolean;
   getHealth(): Promise<RuntimeHealthStatus>;
   getCapabilities?(): Promise<RuntimeCapabilitiesStatus>;
   dispose(): Promise<void>;
@@ -1073,6 +1111,24 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   // Map to hold live agent handles by session id
   const agentHandles = new Map<string, AgentHandle>();
   const sessionWorkspaceHandles = new Map<string, WorkspaceToolsHandle>();
+  const sessionWorkspaceDisposers = new Map<string, () => void>();
+
+  async function disposeSessionWorkspace(sessionIdStr: string): Promise<void> {
+    const unregister = sessionWorkspaceDisposers.get(sessionIdStr);
+    if (unregister) {
+      sessionWorkspaceDisposers.delete(sessionIdStr);
+      try {
+        unregister();
+      } catch {}
+    }
+    const ws = sessionWorkspaceHandles.get(sessionIdStr);
+    if (ws) {
+      sessionWorkspaceHandles.delete(sessionIdStr);
+      try {
+        await ws.dispose();
+      } catch {}
+    }
+  }
 
   // Map to hold live agent model selection refs for dynamic per-turn updates
   const agentSelectionRefs = new Map<string, {
@@ -1228,6 +1284,10 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
   // Map to hold active turns by turnId for cancellation
   const activeTurns = new Map<string, ActiveTurnInfo>();
+  // Set of session IDs marked dirty due to skill/extension plan changes requiring quiesce/recreate
+  const dirtySessions = new Set<string>();
+  // Map of pending extension activation plans awaiting boundary application
+  const pendingSessionPlans = new Map<string, ExtensionActivationPlan | null>();
   let isDisposed = false;
 
   function resolveRuntimeMounts(
@@ -1298,6 +1358,92 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     return { workspaceFolder: resolvedFolder, spacePath };
   }
 
+  function isSessionBusy(sessionIdStr: string): boolean {
+    for (const turn of activeTurns.values()) {
+      if (turn.sessionId === sessionIdStr) return true;
+    }
+    return false;
+  }
+
+  function getSessionsForSpace(spaceIdOrFolderOrPath: string): string[] {
+    const matched: string[] = [];
+    const normalizedTarget = path.resolve(spacesDir, spaceIdOrFolderOrPath);
+    for (const [sid, folder] of sessionWorkspaces.entries()) {
+      const folderPath = path.resolve(spacesDir, folder);
+      if (
+        folder === spaceIdOrFolderOrPath ||
+        folderPath === normalizedTarget ||
+        folderPath === path.resolve(spaceIdOrFolderOrPath) ||
+        sid === spaceIdOrFolderOrPath
+      ) {
+        matched.push(sid);
+      }
+    }
+    if (matched.length === 0 && (agentHandles.has(spaceIdOrFolderOrPath) || sessionWorkspaces.has(spaceIdOrFolderOrPath))) {
+      matched.push(spaceIdOrFolderOrPath);
+    }
+    return matched;
+  }
+
+  async function quiesceSession(sessionIdStr: string, newPlan?: ExtensionActivationPlan | null): Promise<void> {
+    if (newPlan !== undefined) {
+      pendingSessionPlans.set(sessionIdStr, newPlan);
+    }
+    dirtySessions.add(sessionIdStr);
+
+    if (isSessionBusy(sessionIdStr)) {
+      // BUSY: Defer safely to next boundary. Do not kill or dispose the active agent now.
+      return;
+    }
+
+    // IDLE: Scoped quiesce safe disposal of idle handle.
+    await disposeSessionWorkspace(sessionIdStr);
+    const existingHandle = agentHandles.get(sessionIdStr);
+    if (existingHandle) {
+      try {
+        await existingHandle.dispose();
+      } catch {}
+      agentHandles.delete(sessionIdStr);
+      sessionMountHashes.delete(sessionIdStr);
+      sessionProfileHashes.delete(sessionIdStr);
+      sessionExtensionPlanHashes.delete(sessionIdStr);
+      sessionExtensionPlans.delete(sessionIdStr);
+    }
+  }
+
+  async function updateExtensionPlan(
+    sessionIdOrSpace: string,
+    newPlan: ExtensionActivationPlan | null
+  ): Promise<void> {
+    const validatedPlan = newPlan !== null && newPlan !== undefined
+      ? validateExtensionActivationPlan(newPlan)
+      : null;
+
+    const matchedSessions = getSessionsForSpace(sessionIdOrSpace);
+    if (matchedSessions.length === 0) {
+      if (isValidSessionId(sessionIdOrSpace)) {
+        pendingSessionPlans.set(sessionIdOrSpace, validatedPlan);
+        dirtySessions.add(sessionIdOrSpace);
+      }
+      return;
+    }
+
+    for (const sid of matchedSessions) {
+      const oldPlan = sessionExtensionPlans.get(sid);
+      const skillsChanged = haveSkillsChanged(oldPlan, validatedPlan);
+      if (skillsChanged) {
+        await quiesceSession(sid, validatedPlan);
+      } else {
+        const ws = sessionWorkspaceHandles.get(sid);
+        if (ws?.updateExtensionPlan) {
+          await ws.updateExtensionPlan(validatedPlan);
+          sessionExtensionPlanHashes.set(sid, computeExtensionPlanHash(validatedPlan));
+          sessionExtensionPlans.set(sid, validatedPlan);
+        }
+      }
+    }
+  }
+
   // Helper to obtain or resume an agent for a given session ID
   async function getOrCreateAgent(
     sessionIdStr: string,
@@ -1320,8 +1466,9 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     }
 
     let validatedPlan: ExtensionActivationPlan | null = null;
-    if (extensionPlan !== undefined && extensionPlan !== null) {
-      validatedPlan = validateExtensionActivationPlan(extensionPlan);
+    const effectivePlanInput = extensionPlan !== undefined ? extensionPlan : pendingSessionPlans.get(sessionIdStr);
+    if (effectivePlanInput !== undefined && effectivePlanInput !== null) {
+      validatedPlan = validateExtensionActivationPlan(effectivePlanInput);
     }
     const currentPlanHash = computeExtensionPlanHash(validatedPlan);
 
@@ -1351,41 +1498,56 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           throw new AgentProfileSessionMismatchError(sessionIdStr);
         }
       }
-      let shouldEvict = false;
+      let shouldEvict = dirtySessions.has(sessionIdStr);
       if (mounts !== undefined) {
         const recordedMountHash = sessionMountHashes.get(sessionIdStr);
         if (recordedMountHash !== currentMountHash) {
           shouldEvict = true;
         }
       }
-      if (extensionPlan !== undefined) {
+      if (effectivePlanInput !== undefined) {
         const recordedPlanHash = sessionExtensionPlanHashes.get(sessionIdStr);
         if (recordedPlanHash !== currentPlanHash) {
-          const ws = sessionWorkspaceHandles.get(sessionIdStr);
-          if (ws?.updateExtensionPlan) {
-            try {
-              await ws.updateExtensionPlan(validatedPlan);
-              sessionExtensionPlanHashes.set(sessionIdStr, currentPlanHash);
-              sessionExtensionPlans.set(sessionIdStr, validatedPlan);
-            } catch (upErr: unknown) {
-              if ((upErr as any)?.code === 'PLUGIN_ACTIVATION_FAILED' || (upErr as any)?.message?.includes('PLUGIN_ACTIVATION_FAILED')) {
-                const actErr = new Error('PLUGIN_ACTIVATION_FAILED');
-                (actErr as any).code = 'PLUGIN_ACTIVATION_FAILED';
-                throw actErr;
+          const oldPlan = sessionExtensionPlans.get(sessionIdStr);
+          const skillsChanged = haveSkillsChanged(oldPlan, validatedPlan);
+          if (skillsChanged) {
+            shouldEvict = true;
+            dirtySessions.add(sessionIdStr);
+          } else {
+            const ws = sessionWorkspaceHandles.get(sessionIdStr);
+            if (ws?.updateExtensionPlan) {
+              try {
+                await ws.updateExtensionPlan(validatedPlan);
+                sessionExtensionPlanHashes.set(sessionIdStr, currentPlanHash);
+                sessionExtensionPlans.set(sessionIdStr, validatedPlan);
+              } catch (upErr: unknown) {
+                if ((upErr as any)?.code === 'PLUGIN_ACTIVATION_FAILED' || (upErr as any)?.message?.includes('PLUGIN_ACTIVATION_FAILED')) {
+                  const actErr = new Error('PLUGIN_ACTIVATION_FAILED');
+                  (actErr as any).code = 'PLUGIN_ACTIVATION_FAILED';
+                  throw actErr;
+                }
+                shouldEvict = true;
               }
+            } else {
               shouldEvict = true;
             }
-          } else {
-            shouldEvict = true;
           }
         }
       }
       if (shouldEvict) {
         try {
+          const sessions = ctx.sessions ?? (ctx.get ? ctx.get('sessions') : undefined);
+          if (sessions && typeof sessions.flush === 'function') {
+            await sessions.flush(existingHandle.agent.session);
+          }
+        } catch {}
+        await disposeSessionWorkspace(sessionIdStr);
+        try {
           await existingHandle.dispose();
         } catch {}
+        // Allow asynchronous session retirement to settle
+        await new Promise((resolve) => setTimeout(resolve, 50));
         agentHandles.delete(sessionIdStr);
-        sessionWorkspaceHandles.delete(sessionIdStr);
         sessionMountHashes.delete(sessionIdStr);
         sessionProfileHashes.delete(sessionIdStr);
         sessionExtensionPlanHashes.delete(sessionIdStr);
@@ -1411,11 +1573,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           matches = false;
         }
       }
-      if (extensionPlan !== undefined) {
+      if (effectivePlanInput !== undefined) {
         const recordedPlanHash = sessionExtensionPlanHashes.get(sessionIdStr);
         if (recordedPlanHash !== currentPlanHash) {
           matches = false;
         }
+      }
+      if (dirtySessions.has(sessionIdStr)) {
+        matches = false;
       }
       if (matches) {
         return liveAgent;
@@ -1466,9 +1631,17 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           skills: validConfig.skills,
           subagents: validConfig.subagents,
           extensionPlan: validatedPlan,
+          onExtensionPlanUpdated: async (newPlan) => {
+            const oldPlan = sessionExtensionPlans.get(sessionIdStr);
+            if (haveSkillsChanged(oldPlan, newPlan)) {
+              await quiesceSession(sessionIdStr, newPlan);
+            }
+          },
         });
+        await disposeSessionWorkspace(sessionIdStr);
         sessionWorkspaceHandles.set(sessionIdStr, wsHandle);
-        officialPluginsHandle.registerWorkspace(wsHandle);
+        const unregisterWs = officialPluginsHandle.registerWorkspace(wsHandle);
+        sessionWorkspaceDisposers.set(sessionIdStr, unregisterWs);
 
         const memoryService = ctx.memory ?? (ctx.get ? ctx.get('memory') : undefined);
         if (memoryService && typeof memoryService.mountAgentMemory === 'function') {
@@ -1532,6 +1705,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
             });
             break;
           } catch (resErr) {
+            await disposeSessionWorkspace(sessionIdStr);
             resumeAttempts++;
             if (resumeAttempts >= 3) throw resErr;
             await new Promise((r) => setTimeout(r, 50 * resumeAttempts));
@@ -1539,6 +1713,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         }
         agentHandles.set(sessionIdStr, handle!);
       } catch (err: unknown) {
+        await disposeSessionWorkspace(sessionIdStr);
         // FAIL LOUD: Never catch resume failure and create a new one with the same ID
         throw new PersistedSessionResumeError(sessionIdStr, sessionsDir, err);
       }
@@ -1560,18 +1735,23 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         agentSelectionRefs.set(sessionIdStr, selectionRef);
       }
 
-      handle = await agentsRegistry.create({
-        sessionId: sid,
-        meta: { cwd: spacePath },
-        agentOptions: { provider, model },
-        setup: createAgentSetup(spacePath, selectionRef),
-      });
+      try {
+        handle = await agentsRegistry.create({
+          sessionId: sid,
+          meta: { cwd: spacePath },
+          agentOptions: { provider, model },
+          setup: createAgentSetup(spacePath, selectionRef),
+        });
+      } catch (err: unknown) {
+        await disposeSessionWorkspace(sessionIdStr);
+        throw err;
+      }
     }
 
     sessionMountHashes.set(sessionIdStr, currentMountHash);
     sessionMounts.set(sessionIdStr, effectiveMountSpecs);
 
-    if (extensionPlan !== undefined) {
+    if (effectivePlanInput !== undefined) {
       sessionExtensionPlanHashes.set(sessionIdStr, currentPlanHash);
       sessionExtensionPlans.set(sessionIdStr, validatedPlan);
     }
@@ -1581,6 +1761,9 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     }
 
     agentHandles.set(sessionIdStr, handle);
+    // Clear dirty marker ONLY once rebuild success
+    dirtySessions.delete(sessionIdStr);
+    pendingSessionPlans.delete(sessionIdStr);
     return handle.agent;
   }
 
@@ -2470,6 +2653,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     // 5. Create and persist exact seed through official persistence only
     const existingOldHandle = agentHandles.get(sessionIdStr);
     if (existingOldHandle) {
+      await disposeSessionWorkspace(sessionIdStr);
       try {
         await existingOldHandle.dispose();
       } catch {}
@@ -2492,12 +2676,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       agentSelectionRefs.set(sessionIdStr, selectionRef);
     }
 
-    const handle = await agentsRegistry.create({
-      sessionId: sid,
-      meta: { cwd: spacePath },
-      seed,
-      agentOptions: { provider, model },
-      setup: async (agentCtx: Context) => {
+    let handle: AgentHandle;
+    try {
+      handle = await agentsRegistry.create({
+        sessionId: sid,
+        meta: { cwd: spacePath },
+        seed,
+        agentOptions: { provider, model },
+        setup: async (agentCtx: Context) => {
         installModelSelection(agentCtx, selectionRef!);
         if (validatedProfile) {
           installAgentProfile(agentCtx, validatedProfile);
@@ -2526,7 +2712,10 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           skills: validConfig.skills,
           subagents: validConfig.subagents,
         });
-        officialPluginsHandle.registerWorkspace(wsHandle);
+        await disposeSessionWorkspace(sessionIdStr);
+        sessionWorkspaceHandles.set(sessionIdStr, wsHandle);
+        const unregisterWs = officialPluginsHandle.registerWorkspace(wsHandle);
+        sessionWorkspaceDisposers.set(sessionIdStr, unregisterWs);
 
         const memoryService = ctx.memory ?? (ctx.get ? ctx.get('memory') : undefined);
         if (memoryService && typeof memoryService.mountAgentMemory === 'function') {
@@ -2549,6 +2738,10 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         }
       },
     });
+    } catch (importErr) {
+      await disposeSessionWorkspace(sessionIdStr);
+      throw importErr;
+    }
 
     if (validatedProfile) {
       sessionProfileHashes.set(sessionIdStr, validatedProfile.promptHash);
@@ -2960,6 +3153,22 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         } catch {}
       }
       activeTurns.delete(assignedTurnId);
+
+      // Safe turn boundary: if session was marked dirty during a busy turn, quiesce it now
+      if (dirtySessions.has(effSessionId) && !isSessionBusy(effSessionId)) {
+        await disposeSessionWorkspace(effSessionId);
+        const busyHandle = agentHandles.get(effSessionId);
+        if (busyHandle) {
+          try {
+            await busyHandle.dispose();
+          } catch {}
+          agentHandles.delete(effSessionId);
+          sessionMountHashes.delete(effSessionId);
+          sessionProfileHashes.delete(effSessionId);
+          sessionExtensionPlanHashes.delete(effSessionId);
+          sessionExtensionPlans.delete(effSessionId);
+        }
+      }
     }
   }
 
@@ -3144,6 +3353,20 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     sessionProfileHashes.clear();
     activeTurns.clear();
 
+    const allWorkspaceSids = new Set([
+      ...sessionWorkspaceHandles.keys(),
+      ...sessionWorkspaceDisposers.keys(),
+    ]);
+    for (const sid of allWorkspaceSids) {
+      try {
+        await disposeSessionWorkspace(sid);
+      } catch (err: unknown) {
+        disposalErrors.push(
+          err instanceof Error ? err : new Error('Workspace disposal failure', { cause: err })
+        );
+      }
+    }
+
     const receiptStore = ctx.receiptStore ?? (ctx.get ? ctx.get('receiptStore') : undefined);
     if (receiptStore && typeof receiptStore.close === 'function') {
       try {
@@ -3177,8 +3400,21 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   }
 
   function removeAgent(sessionIdStr: string): void {
+    const unregister = sessionWorkspaceDisposers.get(sessionIdStr);
+    if (unregister) {
+      sessionWorkspaceDisposers.delete(sessionIdStr);
+      try {
+        unregister();
+      } catch {}
+    }
+    const ws = sessionWorkspaceHandles.get(sessionIdStr);
+    if (ws) {
+      sessionWorkspaceHandles.delete(sessionIdStr);
+      try {
+        void ws.dispose();
+      } catch {}
+    }
     agentHandles.delete(sessionIdStr);
-    sessionWorkspaceHandles.delete(sessionIdStr);
     sessionProfileHashes.delete(sessionIdStr);
     agentSelectionRefs.delete(sessionIdStr);
     activeFallbackContexts.delete(sessionIdStr);
@@ -3186,6 +3422,8 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     sessionMounts.delete(sessionIdStr);
     sessionExtensionPlanHashes.delete(sessionIdStr);
     sessionExtensionPlans.delete(sessionIdStr);
+    dirtySessions.delete(sessionIdStr);
+    pendingSessionPlans.delete(sessionIdStr);
   }
 
   function getTurnResultAfterSeq(sessionIdStr: string, startIndex = 0): DerivedTurnResult | null {
