@@ -63,6 +63,10 @@ export type DaemonTransportFactory = (
 export interface DockerRuntimeAdapterOptions {
   client?: SafeDockerClient;
   daemonTransportFactory?: DaemonTransportFactory;
+  /** Optional default execution budget hardcap in ms for followup turns */
+  defaultExecutionBudgetMs?: number;
+  /** Optional default idle timeout in ms for followup turns */
+  defaultIdleTimeoutMs?: number;
 }
 
 export interface UserSpecOptions {
@@ -357,22 +361,31 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
     clientOrOptions?: SafeDockerClient | DockerRuntimeAdapterOptions,
     options?: DockerRuntimeAdapterOptions
   ) {
+    const defaultTransportOpts: DaemonDockerTransportOptions = {
+      defaultExecutionBudgetMs:
+        options?.defaultExecutionBudgetMs ??
+        (clientOrOptions as DockerRuntimeAdapterOptions)?.defaultExecutionBudgetMs,
+      defaultIdleTimeoutMs:
+        options?.defaultIdleTimeoutMs ??
+        (clientOrOptions as DockerRuntimeAdapterOptions)?.defaultIdleTimeoutMs,
+    };
+
     if (clientOrOptions && typeof (clientOrOptions as SafeDockerClient).runContainer === 'function') {
       this.client = clientOrOptions as SafeDockerClient;
       this.daemonTransportFactory =
         options?.daemonTransportFactory ??
-        ((client, exp, opts) => new DaemonDockerTransport(client, exp, opts));
+        ((client, exp, opts) => new DaemonDockerTransport(client, exp, { ...defaultTransportOpts, ...opts }));
     } else if (clientOrOptions && typeof clientOrOptions === 'object') {
       const opts = clientOrOptions as DockerRuntimeAdapterOptions;
       this.client = opts.client ?? new SafeDockerClient();
       this.daemonTransportFactory =
         opts.daemonTransportFactory ??
-        ((client, exp, o) => new DaemonDockerTransport(client, exp, o));
+        ((client, exp, o) => new DaemonDockerTransport(client, exp, { ...defaultTransportOpts, ...o }));
     } else {
       this.client = new SafeDockerClient();
       this.daemonTransportFactory =
         options?.daemonTransportFactory ??
-        ((client, exp, opts) => new DaemonDockerTransport(client, exp, opts));
+        ((client, exp, opts) => new DaemonDockerTransport(client, exp, { ...defaultTransportOpts, ...opts }));
     }
   }
 
@@ -422,10 +435,17 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
     const llmProvider = options.llmProvider || process.env.ENKEEP_LLM_PROVIDER || 'cpa-claude';
     const llmModel = options.llmModel || process.env.ENKEEP_LLM_MODEL || 'claude-fable-5';
 
+    const compactionThresholdTokens =
+      (options as any).compactionThresholdTokens ||
+      (options as any).extraEnv?.DSH_COMPACTION_THRESHOLD_TOKENS ||
+      process.env.DSH_COMPACTION_THRESHOLD_TOKENS ||
+      '200000';
+
     const env: Record<string, string> = {
       DSH_USER: userId,
       DSH_HOME: '/home/dsh/.dsh',
       DSH_SPACES: '/home/dsh/spaces',
+      DSH_COMPACTION_THRESHOLD_TOKENS: String(compactionThresholdTokens),
     };
 
     if (isLlmEnabled) {
@@ -1221,6 +1241,31 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           };
         }
         return { status: 'ok', exists: false, code: 'NOT_FOUND' };
+      },
+      compactSession: async (sessionId: string): Promise<ExecCliEnvelope> => {
+        try {
+          const transport = await getOrStartTransport();
+          if (!transport.compactSession) {
+            throw new DockerDaemonError('Transport does not support compactSession');
+          }
+          const res = await transport.compactSession(sessionId);
+          return {
+            status: res.ok ? 'ok' : 'error',
+            sessionId,
+            beforeTokens: res.beforeTokens,
+            afterTokens: res.afterTokens,
+            eventsBefore: res.eventsBefore,
+            eventsAfter: res.eventsAfter,
+            summaryChars: res.summaryChars,
+            error: res.error?.message,
+          };
+        } catch (err: unknown) {
+          return {
+            status: 'error',
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
       },
       fileOperation: async (request: FileOperationRequest): Promise<ExecCliEnvelope> => {
         try {

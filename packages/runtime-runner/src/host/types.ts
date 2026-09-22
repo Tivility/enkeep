@@ -114,4 +114,8 @@ export interface HostProcessMetadata {
 export interface HostRuntimeAdapterOptions {
   daemonCliPath?: string;
   secretKey?: string;
+  /** Optional default execution budget in ms for turns */
+  defaultExecutionBudgetMs?: number;
+  /** Optional default idle timeout in ms for turns */
+  defaultIdleTimeoutMs?: number;
 }

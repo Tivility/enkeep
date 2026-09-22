@@ -92,8 +92,10 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
 
   private readonly daemonCliPath: string;
   private readonly secretKey: string;
+  private readonly options: HostRuntimeAdapterOptions;
 
   constructor(options: HostRuntimeAdapterOptions = {}) {
+    this.options = options;
     this.daemonCliPath = options.daemonCliPath || resolveDefaultCliPath();
     this.secretKey = options.secretKey || DEFAULT_SECRET_KEY;
   }
@@ -290,6 +292,8 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
 
     const transport = new HostDaemonTransport({
       socketPath: effSpec.socketPath,
+      defaultExecutionBudgetMs: this.options.defaultExecutionBudgetMs,
+      defaultIdleTimeoutMs: this.options.defaultIdleTimeoutMs,
     });
 
     const handle = this.createActiveRuntimeHandle(effSpec, childPid, transport, llmProxyServer, platformProxyServer, true);
@@ -377,6 +381,8 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
 
     const transport = new HostDaemonTransport({
       socketPath: spec.socketPath,
+      defaultExecutionBudgetMs: this.options.defaultExecutionBudgetMs,
+      defaultIdleTimeoutMs: this.options.defaultIdleTimeoutMs,
     });
 
     const handle = this.createActiveRuntimeHandle(spec, existingMeta.pid, transport, undefined, undefined, false);
@@ -740,6 +746,27 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
             };
           }
           throw inspectErr;
+        }
+      },
+      compactSession: async (sessionId: string) => {
+        try {
+          const res = await transport.compactSession(sessionId);
+          return {
+            status: res.ok ? 'ok' : 'error',
+            sessionId,
+            beforeTokens: res.beforeTokens,
+            afterTokens: res.afterTokens,
+            eventsBefore: res.eventsBefore,
+            eventsAfter: res.eventsAfter,
+            summaryChars: res.summaryChars,
+            error: res.error?.message,
+          };
+        } catch (err: unknown) {
+          return {
+            status: 'error',
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          };
         }
       },
       fileOperation: async (request: FileOperationRequest) => {

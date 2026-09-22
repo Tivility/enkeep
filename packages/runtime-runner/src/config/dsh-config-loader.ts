@@ -49,12 +49,18 @@ export interface DshParsedDefaultModel {
   reasoningEffort?: string;
 }
 
+export interface DshDeploymentBudgets {
+  defaultExecutionBudgetMs?: number;
+  defaultIdleTimeoutMs?: number;
+}
+
 export interface DshDeploymentConfig {
   dshHome: string;
   providers: Record<string, DshParsedProvider>;
   defaultModel: DshParsedDefaultModel;
   tokens: Record<string, string>;
   allowedHosts: string[];
+  budgets?: DshDeploymentBudgets;
 }
 
 /**
@@ -179,12 +185,47 @@ export function parseDshConfigFiles(
 
   const tokens = envContent ? parseEnvContent(envContent) : {};
 
+  // Parse optional execution budgets from settings.yaml or environment variables
+  let budgets: DshDeploymentBudgets | undefined;
+  if (settingsYamlContent) {
+    try {
+      const settingsParsed = YAML.parse(settingsYamlContent);
+      if (settingsParsed && typeof settingsParsed === 'object') {
+        const eb = (settingsParsed as Record<string, unknown>)['execution-budget'] ||
+          (settingsParsed as Record<string, unknown>)['executionBudget'];
+        if (eb && typeof eb === 'object') {
+          const ebObj = eb as Record<string, unknown>;
+          const execBudget = typeof ebObj.defaultExecutionBudgetMs === 'number' ? ebObj.defaultExecutionBudgetMs : undefined;
+          const idleTimeout = typeof ebObj.defaultIdleTimeoutMs === 'number' ? ebObj.defaultIdleTimeoutMs : undefined;
+          if (execBudget !== undefined || idleTimeout !== undefined) {
+            budgets = {
+              defaultExecutionBudgetMs: execBudget,
+              defaultIdleTimeoutMs: idleTimeout,
+            };
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const envExecBudget = process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+  const envIdleTimeout = process.env.DSH_DEFAULT_IDLE_TIMEOUT_MS;
+  if (envExecBudget || envIdleTimeout) {
+    const parsedExec = envExecBudget ? parseInt(envExecBudget, 10) : undefined;
+    const parsedIdle = envIdleTimeout ? parseInt(envIdleTimeout, 10) : undefined;
+    budgets = {
+      defaultExecutionBudgetMs: Number.isSafeInteger(parsedExec) && parsedExec! > 0 ? parsedExec : budgets?.defaultExecutionBudgetMs,
+      defaultIdleTimeoutMs: Number.isSafeInteger(parsedIdle) && parsedIdle! > 0 ? parsedIdle : budgets?.defaultIdleTimeoutMs,
+    };
+  }
+
   return {
     dshHome,
     providers,
     defaultModel,
     tokens,
     allowedHosts: Array.from(allowedHostsSet),
+    budgets,
   };
 }
 

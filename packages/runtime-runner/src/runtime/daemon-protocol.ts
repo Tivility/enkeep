@@ -52,6 +52,7 @@ export const DAEMON_OPS = {
   SHUTDOWN: 'shutdown',
   ANSWER_APPROVAL: 'answerApproval',
   LIST_APPROVALS: 'listApprovals',
+  COMPACT_SESSION: 'compactSession',
 } as const;
 
 export type DaemonOp = (typeof DAEMON_OPS)[keyof typeof DAEMON_OPS];
@@ -171,6 +172,8 @@ export interface SubmitTurnRequest extends DaemonRequestBase {
     readonly role?: string;
   } | null;
   readonly timeoutMs?: number;
+  readonly idleTimeoutMs?: number;
+  readonly maxExecutionBudgetMs?: number;
   readonly mounts?: readonly RuntimeMountSpec[] | null;
   readonly extensionPlan?: ExtensionActivationPlan | null;
 }
@@ -277,6 +280,11 @@ export interface ShutdownRequest extends DaemonRequestBase {
   readonly drainTimeoutMs?: number;
 }
 
+export interface CompactSessionRequest extends DaemonRequestBase {
+  readonly op: 'compactSession';
+  readonly sessionId: string;
+}
+
 export type DaemonRequest =
   | SubmitTurnRequest
   | CancelRequest
@@ -293,7 +301,8 @@ export type DaemonRequest =
   | InstructionsWriteRequest
   | AnswerApprovalRequest
   | ListApprovalsRequest
-  | ShutdownRequest;
+  | ShutdownRequest
+  | CompactSessionRequest;
 
 // ---------------------------------------------------------------------------
 // Response Envelopes
@@ -462,6 +471,16 @@ export interface ShutdownResponse extends DaemonResponseBase {
   readonly status: 'shutting_down';
 }
 
+export interface CompactSessionResponse extends DaemonResponseBase {
+  readonly op: 'compactSession';
+  readonly ok: true;
+  readonly beforeTokens?: number;
+  readonly afterTokens?: number;
+  readonly eventsBefore: number;
+  readonly eventsAfter: number;
+  readonly summaryChars: number;
+}
+
 export interface DaemonErrorResponse extends DaemonResponseBase {
   readonly ok: false;
   readonly error: {
@@ -488,6 +507,7 @@ export type DaemonResponse =
   | AnswerApprovalResponse
   | ListApprovalsResponse
   | ShutdownResponse
+  | CompactSessionResponse
   | DaemonErrorResponse;
 
 // ---------------------------------------------------------------------------
