@@ -34,10 +34,8 @@ describe('dsh-tools: file-security containment and TOCTOU mitigation', () => {
     fs.mkdirSync(workspaceDir, { recursive: true });
     fs.mkdirSync(outsideDir, { recursive: true });
 
-    // Enable default test simulated resolver on macOS / test environments
-    setDefaultFileSecurityHooks({
-      resolveFdPath: createSimulatedFdResolver(),
-    });
+    // Default hooks are disabled to test native platform resolution (Linux / Darwin)
+    setDefaultFileSecurityHooks(undefined);
   });
 
   afterEach(() => {
@@ -805,24 +803,40 @@ describe('dsh-tools: file-security containment and TOCTOU mitigation', () => {
       }
     });
 
-    it('throws FD_RESOLUTION_UNSUPPORTED on non-Linux hosts when default hooks are disabled (fail-closed)', () => {
+    it('successfully reads authorized file on Darwin host when default hooks are disabled', () => {
       const testFile = path.join(workspaceDir, 'fd-host.txt');
-      fs.writeFileSync(testFile, 'hello');
+      fs.writeFileSync(testFile, 'hello darwin');
 
       setDefaultFileSecurityHooks(undefined);
 
-      if (process.platform !== 'linux') {
+      if (process.platform === 'darwin') {
+        const result = readValidatedFile({
+          workspaceRoot: workspaceDir,
+          filePath: 'fd-host.txt',
+        });
+        expect(result.filename).toBe('fd-host.txt');
+        expect(result.content.toString('utf8')).toBe('hello darwin');
+        expect(result.canonicalPath).toBe(path.resolve(workspaceDir, 'fd-host.txt'));
+      }
+    });
+
+    it('throws FD_RESOLUTION_UNSUPPORTED on unsupported non-Linux/non-Darwin hosts or when kernel resolution fails', () => {
+      const testFile = path.join(workspaceDir, 'unsupported-host.txt');
+      fs.writeFileSync(testFile, 'hello');
+
+      if (process.platform !== 'linux' && process.platform !== 'darwin') {
+        setDefaultFileSecurityHooks(undefined);
         expect(() =>
           readValidatedFile({
             workspaceRoot: workspaceDir,
-            filePath: 'fd-host.txt',
+            filePath: 'unsupported-host.txt',
           })
         ).toThrow(FileSecurityError);
 
         try {
           readValidatedFile({
             workspaceRoot: workspaceDir,
-            filePath: 'fd-host.txt',
+            filePath: 'unsupported-host.txt',
           });
         } catch (err: unknown) {
           const secErr = asFileSecurityError(err);
@@ -830,6 +844,107 @@ describe('dsh-tools: file-security containment and TOCTOU mitigation', () => {
           expect(secErr.status).toBe(500);
         }
       }
+    });
+
+    it('on Darwin with default hooks disabled, strictly rejects symlink with SYMLINK_DISALLOWED (403)', () => {
+      if (process.platform !== 'darwin') return;
+      setDefaultFileSecurityHooks(undefined);
+
+      const realFile = path.join(outsideDir, 'secret-darwin.txt');
+      fs.writeFileSync(realFile, 'SECRET');
+      const symlinkFile = path.join(workspaceDir, 'link-darwin.txt');
+      fs.symlinkSync(realFile, symlinkFile);
+
+      expect(() =>
+        readValidatedFile({
+          workspaceRoot: workspaceDir,
+          filePath: 'link-darwin.txt',
+        })
+      ).toThrow(FileSecurityError);
+
+      try {
+        readValidatedFile({
+          workspaceRoot: workspaceDir,
+          filePath: 'link-darwin.txt',
+        });
+      } catch (err: unknown) {
+        const secErr = asFileSecurityError(err);
+        expect(secErr.code).toBe('SYMLINK_DISALLOWED');
+        expect(secErr.status).toBe(403);
+      }
+    });
+
+    it('on Darwin with default hooks disabled, detects TOCTOU file swap with TOCTOU_SWAP_DETECTED (403)', () => {
+      if (process.platform !== 'darwin') return;
+      setDefaultFileSecurityHooks(undefined);
+
+      const targetFile = path.join(workspaceDir, 'darwin-swap.txt');
+      fs.writeFileSync(targetFile, 'initial');
+
+      expect(() =>
+        readValidatedFile({
+          workspaceRoot: workspaceDir,
+          filePath: 'darwin-swap.txt',
+          hooks: {
+            afterOpen: (_fd, p) => {
+              fs.unlinkSync(p);
+              fs.writeFileSync(p, 'attacker swap');
+            },
+          },
+        })
+      ).toThrow(FileSecurityError);
+
+      try {
+        readValidatedFile({
+          workspaceRoot: workspaceDir,
+          filePath: 'darwin-swap.txt',
+          hooks: {
+            afterOpen: (_fd, p) => {
+              fs.unlinkSync(p);
+              fs.writeFileSync(p, 'attacker swap');
+            },
+          },
+        });
+      } catch (err: unknown) {
+        const secErr = asFileSecurityError(err);
+        expect(secErr.code).toBe('TOCTOU_SWAP_DETECTED');
+        expect(secErr.status).toBe(403);
+      }
+    });
+
+    it('on Darwin with default hooks disabled, detects parent directory swapped to symlink with SYMLINK_DISALLOWED or TOCTOU_SWAP_DETECTED', () => {
+      if (process.platform !== 'darwin') return;
+      setDefaultFileSecurityHooks(undefined);
+
+      const subDir = path.join(workspaceDir, 'darwin-sub');
+      fs.mkdirSync(subDir, { recursive: true });
+      const targetFile = path.join(subDir, 'file.txt');
+      fs.writeFileSync(targetFile, 'content');
+
+      const outsideDirSub = path.join(outsideDir, 'outside-sub');
+      fs.mkdirSync(outsideDirSub, { recursive: true });
+      fs.writeFileSync(path.join(outsideDirSub, 'file.txt'), 'leaked');
+
+      let errorThrown: unknown = null;
+      try {
+        readValidatedFile({
+          workspaceRoot: workspaceDir,
+          filePath: 'darwin-sub/file.txt',
+          hooks: {
+            beforeOpen: () => {
+              fs.rmSync(subDir, { recursive: true, force: true });
+              fs.symlinkSync(outsideDirSub, subDir);
+            },
+          },
+        });
+      } catch (err: unknown) {
+        errorThrown = err;
+      }
+
+      expect(errorThrown).toBeInstanceOf(FileSecurityError);
+      const secErr = asFileSecurityError(errorThrown);
+      expect(secErr.code).toMatch(/^(TOCTOU_SWAP_DETECTED|SYMLINK_DISALLOWED)$/);
+      expect(secErr.status).toBe(403);
     });
 
     it('throws PATH_TRAVERSAL_DETECTED (403) when opened descriptor resolves outside workspace boundary', () => {
