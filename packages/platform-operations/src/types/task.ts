@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { ValidationError } from '../errors/index.js';
+import {
+  validateScheduleType,
+  validateCronExpression,
+  validateIntervalSeconds,
+  validateMisfirePolicy,
+  validateOverlapPolicy,
+  validateTimezone,
+} from '../tasks/schedule-calculator.js';
 
 export type TaskStatus =
   | 'pending'
@@ -452,6 +460,211 @@ export interface Task {
   completedAt?: string | null;
 }
 
+export const ALLOWED_UPDATE_TASK_KEYS = new Set([
+  'title',
+  'description',
+  'assignee',
+  'priority',
+  'prompt',
+  'payload',
+  'dueDate',
+  'scheduleType',
+  'cronExpression',
+  'intervalSeconds',
+  'timezone',
+  'misfirePolicy',
+  'overlapPolicy',
+]);
+
+export const FORBIDDEN_IMMUTABLE_UPDATE_KEYS = new Set([
+  'id',
+  'userId',
+  'user_id',
+  'createdAt',
+  'updatedAt',
+  'claimCount',
+  'claimantId',
+  'leaseExpiresAt',
+  'leaseDurationMs',
+  'maxRetries',
+  'status',
+  'currentRun',
+  'result',
+  'error',
+  'errorCode',
+  'idempotencyKey',
+]);
+
+export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new ValidationError('Task update input must be a plain object');
+  }
+
+  const obj = input as Record<string, unknown>;
+  const keys = Object.keys(obj);
+
+  for (const key of keys) {
+    if (FORBIDDEN_IMMUTABLE_UPDATE_KEYS.has(key)) {
+      if (key === 'userId' || key === 'user_id') {
+        throw new ValidationError('Task ownership is immutable');
+      }
+      if (key === 'status') {
+        throw new ValidationError('Field "status" is immutable and cannot be directly updated');
+      }
+      if (key === 'updatedAt') {
+        throw new ValidationError('Field "updatedAt" is managed automatically and cannot be updated');
+      }
+      throw new ValidationError(`Field "${key}" is immutable and cannot be updated`);
+    }
+    if (!ALLOWED_UPDATE_TASK_KEYS.has(key)) {
+      throw new ValidationError(`Task update input contains unrecognized field "${key}"`);
+    }
+  }
+
+  let hasEditableField = false;
+
+  let title: string | undefined;
+  if (obj.title !== undefined) {
+    title = validateTaskTitle(obj.title);
+    hasEditableField = true;
+  }
+
+  let description: string | null | undefined;
+  if (obj.description !== undefined) {
+    if (obj.description !== null && typeof obj.description !== 'string') {
+      throw new ValidationError('Task description must be a string or null');
+    }
+    description = obj.description;
+    hasEditableField = true;
+  }
+
+  let assignee: string | null | undefined;
+  if (obj.assignee !== undefined) {
+    if (obj.assignee !== null && typeof obj.assignee !== 'string') {
+      throw new ValidationError('Task assignee must be a string or null');
+    }
+    assignee = obj.assignee;
+    hasEditableField = true;
+  }
+
+  let priority: TaskPriority | undefined;
+  if (obj.priority !== undefined) {
+    priority = validateTaskPriority(obj.priority);
+    hasEditableField = true;
+  }
+
+  let prompt: string | undefined;
+  if (obj.prompt !== undefined) {
+    if (typeof obj.prompt !== 'string' || obj.prompt.trim().length === 0) {
+      throw new ValidationError('Task prompt must be a non-empty string');
+    }
+    if (Buffer.byteLength(obj.prompt, 'utf-8') > MAX_PROMPT_BYTES) {
+      throw new ValidationError('Task prompt exceeds maximum allowed size');
+    }
+    prompt = obj.prompt;
+    hasEditableField = true;
+  }
+
+  if (obj.payload !== undefined && obj.payload !== null) {
+    if (typeof obj.payload !== 'object' || Array.isArray(obj.payload)) {
+      throw new ValidationError('Task payload must be a plain object');
+    }
+    const payloadObj = obj.payload as Record<string, unknown>;
+    for (const k of Object.keys(payloadObj)) {
+      if (
+        k === 'sessionId' ||
+        k === 'sessionPolicy' ||
+        k === 'spaceId' ||
+        k === 'spaceFolder' ||
+        k === 'delivery' ||
+        k === 'silent'
+      ) {
+        throw new ValidationError('Task session and space bindings are immutable');
+      }
+      if (k !== 'prompt' && k !== 'type') {
+        throw new ValidationError(`Field "payload.${k}" is immutable and cannot be updated`);
+      }
+    }
+    if (payloadObj.type !== undefined && payloadObj.type !== 'agent_prompt') {
+      throw new ValidationError('Task payload type is immutable');
+    }
+    if (payloadObj.prompt !== undefined) {
+      if (typeof payloadObj.prompt !== 'string' || payloadObj.prompt.trim().length === 0) {
+        throw new ValidationError('Task payload prompt must be a non-empty string');
+      }
+      if (Buffer.byteLength(payloadObj.prompt, 'utf-8') > MAX_PROMPT_BYTES) {
+        throw new ValidationError('Task payload prompt exceeds maximum allowed size');
+      }
+      if (prompt !== undefined && prompt !== payloadObj.prompt) {
+        throw new ValidationError('Conflicting prompt values provided in root and payload');
+      }
+      prompt = payloadObj.prompt;
+      hasEditableField = true;
+    }
+  }
+
+  let dueDate: string | null | undefined;
+  if (obj.dueDate !== undefined) {
+    dueDate = obj.dueDate === null ? null : validateCanonicalDueDate(obj.dueDate);
+    hasEditableField = true;
+  }
+
+  let scheduleType: TaskScheduleType | undefined;
+  if (obj.scheduleType !== undefined) {
+    scheduleType = validateScheduleType(obj.scheduleType);
+    hasEditableField = true;
+  }
+
+  let cronExpression: string | null | undefined;
+  if (obj.cronExpression !== undefined) {
+    cronExpression = obj.cronExpression === null ? null : validateCronExpression(obj.cronExpression);
+    hasEditableField = true;
+  }
+
+  let intervalSeconds: number | null | undefined;
+  if (obj.intervalSeconds !== undefined) {
+    intervalSeconds = obj.intervalSeconds === null ? null : validateIntervalSeconds(obj.intervalSeconds);
+    hasEditableField = true;
+  }
+
+  let timezone: string | undefined;
+  if (obj.timezone !== undefined) {
+    timezone = validateTimezone(obj.timezone);
+    hasEditableField = true;
+  }
+
+  let misfirePolicy: TaskScheduleMisfirePolicy | undefined;
+  if (obj.misfirePolicy !== undefined) {
+    misfirePolicy = validateMisfirePolicy(obj.misfirePolicy);
+    hasEditableField = true;
+  }
+
+  let overlapPolicy: TaskScheduleOverlapPolicy | undefined;
+  if (obj.overlapPolicy !== undefined) {
+    overlapPolicy = validateOverlapPolicy(obj.overlapPolicy);
+    hasEditableField = true;
+  }
+
+  if (!hasEditableField) {
+    throw new ValidationError('At least one editable field must be provided for task update');
+  }
+
+  return {
+    ...(title !== undefined ? { title } : {}),
+    ...(description !== undefined ? { description } : {}),
+    ...(assignee !== undefined ? { assignee } : {}),
+    ...(priority !== undefined ? { priority } : {}),
+    ...(prompt !== undefined ? { prompt, payload: { prompt } } : {}),
+    ...(dueDate !== undefined ? { dueDate } : {}),
+    ...(scheduleType !== undefined ? { scheduleType } : {}),
+    ...(cronExpression !== undefined ? { cronExpression } : {}),
+    ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
+    ...(timezone !== undefined ? { timezone } : {}),
+    ...(misfirePolicy !== undefined ? { misfirePolicy } : {}),
+    ...(overlapPolicy !== undefined ? { overlapPolicy } : {}),
+  };
+}
+
 export interface CreateTaskInput {
   id?: string;
   idempotencyKey?: string;
@@ -466,6 +679,24 @@ export interface CreateTaskInput {
   scheduleType?: TaskScheduleType;
   cronExpression?: string;
   intervalSeconds?: number;
+  timezone?: string;
+  misfirePolicy?: TaskScheduleMisfirePolicy;
+  overlapPolicy?: TaskScheduleOverlapPolicy;
+}
+
+export interface UpdateTaskInput {
+  title?: string;
+  description?: string | null;
+  assignee?: string | null;
+  priority?: TaskPriority;
+  prompt?: string;
+  payload?: {
+    prompt?: string;
+  };
+  dueDate?: string | null;
+  scheduleType?: TaskScheduleType;
+  cronExpression?: string | null;
+  intervalSeconds?: number | null;
   timezone?: string;
   misfirePolicy?: TaskScheduleMisfirePolicy;
   overlapPolicy?: TaskScheduleOverlapPolicy;

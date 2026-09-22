@@ -3,6 +3,7 @@ import type {
   TenantScopedTaskRepository,
   Task,
   CreateTaskInput,
+  UpdateTaskInput,
   TaskQueryOptions,
   TaskRecoveryResult,
   AgentPromptTaskPayload,
@@ -12,6 +13,9 @@ import type {
   TaskRunQueryOptions,
   TaskRunsListResult,
   TaskScheduleType,
+  TaskScheduleMisfirePolicy,
+  TaskScheduleOverlapPolicy,
+  TaskPriority,
 } from '@enkeep/platform-operations';
 import {
   validateAgentPromptPayload,
@@ -41,6 +45,7 @@ import {
   TaskConflictError,
   ValidationError,
   PlatformOperationsError,
+  validateUpdateTaskInput,
 } from '@enkeep/platform-operations';
 import {
   parsePlatformTaskRow,
@@ -51,6 +56,8 @@ import {
   getString,
   getNullableString,
   getNullableNumber,
+  getNumber,
+  getJson,
   withImmediateTransactionSync,
   type DbParam,
   type DbRow,
@@ -266,6 +273,262 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
       throw new Error('Failed to retrieve newly created task');
     }
     return created;
+  }
+
+  async update(id: string, input: UpdateTaskInput): Promise<Task> {
+    const validId = validateTaskId(id);
+    const validatedInput = validateUpdateTaskInput(input);
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const hasSched = this.hasScheduleSchema();
+
+    return withImmediateTransactionSync(this.db, () => {
+      const taskRow = this.db.prepare('SELECT * FROM platform_tasks WHERE id = ? AND user_id = ?').get(validId, this.userId) as DbRow | undefined;
+      if (!taskRow) {
+        throw new TaskNotFoundError(validId);
+      }
+
+      // 1. Reject claimed or running tasks atomically (HTTP 409)
+      const taskStatus = String(taskRow.status);
+      if (taskStatus === 'claimed' || taskStatus === 'running') {
+        const claimantId = getNullableString(taskRow, 'claimant_id') || 'unknown';
+        throw new TaskAlreadyClaimedError(validId, claimantId);
+      }
+
+      let schedRow: DbRow | undefined;
+      if (hasSched) {
+        const activeRun = this.db.prepare(`
+          SELECT claimant_id FROM task_runs
+          WHERE task_id = ? AND user_id = ?
+            AND status IN ('claimed', 'running')
+            AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+          LIMIT 1
+        `).get(validId, this.userId, nowIso) as DbRow | undefined;
+        if (activeRun) {
+          throw new TaskAlreadyClaimedError(validId, String(activeRun.claimant_id || taskRow.claimant_id || 'unknown'));
+        }
+
+        schedRow = this.db.prepare('SELECT * FROM task_schedules WHERE task_id = ? AND user_id = ?').get(validId, this.userId) as DbRow | undefined;
+      }
+
+      // 2. Determine whether task is recurring or once
+      const existingSchedType =
+        (schedRow ? getNullableString(schedRow, 'schedule_type') : null) ??
+        getNullableString(taskRow, 'schedule_type') ??
+        'once';
+      const isRecurring = existingSchedType === 'cron' || existingSchedType === 'interval';
+
+      // 3. Reject terminal once tasks or cancelled/failed recurring tasks
+      if (!isRecurring) {
+        if (taskStatus === 'completed' || taskStatus === 'cancelled' || taskStatus === 'failed') {
+          throw new TaskAlreadyCompletedError(validId);
+        }
+      } else {
+        if (taskStatus === 'cancelled' || taskStatus === 'failed') {
+          throw new TaskConflictError(validId, `Recurring task with status "${taskStatus}" cannot be modified`);
+        }
+      }
+
+      // 4. Merge fields
+      const title = validatedInput.title !== undefined ? validatedInput.title : getString(taskRow, 'title');
+      const description = validatedInput.description !== undefined ? validatedInput.description : getNullableString(taskRow, 'description');
+      const assignee = validatedInput.assignee !== undefined ? validatedInput.assignee : getNullableString(taskRow, 'assignee');
+      const priority = validatedInput.priority !== undefined ? validatedInput.priority : (getString(taskRow, 'priority') as TaskPriority);
+
+      // Merge prompt into payload while strictly preserving existing session, space, and other payload bindings
+      const existingPayload = getJson<AgentPromptTaskPayload>(taskRow, 'payload');
+      if (!existingPayload || typeof existingPayload !== 'object' || existingPayload.type !== 'agent_prompt') {
+        throw new Error(`Corrupted task row: missing or invalid agent_prompt payload for task '${validId}'`);
+      }
+      const newPrompt = validatedInput.prompt ?? validatedInput.payload?.prompt;
+      const mergedPayload: AgentPromptTaskPayload = newPrompt !== undefined
+        ? { ...existingPayload, prompt: newPrompt }
+        : { ...existingPayload };
+      const payloadStr = JSON.stringify(mergedPayload);
+
+      // Schedule configuration
+      const scheduleType: TaskScheduleType =
+        validatedInput.scheduleType ??
+        (existingSchedType as TaskScheduleType);
+      const cronExpression =
+        validatedInput.cronExpression !== undefined
+          ? validatedInput.cronExpression
+          : (schedRow ? getNullableString(schedRow, 'cron_expression') : getNullableString(taskRow, 'cron_expression'));
+      const intervalSeconds =
+        validatedInput.intervalSeconds !== undefined
+          ? validatedInput.intervalSeconds
+          : (schedRow ? getNullableNumber(schedRow, 'interval_seconds') : getNullableNumber(taskRow, 'interval_seconds'));
+      const timezone =
+        validatedInput.timezone !== undefined
+          ? validatedInput.timezone
+          : ((schedRow ? getNullableString(schedRow, 'timezone') : null) ?? getNullableString(taskRow, 'timezone') ?? 'UTC');
+      const dueDate =
+        validatedInput.dueDate !== undefined
+          ? validatedInput.dueDate
+          : getNullableString(taskRow, 'due_date');
+      const misfirePolicy =
+        validatedInput.misfirePolicy ??
+        (schedRow ? (getNullableString(schedRow, 'misfire_policy') as TaskScheduleMisfirePolicy | null) : null) ??
+        'coalesce';
+      const overlapPolicy =
+        validatedInput.overlapPolicy ??
+        (schedRow ? (getNullableString(schedRow, 'overlap_policy') as TaskScheduleOverlapPolicy | null) : null) ??
+        'skip';
+
+      // Validate scheduleType specific requirements
+      if (scheduleType === 'cron' && !cronExpression) {
+        throw new ValidationError('Cron expression is required for cron schedule type');
+      }
+      if (scheduleType === 'interval' && !intervalSeconds) {
+        throw new ValidationError('Interval seconds is required for interval schedule type');
+      }
+
+      // Recompute next_run_at if schedule fields changed
+      const isScheduleChanged =
+        validatedInput.scheduleType !== undefined ||
+        validatedInput.cronExpression !== undefined ||
+        validatedInput.intervalSeconds !== undefined ||
+        validatedInput.dueDate !== undefined ||
+        validatedInput.timezone !== undefined;
+
+      const isEnabled = schedRow ? getNumber(schedRow, 'enabled') === 1 : true;
+      const pausedAt = schedRow ? getNullableString(schedRow, 'paused_at') : null;
+      const lastRunAt = schedRow ? getNullableString(schedRow, 'last_run_at') : null;
+
+      let nextRunAt = schedRow ? getNullableString(schedRow, 'next_run_at') : getNullableString(taskRow, 'next_run_at');
+
+      if (isScheduleChanged) {
+        nextRunAt = computeNextRun(
+          {
+            scheduleType,
+            cronExpression: scheduleType === 'cron' ? cronExpression : null,
+            intervalSeconds: scheduleType === 'interval' ? intervalSeconds : null,
+            dueDate: scheduleType === 'once' ? dueDate : null,
+            lastRunAt,
+            pausedAt,
+            enabled: isEnabled,
+            timezone,
+          },
+          now
+        );
+      }
+
+      const effectiveCronExpr = scheduleType === 'cron' ? cronExpression : null;
+      const effectiveIntervalSec = scheduleType === 'interval' ? intervalSeconds : null;
+      const effectiveDueDate = scheduleType === 'once' ? dueDate : null;
+
+      // 5. Update platform_tasks
+      if (hasSched) {
+        this.db.prepare(`
+          UPDATE platform_tasks
+          SET title = ?,
+              description = ?,
+              assignee = ?,
+              priority = ?,
+              payload = ?,
+              due_date = ?,
+              schedule_type = ?,
+              cron_expression = ?,
+              interval_seconds = ?,
+              next_run_at = ?,
+              timezone = ?,
+              updated_at = ?
+          WHERE id = ? AND user_id = ?
+        `).run(
+          title,
+          description,
+          assignee,
+          priority,
+          payloadStr,
+          effectiveDueDate,
+          scheduleType,
+          effectiveCronExpr,
+          effectiveIntervalSec,
+          nextRunAt,
+          timezone,
+          nowIso,
+          validId,
+          this.userId
+        );
+
+        // 6. Update or insert task_schedules
+        if (schedRow) {
+          this.db.prepare(`
+            UPDATE task_schedules
+            SET schedule_type = ?,
+                cron_expression = ?,
+                interval_seconds = ?,
+                next_run_at = ?,
+                timezone = ?,
+                misfire_policy = ?,
+                overlap_policy = ?,
+                updated_at = ?
+            WHERE task_id = ? AND user_id = ?
+          `).run(
+            scheduleType,
+            effectiveCronExpr,
+            effectiveIntervalSec,
+            nextRunAt,
+            timezone,
+            misfirePolicy,
+            overlapPolicy,
+            nowIso,
+            validId,
+            this.userId
+          );
+        } else {
+          const scheduleId = generateScheduleId();
+          this.db.prepare(`
+            INSERT INTO task_schedules (
+              id, task_id, user_id, schedule_type, cron_expression, interval_seconds,
+              next_run_at, timezone, enabled, misfire_policy, overlap_policy,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+          `).run(
+            scheduleId,
+            validId,
+            this.userId,
+            scheduleType,
+            effectiveCronExpr,
+            effectiveIntervalSec,
+            nextRunAt,
+            timezone,
+            misfirePolicy,
+            overlapPolicy,
+            nowIso,
+            nowIso
+          );
+        }
+      } else {
+        this.db.prepare(`
+          UPDATE platform_tasks
+          SET title = ?,
+              description = ?,
+              assignee = ?,
+              priority = ?,
+              payload = ?,
+              due_date = ?,
+              updated_at = ?
+          WHERE id = ? AND user_id = ?
+        `).run(
+          title,
+          description,
+          assignee,
+          priority,
+          payloadStr,
+          effectiveDueDate,
+          nowIso,
+          validId,
+          this.userId
+        );
+      }
+
+      // 7. Refetch and attach schedule and run
+      const refreshed = this.db.prepare('SELECT * FROM platform_tasks WHERE id = ? AND user_id = ?').get(validId, this.userId) as DbRow;
+      const task = parsePlatformTaskRow(refreshed);
+      return this.attachScheduleAndRun(task)!;
+    });
   }
 
   async findById(id: string): Promise<Task | null> {

@@ -19,6 +19,7 @@ import type {
   SetQuotaLimitInput as StrictSetQuotaLimitInput,
   TaskWorkerExecutionResult as TaskExecutionResult,
   TaskWorkerDiagnostics,
+  UpdateTaskInput,
 } from '@enkeep/platform-operations';
 
 export type {
@@ -32,6 +33,7 @@ export type {
   StrictSetQuotaLimitInput,
   TaskExecutionResult,
   TaskWorkerDiagnostics,
+  UpdateTaskInput,
 };
 
 export interface PluginReadinessStatus {
@@ -525,6 +527,7 @@ export interface ManagementOperationsProvider {
   cancelTask(userId: string, taskId: string): Promise<SafeTask>;
   pauseTask?(userId: string, taskId: string): Promise<SafeTask>;
   resumeTask?(userId: string, taskId: string): Promise<SafeTask>;
+  updateTask?(userId: string, taskId: string, input: UpdateTaskInput): Promise<SafeTask>;
   getTask(userId: string, taskId: string): Promise<SafeTask | null>;
   setQuotaLimit(userId: string, input: StrictSetQuotaLimitInput): Promise<TenantQuotaLimit>;
   checkQuota(userId: string, query?: CheckQuotaQuery): Promise<CheckQuotaResult>;

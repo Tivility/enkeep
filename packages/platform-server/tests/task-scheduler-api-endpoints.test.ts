@@ -523,4 +523,311 @@ describe('Task Scheduler Management APIs (Cron, Interval, Pause/Resume, Runs, Ru
       expect(adminTasksJson.data.total).toBeGreaterThanOrEqual(1);
     });
   });
+
+  describe('5. PUT /api/manage/tasks/:id (In-Place Task Update & Validation)', () => {
+    it('updates prompt, title, priority on existing task and returns 200 with updated task', async () => {
+      // 1. Create once task
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000001',
+        },
+        body: JSON.stringify({
+          title: 'Initial Title',
+          prompt: 'Initial prompt text',
+          sessionId: sessionRouteId,
+          priority: 'low',
+        }),
+      });
+      expect(createRes.status).toBe(201);
+      const { data: { task: created } } = await createRes.json();
+
+      // 2. PUT update
+      const updateRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({
+          title: 'Updated Title',
+          prompt: 'Updated prompt text',
+          priority: 'urgent',
+        }),
+      });
+      expect(updateRes.status).toBe(200);
+      const updateJson = await updateRes.json();
+      expect(updateJson.success).toBe(true);
+      expect(updateJson.data.updated).toBe(true);
+      expect(updateJson.data.task.title).toBe('Updated Title');
+      expect(updateJson.data.task.priority).toBe('urgent');
+      expect(updateJson.data.task.payload.prompt).toBe('Updated prompt text');
+      expect(updateJson.data.task.payload.sessionId).toBe(sessionRouteId);
+    });
+
+    it('switches schedule from once to cron and recomputes nextRunAt', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000002',
+        },
+        body: JSON.stringify({
+          title: 'Once to Cron Task',
+          prompt: 'Cron conversion prompt',
+          sessionId: sessionRouteId,
+          scheduleType: 'once',
+          dueDate: '2026-12-31T23:59:59.000Z',
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      const updateRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({
+          scheduleType: 'cron',
+          cronExpression: '0 3 * * *',
+        }),
+      });
+      expect(updateRes.status).toBe(200);
+      const updateJson = await updateRes.json();
+      expect(updateJson.data.task.scheduleType).toBe('cron');
+      expect(updateJson.data.task.cronExpression).toBe('0 3 * * *');
+      expect(updateJson.data.task.nextRunAt).toBeTruthy();
+    });
+
+    it('rejects unknown fields with 400', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000003',
+        },
+        body: JSON.stringify({
+          title: 'Unknown Field Task',
+          prompt: 'Testing unknown fields',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      const updateRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({
+          phantomField: 'not_allowed',
+        }),
+      });
+      expect(updateRes.status).toBe(400);
+      const json = await updateRes.json();
+      expect(json.success).toBe(false);
+      expect(json.error.message).toContain('unrecognized field "phantomField"');
+    });
+
+    it('rejects attempts to change owner, space, or session with 400', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000004',
+        },
+        body: JSON.stringify({
+          title: 'Immutable Guard Task',
+          prompt: 'Testing immutability',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      // 1. Root owner/userId
+      const ownerRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ userId: 'other_user' }),
+      });
+      expect(ownerRes.status).toBe(400);
+
+      // 2. Root spaceId
+      const spaceRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ spaceId: 'spc_other' }),
+      });
+      expect(spaceRes.status).toBe(400);
+
+      // 3. Root sessionId
+      const sessionRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ sessionId: 'ses_other' }),
+      });
+      expect(sessionRes.status).toBe(400);
+
+      // 4. Nested payload space/session
+      const payloadSpaceRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ payload: { spaceId: 'spc_tamper' } }),
+      });
+      expect(payloadSpaceRes.status).toBe(400);
+    });
+
+    it('rejects blank or invalid schedule configurations with 400', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000005',
+        },
+        body: JSON.stringify({
+          title: 'Invalid Sched Task',
+          prompt: 'Testing invalid sched',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      // Blank cron expression
+      const blankCronRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ cronExpression: '' }),
+      });
+      expect(blankCronRes.status).toBe(400);
+
+      // Invalid cron expression
+      const invalidCronRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ cronExpression: 'invalid * *' }),
+      });
+      expect(invalidCronRes.status).toBe(400);
+
+      // Invalid interval seconds
+      const invalidIntervalRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ intervalSeconds: 10 }),
+      });
+      expect(invalidIntervalRes.status).toBe(400);
+
+      // Empty edit body
+      const emptyRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({}),
+      });
+      expect(emptyRes.status).toBe(400);
+    });
+
+    it('rejects cross-tenant or missing task update with 404', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000006',
+        },
+        body: JSON.stringify({
+          title: 'Tenant 1 Task',
+          prompt: 'Private to tenant 1',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      // Tenant 2 tries to update Tenant 1's task
+      const crossRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant2Cookie),
+        body: JSON.stringify({ title: 'Tenant 2 Hijack' }),
+      });
+      expect(crossRes.status).toBe(404);
+
+      // Non-existent task ID
+      const missingRes = await fetch(`${baseUrl}/api/manage/tasks/task_00000000000000000000000000000000`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ title: 'Missing Task' }),
+      });
+      expect(missingRes.status).toBe(404);
+    });
+
+    it('rejects update of claimed/running task with 409', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000007',
+        },
+        body: JSON.stringify({
+          title: 'Claimed Task',
+          prompt: 'In flight task',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      // Simulate claimed status in DB
+      db.prepare("UPDATE platform_tasks SET status = 'claimed', claimant_id = 'worker_test' WHERE id = ?").run(created.id);
+
+      const busyRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ title: 'Should Fail While Claimed' }),
+      });
+      expect(busyRes.status).toBe(409);
+      const json = await busyRes.json();
+      expect(json.error.code).toBe('TASK_CONFLICT');
+    });
+
+    it('rejects update of terminal once task with 409', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000008',
+        },
+        body: JSON.stringify({
+          title: 'Completed Task',
+          prompt: 'Completed task',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      // Mark completed
+      db.prepare("UPDATE platform_tasks SET status = 'completed' WHERE id = ?").run(created.id);
+
+      const terminalRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PUT',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ title: 'Should Fail On Terminal' }),
+      });
+      expect(terminalRes.status).toBe(409);
+      const json = await terminalRes.json();
+      expect(json.error.code).toBe('TASK_CONFLICT');
+    });
+
+    it('rejects PATCH with 405 Method Not Allowed (no PATCH alias)', async () => {
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000009',
+        },
+        body: JSON.stringify({
+          title: 'No PATCH Task',
+          prompt: 'Test no PATCH',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      const patchRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'PATCH',
+        headers: getHeaders(tenant1Cookie),
+        body: JSON.stringify({ title: 'PATCH Not Allowed' }),
+      });
+      expect(patchRes.status).toBe(405);
+    });
+  });
 });

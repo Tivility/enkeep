@@ -1,6 +1,7 @@
 import type {
   Task,
   CreateTaskInput,
+  UpdateTaskInput,
   TaskQueryOptions,
   TaskRecoveryResult,
   AgentPromptTaskPayload,
@@ -14,6 +15,7 @@ import type {
 import {
   validateAgentPromptPayload,
   validateAgentPromptResult,
+  validateUpdateTaskInput,
   generateTaskId,
   generateScheduleId,
   generateRunId,
@@ -169,6 +171,155 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     this.tasks.set(id, task);
     this.schedules.set(id, schedule);
     return { ...task };
+  }
+
+  async update(id: string, input: UpdateTaskInput): Promise<Task> {
+    const validId = validateTaskId(id);
+    const validatedInput = validateUpdateTaskInput(input);
+
+    const existing = this.tasks.get(validId);
+    if (!existing || existing.userId !== this.userId) {
+      throw new TaskNotFoundError(validId);
+    }
+
+    // 1. If currently claimed or running, reject with TaskAlreadyClaimedError
+    if (existing.status === 'claimed' || existing.status === 'running') {
+      throw new TaskAlreadyClaimedError(validId, existing.claimantId || 'unknown');
+    }
+
+    const existingSchedule = this.schedules.get(validId) ?? existing.schedule;
+    const isRecurring =
+      existing.scheduleType === 'cron' ||
+      existing.scheduleType === 'interval' ||
+      existingSchedule?.scheduleType === 'cron' ||
+      existingSchedule?.scheduleType === 'interval';
+
+    // 2. Reject terminal single tasks or cancelled/failed tasks
+    if (!isRecurring) {
+      if (existing.status === 'completed' || existing.status === 'cancelled' || existing.status === 'failed') {
+        throw new TaskAlreadyCompletedError(validId);
+      }
+    } else {
+      if (existing.status === 'cancelled' || existing.status === 'failed') {
+        throw new TaskConflictError(validId, `Recurring task with status "${existing.status}" cannot be modified`);
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const now = new Date();
+
+    const title = validatedInput.title !== undefined ? validatedInput.title : existing.title;
+    const description = validatedInput.description !== undefined ? validatedInput.description : existing.description;
+    const assignee = validatedInput.assignee !== undefined ? validatedInput.assignee : existing.assignee;
+    const priority = validatedInput.priority !== undefined ? validatedInput.priority : existing.priority;
+
+    // Prompt updates payload.prompt while preserving immutable session and space fields
+    const prompt = validatedInput.prompt ?? validatedInput.payload?.prompt;
+    const payload: AgentPromptTaskPayload = prompt !== undefined
+      ? { ...existing.payload, prompt }
+      : { ...existing.payload };
+
+    // Schedule configuration
+    const scheduleType = validatedInput.scheduleType ?? existingSchedule?.scheduleType ?? existing.scheduleType ?? 'once';
+    const cronExpression = validatedInput.cronExpression !== undefined ? validatedInput.cronExpression : (existingSchedule?.cronExpression ?? existing.cronExpression ?? null);
+    const intervalSeconds = validatedInput.intervalSeconds !== undefined ? validatedInput.intervalSeconds : (existingSchedule?.intervalSeconds ?? existing.intervalSeconds ?? null);
+    const timezone = validatedInput.timezone !== undefined ? validatedInput.timezone : (existingSchedule?.timezone ?? existing.timezone ?? 'UTC');
+    const dueDate = validatedInput.dueDate !== undefined ? validatedInput.dueDate : (existing.dueDate ?? null);
+    const misfirePolicy = validatedInput.misfirePolicy ?? existingSchedule?.misfirePolicy ?? 'coalesce';
+    const overlapPolicy = validatedInput.overlapPolicy ?? existingSchedule?.overlapPolicy ?? 'skip';
+
+    // Validate type-specific schedule constraints
+    if (scheduleType === 'cron' && !cronExpression) {
+      throw new ValidationError('Cron expression is required for cron schedule type');
+    }
+    if (scheduleType === 'interval' && !intervalSeconds) {
+      throw new ValidationError('Interval seconds is required for interval schedule type');
+    }
+
+    // Recompute next_run_at if schedule fields changed
+    let nextRunAt = existing.nextRunAt;
+    const isScheduleChanged =
+      validatedInput.scheduleType !== undefined ||
+      validatedInput.cronExpression !== undefined ||
+      validatedInput.intervalSeconds !== undefined ||
+      validatedInput.dueDate !== undefined ||
+      validatedInput.timezone !== undefined;
+
+    if (isScheduleChanged) {
+      nextRunAt = computeNextRun(
+        {
+          scheduleType,
+          cronExpression,
+          intervalSeconds,
+          dueDate,
+          lastRunAt: existingSchedule?.lastRunAt ?? null,
+          pausedAt: existingSchedule?.pausedAt ?? null,
+          enabled: existingSchedule ? existingSchedule.enabled : true,
+          timezone,
+        },
+        now
+      );
+    }
+
+    let updatedSchedule: TaskSchedule | null = existingSchedule ? { ...existingSchedule } : null;
+    if (scheduleType === 'cron' || scheduleType === 'interval') {
+      if (!updatedSchedule) {
+        updatedSchedule = {
+          id: generateScheduleId(),
+          taskId: validId,
+          userId: this.userId,
+          scheduleType,
+          cronExpression,
+          intervalSeconds,
+          nextRunAt,
+          lastRunAt: null,
+          timezone,
+          enabled: true,
+          pausedAt: null,
+          misfirePolicy,
+          overlapPolicy,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+      } else {
+        updatedSchedule.scheduleType = scheduleType;
+        updatedSchedule.cronExpression = cronExpression;
+        updatedSchedule.intervalSeconds = intervalSeconds;
+        updatedSchedule.timezone = timezone;
+        updatedSchedule.nextRunAt = nextRunAt;
+        updatedSchedule.misfirePolicy = misfirePolicy;
+        updatedSchedule.overlapPolicy = overlapPolicy;
+        updatedSchedule.updatedAt = nowIso;
+      }
+      this.schedules.set(validId, updatedSchedule);
+    } else if (scheduleType === 'once' && updatedSchedule) {
+      updatedSchedule.scheduleType = 'once';
+      updatedSchedule.cronExpression = null;
+      updatedSchedule.intervalSeconds = null;
+      updatedSchedule.nextRunAt = nextRunAt;
+      updatedSchedule.updatedAt = nowIso;
+      this.schedules.set(validId, updatedSchedule);
+    }
+
+    const updatedTask: Task = {
+      ...existing,
+      title,
+      description,
+      assignee,
+      priority,
+      payload,
+      dueDate: scheduleType === 'once' ? dueDate : null,
+      scheduleType,
+      cronExpression: scheduleType === 'cron' ? cronExpression : null,
+      intervalSeconds: scheduleType === 'interval' ? intervalSeconds : null,
+      timezone,
+      nextRunAt,
+      schedule: updatedSchedule,
+      updatedAt: nowIso,
+    };
+
+    this.tasks.set(validId, updatedTask);
+    return { ...updatedTask };
   }
 
   async findById(id: string): Promise<Task | null> {

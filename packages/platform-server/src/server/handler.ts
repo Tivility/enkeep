@@ -73,8 +73,8 @@ import type {
   UserRuntimeStatus,
   OperationsReadinessStatus,
 } from "../management/types.js";
-import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority } from "@enkeep/platform-operations";
-import { QuotaExceededError, validateTimezone } from "@enkeep/platform-operations";
+import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority, UpdateTaskInput } from "@enkeep/platform-operations";
+import { QuotaExceededError, validateTimezone, validateUpdateTaskInput } from "@enkeep/platform-operations";
 import Busboy from "busboy";
 import {
   RuntimeFileApiService,
@@ -3717,18 +3717,55 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
 
             if (action === "" || action === "/") {
               if (method === "GET") {
-                if (!operations) {
+                if (!operations && !opsProvider) {
                   throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
                 }
                 const task = opsProvider
                   ? await opsProvider.getTask(user.id, taskId)
-                  : await operations.forTenant(user.id).tasks.getTask(taskId);
+                  : await (operations as PlatformOperationsService).forTenant(user.id).tasks.getTask(taskId);
                 if (!task) {
                   throw new NotFoundError(`Task "${taskId}" not found`);
                 }
                 sendJsonResponse(res, 200, createSuccessEnvelope(task));
                 return;
               }
+
+              if (method === "PUT") {
+                validateCsrf(req, { csrfToken });
+                if (!operations && !opsProvider) {
+                  throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
+                }
+                const body = await parseJsonBody(req, maxBodyBytes);
+                if (body !== null && typeof body === "object" && !Array.isArray(body)) {
+                  for (const key of Object.keys(body)) {
+                    if (key === "userId" || key === "user_id" || key === "owner") {
+                      throw new ValidationError("Task ownership is immutable");
+                    }
+                    if (key === "spaceId" || key === "sessionId") {
+                      throw new ValidationError("Task session and space bindings are immutable");
+                    }
+                  }
+                }
+                const validatedInput = validateUpdateTaskInput(body);
+
+                const updated = opsProvider && opsProvider.updateTask
+                  ? await opsProvider.updateTask(user.id, taskId, validatedInput)
+                  : (operations ? await (operations as PlatformOperationsService).forTenant(user.id).tasks.updateTask(taskId, validatedInput) : null);
+
+                if (!updated) {
+                  throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
+                }
+
+                sendJsonResponse(res, 200, createSuccessEnvelope({
+                  id: updated.id,
+                  status: updated.status,
+                  updated: true,
+                  task: updated,
+                }));
+                return;
+              }
+
+              throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
             }
 
             if (action === "/cancel") {
