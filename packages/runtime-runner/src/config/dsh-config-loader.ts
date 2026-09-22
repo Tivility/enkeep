@@ -55,6 +55,23 @@ export interface DshDeploymentBudgets {
   defaultIdleTimeoutMs?: number;
 }
 
+export interface DshParsedWebSearchConfig {
+  readonly apiKeyEnv?: string;
+  readonly baseURL?: string;
+  readonly model?: string;
+  readonly maxUses?: number;
+  readonly maxTokens?: number;
+  readonly apiVersion?: string;
+}
+
+export interface DshParsedWebConfig {
+  readonly search?: boolean;
+  readonly fetch?: boolean;
+  readonly searchProvider?: string;
+  readonly fetchProvider?: string;
+  readonly searchConfig?: DshParsedWebSearchConfig;
+}
+
 export interface DshDeploymentConfig {
   dshHome: string;
   providers: Record<string, DshParsedProvider>;
@@ -63,6 +80,7 @@ export interface DshDeploymentConfig {
   allowedHosts: string[];
   budgets?: DshDeploymentBudgets;
   containerNetworkMode?: RuntimeNetworkMode;
+  web?: DshParsedWebConfig;
 }
 
 /**
@@ -257,6 +275,128 @@ export function parseDshConfigFiles(
     }
   }
 
+  // Parse optional web search & fetch configuration
+  let webConfig: DshParsedWebConfig | undefined;
+
+  // 1. settings.yaml (web and web-search-deepseek namespaces)
+  if (settingsYamlContent) {
+    try {
+      const settingsParsed = YAML.parse(settingsYamlContent);
+      if (settingsParsed && typeof settingsParsed === 'object') {
+        const rawWeb = (settingsParsed as Record<string, unknown>)['web'];
+        const rawDeepSeekSearch = (settingsParsed as Record<string, unknown>)['web-search-deepseek'];
+
+        let searchProvider: string | undefined;
+        let fetchProvider: string | undefined;
+        let searchEnabled: boolean | undefined;
+        let fetchEnabled: boolean | undefined;
+
+        if (rawWeb && typeof rawWeb === 'object') {
+          const wObj = rawWeb as Record<string, unknown>;
+          if (typeof wObj.searchProvider === 'string') searchProvider = wObj.searchProvider;
+          if (typeof wObj.fetchProvider === 'string') fetchProvider = wObj.fetchProvider;
+          if (typeof wObj.search === 'boolean') searchEnabled = wObj.search;
+          if (typeof wObj.fetch === 'boolean') fetchEnabled = wObj.fetch;
+        }
+
+        let searchConfig: DshParsedWebSearchConfig | undefined;
+        if (rawDeepSeekSearch && typeof rawDeepSeekSearch === 'object') {
+          const dsObj = rawDeepSeekSearch as Record<string, unknown>;
+          searchConfig = {
+            apiKeyEnv: typeof dsObj.apiKeyEnv === 'string' ? dsObj.apiKeyEnv : 'DEEPSEEK_API_KEY',
+            baseURL: typeof dsObj.baseURL === 'string' ? dsObj.baseURL : undefined,
+            model: typeof dsObj.model === 'string' ? dsObj.model : undefined,
+            maxUses: typeof dsObj.maxUses === 'number' ? dsObj.maxUses : undefined,
+            maxTokens: typeof dsObj.maxTokens === 'number' ? dsObj.maxTokens : undefined,
+            apiVersion: typeof dsObj.apiVersion === 'string' ? dsObj.apiVersion : undefined,
+          };
+          if (searchConfig.baseURL) {
+            try {
+              allowedHostsSet.add(new URL(searchConfig.baseURL).hostname.toLowerCase());
+            } catch {}
+          }
+        }
+
+        if (searchProvider || fetchProvider || searchEnabled !== undefined || fetchEnabled !== undefined || searchConfig) {
+          webConfig = {
+            search: searchEnabled,
+            fetch: fetchEnabled,
+            searchProvider,
+            fetchProvider,
+            searchConfig,
+          };
+        }
+      }
+    } catch {}
+  }
+
+  // 2. cordis.patch.yml entries
+  if (Array.isArray(patchParsed)) {
+    const webSearchEntry = patchParsed.find(
+      (e: unknown): e is { id: string; name?: string; config?: Record<string, unknown> } =>
+        typeof e === 'object' && e !== null && 'id' in e && (e as { id: string }).id === 'web-search-deepseek'
+    );
+    if (webSearchEntry?.config) {
+      const c = webSearchEntry.config;
+      const deepseekConf: DshParsedWebSearchConfig = {
+        apiKeyEnv: typeof c.apiKeyEnv === 'string' ? c.apiKeyEnv : (webConfig?.searchConfig?.apiKeyEnv ?? 'DEEPSEEK_API_KEY'),
+        baseURL: typeof c.baseURL === 'string' ? c.baseURL : webConfig?.searchConfig?.baseURL,
+        model: typeof c.model === 'string' ? c.model : webConfig?.searchConfig?.model,
+        maxUses: typeof c.maxUses === 'number' ? c.maxUses : webConfig?.searchConfig?.maxUses,
+        maxTokens: typeof c.maxTokens === 'number' ? c.maxTokens : webConfig?.searchConfig?.maxTokens,
+        apiVersion: typeof c.apiVersion === 'string' ? c.apiVersion : webConfig?.searchConfig?.apiVersion,
+      };
+      if (deepseekConf.baseURL) {
+        try {
+          allowedHostsSet.add(new URL(deepseekConf.baseURL).hostname.toLowerCase());
+        } catch {}
+      }
+      webConfig = {
+        ...webConfig,
+        searchProvider: webConfig?.searchProvider ?? 'deepseek-official',
+        searchConfig: deepseekConf,
+      };
+    }
+
+    const webEntry = patchParsed.find(
+      (e: unknown): e is { id: string; name?: string; config?: Record<string, unknown> } =>
+        typeof e === 'object' && e !== null && 'id' in e && (e as { id: string }).id === 'web'
+    );
+    if (webEntry?.config) {
+      const c = webEntry.config;
+      webConfig = {
+        ...webConfig,
+        searchProvider: typeof c.searchProvider === 'string' ? c.searchProvider : webConfig?.searchProvider,
+        fetchProvider: typeof c.fetchProvider === 'string' ? c.fetchProvider : webConfig?.fetchProvider,
+      };
+    }
+  }
+
+  // 3. Operational environment overrides
+  const envSearchProvider = process.env.DSH_WEB_SEARCH_PROVIDER;
+  const envFetchProvider = process.env.DSH_WEB_FETCH_PROVIDER;
+  const envSearchBaseUrl = process.env.DEEPSEEK_SEARCH_BASE_URL;
+
+  if (envSearchProvider || envFetchProvider || envSearchBaseUrl) {
+    let searchConfig = webConfig?.searchConfig;
+    if (envSearchBaseUrl) {
+      searchConfig = {
+        ...searchConfig,
+        apiKeyEnv: searchConfig?.apiKeyEnv ?? 'DEEPSEEK_API_KEY',
+        baseURL: envSearchBaseUrl,
+      };
+      try {
+        allowedHostsSet.add(new URL(envSearchBaseUrl).hostname.toLowerCase());
+      } catch {}
+    }
+    webConfig = {
+      ...webConfig,
+      searchProvider: envSearchProvider ?? webConfig?.searchProvider,
+      fetchProvider: envFetchProvider ?? webConfig?.fetchProvider,
+      searchConfig,
+    };
+  }
+
   return {
     dshHome,
     providers,
@@ -265,6 +405,7 @@ export function parseDshConfigFiles(
     allowedHosts: Array.from(allowedHostsSet),
     budgets,
     containerNetworkMode,
+    web: webConfig,
   };
 }
 

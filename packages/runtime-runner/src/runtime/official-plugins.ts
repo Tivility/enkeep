@@ -84,6 +84,9 @@ import * as ToolSubagentListAgentsPlugin from '@deepseek-ai/dsh-tool-subagent-co
 import ApprovalService, { type ApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy';
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets';
+import { WebRuntime } from '@deepseek-ai/dsh-web';
+import * as HttpFetchProviderPlugin from '@deepseek-ai/dsh-web-fetch-http';
+import * as ToolWebPlugin from '@deepseek-ai/dsh-tool-web';
 import * as McpGovernancePlugin from '@enkeep/dsh-mcp-governance';
 import * as CliToolsPlugin from '@enkeep/dsh-tool-cli';
 import { validateTrustedPluginDescriptor, type TrustedPluginDefinition } from '@enkeep/dsh-enkeep-bundle';
@@ -139,6 +142,23 @@ export interface ApprovalMountConfig {
   readonly policy?: ApprovalPolicy;
 }
 
+export interface WebMountConfig {
+  readonly search?: boolean;
+  readonly fetch?: boolean;
+  readonly searchProvider?: string;
+  readonly fetchProvider?: string;
+  readonly searchPlugin?: any;
+  readonly searchPluginConfig?: any;
+  readonly searchConfig?: {
+    readonly apiKeyEnv?: string;
+    readonly baseURL?: string;
+    readonly model?: string;
+    readonly maxUses?: number;
+    readonly maxTokens?: number;
+    readonly apiVersion?: string;
+  };
+}
+
 export interface OfficialPluginsConfig {
   readonly dshHome: string;
   readonly spacesDir: string;
@@ -152,6 +172,7 @@ export interface OfficialPluginsConfig {
   readonly shell?: ShellMountConfig;
   readonly fs?: FsMountConfig;
   readonly approval?: ApprovalMountConfig;
+  readonly web?: WebMountConfig;
 }
 
 export interface WorkspaceToolsMountOptions {
@@ -166,6 +187,7 @@ export interface WorkspaceToolsMountOptions {
   readonly subagents?: SubagentsMountConfig;
   readonly shell?: ShellMountConfig;
   readonly fs?: FsMountConfig;
+  readonly web?: WebMountConfig;
   readonly defaultPreset?: string;
   readonly extensionPlan?: ExtensionActivationPlan | null;
   readonly onExtensionPlanUpdated?: (newPlan: ExtensionActivationPlan | null) => Promise<void> | void;
@@ -189,6 +211,11 @@ export interface RuntimeCapabilitiesStatus {
   readonly permissions: boolean;
   readonly filesystem: boolean;
   readonly shell: boolean;
+  readonly web?: {
+    readonly search: boolean;
+    readonly fetch: boolean;
+    readonly provider?: string;
+  };
   readonly maxSubagentDepth: number;
   readonly maxSubagentConcurrency: number;
   readonly activeSubagentsCount: number;
@@ -999,6 +1026,46 @@ export async function mountWorkspaceTools(
     });
     fibers.push(permissionFiber);
 
+    // 15.5 Web Tool Suite scoped to Agent (web_fetch default enabled; web_search registered only when provider is available)
+    const webFetchEnabled = options.web?.fetch !== false;
+    let webSearchEnabled = false;
+
+    if (options.web?.search !== false) {
+      const webService: any =
+        (agentCtx.get ? agentCtx.get('web') : undefined) ??
+        (agentCtx as any).web ??
+        (agentCtx as any).root?.get?.('web') ??
+        (agentCtx as any).root?.web;
+
+      if (webService && webService.searchProviders) {
+        const providersMap: Map<string, any> = webService.searchProviders;
+        const configuredId: string | undefined =
+          options.web?.searchProvider ?? webService.searchProviderId ?? process.env.DSH_WEB_SEARCH_PROVIDER;
+
+        if (configuredId) {
+          const provider = providersMap.get(configuredId);
+          if (provider && (typeof provider.available !== 'function' || provider.available())) {
+            webSearchEnabled = true;
+          }
+        } else if (providersMap.size > 0) {
+          for (const provider of providersMap.values()) {
+            if (typeof provider.available !== 'function' || provider.available()) {
+              webSearchEnabled = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (webFetchEnabled || webSearchEnabled) {
+      const toolWebFiber = await agentCtx.plugin(ToolWebPlugin, {
+        search: webSearchEnabled,
+        fetch: webFetchEnabled,
+      });
+      fibers.push(toolWebFiber);
+    }
+
     // 16. MCP Dynamic Tool Registration from ExtensionActivationPlan
     let mcpMountHandle: { dispose(): Promise<void> } | undefined;
     if (options.extensionPlan !== undefined && options.extensionPlan !== null) {
@@ -1388,6 +1455,57 @@ export async function mountOfficialPlugins(
     fibers.push(mcpGovFiber);
     mountedPlugins.set('mcp-governance', mcpGovFiber);
 
+    // 7.5 Process-global Web Access Seam (WebRuntime + HttpFetchProvider + optional WebSearchProvider)
+    let webService: any = ctx.get ? ctx.get('web') : undefined;
+    if (!webService) {
+      try {
+        webService = (ctx as any).web;
+      } catch {}
+    }
+
+    if (!webService) {
+      const webRuntimeFiber = await ctx.plugin(WebRuntime, {
+        searchProvider: config.web?.searchProvider,
+        fetchProvider: config.web?.fetchProvider,
+      });
+      fibers.push(webRuntimeFiber);
+      mountedPlugins.set('web', webRuntimeFiber);
+      webService = ctx.get ? ctx.get('web') : (ctx as any).web;
+    }
+
+    if (!mountedPlugins.has('web-fetch-http')) {
+      const httpFetchFiber = await ctx.plugin(HttpFetchProviderPlugin);
+      fibers.push(httpFetchFiber);
+      mountedPlugins.set('web-fetch-http', httpFetchFiber);
+    }
+
+    // Optional Search Provider Plugin Mount (custom plugin or official DeepSeek search provider)
+    if (config.web?.searchPlugin) {
+      const searchPluginFiber = await ctx.plugin(config.web.searchPlugin, config.web.searchPluginConfig ?? {});
+      fibers.push(searchPluginFiber);
+      mountedPlugins.set('web-search-plugin', searchPluginFiber);
+    } else if (
+      config.web?.searchProvider === 'deepseek-official' ||
+      config.web?.searchProvider === 'deepseek' ||
+      config.web?.searchConfig !== undefined
+    ) {
+      try {
+        const deepseekPlugin = await import('@deepseek-ai/dsh-web-search-deepseek');
+        const dsFiber = await ctx.plugin(deepseekPlugin as any, {
+          apiKeyEnv: config.web?.searchConfig?.apiKeyEnv ?? 'DEEPSEEK_API_KEY',
+          baseURL: config.web?.searchConfig?.baseURL,
+          model: config.web?.searchConfig?.model,
+          maxUses: config.web?.searchConfig?.maxUses,
+          maxTokens: config.web?.searchConfig?.maxTokens,
+          apiVersion: config.web?.searchConfig?.apiVersion,
+        });
+        fibers.push(dsFiber);
+        mountedPlugins.set('web-search-deepseek', dsFiber);
+      } catch {
+        // Fail-safe: if official search plugin is unavailable, do not crash; web_search tool remains unadvertised
+      }
+    }
+
     // 8. Global Authoritative Policy Enforcement Gate at tool executor boundary
     ctx.on('tools/pre-execute', async (exec, next) => {
       const session = exec.agent?.session;
@@ -1400,7 +1518,7 @@ export async function mountOfficialPlugins(
       const toolName = exec.name;
 
       // 1. Safe read/inspection tools are unconditionally allowed in any mode
-      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'check_quota'].includes(toolName)) {
+      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'check_quota', 'web_search', 'web_fetch'].includes(toolName)) {
         return await next();
       }
 
@@ -1577,6 +1695,36 @@ export async function mountOfficialPlugins(
       }
     }
 
+    // Probe Web capabilities
+    const globalWebService: any = ctx.get ? ctx.get('web') : (ctx as any).web;
+    let webSearchOperational = false;
+    let webFetchOperational = false;
+    let activeWebSearchProvider: string | undefined;
+
+    if (globalWebService) {
+      if (globalWebService.fetchProviders && globalWebService.fetchProviders.size > 0) {
+        webFetchOperational = true;
+      }
+      if (globalWebService.searchProviders && globalWebService.searchProviders.size > 0) {
+        const configuredId = globalWebService.searchProviderId;
+        if (configuredId) {
+          const p = globalWebService.searchProviders.get(configuredId);
+          if (p && (typeof p.available !== 'function' || p.available())) {
+            webSearchOperational = true;
+            activeWebSearchProvider = configuredId;
+          }
+        } else {
+          for (const [id, p] of globalWebService.searchProviders.entries()) {
+            if (typeof p.available !== 'function' || p.available()) {
+              webSearchOperational = true;
+              activeWebSearchProvider = id;
+              break;
+            }
+          }
+        }
+      }
+    }
+
     return {
       compaction: compactionReady,
       instructions: instructionsReady,
@@ -1587,6 +1735,11 @@ export async function mountOfficialPlugins(
       permissions: permissionsReady,
       filesystem: fsOperational,
       shell: shellOperational,
+      web: {
+        search: webSearchOperational,
+        fetch: webFetchOperational,
+        provider: activeWebSearchProvider,
+      },
       maxSubagentDepth,
       maxSubagentConcurrency,
       activeSubagentsCount,
