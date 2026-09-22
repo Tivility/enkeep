@@ -7,6 +7,7 @@ import {
   NotFoundError,
   PlatformError,
 } from '@enkeep/platform-core';
+import { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS } from '@enkeep/web-channel';
 import type {
   TaskInputPreparationContext,
   TaskInputPreparationResult,
@@ -360,16 +361,16 @@ export class PipelineTaskInputPreparerService {
     }
 
     // Determine executionBudget for registered pipeline observation/aggregation tasks
-    // Finite safe integer <= 900000, default 900000, invalid fail closed
-    const rawMaxWaitMs = registration.maxWaitMs ?? 900_000;
+    // Finite safe integer <= 1800000, default 1800000, invalid fail closed
+    const rawMaxWaitMs = registration.maxWaitMs ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
     if (
       typeof rawMaxWaitMs !== 'number' ||
       !Number.isSafeInteger(rawMaxWaitMs) ||
       rawMaxWaitMs <= 0 ||
-      rawMaxWaitMs > 900_000
+      rawMaxWaitMs > DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS
     ) {
       throw new ValidationError(
-        '[INVALID_EXECUTION_BUDGET] Registered task maxWaitMs must be a finite integer between 1 and 900000'
+        `[INVALID_EXECUTION_BUDGET] Registered task maxWaitMs must be a finite integer between 1 and ${DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS}`
       );
     }
     const executionBudget: TaskExecutionBudget = {

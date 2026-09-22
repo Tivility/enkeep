@@ -15,6 +15,7 @@ import {
   type TenantQuotaProvider,
   type QuotaReservationBundle,
   type QuotaReservationRequest,
+  DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
 } from '../src/index.js';
 import type { InboundEnvelope } from '@enkeep/web-channel';
 
@@ -2549,6 +2550,202 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       db.prepare('PRAGMA foreign_keys = ON').run();
 
       await expect(gateway.cancelTurn('u1', 'turn_corrupt_route')).rejects.toThrowError(/INVARIANT_VIOLATION|missing route_id/);
+    });
+  });
+
+  describe('Interactive Turn Timeout & Failure Notice Delivery', () => {
+    it('verifies default timeout constant is 1800000 and is passed in executionRequest', async () => {
+      expect(DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS).toBe(1_800_000);
+
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+      let capturedRequest: any = null;
+
+      const executor = {
+        execute: async (req: any) => {
+          capturedRequest = req;
+          return {
+            replyText: 'Echo response',
+            usage: { totalTokens: 10 },
+          };
+        },
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        database: db,
+        storage,
+        messageStore,
+        executor,
+        quotaMode: 'disabled',
+        profileResolver,
+      });
+
+      const envelope = createSampleEnvelope();
+      const result = await gateway.dispatchInbound(envelope);
+      expect(result.accepted).toBe(true);
+
+      await gateway.drain(1000);
+
+      expect(capturedRequest).not.toBeNull();
+      expect(capturedRequest.timeoutMs).toBe(1_800_000);
+      expect(capturedRequest.timeoutMs).toBe(DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS);
+    });
+
+    it('preserves explicit small timeoutMs without overriding with default 30min', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+      let capturedRequest: any = null;
+
+      const executor = {
+        execute: async (req: any) => {
+          capturedRequest = req;
+          return {
+            replyText: 'Echo response',
+            usage: { totalTokens: 10 },
+          };
+        },
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        database: db,
+        storage,
+        messageStore,
+        executor,
+        quotaMode: 'disabled',
+        profileResolver,
+      });
+
+      const envelope = createSampleEnvelope();
+      const result = await gateway.dispatchInbound(envelope, { timeoutMs: 5000 });
+      expect(result.accepted).toBe(true);
+
+      await gateway.drain(1000);
+
+      expect(capturedRequest).not.toBeNull();
+      expect(capturedRequest.timeoutMs).toBe(5000);
+    });
+
+    it('rejects dispatch timeoutMs exceeding 1800000 cap', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+      const gateway = new DeliveryRuntimeGateway({
+        database: db,
+        storage,
+        messageStore,
+        executor: {
+          execute: async () => ({ replyText: 'ok', usage: { totalTokens: 1 } }),
+          cancel: async () => true,
+        },
+        quotaMode: 'disabled',
+        profileResolver,
+      });
+
+      const envelope = createSampleEnvelope();
+      await expect(
+        gateway.dispatchInbound(envelope, { timeoutMs: 1_800_001 })
+      ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
+    });
+
+    it('a stubbed executor that rejects with TURN_TIMEOUT results in a failed turn_runs row AND a delivered assistant notice web_messages row AND one turnCompleted listener call carrying the notice text', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      const timeoutError = Object.assign(new Error('TURN_TIMEOUT'), {
+        code: 'TURN_TIMEOUT',
+        stepCount: 7,
+      });
+
+      const executor = {
+        execute: async () => {
+          throw timeoutError;
+        },
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        database: db,
+        storage,
+        messageStore,
+        executor,
+        quotaMode: 'disabled',
+        profileResolver,
+      });
+
+      const completedEvents: any[] = [];
+      gateway.onTurnCompleted((event) => {
+        completedEvents.push(event);
+      });
+
+      const envelope = createSampleEnvelope();
+      const result = await gateway.dispatchInbound(envelope);
+      const turnId = result.turnId!;
+
+      await gateway.drain(1000);
+
+      // 1. turn_runs row has status 'failed' with error 'TURN_TIMEOUT'
+      const turnRow = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get(turnId) as { status: string; error?: string };
+      expect(turnRow).toBeDefined();
+      expect(turnRow.status).toBe('failed');
+      expect(turnRow.error).toBe('TURN_TIMEOUT');
+
+      // 2. web_messages has delivered assistant notice row
+      const assistantMsgRow = db.prepare(`
+        SELECT role, content, status, turn_id
+        FROM web_messages
+        WHERE session_id = 'ses1' AND turn_id = ? AND role = 'assistant'
+      `).get(turnId) as { role: string; content: string; status: string; turn_id: string };
+
+      expect(assistantMsgRow).toBeDefined();
+      expect(assistantMsgRow.role).toBe('assistant');
+      expect(assistantMsgRow.status).toBe('delivered');
+      expect(assistantMsgRow.turn_id).toBe(turnId);
+      expect(assistantMsgRow.content).toBe('⏱️ 本轮处理超过 30 分钟已被终止（已执行 7 步）。请缩小范围或用 /new 开新一代后重试。');
+
+      // 3. Exactly one turnCompleted listener call carrying the notice text
+      expect(completedEvents.length).toBe(1);
+      expect(completedEvents[0].turnId).toBe(turnId);
+      expect(completedEvents[0].executionResult.replyText).toBe(assistantMsgRow.content);
+      expect(completedEvents[0].executionMode).toBe('command');
+    });
+
+    it('verifies notice text formats without step count when step count is unavailable', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      const executor = {
+        execute: async () => {
+          throw new Error('TURN_TIMEOUT');
+        },
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        database: db,
+        storage,
+        messageStore,
+        executor,
+        quotaMode: 'disabled',
+        profileResolver,
+      });
+
+      const completedEvents: any[] = [];
+      gateway.onTurnCompleted((event) => {
+        completedEvents.push(event);
+      });
+
+      const envelope = createSampleEnvelope();
+      const result = await gateway.dispatchInbound(envelope);
+      const turnId = result.turnId!;
+
+      await gateway.drain(1000);
+
+      const assistantMsgRow = db.prepare(`
+        SELECT role, content, status, turn_id
+        FROM web_messages
+        WHERE session_id = 'ses1' AND turn_id = ? AND role = 'assistant'
+      `).get(turnId) as { role: string; content: string; status: string; turn_id: string };
+
+      expect(assistantMsgRow).toBeDefined();
+      expect(assistantMsgRow.content).toBe('⏱️ 本轮处理超过 30 分钟已被终止。请缩小范围或用 /new 开新一代后重试。');
+      expect(completedEvents.length).toBe(1);
+      expect(completedEvents[0].executionResult.replyText).toBe(assistantMsgRow.content);
     });
   });
 });

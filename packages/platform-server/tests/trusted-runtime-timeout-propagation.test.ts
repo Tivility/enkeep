@@ -278,7 +278,6 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
       storage,
       database: db,
       pollIntervalMs: 50,
-      maxWaitMs: 300_000,
     });
   }
 
@@ -454,11 +453,11 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
     expect(cancelCalledForTurn).not.toBeNull();
   });
 
-  it('4. Ordinary task without execution budget retains 300s default for both outer and inner', async () => {
+  it('4. Ordinary task without execution budget retains 1800s default for both outer and inner', async () => {
     setupSystem('fixed');
 
-    // Harness delay 400s (exceeds 300s default)
-    harnessDelayMs = 400_000;
+    // Harness delay 1900s (exceeds 1800s default)
+    harnessDelayMs = 1_900_000;
 
     const ordinaryCtx: AgentPromptDispatchContext = {
       task: {
@@ -485,7 +484,7 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
       signal: new AbortController().signal,
       workerId: 'worker_synth_04',
       tenantId: tenantAlice,
-      // executionBudget undefined -> defaults to 300_000ms
+      // executionBudget undefined -> defaults to 1_800_000ms
     };
 
     let dispatchErr: Error | null = null;
@@ -494,10 +493,18 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
     });
 
     await vi.advanceTimersByTimeAsync(10);
-    expect(capturedFollowupRequest?.timeoutMs).toBe(300_000);
+    expect(capturedFollowupRequest?.timeoutMs).toBe(1_800_000);
 
-    // At 300_050ms: times out
-    await vi.advanceTimersByTimeAsync(300_050);
+    // At 300s: still executing
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(cancelCalledForTurn).toBeNull();
+
+    // At 1000s: still executing
+    await vi.advanceTimersByTimeAsync(700_000);
+    expect(cancelCalledForTurn).toBeNull();
+
+    // At 1800_050ms: times out
+    await vi.advanceTimersByTimeAsync(800_050);
     await dispatchPromise;
 
     expect(dispatchErr).not.toBeNull();
@@ -510,9 +517,9 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
     const invalidBudgets = [
       { maxWaitMs: 0 },
       { maxWaitMs: -100 },
-      { maxWaitMs: 900_001 },
+      { maxWaitMs: 1_800_001 },
       { maxWaitMs: 1.5 },
-      { maxWaitMs: '900000' as any },
+      { maxWaitMs: '1800000' as any },
       { unknownKey: 5000 } as any,
     ];
 
@@ -558,7 +565,7 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
           content: 'Direct bad dispatch',
           timestamp: new Date().toISOString(),
         },
-        { timeoutMs: 900_001 }
+        { timeoutMs: 1_800_001 }
       )
     ).rejects.toThrow(ValidationError);
 
@@ -580,7 +587,7 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
     expect(turnCount.cnt).toBe(0);
   });
 
-  it('6. External Web payload injection of timeoutMs/metadata has zero effect; ordinary 300s remains default', async () => {
+  it('6. External Web payload injection of timeoutMs/metadata has zero effect; ordinary 1800s remains default', async () => {
     setupSystem('fixed');
     harnessDelayMs = 0;
 
@@ -602,9 +609,9 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
     // Let scheduler claim and execute turn
     await vi.advanceTimersByTimeAsync(50);
 
-    // Verify that injected parameters had NO effect: timeoutMs defaulted to 300_000
-    expect(capturedTurnRequest?.timeoutMs).toBe(300_000);
-    expect(capturedFollowupRequest?.timeoutMs).toBe(300_000);
+    // Verify that injected parameters had NO effect: timeoutMs defaulted to 1_800_000
+    expect(capturedTurnRequest?.timeoutMs).toBe(1_800_000);
+    expect(capturedFollowupRequest?.timeoutMs).toBe(1_800_000);
   });
 
   it('7. Queued cancellation and schedule lease semantics are preserved', async () => {
@@ -635,5 +642,60 @@ describe('Production Trusted Runtime Timeout Propagation E2E', () => {
 
     const inboxRow = db.prepare('SELECT status, error FROM delivery_inbox WHERE turn_id = ?').get(turnId) as { status: string; error: string };
     expect(inboxRow.status).toBe('cancelled');
+  });
+
+  it('8. Explicit caller short timeout (5000ms) is preserved and cancels at 5000ms, not 1800s', async () => {
+    setupSystem('fixed');
+
+    harnessDelayMs = 10_000;
+
+    const shortCtx: AgentPromptDispatchContext = {
+      task: {
+        id: trustedTaskId,
+        userId: tenantAlice,
+        title: 'Short Timeout Task',
+        priority: 'high',
+        status: 'running',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute short turn',
+          sessionId,
+          sessionPolicy: 'existing_session',
+        },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Execute short turn',
+        sessionId,
+        sessionPolicy: 'existing_session',
+      },
+      signal: new AbortController().signal,
+      workerId: 'worker_synth_short',
+      tenantId: tenantAlice,
+      executionBudget: {
+        maxWaitMs: 5000,
+      },
+    };
+
+    let dispatchErr: Error | null = null;
+    const dispatchPromise = dispatcher.dispatch(shortCtx).catch((err) => {
+      dispatchErr = err;
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(capturedFollowupRequest?.timeoutMs).toBe(5000);
+
+    // At 4000ms: still executing
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(cancelCalledForTurn).toBeNull();
+
+    // At 5050ms: times out
+    await vi.advanceTimersByTimeAsync(1050);
+    await dispatchPromise;
+
+    expect(dispatchErr).not.toBeNull();
+    expect(cancelCalledForTurn).not.toBeNull();
   });
 });

@@ -12,13 +12,14 @@ import {
   type ExtensionActivationPlan,
   type ExtensionPlanResolver,
 } from '@enkeep/platform-core';
-import type {
-  InboundEnvelope,
-  RuntimeGateway,
-  InternalRuntimeDispatchResult,
-  TurnExecutionStatus,
-  PublicEventCode,
-  DeliveryDispatchOptions,
+import {
+  DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
+  type InboundEnvelope,
+  type RuntimeGateway,
+  type InternalRuntimeDispatchResult,
+  type TurnExecutionStatus,
+  type PublicEventCode,
+  type DeliveryDispatchOptions,
 } from '@enkeep/web-channel';
 import {
   SqliteWebMessageStore,
@@ -77,6 +78,7 @@ export interface DeliveryExecutionRequest {
   readonly timeoutMs?: number;
 }
 
+export { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS };
 export type { DeliveryDispatchOptions };
 
 export type InspectedTurnErrorCode =
@@ -817,10 +819,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           typeof options.timeoutMs !== 'number' ||
           !Number.isSafeInteger(options.timeoutMs) ||
           options.timeoutMs <= 0 ||
-          options.timeoutMs > 900_000
+          options.timeoutMs > DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS
         ) {
           throw new ValidationError(
-            'Dispatch timeoutMs must be a finite integer between 1 and 900000'
+            `Dispatch timeoutMs must be a finite integer between 1 and ${DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS}`
           );
         }
         requestedTimeoutMs = options.timeoutMs;
@@ -2026,7 +2028,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
           }
 
-          const timeoutMs = this.turnTimeouts.get(turnId) ?? 300_000;
+          const timeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
           const executionRequest: DeliveryExecutionRequest = {
             userId,
             platformSpaceId: spaceId,
@@ -2591,12 +2593,29 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       isSessionCorrupted = isCorruptedSessionError(error),
     } = params;
 
-    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+    const userMsgRow = this.db.prepare("SELECT created_at FROM web_messages WHERE session_id = ? AND user_id = ? AND role = 'user' AND turn_id = ?").get(sessionId, userId, turnId) as { created_at: string } | undefined;
+    const userCreatedAtMs = userMsgRow ? new Date(userMsgRow.created_at).getTime() : 0;
+    const assistantTimestampMs = Math.max(nowMs, userCreatedAtMs + 1);
+    const nowIso = new Date(assistantTimestampMs).toISOString();
+
     const isQuota =
       error instanceof QuotaExceededError ||
       (error as { code?: string })?.code === 'QUOTA_EXCEEDED' ||
       (error as { name?: string })?.name === 'QuotaExceededError';
     const isLeaseLost = (error as { code?: string })?.code === 'LEASE_LOST';
+    const isTimeout =
+      params.code === 'TURN_TIMEOUT' ||
+      (error as { code?: string })?.code === 'TURN_TIMEOUT' ||
+      (error as { code?: string })?.code === 'TIMEOUT' ||
+      (error as { errorCode?: string })?.errorCode === 'TURN_TIMEOUT' ||
+      (error as { name?: string })?.name === 'TURN_TIMEOUT' ||
+      (error instanceof Error && (
+        error.message === 'TURN_TIMEOUT' ||
+        error.message.startsWith('TURN_TIMEOUT') ||
+        error.message.includes('Followup turn execution timed out')
+      )) ||
+      (typeof error === 'string' && (error === 'TURN_TIMEOUT' || error.startsWith('TURN_TIMEOUT')));
 
     const safeErrorMessage = params.reason || (isQuota
       ? 'Quota exceeded'
@@ -2604,13 +2623,42 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       ? 'Session corrupted: recovery required'
       : isLeaseLost
       ? 'Lease lost during execution'
+      : isTimeout
+      ? 'TURN_TIMEOUT'
       : 'Turn execution failed');
 
     const safeErrorCode: PublicEventCode = params.code || (isQuota
       ? 'QUOTA_EXCEEDED'
       : isSessionCorrupted
       ? 'RECOVERY_REQUIRED'
+      : isTimeout
+      ? 'TURN_TIMEOUT'
       : 'EXECUTION_FAILED');
+
+    let spaceId = params.spaceId;
+    if (!spaceId) {
+      try {
+        const turnRow = this.db.prepare('SELECT space_id FROM turn_runs WHERE turn_id = ? AND user_id = ?').get(turnId, userId) as { space_id?: string } | undefined;
+        spaceId = turnRow?.space_id;
+      } catch {}
+    }
+    spaceId = spaceId || 'space-a';
+    const routeKey = `${userId}:web:${spaceId}:${sessionId}`;
+
+    let noticeContent = '';
+    if (isTimeout) {
+      const effectiveTimeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
+      const durationText = effectiveTimeoutMs >= 60_000 && effectiveTimeoutMs % 60_000 === 0
+        ? `${effectiveTimeoutMs / 60_000} 分钟`
+        : `${Math.round(effectiveTimeoutMs / 1000)} 秒`;
+
+      const stepCount = (error as any)?.stepCount ?? (error as any)?.steps ?? (error as any)?.eventsCount;
+      const stepClause = (typeof stepCount === 'number' && Number.isFinite(stepCount) && stepCount >= 0)
+        ? `（已执行 ${stepCount} 步）`
+        : '';
+
+      noticeContent = `⏱️ 本轮处理超过 ${durationText}已被终止${stepClause}。请缩小范围或用 /new 开新一代后重试。`;
+    }
 
     console.error('[delivery-gateway] turn failed', {
       turnId,
@@ -2628,7 +2676,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         UPDATE turn_runs
         SET status = 'failed', error = ?, finished_at = ?, updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status IN ('queued', 'running')
-      `).run(safeErrorMessage, nowIso, turnId, userId);
+      `).run(isTimeout ? 'TURN_TIMEOUT' : safeErrorMessage, nowIso, turnId, userId);
 
       // 2. Update delivery_inbox to failed
       this.db.prepare(`
@@ -2650,6 +2698,51 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         SET status = 'failed'
         WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'user'
       `).run(sessionId, userId, turnId);
+
+      // 3c. If timeout, insert assistant system notice message into web_messages
+      if (isTimeout && noticeContent) {
+        const existingAssistantMsg = this.db.prepare(`
+          SELECT id, content, status, created_at FROM web_messages
+          WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
+        `).get(sessionId, userId, turnId) as WebMessageRecord | undefined;
+
+        if (!existingAssistantMsg) {
+          const assistantMsgId = generate32HexId('msg');
+          this.db.prepare(`
+            INSERT INTO web_messages (
+              id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+            ) VALUES (?, ?, ?, 'assistant', ?, 'delivered', ?, ?, ?)
+          `).run(
+            assistantMsgId,
+            sessionId,
+            userId,
+            noticeContent,
+            routeKey,
+            turnId,
+            nowIso
+          );
+
+          const assistantMsgRecord: WebMessageRecord = {
+            id: assistantMsgId,
+            role: 'assistant',
+            content: noticeContent,
+            status: 'delivered',
+            createdAt: nowIso,
+          };
+
+          const eventPayload = JSON.stringify({ message: assistantMsgRecord });
+          this.db.prepare(`
+            INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+            VALUES (?, ?, ?, 'message', ?, ?)
+          `).run(
+            generate32HexId('evt'),
+            sessionId,
+            userId,
+            eventPayload,
+            nowIso
+          );
+        }
+      }
 
       // 4. Insert turn_failed event into web_events
       this.db.prepare(`
@@ -2733,26 +2826,56 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       this.db.exec('COMMIT');
       inTx = false;
 
-      // 6. Safely notify turnFailedListeners outside the transaction
-      for (const listener of this.turnFailedListeners) {
-        try {
-          const res = listener({
-            userId,
-            sessionId,
-            spaceId: params.spaceId,
-            turnId,
-            deliveryId,
-            idempotencyKey,
-            code: safeErrorCode,
-            reason: safeErrorMessage,
-          });
-          if (res && typeof (res as Promise<void>).catch === 'function') {
-            (res as Promise<void>).catch((listenerErr) => {
-              this.recordSettledError(listenerErr);
+      // 6. Safely notify listeners outside the transaction
+      if (isTimeout && noticeContent) {
+        const executionResult: TurnExecutionResult = {
+          replyText: noticeContent,
+          usage: { totalTokens: 0 },
+        };
+        const tokenUsage = { tokens: 0 };
+        for (const listener of this.turnCompletedListeners) {
+          try {
+            const res = listener({
+              userId,
+              sessionId,
+              spaceId,
+              turnId,
+              deliveryId,
+              idempotencyKey,
+              executionResult,
+              tokenUsage,
+              executionMode: 'command',
             });
+            if (res && typeof (res as Promise<void>).catch === 'function') {
+              (res as Promise<void>).catch((listenerErr) => {
+                this.recordSettledError(listenerErr);
+              });
+            }
+          } catch (listenerErr) {
+            this.recordSettledError(listenerErr);
           }
-        } catch (listenerErr) {
-          this.recordSettledError(listenerErr);
+        }
+      } else {
+        for (const listener of this.turnFailedListeners) {
+          try {
+            const res = listener({
+              userId,
+              sessionId,
+              spaceId: params.spaceId,
+              turnId,
+              deliveryId,
+              idempotencyKey,
+              code: safeErrorCode,
+              reason: safeErrorMessage,
+            });
+            if (res && typeof (res as Promise<void>).catch === 'function') {
+              (res as Promise<void>).catch((listenerErr) => {
+                this.recordSettledError(listenerErr);
+              });
+            }
+          } catch (listenerErr) {
+            this.recordSettledError(listenerErr);
+          }
         }
       }
     } catch (err) {

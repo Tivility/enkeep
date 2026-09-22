@@ -222,8 +222,8 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
     expect(capturedAdapterTurnRequest?.timeoutMs).toBe(900_000);
   });
 
-  // Test 2: Ordinary task defaults to undefined -> host 300000ms default
-  it('2. ordinary task without executionBudget leaves timeoutMs undefined, falling back to 300s default', async () => {
+  // Test 2: Ordinary task defaults to undefined -> host 1800000ms default
+  it('2. ordinary task without executionBudget leaves timeoutMs undefined, falling back to 1800s default', async () => {
     const ordinaryTask = {
       id: ordinaryTaskId,
       userId: tenantAlice,
@@ -264,16 +264,16 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
     const result = await dispatchPromise;
 
     expect(result.status).toBe('completed');
-    // DeliveryExecutionRequest timeoutMs defaults to ordinary 300s
+    // DeliveryExecutionRequest timeoutMs defaults to ordinary 1800s
     expect(capturedExecutionRequest).not.toBeNull();
-    expect(capturedExecutionRequest?.timeoutMs ?? 300_000).toBe(300_000);
-    // Adapter sendTurn receives 300s default
+    expect(capturedExecutionRequest?.timeoutMs).toBe(1_800_000);
+    // Adapter sendTurn receives 1800s default
     expect(capturedAdapterTurnRequest).not.toBeNull();
-    expect(capturedAdapterTurnRequest?.timeoutMs ?? 300_000).toBe(300_000);
+    expect(capturedAdapterTurnRequest?.timeoutMs).toBe(1_800_000);
   });
 
-  // Test 3: Invalid registry budget (> 900_000) rejected pre-dispatch
-  it('3. invalid registry/context budget > 900000 fails closed and rejects pre-dispatch without invoking executor', async () => {
+  // Test 3: Invalid registry budget (> 1800000) rejected pre-dispatch
+  it('3. invalid registry/context budget > 1800000 fails closed and rejects pre-dispatch without invoking executor', async () => {
     const invalidTask = {
       id: trustedTaskId,
       userId: tenantAlice,
@@ -296,11 +296,11 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
       signal: new AbortController().signal,
       workerId: 'worker_inv_1',
       tenantId: tenantAlice,
-      executionBudget: { maxWaitMs: 900_001 },
+      executionBudget: { maxWaitMs: 1_800_001 },
     };
 
     await expect(dispatcher.dispatch(invalidContext)).rejects.toThrow(
-      /Execution budget maxWaitMs must be a finite integer between 1 and 900000/
+      /Execution budget maxWaitMs must be a finite integer between 1 and 1800000/
     );
 
     // Executor was never reached
@@ -320,23 +320,23 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
 
     // Unrecognized option key rejected
     await expect(
-      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 900_000, extraOption: true } as any)
+      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 1_800_000, extraOption: true } as any)
     ).rejects.toThrow(/Unrecognized dispatch option/);
 
     // Non-integer timeoutMs rejected
     await expect(
       deliveryGateway.dispatchInbound(envelope, { timeoutMs: 500.5 } as any)
-    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 900000/);
+    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
 
     // Negative timeoutMs rejected
     await expect(
       deliveryGateway.dispatchInbound(envelope, { timeoutMs: -100 })
-    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 900000/);
+    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
 
-    // > 900_000 rejected
+    // > 1_800_000 rejected
     await expect(
-      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 1_000_000 })
-    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 900000/);
+      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 1_800_001 })
+    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
   });
 
   // Test 5: Outer timeout / cancellation cleanly forwarded to executor.cancel
@@ -399,5 +399,43 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
     expect(dispatchErr).not.toBeNull();
     expect((dispatchErr as any)?.message).toMatch(/Task execution was aborted/);
     expect(cancelCalledForTurn).not.toBeNull();
+  });
+
+  // Test 6: Explicit small budget (5000ms) preserves exact value without overriding with 30min
+  it('6. explicit small budget (5000ms) propagates end-to-end to adapter sendTurn without overriding with 30min', async () => {
+    const smallTask = {
+      id: trustedTaskId,
+      userId: tenantAlice,
+      title: 'Small Budget Task',
+      priority: 'high' as const,
+      status: 'running' as const,
+      payload: {
+        type: 'agent_prompt' as const,
+        prompt: 'Run small budget task',
+        sessionId,
+        sessionPolicy: 'existing_session' as const,
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const dispatchContext: AgentPromptDispatchContext = {
+      task: smallTask,
+      payload: smallTask.payload,
+      signal: new AbortController().signal,
+      workerId: 'worker_small_1',
+      tenantId: tenantAlice,
+      executionBudget: { maxWaitMs: 5000 },
+    };
+
+    const dispatchPromise = dispatcher.dispatch(dispatchContext);
+    await vi.advanceTimersByTimeAsync(100);
+    const result = await dispatchPromise;
+
+    expect(result.status).toBe('completed');
+    expect(capturedExecutionRequest).not.toBeNull();
+    expect(capturedExecutionRequest?.timeoutMs).toBe(5000);
+    expect(capturedAdapterTurnRequest).not.toBeNull();
+    expect(capturedAdapterTurnRequest?.timeoutMs).toBe(5000);
   });
 });

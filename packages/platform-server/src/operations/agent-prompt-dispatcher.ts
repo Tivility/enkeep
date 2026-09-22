@@ -8,7 +8,7 @@ import {
   type Space,
   type SessionRoute,
 } from '@enkeep/platform-core';
-import { type InboundEnvelope, buildRouteKey } from '@enkeep/web-channel';
+import { type InboundEnvelope, buildRouteKey, DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS } from '@enkeep/web-channel';
 import {
   validateAgentPromptPayload,
   type AgentPromptDispatchContext,
@@ -152,8 +152,8 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     this.gateway = options.gateway;
     this.storage = options.storage;
     this.db = options.database;
-    const maxWait = options.maxWaitMs ?? 300_000;
-    this.maxWaitMs = Number.isSafeInteger(maxWait) && maxWait > 0 ? maxWait : 300_000;
+    const maxWait = options.maxWaitMs ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
+    this.maxWaitMs = Number.isSafeInteger(maxWait) && maxWait > 0 ? maxWait : DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
     const pollInterval = options.pollIntervalMs ?? 50;
     this.pollIntervalMs = Number.isSafeInteger(pollInterval) && pollInterval > 0 ? pollInterval : 50;
   }
@@ -196,9 +196,9 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       }
       if (context.executionBudget.maxWaitMs !== undefined) {
         const wait = context.executionBudget.maxWaitMs;
-        if (typeof wait !== 'number' || !Number.isSafeInteger(wait) || wait <= 0 || wait > 900_000) {
+        if (typeof wait !== 'number' || !Number.isSafeInteger(wait) || wait <= 0 || wait > DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS) {
           throw new ValidationError(
-            '[INVALID_EXECUTION_BUDGET] Execution budget maxWaitMs must be a finite integer between 1 and 900000'
+            `[INVALID_EXECUTION_BUDGET] Execution budget maxWaitMs must be a finite integer between 1 and ${DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS}`
           );
         }
         effectiveMaxWaitMs = wait;

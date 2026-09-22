@@ -131,7 +131,7 @@ describe('Trusted Pipeline Task 900s Budget vs Ordinary 300s Budget Integration'
       storage,
       database: db,
       pollIntervalMs: 50,
-      // Default maxWaitMs is 300_000 (5 minutes)
+      // Default maxWaitMs is 1_800_000 (30 minutes)
     });
 
     preparer = new PipelineTaskInputPreparerService({
@@ -247,9 +247,9 @@ describe('Trusted Pipeline Task 900s Budget vs Ordinary 300s Budget Integration'
     expect(aggPrep?.executionBudget?.maxWaitMs).toBe(900_000);
   });
 
-  it('ordinary task times out at 300s (default maxWaitMs) and cancels turn', async () => {
-    // Ordinary task runs longer than 300s: set executor delay to 400s
-    executorDelayMs = 400_000;
+  it('ordinary task times out at 1800s (default maxWaitMs 30min) and cancels turn', async () => {
+    // Ordinary task runs longer than 1800s: set executor delay to 1900s
+    executorDelayMs = 1_900_000;
 
     const ordinaryCtx: AgentPromptDispatchContext = {
       task: {
@@ -276,7 +276,7 @@ describe('Trusted Pipeline Task 900s Budget vs Ordinary 300s Budget Integration'
       signal: new AbortController().signal,
       workerId: 'worker_test_1',
       tenantId: tenantAlice,
-      // No executionBudget -> defaults to dispatcher 300_000ms
+      // No executionBudget -> defaults to dispatcher 1_800_000ms
     };
 
     let dispatchErr: Error | null = null;
@@ -284,8 +284,68 @@ describe('Trusted Pipeline Task 900s Budget vs Ordinary 300s Budget Integration'
       dispatchErr = err;
     });
 
-    // Advance fake timer to 300_050ms
-    await vi.advanceTimersByTimeAsync(300_050);
+    // Advance fake timer to 300_000ms: still running
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(cancelCalledForTurn).toBeNull();
+
+    // Advance fake timer past 1800s to 1_800_050ms
+    await vi.advanceTimersByTimeAsync(1_500_050);
+    await dispatchPromise;
+
+    expect(dispatchErr).not.toBeNull();
+    expect((dispatchErr as any)?.message).toMatch(/Turn execution timed out/i);
+    expect(cancelCalledForTurn).not.toBeNull();
+  });
+
+  it('honors caller explicit short maxWaitMs and does not override with 30min', async () => {
+    executorDelayMs = 20_000;
+
+    const shortDispatcher = createAgentPromptDeliveryDispatcher({
+      gateway: deliveryGateway,
+      storage,
+      database: db,
+      pollIntervalMs: 50,
+      maxWaitMs: 5000,
+    });
+
+    const shortCtx: AgentPromptDispatchContext = {
+      task: {
+        id: ordinaryTaskId,
+        userId: tenantAlice,
+        title: 'Short Timeout Task',
+        priority: 'medium' as const,
+        status: 'running' as const,
+        payload: {
+          type: 'agent_prompt' as const,
+          prompt: 'Short timeout operation',
+          sessionId,
+          sessionPolicy: 'existing_session' as const,
+        },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      payload: {
+        type: 'agent_prompt' as const,
+        prompt: 'Short timeout operation',
+        sessionId,
+        sessionPolicy: 'existing_session' as const,
+      },
+      signal: new AbortController().signal,
+      workerId: 'worker_test_short',
+      tenantId: tenantAlice,
+    };
+
+    let dispatchErr: Error | null = null;
+    const dispatchPromise = shortDispatcher.dispatch(shortCtx).catch((err) => {
+      dispatchErr = err;
+    });
+
+    // At 4000ms, still running
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(cancelCalledForTurn).toBeNull();
+
+    // Advance to 5050ms -> times out
+    await vi.advanceTimersByTimeAsync(1050);
     await dispatchPromise;
 
     expect(dispatchErr).not.toBeNull();
@@ -422,13 +482,13 @@ describe('Trusted Pipeline Task 900s Budget vs Ordinary 300s Budget Integration'
       tenantId: tenantAlice,
     };
 
-    // Budget exceeds 900,000 limit
+    // Budget exceeds 1,800,000 limit
     await expect(
       dispatcher.dispatch({
         ...baseCtx,
-        executionBudget: { maxWaitMs: 900_001 },
+        executionBudget: { maxWaitMs: 1_800_001 },
       })
-    ).rejects.toThrow(/Execution budget maxWaitMs must be a finite integer between 1 and 900000/);
+    ).rejects.toThrow(/Execution budget maxWaitMs must be a finite integer between 1 and 1800000/);
 
     // Negative budget
     await expect(
@@ -436,7 +496,7 @@ describe('Trusted Pipeline Task 900s Budget vs Ordinary 300s Budget Integration'
         ...baseCtx,
         executionBudget: { maxWaitMs: -1 },
       })
-    ).rejects.toThrow(/Execution budget maxWaitMs must be a finite integer between 1 and 900000/);
+    ).rejects.toThrow(/Execution budget maxWaitMs must be a finite integer between 1 and 1800000/);
 
     // Non-integer budget
     await expect(
@@ -444,7 +504,7 @@ describe('Trusted Pipeline Task 900s Budget vs Ordinary 300s Budget Integration'
         ...baseCtx,
         executionBudget: { maxWaitMs: 300.5 as any },
       })
-    ).rejects.toThrow(/Execution budget maxWaitMs must be a finite integer between 1 and 900000/);
+    ).rejects.toThrow(/Execution budget maxWaitMs must be a finite integer between 1 and 1800000/);
 
     // Unknown field in budget
     await expect(
