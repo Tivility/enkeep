@@ -30,7 +30,14 @@ import { Duplex, PassThrough } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
 import type { StreamHandler, StreamMetadata } from './contract.js';
-import type { PlatformOperationsService, UpdateTaskInput, Task } from '@enkeep/platform-operations';
+import type {
+  PlatformOperationsService,
+  UpdateTaskInput,
+  Task,
+  AgentPromptSessionPolicy,
+  AgentPromptContextMode,
+  AgentPromptTaskPayload,
+} from '@enkeep/platform-operations';
 import {
   validateUpdateTaskInput,
   TASK_ID_REGEX,
@@ -1149,7 +1156,7 @@ export class PlatformProxyHandler implements StreamHandler {
       return;
     }
 
-    const { title, prompt, sessionId, priority, dueDate } = parsedBody;
+    const { title, prompt, sessionId, priority, dueDate, sessionPolicy, contextMode } = parsedBody;
 
     // Strict validation
     if (typeof title !== 'string' || title.length === 0 || title !== title.trim() || title.length > 256) {
@@ -1190,16 +1197,49 @@ export class PlatformProxyHandler implements StreamHandler {
       }
     }
 
+    let effectiveSessionPolicy: AgentPromptSessionPolicy = 'existing_session';
+    if (sessionPolicy !== undefined && sessionPolicy !== null) {
+      if (sessionPolicy !== 'existing_session' && sessionPolicy !== 'isolated') {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Invalid sessionPolicy. Allowed: existing_session, isolated' },
+        });
+        return;
+      }
+      effectiveSessionPolicy = sessionPolicy as AgentPromptSessionPolicy;
+    }
+
+    let parsedContextMode: AgentPromptContextMode | undefined;
+    if (contextMode !== undefined && contextMode !== null) {
+      if (contextMode !== 'group' && contextMode !== 'isolated') {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Invalid contextMode. Allowed: group, isolated' },
+        });
+        return;
+      }
+      parsedContextMode = contextMode as AgentPromptContextMode;
+      const mapped = parsedContextMode === 'isolated' ? 'isolated' : 'existing_session';
+      if (sessionPolicy !== undefined && sessionPolicy !== null && sessionPolicy !== mapped) {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Conflicting sessionPolicy and contextMode provided' },
+        });
+        return;
+      }
+      if (sessionPolicy === undefined || sessionPolicy === null) {
+        effectiveSessionPolicy = mapped;
+      }
+    }
+
     const taskPriority: TaskPriority = isTaskPriority(priority) ? priority : 'medium';
 
     // Call operations.createTask if operations is configured
     if (this.operations) {
       try {
-        const payload = {
+        const payload: AgentPromptTaskPayload = {
           type: 'agent_prompt' as const,
           prompt,
           sessionId,
-          sessionPolicy: 'existing_session' as const,
+          sessionPolicy: effectiveSessionPolicy,
+          ...(parsedContextMode !== undefined ? { contextMode: parsedContextMode } : {}),
         };
 
         const result = await this.operations.forTenant(this.platformUserId).tasks.createTask({
@@ -1259,6 +1299,14 @@ export class PlatformProxyHandler implements StreamHandler {
         const taskId = `task_${randomUUID().replace(/-/g, '')}`;
         const createdAt = new Date().toISOString();
 
+        const payloadObj = {
+          type: 'agent_prompt',
+          prompt,
+          sessionId,
+          sessionPolicy: effectiveSessionPolicy,
+          ...(parsedContextMode !== undefined ? { contextMode: parsedContextMode } : {}),
+        };
+
         this.db.prepare(`
           INSERT INTO platform_tasks (
             id, user_id, idempotency_key, title, status, priority, due_date, payload, created_at, updated_at
@@ -1270,7 +1318,7 @@ export class PlatformProxyHandler implements StreamHandler {
           title,
           taskPriority,
           (typeof dueDate === 'string' ? dueDate : null),
-          JSON.stringify({ type: 'agent_prompt', prompt, sessionId }),
+          JSON.stringify(payloadObj),
           createdAt,
           createdAt
         );

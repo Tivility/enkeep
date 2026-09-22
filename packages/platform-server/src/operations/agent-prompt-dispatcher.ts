@@ -217,8 +217,8 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new ValidationError('[INVALID_PAYLOAD] Task payload sessionId format is invalid');
     }
 
-    if (payload.sessionPolicy !== 'existing_session') {
-      throw new ValidationError('[INVALID_PAYLOAD] Task payload sessionPolicy must be existing_session');
+    if (payload.sessionPolicy !== 'existing_session' && payload.sessionPolicy !== 'isolated') {
+      throw new ValidationError('[INVALID_PAYLOAD] Task payload sessionPolicy must be existing_session or isolated');
     }
 
     // Validate optional payload.spaceId format when provided
@@ -306,43 +306,69 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new ValidationError('[SPACE_FOLDER_MISMATCH] Task payload spaceFolder does not match target space folder');
     }
 
-    // Authoritative canonical session validation
-    const spaceRow = this.db
-      .prepare('SELECT canonical_session_id FROM spaces WHERE id = ? AND user_id = ? LIMIT 1')
-      .get(targetSpace.id, tenantId) as { canonical_session_id: string | null } | undefined;
+    let ephemeralRoute: SessionRoute | null = null;
 
-    const currentCanonicalId = spaceRow?.canonical_session_id ?? null;
-    if (currentCanonicalId && currentCanonicalId !== targetRoute.id) {
-      const canonRoute = this.db
-        .prepare('SELECT id, status FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? LIMIT 1')
-        .get(currentCanonicalId, targetSpace.id, tenantId) as { id: string; status: string } | undefined;
+    if (payload.sessionPolicy === 'existing_session') {
+      // Authoritative canonical session validation
+      const spaceRow = this.db
+        .prepare('SELECT canonical_session_id FROM spaces WHERE id = ? AND user_id = ? LIMIT 1')
+        .get(targetSpace.id, tenantId) as { canonical_session_id: string | null } | undefined;
 
-      if (canonRoute && canonRoute.status === 'active') {
-        throw new ValidationError('[NON_CANONICAL_SESSION] Specified session is not the canonical session for space');
+      const currentCanonicalId = spaceRow?.canonical_session_id ?? null;
+      if (currentCanonicalId && currentCanonicalId !== targetRoute.id) {
+        const canonRoute = this.db
+          .prepare('SELECT id, status FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? LIMIT 1')
+          .get(currentCanonicalId, targetSpace.id, tenantId) as { id: string; status: string } | undefined;
+
+        if (canonRoute && canonRoute.status === 'active') {
+          throw new ValidationError('[NON_CANONICAL_SESSION] Specified session is not the canonical session for space');
+        }
+        // Stale or archived canonical session: rebind space canonical_session_id to active targetRoute
+        this.db
+          .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(targetRoute.id, targetSpace.id, tenantId);
+      } else if (!currentCanonicalId) {
+        // First active session: set as canonical_session_id to preserve onecanonical invariant
+        this.db
+          .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(targetRoute.id, targetSpace.id, tenantId);
       }
-      // Stale or archived canonical session: rebind space canonical_session_id to active targetRoute
-      this.db
-        .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(targetRoute.id, targetSpace.id, tenantId);
-    } else if (!currentCanonicalId) {
-      // First active session: set as canonical_session_id to preserve onecanonical invariant
-      this.db
-        .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(targetRoute.id, targetSpace.id, tenantId);
+
+      // Sync session_routes executionMode with authoritative space executionMode if divergent
+      if (targetRoute.executionMode !== targetSpace.executionMode) {
+        this.db
+          .prepare('UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(targetSpace.executionMode, targetRoute.id, tenantId);
+      }
+    } else {
+      // payload.sessionPolicy === 'isolated'
+      // Create fresh ephemeral session in the same space without mutating canonical_session_id
+      const ephemeralSessionId = `ses_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+      const ephemeralDshSessionId = `ses_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+      const title = `[Task] ${task.title}`;
+
+      ephemeralRoute = await tenantStorage.sessionRoutes.create({
+        id: ephemeralSessionId,
+        spaceId: targetSpace.id,
+        channel: 'web',
+        accountId: 'default',
+        nativeContextId: ephemeralSessionId,
+        peerId: `web:${ephemeralSessionId}`,
+        dshSessionId: ephemeralDshSessionId,
+        executionMode: targetSpace.executionMode,
+        title,
+        agentProfileId: targetRoute.agentProfileId ?? null,
+        agentProfileSnapshotId: targetRoute.agentProfileSnapshotId ?? null,
+      });
     }
 
-    // Sync session_routes executionMode with authoritative space executionMode if divergent
-    if (targetRoute.executionMode !== targetSpace.executionMode) {
-      this.db
-        .prepare('UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(targetSpace.executionMode, targetRoute.id, tenantId);
-    }
+    const dispatchRoute = ephemeralRoute ?? targetRoute;
 
     // 3. Construct InboundEnvelope strictly authoritative from route
     // Canonical delivery ID format: deliv_ + 32 lowercase hex UUID
     const deliveryId = `deliv_${randomUUID().replace(/-/g, '')}`;
     const nowIso = new Date().toISOString();
-    const platformSessionId = targetRoute.id;
+    const platformSessionId = dispatchRoute.id;
 
     // Simplified InboundEnvelope: id, userId, sessionId, content, timestamp
     const envelope: InboundEnvelope = {
@@ -355,6 +381,9 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
 
     // Check abort again immediately before dispatch
     if (signal.aborted) {
+      if (ephemeralRoute) {
+        await tenantStorage.sessionRoutes.archive(ephemeralRoute.id).catch(() => {});
+      }
       throw new Error('[TASK_ABORTED] Task execution was aborted');
     }
 
@@ -362,8 +391,21 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     const dispatchOptions = context.executionBudget?.maxWaitMs !== undefined
       ? { timeoutMs: effectiveMaxWaitMs }
       : undefined;
-    const dispatchRes = await this.gateway.dispatchInbound(envelope, dispatchOptions);
+
+    let dispatchRes;
+    try {
+      dispatchRes = await this.gateway.dispatchInbound(envelope, dispatchOptions);
+    } catch (dispatchErr) {
+      if (ephemeralRoute) {
+        await tenantStorage.sessionRoutes.archive(ephemeralRoute.id).catch(() => {});
+      }
+      throw dispatchErr;
+    }
+
     if (!dispatchRes.accepted || !dispatchRes.turnId) {
+      if (ephemeralRoute) {
+        await tenantStorage.sessionRoutes.archive(ephemeralRoute.id).catch(() => {});
+      }
       if (dispatchRes.isDuplicate) {
         throw new PlatformError(
           '[GATEWAY_DISPATCH_DUPLICATE] Inbound delivery rejected as duplicate',
@@ -379,15 +421,40 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     }
     const turnId = dispatchRes.turnId;
 
+    // Record session_id and turn_id in task_runs if task run record exists
+    try {
+      if (task.currentRun?.id) {
+        this.db
+          .prepare('UPDATE task_runs SET session_id = ?, turn_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(dispatchRoute.id, turnId, task.currentRun.id, tenantId);
+      } else if (task.id) {
+        this.db
+          .prepare("UPDATE task_runs SET session_id = ?, turn_id = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ? AND user_id = ? AND status IN ('claimed', 'running')")
+          .run(dispatchRoute.id, turnId, task.id, tenantId);
+      }
+    } catch {
+      // Best-effort update if task_runs table exists
+    }
+
     // 5. Execution / Polling Promise race with one awaited cancellation routine
-    return await this.pollTurnExecution({
-      tenantId,
-      turnId,
-      routeId: targetRoute.id,
-      sessionId: platformSessionId,
-      signal,
-      maxWaitMs: effectiveMaxWaitMs,
-    });
+    try {
+      return await this.pollTurnExecution({
+        tenantId,
+        turnId,
+        routeId: dispatchRoute.id,
+        sessionId: platformSessionId,
+        signal,
+        maxWaitMs: effectiveMaxWaitMs,
+      });
+    } finally {
+      if (ephemeralRoute) {
+        try {
+          await tenantStorage.sessionRoutes.archive(ephemeralRoute.id);
+        } catch {
+          // Preserve debuggable outcome without masking original error
+        }
+      }
+    }
   }
 
   /**

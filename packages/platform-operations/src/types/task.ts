@@ -20,7 +20,8 @@ export type TaskStatus =
 export const TASK_PRIORITIES = ['low', 'medium', 'high', 'urgent'] as const;
 export type TaskPriority = typeof TASK_PRIORITIES[number];
 
-export type AgentPromptSessionPolicy = 'existing_session';
+export type AgentPromptSessionPolicy = 'existing_session' | 'isolated';
+export type AgentPromptContextMode = 'group' | 'isolated';
 
 export const TASK_ID_REGEX = /^(?:task_[0-9a-f]{32}|task_hpc_[0-9a-f]{24})$/;
 export const SCHEDULE_ID_REGEX = /^sched_[0-9a-f]{32}$/;
@@ -59,6 +60,7 @@ export const ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS = new Set([
   'prompt',
   'sessionId',
   'sessionPolicy',
+  'contextMode',
   'spaceId',
   'spaceFolder',
   'delivery',
@@ -223,7 +225,8 @@ export interface AgentPromptTaskPayload {
   type: 'agent_prompt';
   prompt: string;
   sessionId: string;
-  sessionPolicy: 'existing_session';
+  sessionPolicy: AgentPromptSessionPolicy;
+  contextMode?: AgentPromptContextMode;
   spaceId?: string;
   spaceFolder?: string;
   delivery?: TaskDeliveryTarget;
@@ -278,8 +281,28 @@ export function validateAgentPromptPayload(payload: unknown): AgentPromptTaskPay
 
   const sessionId = validateSessionId(obj.sessionId);
 
-  if (obj.sessionPolicy !== 'existing_session') {
-    throw new ValidationError('Invalid task payload session policy');
+  let sessionPolicy: AgentPromptSessionPolicy = 'existing_session';
+  if (obj.sessionPolicy !== undefined) {
+    if (obj.sessionPolicy !== 'existing_session' && obj.sessionPolicy !== 'isolated') {
+      throw new ValidationError('Invalid task payload session policy');
+    }
+    sessionPolicy = obj.sessionPolicy;
+  }
+
+  let contextMode: AgentPromptContextMode | undefined;
+  if (obj.contextMode !== undefined) {
+    if (obj.contextMode !== 'group' && obj.contextMode !== 'isolated') {
+      throw new ValidationError('Invalid task payload context mode');
+    }
+    contextMode = obj.contextMode;
+    if (obj.sessionPolicy === undefined) {
+      sessionPolicy = contextMode === 'isolated' ? 'isolated' : 'existing_session';
+    } else {
+      const mapped = contextMode === 'isolated' ? 'isolated' : 'existing_session';
+      if (sessionPolicy !== mapped) {
+        throw new ValidationError('Conflicting sessionPolicy and contextMode in task payload');
+      }
+    }
   }
 
   let spaceId: string | undefined;
@@ -329,7 +352,8 @@ export function validateAgentPromptPayload(payload: unknown): AgentPromptTaskPay
     type: 'agent_prompt',
     prompt: obj.prompt,
     sessionId,
-    sessionPolicy: 'existing_session',
+    sessionPolicy,
+    ...(contextMode !== undefined ? { contextMode } : {}),
     ...(spaceId !== undefined ? { spaceId } : {}),
     ...(spaceFolder !== undefined ? { spaceFolder } : {}),
     ...(delivery !== undefined ? { delivery } : {}),
@@ -574,6 +598,7 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
       if (
         k === 'sessionId' ||
         k === 'sessionPolicy' ||
+        k === 'contextMode' ||
         k === 'spaceId' ||
         k === 'spaceFolder' ||
         k === 'delivery' ||

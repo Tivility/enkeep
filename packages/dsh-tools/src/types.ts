@@ -75,14 +75,19 @@ export type TaskScheduleMisfirePolicy = 'coalesce' | 'skip';
 
 export type TaskScheduleOverlapPolicy = 'skip';
 
+export type AgentPromptSessionPolicy = 'existing_session' | 'isolated';
+export type AgentPromptContextMode = 'group' | 'isolated';
+
 /**
  * Strict TaskPayload matching canonical PlatformServer POST /api/manage/tasks body.
- * Only title, prompt, sessionId, priority, and dueDate are permitted.
+ * Title, prompt, sessionId, optional sessionPolicy/contextMode, priority, and dueDate are permitted.
  */
 export interface TaskPayload {
   readonly title: string;
   readonly prompt: string;
   readonly sessionId: string;
+  readonly sessionPolicy?: AgentPromptSessionPolicy;
+  readonly contextMode?: AgentPromptContextMode;
   readonly priority?: TaskPriority;
   readonly dueDate?: string;
 }

@@ -73,7 +73,7 @@ import type {
   UserRuntimeStatus,
   OperationsReadinessStatus,
 } from "../management/types.js";
-import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority, UpdateTaskInput } from "@enkeep/platform-operations";
+import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority, UpdateTaskInput, AgentPromptSessionPolicy, AgentPromptContextMode } from "@enkeep/platform-operations";
 import { QuotaExceededError, validateTimezone, validateUpdateTaskInput } from "@enkeep/platform-operations";
 import Busboy from "busboy";
 import {
@@ -162,6 +162,8 @@ const ALLOWED_CREATE_TASK_KEYS = new Set([
   "title",
   "prompt",
   "sessionId",
+  "sessionPolicy",
+  "contextMode",
   "dueDate",
   "priority",
   "scheduleType",
@@ -2036,6 +2038,11 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                   }
                 })();
 
+                // Mark the rejection as observed now: the promise is awaited only after
+                // busboy finishes, and an early synchronous validation failure (e.g. bad
+                // spaceId) would otherwise surface as an unhandled rejection and crash the
+                // process before Promise.all attaches its handler.
+                writePromise.catch(() => {});
                 filePromises.push(writePromise);
               });
 
@@ -3627,11 +3634,36 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                 throw new NotFoundError(`Session "${sessionId}" not found`);
               }
 
+              let sessionPolicy: AgentPromptSessionPolicy = "existing_session";
+              if (body.sessionPolicy !== undefined && body.sessionPolicy !== null) {
+                if (body.sessionPolicy !== "existing_session" && body.sessionPolicy !== "isolated") {
+                  throw new ValidationError(`Invalid sessionPolicy "${String(body.sessionPolicy)}". Expected "existing_session" or "isolated"`);
+                }
+                sessionPolicy = body.sessionPolicy as AgentPromptSessionPolicy;
+              }
+
+              let contextMode: AgentPromptContextMode | undefined;
+              if (body.contextMode !== undefined && body.contextMode !== null) {
+                if (body.contextMode !== "group" && body.contextMode !== "isolated") {
+                  throw new ValidationError(`Invalid contextMode "${String(body.contextMode)}". Expected "group" or "isolated"`);
+                }
+                contextMode = body.contextMode as AgentPromptContextMode;
+                if (body.sessionPolicy === undefined) {
+                  sessionPolicy = contextMode === "isolated" ? "isolated" : "existing_session";
+                } else if (
+                  (sessionPolicy === "isolated" && contextMode === "group") ||
+                  (sessionPolicy === "existing_session" && contextMode === "isolated")
+                ) {
+                  throw new ValidationError("Conflicting sessionPolicy and contextMode specified");
+                }
+              }
+
               const payload: any = {
                 type: "agent_prompt" as const,
                 prompt: body.prompt as string,
                 sessionId,
-                sessionPolicy: "existing_session" as const,
+                sessionPolicy,
+                ...(contextMode ? { contextMode } : {}),
               };
               if (body.delivery !== undefined && body.delivery !== null) {
                 payload.delivery = body.delivery;

@@ -815,7 +815,7 @@ describe('dsh-tools: tool implementations with Operational Truth', () => {
       expect(params.required).toEqual(['title', 'prompt', 'sessionId', 'idempotencyKey']);
       expect(params.additionalProperties).toBe(false);
       expect(Object.keys(params.properties)).toEqual(
-        expect.arrayContaining(['title', 'prompt', 'sessionId', 'idempotencyKey', 'priority', 'dueDate'])
+        expect.arrayContaining(['title', 'prompt', 'sessionId', 'idempotencyKey', 'priority', 'dueDate', 'sessionPolicy', 'contextMode'])
       );
       expect(params.properties.description).toBeUndefined();
       expect(params.properties.assignee).toBeUndefined();
@@ -943,6 +943,179 @@ describe('dsh-tools: tool implementations with Operational Truth', () => {
         priority: 'urgent',
         dueDate: '2026-09-01T12:00:00.000Z',
       });
+    });
+
+    it('executes via canonical management API POST /api/manage/tasks with sessionPolicy="isolated"', async () => {
+      let requestedPath = '';
+      let requestOpts: any = null;
+      const mockClient: PlatformClientService = {
+        async request(p, opts: any) {
+          requestedPath = p;
+          requestOpts = opts;
+          return {
+            status: 201,
+            data: {
+              success: true,
+              data: {
+                task: {
+                  id: validTaskId,
+                  title: 'Isolated Task Execution',
+                  status: 'pending',
+                  priority: 'medium',
+                  dueDate: null,
+                  createdAt: '2026-08-25T00:00:00.000Z',
+                },
+                isIdempotentHit: false,
+              },
+            },
+          };
+        },
+      };
+
+      const tool = createCreateTaskTool(() => mockClient);
+      const res = await tool.execute({
+        title: 'Isolated Task Execution',
+        prompt: 'Run task in isolated context',
+        sessionId: validSessionId,
+        idempotencyKey: validUuidV4,
+        sessionPolicy: 'isolated',
+      });
+
+      expect(res.success).toBe(true);
+      expect(requestedPath).toBe('/api/manage/tasks');
+      expect(requestOpts.body).toEqual({
+        title: 'Isolated Task Execution',
+        prompt: 'Run task in isolated context',
+        sessionId: validSessionId,
+        sessionPolicy: 'isolated',
+      });
+    });
+
+    it('maps contextMode="isolated" to sessionPolicy="isolated" in request body', async () => {
+      let requestOpts: any = null;
+      const mockClient: PlatformClientService = {
+        async request(_p, opts: any) {
+          requestOpts = opts;
+          return {
+            status: 201,
+            data: {
+              success: true,
+              data: {
+                task: {
+                  id: validTaskId,
+                  title: 'Context Mode Task',
+                  status: 'pending',
+                  priority: 'medium',
+                  dueDate: null,
+                  createdAt: '2026-08-25T00:00:00.000Z',
+                },
+                isIdempotentHit: false,
+              },
+            },
+          };
+        },
+      };
+
+      const tool = createCreateTaskTool(() => mockClient);
+      await tool.execute({
+        title: 'Context Mode Task',
+        prompt: 'Run task in context mode',
+        sessionId: validSessionId,
+        idempotencyKey: validUuidV4,
+        contextMode: 'isolated',
+      });
+
+      expect(requestOpts.body).toEqual({
+        title: 'Context Mode Task',
+        prompt: 'Run task in context mode',
+        sessionId: validSessionId,
+        sessionPolicy: 'isolated',
+      });
+    });
+
+    it('maps contextMode="group" to sessionPolicy="existing_session" in request body', async () => {
+      let requestOpts: any = null;
+      const mockClient: PlatformClientService = {
+        async request(_p, opts: any) {
+          requestOpts = opts;
+          return {
+            status: 201,
+            data: {
+              success: true,
+              data: {
+                task: {
+                  id: validTaskId,
+                  title: 'Group Context Task',
+                  status: 'pending',
+                  priority: 'medium',
+                  dueDate: null,
+                  createdAt: '2026-08-25T00:00:00.000Z',
+                },
+                isIdempotentHit: false,
+              },
+            },
+          };
+        },
+      };
+
+      const tool = createCreateTaskTool(() => mockClient);
+      await tool.execute({
+        title: 'Group Context Task',
+        prompt: 'Run task in group context',
+        sessionId: validSessionId,
+        idempotencyKey: validUuidV4,
+        contextMode: 'group',
+      });
+
+      expect(requestOpts.body).toEqual({
+        title: 'Group Context Task',
+        prompt: 'Run task in group context',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+      });
+    });
+
+    it('rejects invalid sessionPolicy, invalid contextMode, or conflicting policies', async () => {
+      const mockClient: PlatformClientService = {
+        async request() {
+          return { status: 200, data: {} };
+        },
+      };
+      const tool = createCreateTaskTool(() => mockClient);
+
+      // Invalid sessionPolicy
+      await expect(
+        tool.execute({
+          title: 'Task',
+          prompt: 'Do work',
+          sessionId: validSessionId,
+          idempotencyKey: validUuidV4,
+          sessionPolicy: 'invalid_policy' as any,
+        })
+      ).rejects.toThrow(TypeError);
+
+      // Invalid contextMode
+      await expect(
+        tool.execute({
+          title: 'Task',
+          prompt: 'Do work',
+          sessionId: validSessionId,
+          idempotencyKey: validUuidV4,
+          contextMode: 'invalid_mode' as any,
+        })
+      ).rejects.toThrow(TypeError);
+
+      // Conflicting sessionPolicy and contextMode
+      await expect(
+        tool.execute({
+          title: 'Task',
+          prompt: 'Do work',
+          sessionId: validSessionId,
+          idempotencyKey: validUuidV4,
+          sessionPolicy: 'isolated',
+          contextMode: 'group',
+        })
+      ).rejects.toThrow(TypeError);
     });
 
     it('fails closed when client is missing (PLATFORM_TOOL_UNAVAILABLE in zero-network)', async () => {
