@@ -186,7 +186,7 @@ export function createMemoryWriteTool(options: MemoryWriteToolOptions): ToolDefi
               content: finalContent,
               userId,
               spaceId,
-              previousEtag,
+              ...(previousEtag !== undefined ? { previousEtag } : {}),
             },
             timeoutMs: 15_000,
           });
@@ -210,7 +210,7 @@ export function createMemoryWriteTool(options: MemoryWriteToolOptions): ToolDefi
         etag: newEtag,
         mode,
         isNewFile,
-        previousEtag,
+        ...(previousEtag !== undefined ? { previousEtag } : {}),
       };
     },
   };

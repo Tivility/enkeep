@@ -146,10 +146,10 @@ describe('dsh-memory: Tools & Confinement', () => {
     expect(res.etag).toBeDefined();
   });
 
-  it('executes memory_write tool with append, overwrite, and OCC', async () => {
+  it('executes memory_write tool with append, overwrite, and OCC, returning lossless JSON without undefined previousEtag', async () => {
     const writeTool = createMemoryWriteTool({ dshHome, spacePath, userId: 'u1', spaceId: 's1' });
 
-    // 1. Initial write (overwrite)
+    // 1. Initial write (new file creation)
     const writeRes = (await writeTool.execute({
       path: 'notes.md',
       scope: 'global',
@@ -158,10 +158,35 @@ describe('dsh-memory: Tools & Confinement', () => {
     } as any, {} as any)) as any;
 
     expect(writeRes.success).toBe(true);
+    expect(writeRes.isNewFile).toBe(true);
     expect(writeRes.bytesWritten).toBeGreaterThan(0);
+    expect(writeRes.path).toBe('notes.md');
+    expect(writeRes.scope).toBe('global');
+    expect(writeRes.mode).toBe('overwrite');
+    expect(typeof writeRes.etag).toBe('string');
+    // Crucial G05 regression assertion: new file must omit previousEtag rather than returning undefined
+    expect('previousEtag' in writeRes).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(writeRes, 'previousEtag')).toBe(false);
+    expect(Object.keys(writeRes).sort()).toEqual([
+      'bytesWritten',
+      'etag',
+      'isNewFile',
+      'mode',
+      'path',
+      'scope',
+      'success',
+    ]);
+    // Lossless JSON roundtrip validation
+    expect(JSON.parse(JSON.stringify(writeRes))).toEqual(writeRes);
+
+    // Verify physical persistence
+    const targetFile = path.join(dshHome, 'memory', 'notes.md');
+    expect(fs.existsSync(targetFile)).toBe(true);
+    expect(fs.readFileSync(targetFile, 'utf-8')).toBe('Initial content');
+
     const initialEtag = writeRes.etag;
 
-    // 2. Append write
+    // 2. Append write (existing file update)
     const appendRes = (await writeTool.execute({
       path: 'notes.md',
       scope: 'global',
@@ -170,6 +195,11 @@ describe('dsh-memory: Tools & Confinement', () => {
     } as any, {} as any)) as any;
 
     expect(appendRes.success).toBe(true);
+    expect(appendRes.isNewFile).toBe(false);
+    expect('previousEtag' in appendRes).toBe(true);
+    expect(appendRes.previousEtag).toBe(initialEtag);
+    expect(JSON.parse(JSON.stringify(appendRes))).toEqual(appendRes);
+
     const readTool = createMemoryReadTool({ dshHome, spacePath });
     const readRes = (await readTool.execute({ path: 'notes.md', scope: 'global' } as any, {} as any)) as any;
     expect(readRes.content).toContain('Initial content');
