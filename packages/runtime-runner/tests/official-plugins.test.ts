@@ -27,6 +27,9 @@ import {
   mountOfficialPlugins,
   type OfficialPluginsHandle,
   type RuntimeCapabilitiesStatus,
+  isolateWorkspaceRealms,
+  isContextDerivedFrom,
+  mountWorkspaceTools,
 } from '../src/runtime/official-plugins.js';
 import {
   DeterministicDemoLlmAdapter,
@@ -682,6 +685,108 @@ description: Bob private skill.
       const health = await runtime.getHealth();
       expect(health.status).toBe('error');
       expect(health.dshReady).toBe(false);
+    });
+  });
+
+  describe('G02: Cordis Context Isolation and Per-Agent Fs Root Scoping', () => {
+    it('isolateWorkspaceRealms maintains prototype inheritance without flattening prototypes', () => {
+      const root = new Context();
+      const isolateSym = Symbol.for('cordis.isolate');
+
+      const agentA = root.extend();
+      const agentB = root.extend();
+
+      isolateWorkspaceRealms(agentA);
+      isolateWorkspaceRealms(agentB);
+
+      // Verify tokens are unique between independent contexts
+      const tokenA = (agentA as any)[isolateSym]?.fs;
+      const tokenB = (agentB as any)[isolateSym]?.fs;
+      expect(typeof tokenA).toBe('symbol');
+      expect(typeof tokenB).toBe('symbol');
+      expect(tokenA).not.toBe(tokenB);
+
+      // Verify child context inherits the same token via prototype
+      const childA = agentA.extend();
+      expect((childA as any)[isolateSym]?.fs).toBe(tokenA);
+    });
+
+    it('isContextDerivedFrom correctly validates prototype ancestry and isolation token', () => {
+      const root = new Context();
+      const agentA = root.extend();
+      const agentB = root.extend();
+
+      isolateWorkspaceRealms(agentA);
+      isolateWorkspaceRealms(agentB);
+
+      const childA1 = agentA.extend();
+      const childA2 = childA1.extend();
+      const childB1 = agentB.extend();
+
+      expect(isContextDerivedFrom(agentA, agentA)).toBe(true);
+      expect(isContextDerivedFrom(childA1, agentA)).toBe(true);
+      expect(isContextDerivedFrom(childA2, agentA)).toBe(true);
+
+      // Cross-agent checks must fail
+      expect(isContextDerivedFrom(agentB, agentA)).toBe(false);
+      expect(isContextDerivedFrom(childB1, agentA)).toBe(false);
+      expect(isContextDerivedFrom(agentA, agentB)).toBe(false);
+      expect(isContextDerivedFrom(root, agentA)).toBe(false);
+
+      // Sub-isolated context (e.g. agentA.isolate('fs') for instructions) must not match tool fs
+      const instructionsCtx = agentA.isolate('fs');
+      expect(isContextDerivedFrom(instructionsCtx, agentA)).toBe(false);
+    });
+
+    it('two concurrently existing workspace tools handles resolve correct fs without cross-agent contamination', async () => {
+      const spaceA = path.join(aliceSpaces, 'space-a');
+      const spaceB = path.join(aliceSpaces, 'space-b');
+      fs.mkdirSync(spaceA, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(spaceB, { recursive: true, mode: 0o700 });
+
+      const root = new Context();
+      const agentCtxA = root.extend();
+      const agentCtxB = root.extend();
+
+      const handleA = await mountWorkspaceTools(agentCtxA, {
+        spacePath: spaceA,
+        dshHome: aliceHome,
+      });
+
+      const handleB = await mountWorkspaceTools(agentCtxB, {
+        spacePath: spaceB,
+        dshHome: aliceHome,
+      });
+
+      try {
+        const fsA = agentCtxA.get('fs');
+        const fsB = agentCtxB.get('fs');
+
+        expect(fsA).toBeDefined();
+        expect(fsB).toBeDefined();
+        expect((fsA as any).spaceFsConfig?.cwd).toBe(spaceA);
+        expect((fsB as any).spaceFsConfig?.cwd).toBe(spaceB);
+
+        // Verify A->B->A->B resolution sequence maintains per-agent root binding
+        expect((agentCtxA.get('fs') as any).spaceFsConfig?.cwd).toBe(spaceA);
+        expect((agentCtxB.get('fs') as any).spaceFsConfig?.cwd).toBe(spaceB);
+        expect((agentCtxA.get('fs') as any).spaceFsConfig?.cwd).toBe(spaceA);
+        expect((agentCtxB.get('fs') as any).spaceFsConfig?.cwd).toBe(spaceB);
+
+        // Child context under A gets fsA via internal/get waterfall
+        const childA = agentCtxA.extend();
+        const childB = agentCtxB.extend();
+        expect(isContextDerivedFrom(childA, agentCtxA)).toBe(true);
+        expect(isContextDerivedFrom(childA, agentCtxB)).toBe(false);
+
+        const resolvedFsChildA = root.events.waterfall('internal/get', childA, 'fs', new Error(), () => null);
+        const resolvedFsChildB = root.events.waterfall('internal/get', childB, 'fs', new Error(), () => null);
+        expect((resolvedFsChildA as any)?.spaceFsConfig?.cwd).toBe(spaceA);
+        expect((resolvedFsChildB as any)?.spaceFsConfig?.cwd).toBe(spaceB);
+      } finally {
+        await handleA.dispose();
+        await handleB.dispose();
+      }
     });
   });
 });

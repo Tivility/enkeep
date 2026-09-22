@@ -266,13 +266,44 @@ export function findMatchingMount(
 
 /**
  * Isolates workspace service symbols in a Cordis context so each agent has private instances.
+ * Uses Cordis prototypal inheritance (Object.create) so ancestor service isolation is preserved
+ * without mutating ancestor contexts or flattening prototypes.
  */
 export function isolateWorkspaceRealms(ctx: Context): void {
   const services = ['fs', 'subprocess', 'shell', 'shellEnv', 'jobs', 'spillStore', 'permissionPresets', 'attachments'];
   const isolateSym = Symbol.for('cordis.isolate');
+  const shadow = Object.create((ctx as any)[isolateSym] ?? null);
   for (const name of services) {
-    (ctx as any)[isolateSym] = { ...(ctx as any)[isolateSym], [name]: Symbol(name) };
+    shadow[name] = Symbol(name);
   }
+  (ctx as any)[isolateSym] = shadow;
+}
+
+/**
+ * Validates whether a given Cordis context derives from targetScope for isolated service resolution.
+ * Verifies both Cordis service isolation token equality (symbols.isolate) and prototype chain descent.
+ */
+export function isContextDerivedFrom(ctx: Context | undefined, targetScope: Context): boolean {
+  if (!ctx || !targetScope) return false;
+  if (ctx === targetScope) return true;
+
+  const isolateSym = Symbol.for('cordis.isolate');
+  const targetToken = (targetScope as any)[isolateSym]?.fs;
+  const ctxToken = (ctx as any)[isolateSym]?.fs;
+  if (!targetToken || ctxToken !== targetToken) {
+    return false;
+  }
+
+  let curr: unknown = ctx;
+  while (curr) {
+    if (curr === targetScope) return true;
+    try {
+      curr = Object.getPrototypeOf(curr);
+    } catch {
+      break;
+    }
+  }
+  return false;
 }
 
 export interface SpaceIsolatedFsConfig {
@@ -762,10 +793,17 @@ export async function mountWorkspaceTools(
     fibers.push(fsFiber);
 
     // Allow inner nested injection contexts (e.g. ToolFs read_image imageCtx) to access space-isolated fs
-    agentCtx.on('internal/get', (ctx, prop, error, next) => {
-      if (prop === 'fs') return agentCtx.get('fs');
+    const getFsDisposer = agentCtx.on('internal/get', (ctx, prop, error, next) => {
+      if (prop === 'fs' && isContextDerivedFrom(ctx, agentCtx)) {
+        return agentCtx.get('fs');
+      }
       return next();
     });
+    fibers.push({
+      dispose: async () => {
+        getFsDisposer();
+      },
+    } as any);
 
     // 2. FsObservationPolicy (enforces read-before-write/edit)
     const fsPolicyFiber = await agentCtx.plugin(FsObservationPolicyPlugin);

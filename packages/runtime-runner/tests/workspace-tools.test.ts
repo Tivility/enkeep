@@ -374,4 +374,101 @@ describe('Official DSH Workspace Tools & Multi-Space Isolation', () => {
       await runtime2.dispose();
     }
   });
+
+  it('Target regression G02: simultaneously existing contexts A/B resolve correct fs in A->B->A calls without cross-space leakage', async () => {
+    const spaceA = 'space-alpha';
+    const spaceB = 'space-beta';
+    const spaceAPath = path.join(aliceSpaces, spaceA);
+    const spaceBPath = path.join(aliceSpaces, spaceB);
+    fs.mkdirSync(spaceAPath, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(spaceBPath, { recursive: true, mode: 0o700 });
+
+    const runtime = await bootDshRuntime({
+      userId: 'alice',
+      dshHome: aliceHome,
+      spacesDir: aliceSpaces,
+    });
+
+    try {
+      const sessionA = 'ses_0123456789abcdef0123456789abcdea';
+      const sessionB = 'ses_0123456789abcdef0123456789abcdeb';
+
+      // 1. Session A (in space-alpha) writes alpha.txt
+      const resA1 = await runtime.sendFollowup(
+        '[enkeep-test-tool-call=write:{"file_path":"alpha.txt","content":"Alpha payload"}] write alpha',
+        sessionA,
+        'turn_0123456789abcdef0123456789abcde1',
+        null,
+        spaceA
+      );
+      expect(resA1.status).toBe('completed');
+      expect(fs.existsSync(path.join(spaceAPath, 'alpha.txt'))).toBe(true);
+      expect(fs.readFileSync(path.join(spaceAPath, 'alpha.txt'), 'utf8')).toBe('Alpha payload');
+      expect(fs.existsSync(path.join(spaceBPath, 'alpha.txt'))).toBe(false);
+
+      // 2. Simultaneously active Session B (in space-beta) writes beta.txt
+      // (Prior to G02 fix, this failed with FS_SANDBOX_DENIED due to leaked agentA fs root binding)
+      const resB1 = await runtime.sendFollowup(
+        '[enkeep-test-tool-call=write:{"file_path":"beta.txt","content":"Beta payload"}] write beta',
+        sessionB,
+        'turn_0123456789abcdef0123456789abcde2',
+        null,
+        spaceB
+      );
+      expect(resB1.status).toBe('completed');
+      expect(fs.existsSync(path.join(spaceBPath, 'beta.txt'))).toBe(true);
+      expect(fs.readFileSync(path.join(spaceBPath, 'beta.txt'), 'utf8')).toBe('Beta payload');
+      expect(fs.existsSync(path.join(spaceAPath, 'beta.txt'))).toBe(false);
+
+      // 3. A -> B -> A: Session A reads alpha.txt and writes alpha-updated.txt
+      const resA2 = await runtime.sendFollowup(
+        '[enkeep-test-tool-call=read:{"file_path":"alpha.txt"}] read alpha',
+        sessionA,
+        'turn_0123456789abcdef0123456789abcde3',
+        null,
+        spaceA
+      );
+      expect(resA2.status).toBe('completed');
+
+      const resA3 = await runtime.sendFollowup(
+        '[enkeep-test-tool-call=write:{"file_path":"alpha-updated.txt","content":"Alpha updated payload"}] write alpha updated',
+        sessionA,
+        'turn_0123456789abcdef0123456789abcde4',
+        null,
+        spaceA
+      );
+      expect(resA3.status).toBe('completed');
+      expect(fs.existsSync(path.join(spaceAPath, 'alpha-updated.txt'))).toBe(true);
+      expect(fs.existsSync(path.join(spaceBPath, 'alpha-updated.txt'))).toBe(false);
+
+      // 4. Session B reads beta.txt
+      const resB2 = await runtime.sendFollowup(
+        '[enkeep-test-tool-call=read:{"file_path":"beta.txt"}] read beta',
+        sessionB,
+        'turn_0123456789abcdef0123456789abcde5',
+        null,
+        spaceB
+      );
+      expect(resB2.status).toBe('completed');
+
+      // 5. Strict mutual isolation verification
+      const agentA = await runtime.getOrCreateAgent(sessionA, null, spaceA);
+      const agentB = await runtime.getOrCreateAgent(sessionB, null, spaceB);
+      const fsA = agentA.ctx.get('fs');
+      const fsB = agentB.ctx.get('fs');
+
+      expect(fsA).toBeDefined();
+      expect(fsB).toBeDefined();
+
+      await expect(
+        fsA.resolve('../space-beta/beta.txt', { cwd: spaceAPath })
+      ).rejects.toThrow(/outside space boundary/);
+
+      await expect(
+        fsB.resolve('../space-alpha/alpha.txt', { cwd: spaceBPath })
+      ).rejects.toThrow(/outside space boundary/);
+    } finally {
+      await runtime.dispose();
+    }
+  });
 });
