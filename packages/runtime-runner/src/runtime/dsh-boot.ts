@@ -88,6 +88,7 @@ import {
   type AgentProfileSnapshot,
   type ValidatedAgentProfile,
 } from './agent-profile.js';
+import { installSubagentScopeDecorator } from './child-scope.js';
 import {
   mountOfficialPlugins,
   mountWorkspaceTools,
@@ -807,6 +808,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   await ctx.plugin(ToolsRegistry);
   await ctx.plugin(AgentRegistry);
   await ctx.plugin(AgentLoop);
+  const subagentScopeDisposer = installSubagentScopeDecorator(ctx);
   await ctx.plugin(AgentDefaultModel, {
     provider,
     model,
@@ -3376,6 +3378,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           err instanceof Error ? err : new Error('Disposal failure', { cause: err })
         );
       }
+    }
+
+    try {
+      subagentScopeDisposer();
+    } catch (err: unknown) {
+      disposalErrors.push(
+        err instanceof Error ? err : new Error('Subagent scope decorator disposal failure', { cause: err })
+      );
     }
 
     try {

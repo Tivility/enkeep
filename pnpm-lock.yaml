@@ -922,6 +922,9 @@ importers:
       '@deepseek-ai/dsh-sandbox-policy':
         specifier: 0.1.2-rc.1
         version: 0.1.2-rc.1(18dce1690d004f995bc0c8cfc6c6a37b)
+      '@deepseek-ai/dsh-scope':
+        specifier: 0.1.2-rc.1
+        version: 0.1.2-rc.1(@deepseek-ai/cordis@4.0.2)(@deepseek-ai/dsh-invariants@0.1.2-rc.1(@deepseek-ai/cordis@4.0.2))
       '@deepseek-ai/dsh-session':
         specifier: 0.1.2-rc.1
         version: 0.1.2-rc.1(@deepseek-ai/cordis@4.0.2)(@deepseek-ai/dsh-scope@0.1.2-rc.1(@deepseek-ai/cordis@4.0.2)(@deepseek-ai/dsh-invariants@0.1.2-rc.1(@deepseek-ai/cordis@4.0.2)))
