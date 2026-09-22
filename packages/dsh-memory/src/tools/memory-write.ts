@@ -151,11 +151,25 @@ export function createMemoryWriteTool(options: MemoryWriteToolOptions): ToolDefi
       if (!isNewFile) {
         existingContent = fs.readFileSync(targetPath, 'utf-8');
         const prevHash = computeContentHash(existingContent);
-        previousEtag = `"${prevHash.slice(0, 16)}"`;
+        const prevShortHash = prevHash.slice(0, 16);
+        previousEtag = `"${prevShortHash}"`;
 
         if (args.expectedEtag) {
-          const cleanExpected = args.expectedEtag.replace(/^W\//, '').trim();
-          if (cleanExpected !== previousEtag && cleanExpected !== prevHash) {
+          const raw = args.expectedEtag.trim();
+          const cleanExpected = raw.replace(/^W\//, '').trim();
+          const unquotedExpected =
+            cleanExpected.startsWith('"') && cleanExpected.endsWith('"') && cleanExpected.length >= 2
+              ? cleanExpected.slice(1, -1)
+              : cleanExpected;
+
+          const matches =
+            raw === previousEtag ||
+            cleanExpected === previousEtag ||
+            unquotedExpected === prevShortHash ||
+            unquotedExpected === prevHash ||
+            cleanExpected === `"${prevHash}"`;
+
+          if (!matches) {
             throw new Error(
               `Memory write conflict: expectedEtag "${args.expectedEtag}" does not match current etag ${previousEtag}`
             );

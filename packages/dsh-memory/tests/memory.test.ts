@@ -217,6 +217,97 @@ describe('dsh-memory: Tools & Confinement', () => {
     ).rejects.toThrow(/Memory write conflict/);
   });
 
+  it('handles optimistic concurrency with read-returned quoted ETag, rejects stale tokens, and supports backwards-compatible unquoted hash', async () => {
+    const writeTool = createMemoryWriteTool({ dshHome, spacePath });
+    const readTool = createMemoryReadTool({ dshHome, spacePath });
+
+    // Step 1: Initialize file and read its exact quoted ETag
+    await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'overwrite',
+      content: 'Version 1 content',
+    } as any, {} as any);
+
+    const read1 = (await readTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+    } as any, {} as any)) as any;
+
+    expect(read1.etag).toMatch(/^"[0-9a-f]{16}"$/);
+    const tokenV1Quoted = read1.etag;
+    const tokenV1Unquoted = read1.etag.replace(/"/g, '');
+
+    // Test 1: Write with exact quoted ETag returned by memory_read succeeds
+    const write2 = (await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'overwrite',
+      content: 'Version 2 content',
+      expectedEtag: tokenV1Quoted,
+    } as any, {} as any)) as any;
+
+    expect(write2.success).toBe(true);
+    expect(write2.previousEtag).toBe(tokenV1Quoted);
+    const tokenV2Quoted = write2.etag;
+
+    // Test 2: Stale tokens, mismatched tokens, and unsupported tokens are rejected with conflict
+    await expect(
+      writeTool.execute({
+        path: 'concurrency.md',
+        scope: 'global',
+        mode: 'overwrite',
+        content: 'Version 3 stale overwrite',
+        expectedEtag: tokenV1Quoted, // stale v1 token
+      } as any, {} as any)
+    ).rejects.toThrow(/Memory write conflict: expectedEtag .* does not match current etag/);
+
+    await expect(
+      writeTool.execute({
+        path: 'concurrency.md',
+        scope: 'global',
+        mode: 'overwrite',
+        content: 'Version 3 invalid token',
+        expectedEtag: 'invalid-random-etag',
+      } as any, {} as any)
+    ).rejects.toThrow(/Memory write conflict: expectedEtag .* does not match current etag/);
+
+    await expect(
+      writeTool.execute({
+        path: 'concurrency.md',
+        scope: 'global',
+        mode: 'overwrite',
+        content: 'Version 3 wildcard token',
+        expectedEtag: '*',
+      } as any, {} as any)
+    ).rejects.toThrow(/Memory write conflict: expectedEtag .* does not match current etag/);
+
+    // Test 3: Unquoted hash and weak ETag variants are supported for backward compatibility
+    const tokenV2Unquoted = tokenV2Quoted.replace(/"/g, '');
+    const write3 = (await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'overwrite',
+      content: 'Version 3 content',
+      expectedEtag: tokenV2Unquoted, // unquoted 16-char hash
+    } as any, {} as any)) as any;
+
+    expect(write3.success).toBe(true);
+    expect(write3.previousEtag).toBe(tokenV2Quoted);
+
+    // Weak ETag syntax W/"..."
+    const tokenV3Quoted = write3.etag;
+    const write4 = (await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'append',
+      content: '\nVersion 4 appended',
+      expectedEtag: `W/${tokenV3Quoted}`,
+    } as any, {} as any)) as any;
+
+    expect(write4.success).toBe(true);
+  });
+
   it('executes memory_search tool and finds keyword matches', async () => {
     const globalMemoryDir = path.join(dshHome, 'memory');
     fs.mkdirSync(globalMemoryDir, { recursive: true });
