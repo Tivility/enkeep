@@ -2886,7 +2886,7 @@ export function executeFileOperation(
       if (reqObj.stageToken !== undefined) {
         stageToken = validateStageToken(reqObj.stageToken);
       } else {
-        stageToken = `.${path.basename(targetPath)}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
+        stageToken = `.stage.${crypto.randomBytes(8).toString('hex')}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
       }
 
       const tempPath = path.join(parentDir, stageToken);
@@ -2967,7 +2967,7 @@ export function executeFileOperation(
       }
       const stageToken = validateStageToken(reqObj.stageToken);
       const expectedPrefix = `.${path.basename(targetPath)}.`;
-      if (!stageToken.startsWith(expectedPrefix)) {
+      if (!stageToken.startsWith('.stage.') && !stageToken.startsWith(expectedPrefix)) {
         throw new FileOpError('INVALID_REQUEST');
       }
       const expectedEtag = typeof reqObj.expectedEtag === 'string' ? reqObj.expectedEtag : undefined;
@@ -3065,7 +3065,7 @@ export function executeFileOperation(
       }
       const stageToken = validateStageToken(reqObj.stageToken);
       const expectedPrefix = `.${path.basename(targetPath)}.`;
-      if (!stageToken.startsWith(expectedPrefix)) {
+      if (!stageToken.startsWith('.stage.') && !stageToken.startsWith(expectedPrefix)) {
         throw new FileOpError('INVALID_REQUEST');
       }
       const parentDir = path.dirname(targetPath);
@@ -3273,7 +3273,7 @@ export async function executeFileStageStream(
   }
   verifyOwnership(parentStat, expectedUid);
 
-  const tempFileName = `.${path.basename(targetPath)}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
+  const tempFileName = `.stage.${crypto.randomBytes(8).toString('hex')}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
   const tempPath = path.join(parentDir, tempFileName);
   const nofollow = getNoFollowFlag();
 
@@ -3560,7 +3560,9 @@ export async function executeFileCommitStage(
         }
 
         // Overwrite: preserve target as backup rollbackToken
-        const backupToken = options.rollbackToken ? validateRollbackToken(options.rollbackToken) : `.${path.basename(targetPath)}.${crypto.randomBytes(8).toString('hex')}.rollback.tmp`;
+        const backupToken = options.rollbackToken
+          ? validateRollbackToken(options.rollbackToken)
+          : `.rollback.${crypto.randomBytes(8).toString('hex')}.${crypto.randomBytes(8).toString('hex')}.rollback.tmp`;
         const backupPath = path.join(parentDir, backupToken);
         try {
           filesystem.renameSync(targetPath, backupPath);
@@ -3864,7 +3866,8 @@ export async function executeFileFinalizeStage(
   const spaceRoot = path.join(spacesDir, space);
   const targetPath = path.join(spaceRoot, ...segments);
   const parentDir = path.dirname(targetPath);
-  const backupPath = path.join(parentDir, options.rollbackToken);
+  const rollbackToken = validateRollbackToken(options.rollbackToken);
+  const backupPath = path.join(parentDir, rollbackToken);
   const nofollow = getNoFollowFlag();
 
   try {
@@ -3908,7 +3911,8 @@ export async function executeFileRollbackCommit(
     const parentDir = path.dirname(targetPath);
 
     if (options.rollbackToken) {
-      const backupPath = path.join(parentDir, options.rollbackToken);
+      const rollbackToken = validateRollbackToken(options.rollbackToken);
+      const backupPath = path.join(parentDir, rollbackToken);
       try {
         if (filesystem.existsSync(backupPath)) {
           filesystem.renameSync(backupPath, targetPath);
@@ -3926,7 +3930,8 @@ export async function executeFileRollbackCommit(
 
     if (options.stageToken) {
       try {
-        const tempPath = path.join(parentDir, options.stageToken);
+        const stageToken = validateStageToken(options.stageToken);
+        const tempPath = path.join(parentDir, stageToken);
         filesystem.unlinkSync(tempPath);
       } catch {
         // Ignore
