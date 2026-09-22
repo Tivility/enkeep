@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import YAML from 'yaml';
+import type { RuntimeNetworkMode } from '../spec/types.js';
 
 export interface DshParsedModel {
   id: string;
@@ -61,6 +62,7 @@ export interface DshDeploymentConfig {
   tokens: Record<string, string>;
   allowedHosts: string[];
   budgets?: DshDeploymentBudgets;
+  containerNetworkMode?: RuntimeNetworkMode;
 }
 
 /**
@@ -102,44 +104,47 @@ export function parseEnvContent(envText: string): Record<string, string> {
  * @param dshHome - Path to DSH home directory
  */
 export function parseDshConfigFiles(
-  patchYmlContent: string,
+  patchYmlContent?: string,
   settingsYamlContent?: string,
   envContent?: string,
   dshHome = path.join(os.homedir(), '.dsh')
 ): DshDeploymentConfig {
-  const patchParsed: unknown = YAML.parse(patchYmlContent);
-  if (!Array.isArray(patchParsed)) {
-    throw new Error('Invalid cordis.patch.yml: top-level must be an array of plugin configurations');
-  }
-
-  // Find id: llm-pi-ai entry
-  const piAiEntry = patchParsed.find(
-    (e: unknown): e is { id: string; config?: { providers?: Record<string, DshParsedProvider> } } =>
-      typeof e === 'object' && e !== null && 'id' in e && (e as { id: string }).id === 'llm-pi-ai'
-  );
-
-  const rawProviders = piAiEntry?.config?.providers;
-  if (!rawProviders || typeof rawProviders !== 'object') {
-    throw new Error('Invalid cordis.patch.yml: missing id: llm-pi-ai with config.providers');
-  }
-
   const providers: Record<string, DshParsedProvider> = {};
   const allowedHostsSet = new Set<string>();
+  let patchParsed: unknown = undefined;
 
-  for (const [providerKey, providerVal] of Object.entries(rawProviders)) {
-    if (!providerVal || typeof providerVal !== 'object') continue;
-    const p = providerVal as DshParsedProvider;
-    providers[providerKey] = {
-      ...p,
-      baseURL: p.baseURL,
-      api: p.api || 'openai-completions',
-    };
+  if (patchYmlContent && patchYmlContent.trim().length > 0) {
+    patchParsed = YAML.parse(patchYmlContent);
+    if (!Array.isArray(patchParsed)) {
+      throw new Error('Invalid cordis.patch.yml: top-level must be an array of plugin configurations');
+    }
 
-    if (p.baseURL && typeof p.baseURL === 'string') {
-      try {
-        const u = new URL(p.baseURL);
-        allowedHostsSet.add(u.hostname.toLowerCase());
-      } catch {}
+    // Find id: llm-pi-ai entry
+    const piAiEntry = patchParsed.find(
+      (e: unknown): e is { id: string; config?: { providers?: Record<string, DshParsedProvider> } } =>
+        typeof e === 'object' && e !== null && 'id' in e && (e as { id: string }).id === 'llm-pi-ai'
+    );
+
+    const rawProviders = piAiEntry?.config?.providers;
+    if (!rawProviders || typeof rawProviders !== 'object') {
+      throw new Error('Invalid cordis.patch.yml: missing id: llm-pi-ai with config.providers');
+    }
+
+    for (const [providerKey, providerVal] of Object.entries(rawProviders)) {
+      if (!providerVal || typeof providerVal !== 'object') continue;
+      const p = providerVal as DshParsedProvider;
+      providers[providerKey] = {
+        ...p,
+        baseURL: p.baseURL,
+        api: p.api || 'openai-completions',
+      };
+
+      if (p.baseURL && typeof p.baseURL === 'string') {
+        try {
+          const u = new URL(p.baseURL);
+          allowedHostsSet.add(u.hostname.toLowerCase());
+        } catch {}
+      }
     }
   }
 
@@ -169,7 +174,7 @@ export function parseDshConfigFiles(
         }
       }
     } catch {}
-  } else {
+  } else if (Array.isArray(patchParsed)) {
     // Check cordis.patch.yml for id: agent-default-model
     const defaultModelEntry = patchParsed.find(
       (e: unknown): e is { id: string; config?: { provider?: string; model?: string } } =>
@@ -219,6 +224,39 @@ export function parseDshConfigFiles(
     };
   }
 
+  // Parse optional container network mode from settings.yaml or environment variables
+  let containerNetworkMode: RuntimeNetworkMode | undefined;
+  if (settingsYamlContent) {
+    try {
+      const settingsParsed = YAML.parse(settingsYamlContent);
+      if (settingsParsed && typeof settingsParsed === 'object') {
+        const cnm =
+          (settingsParsed as Record<string, unknown>)['container-network-mode'] ||
+          (settingsParsed as Record<string, unknown>)['containerNetworkMode'] ||
+          ((settingsParsed as Record<string, unknown>)['container-network'] as Record<string, unknown> | undefined)?.mode ||
+          ((settingsParsed as Record<string, unknown>)['containerNetwork'] as Record<string, unknown> | undefined)?.mode;
+        if (cnm === 'none' || cnm === 'bridge') {
+          containerNetworkMode = cnm;
+        } else if (cnm !== undefined && cnm !== null) {
+          throw new Error(`Invalid container network mode "${String(cnm)}" in settings.yaml: must be "none" or "bridge"`);
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('Invalid container network mode')) {
+        throw err;
+      }
+    }
+  }
+
+  const envNetworkMode = process.env.ENKEEP_CONTAINER_NETWORK_MODE || process.env.DSH_CONTAINER_NETWORK_MODE;
+  if (envNetworkMode) {
+    if (envNetworkMode === 'none' || envNetworkMode === 'bridge') {
+      containerNetworkMode = envNetworkMode;
+    } else {
+      throw new Error(`Invalid container network mode "${envNetworkMode}" in environment: must be "none" or "bridge"`);
+    }
+  }
+
   return {
     dshHome,
     providers,
@@ -226,6 +264,7 @@ export function parseDshConfigFiles(
     tokens,
     allowedHosts: Array.from(allowedHostsSet),
     budgets,
+    containerNetworkMode,
   };
 }
 
@@ -253,7 +292,19 @@ export function loadDshDeploymentConfig(customDshHome?: string): DshDeploymentCo
   }
 
   if (!patchPath) {
-    return null;
+    const settingsPath = path.join(dshHome, 'settings.yaml');
+    const settingsContent = fs.existsSync(settingsPath) ? fs.readFileSync(settingsPath, 'utf8') : undefined;
+    const envPath = path.join(dshHome, '.env');
+    const envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : undefined;
+
+    if (!settingsContent && !envContent) {
+      return null;
+    }
+    try {
+      return parseDshConfigFiles('', settingsContent, envContent, dshHome);
+    } catch {
+      return null;
+    }
   }
 
   try {

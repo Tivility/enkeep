@@ -136,6 +136,7 @@ export interface DemoUpOptions extends DemoPathOptions {
   runtimeAdapter?: RuntimeContainerPort;
   hostRuntimeAdapter?: RuntimeContainerPort;
   allowHostRuntime?: boolean;
+  containerNetworkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
   llmEnabled?: boolean;
   llmProvider?: string;
   llmModel?: string;

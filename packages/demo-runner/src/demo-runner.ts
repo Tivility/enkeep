@@ -51,6 +51,7 @@ COMMANDS:
 
 OPTIONS:
   --port <number>             Fixed loopback Platform port for up (default dynamic)
+  --network-mode <mode>       Container network mode: "none" (default) or "bridge"
   --lark-test-credentials <f> Path to Lark test credentials file (0600 mode)
   --json                      Output results as JSON (errors omit stack trace)
   --remove-vols               Remove demo Docker volumes on teardown
@@ -104,6 +105,65 @@ export function parsePlatformPort(
   const port = Number.parseInt(trimmed, 10);
   validateSafePort(port);
   return port;
+}
+
+/**
+ * Parses and validates container network mode from CLI arguments, environment variables, or DSH settings.
+ * Whitelist supported: 'none' | 'bridge'. Defaults to 'none' for backwards compatibility.
+ * Priority: CLI `--network-mode <mode>` / `--network <mode>` > env `ENKEEP_CONTAINER_NETWORK_MODE` > env `DSH_CONTAINER_NETWORK_MODE` > settings `container-network-mode` > default 'none'.
+ * Rejects null, undefined, unknown, or unsupported modes fail-closed.
+ */
+export function parseContainerNetworkMode(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env,
+  dshConfig: import('@enkeep/runtime-runner').DshDeploymentConfig | null = loadDshDeploymentConfig()
+): import('@enkeep/runtime-runner').RuntimeNetworkMode {
+  let rawMode: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--network-mode' || arg === '--network') {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        throw new Error(`Safety Violation: ${arg} requires a valid network mode ("none" or "bridge").`);
+      }
+      rawMode = next;
+      break;
+    } else if (arg.startsWith('--network-mode=')) {
+      const val = arg.slice('--network-mode='.length);
+      if (!val) {
+        throw new Error('Safety Violation: --network-mode requires a valid network mode ("none" or "bridge").');
+      }
+      rawMode = val;
+      break;
+    } else if (arg.startsWith('--network=')) {
+      const val = arg.slice('--network='.length);
+      if (!val) {
+        throw new Error('Safety Violation: --network requires a valid network mode ("none" or "bridge").');
+      }
+      rawMode = val;
+      break;
+    }
+  }
+
+  if (rawMode === undefined && env.ENKEEP_CONTAINER_NETWORK_MODE !== undefined && env.ENKEEP_CONTAINER_NETWORK_MODE !== '') {
+    rawMode = env.ENKEEP_CONTAINER_NETWORK_MODE;
+  } else if (rawMode === undefined && env.DSH_CONTAINER_NETWORK_MODE !== undefined && env.DSH_CONTAINER_NETWORK_MODE !== '') {
+    rawMode = env.DSH_CONTAINER_NETWORK_MODE;
+  } else if (rawMode === undefined && dshConfig?.containerNetworkMode !== undefined) {
+    rawMode = dshConfig.containerNetworkMode;
+  }
+
+  if (rawMode === undefined) {
+    return 'none';
+  }
+
+  const trimmed = rawMode.trim().toLowerCase();
+  if (trimmed !== 'none' && trimmed !== 'bridge') {
+    throw new Error(`Safety Violation: Invalid container network mode "${rawMode}". Must be "none" or "bridge".`);
+  }
+
+  return trimmed as import('@enkeep/runtime-runner').RuntimeNetworkMode;
 }
 
 export async function getStatus(options?: DemoStatusOptions | string): Promise<DemoStatusResult> {
@@ -193,11 +253,13 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
       case 'up': {
         const platformPort = parsePlatformPort(args);
         const larkTestCredentialsFile = parseLarkTestCredentialsPath(args);
+        const containerNetworkMode = parseContainerNetworkMode(args);
         const system = await launchDemoSystem({
           repoRoot,
           allowHostRuntime,
           platformPort,
           larkTestCredentialsFile,
+          containerNetworkMode,
         });
         const dshConfig = loadDshDeploymentConfig();
         const isLlmConfigured = Boolean(

@@ -36,12 +36,13 @@ import {
   validateContainerSpec,
   isRecord,
   DockerOwnershipError,
+  NetworkModeMismatchError,
   DockerCollisionError,
   DockerDaemonError,
   DockerNotFoundError,
   DockerProtocolError,
 } from '../spec/validator.js';
-import type { RuntimeContainerSpec, RunContainerResult } from '../spec/types.js';
+import type { RuntimeContainerSpec, RunContainerResult, RuntimeNetworkMode } from '../spec/types.js';
 import type { ExecCliRequest, ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type { FileOperationResult, FileListEntry, FileOpType } from '../runtime/file-ops.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
@@ -98,6 +99,8 @@ export interface OwnershipExpectation {
   containerPath: string;
   /** Controlled host mounts */
   mounts?: readonly RuntimeMountSpec[];
+  /** Container network isolation mode ('none' | 'bridge', default 'none') */
+  networkMode?: RuntimeNetworkMode;
 }
 
 export interface VolumeOwnershipExpectation {
@@ -1363,6 +1366,7 @@ export class SafeDockerClient {
       volumeId: spec.volume.volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      networkMode: spec.networkMode,
     };
 
     try {
@@ -1478,6 +1482,7 @@ export class SafeDockerClient {
       volumeId: spec.volume.volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      networkMode: spec.networkMode,
     };
 
     try {
@@ -1624,9 +1629,14 @@ export class SafeDockerClient {
       throw new DockerOwnershipError('Container Config.User must be exactly "1000:1000"');
     }
 
-    // Mandatory exact NetworkMode 'none'
-    if (!info.networkMode || info.networkMode.trim() !== 'none') {
-      throw new DockerOwnershipError('Container NetworkMode must be "none". Zero-network violation.');
+    // Mandatory exact NetworkMode ('none' or 'bridge' matching expectation)
+    const expectedNetworkMode = expectation.networkMode ?? 'none';
+    if (!info.networkMode || info.networkMode.trim() !== expectedNetworkMode) {
+      throw new NetworkModeMismatchError(
+        info.networkMode || 'unknown',
+        expectedNetworkMode,
+        `Container NetworkMode must be "${expectedNetworkMode}". Network mode violation: existing is "${info.networkMode || 'unknown'}".`
+      );
     }
 
     // Mandatory exact ReadonlyRootfs true

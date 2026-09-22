@@ -59,10 +59,27 @@ export function is64HexContainerId(id: unknown): id is string {
 // --- Typed Error Hierarchy ---
 
 export class DockerOwnershipError extends Error {
-  readonly code = 'DOCKER_OWNERSHIP_VIOLATION';
+  readonly code: string = 'DOCKER_OWNERSHIP_VIOLATION';
   constructor(message = 'Docker ownership or hardening invariant violation') {
     super(`Safety Violation: ${message}`);
     this.name = 'DockerOwnershipError';
+  }
+}
+
+export class NetworkModeMismatchError extends DockerOwnershipError {
+  override readonly code: string = 'NETWORK_MODE_MISMATCH';
+  readonly existingMode: string;
+  readonly desiredMode: string;
+
+  constructor(existingMode: string, desiredMode: string, message?: string) {
+    super(
+      message ??
+        `Container networkMode mismatch: existing container has "${existingMode}", but requested "${desiredMode}". ` +
+        `Controlled rollout requires draining active turns and controlled teardown/rebuild.`
+    );
+    this.name = 'NetworkModeMismatchError';
+    this.existingMode = existingMode;
+    this.desiredMode = desiredMode;
   }
 }
 
@@ -225,15 +242,15 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
     );
   }
 
-  // 7. Zero-Network mode enforcement: must be exactly 'none'
+  // 7. Network mode enforcement: whitelisted 'none' or 'bridge'
   const networkMode = rawSpec.networkMode;
-  if (networkMode !== 'none') {
-    errors.push('networkMode MUST be "none"');
+  if (networkMode !== 'none' && networkMode !== 'bridge') {
+    errors.push('networkMode MUST be "none" or "bridge"');
   }
 
-  // 8. No published ports permitted under zero-network mode
+  // 8. No published ports permitted under container isolation architecture
   if ('publishedPorts' in rawSpec) {
-    errors.push('publishedPorts is strictly forbidden under zero-network architecture');
+    errors.push('publishedPorts is strictly forbidden under container isolation architecture');
   }
 
   // 9. Controlled host mounts validation & legacy bindMounts check

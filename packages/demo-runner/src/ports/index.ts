@@ -33,6 +33,7 @@ import {
   DockerRuntimeAdapter,
   SafeDockerClient,
   DockerNotFoundError,
+  NetworkModeMismatchError,
   computeSessionEventsChecksum,
   canonicalJsonStringify,
   loadDshDeploymentConfig,
@@ -45,6 +46,7 @@ import {
 } from '@enkeep/runtime-runner';
 import {
   validateContainerSpec,
+  type RuntimeNetworkMode,
 } from '@enkeep/runtime-runner/spec';
 import type {
   ProbeSnapshot,
@@ -180,6 +182,7 @@ export interface RuntimeContainerPort {
     llmModel?: string;
     llmProviders?: string | Record<string, unknown>;
     browserService?: import('@enkeep/platform-core').BrowserService;
+    networkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
     mounts?: readonly import('@enkeep/platform-core').RuntimeMountSpec[];
   }): Promise<UserRuntimeHandle>;
   connectUserRuntime?(options: {
@@ -604,10 +607,17 @@ function createUserRuntimeHandle(
 export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
   private readonly adapter: DockerRuntimeAdapter;
   private readonly client: SafeDockerClient;
+  private readonly defaultNetworkMode: import('@enkeep/runtime-runner').RuntimeNetworkMode;
 
-  constructor(client: SafeDockerClient = new SafeDockerClient()) {
+  constructor(
+    client: SafeDockerClient = new SafeDockerClient(),
+    options?: { defaultNetworkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode }
+  ) {
     this.client = client;
-    this.adapter = new DockerRuntimeAdapter(client);
+    this.defaultNetworkMode = options?.defaultNetworkMode ?? 'none';
+    this.adapter = new DockerRuntimeAdapter(client, {
+      defaultNetworkMode: this.defaultNetworkMode,
+    });
   }
 
   async startUserRuntime(options: {
@@ -619,6 +629,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
     resourceSuffix?: string;
     timeoutMs?: number;
     llmEnabled?: boolean;
+    networkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
     mounts?: readonly import('@enkeep/platform-core').RuntimeMountSpec[];
   }): Promise<UserRuntimeHandle> {
     const pathOptions: DemoPathOptions = {
@@ -641,11 +652,13 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
 
     // 1. Build initial temporary spec only to derive deterministic container and volume names
     const tempRunId = generateRunId();
+    const networkMode = options.networkMode ?? this.defaultNetworkMode;
     const tempSpec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
       image: options.image ?? 'enkeep-demo-runtime:latest',
       nameSuffix: options.resourceSuffix,
       runId: tempRunId,
+      networkMode,
     });
     const expectedVolumeName = tempSpec.volume.volumeName;
 
@@ -660,6 +673,23 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       existingContainer &&
       existingContainer.id === existingContainerMeta.containerId
     );
+
+
+    if (isExistingContainerReconnect && existingContainer) {
+      const existingMode = (existingContainer.networkMode as RuntimeNetworkMode) || 'none';
+      const desiredMode = networkMode;
+      if (existingMode !== desiredMode) {
+        // Actionable guidance error rather than raw fatal unknown error or silent rebuild.
+        // No self-stop or automatic destruction: controlled deployer must drain active turns and perform teardown or recreate externally.
+        throw new NetworkModeMismatchError(
+          existingMode,
+          desiredMode,
+          `Container networkMode mismatch for "${tempSpec.containerName}": existing container is running with mode "${existingMode}", but requested "${desiredMode}". ` +
+          `Automatic rebuild is disabled to prevent interrupting active turns. ` +
+          `A controlled deployer must drain active turns and perform teardown or recreate.`
+        );
+      }
+    }
 
     let selectedVolumeId: string;
     let finalRunId: string;
@@ -770,6 +800,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       nameSuffix: options.resourceSuffix,
       runId: finalRunId,
       volumeId: selectedVolumeId,
+      networkMode,
       llmEnabled: isLlmEnabled,
       llmProvider,
       llmModel,

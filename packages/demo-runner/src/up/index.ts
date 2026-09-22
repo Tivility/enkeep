@@ -482,9 +482,21 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     options.allowHostRuntime ??
     (process.env.ENKEEP_ALLOW_HOST_RUNTIME === '1' || process.env.ENKEEP_ALLOW_HOST_RUNTIME === 'true');
 
+  const dshDeploymentConfig = loadDshDeploymentConfig();
+
+  const containerNetworkMode =
+    options.containerNetworkMode ??
+    (process.env.ENKEEP_CONTAINER_NETWORK_MODE as import('@enkeep/runtime-runner').RuntimeNetworkMode) ??
+    (process.env.DSH_CONTAINER_NETWORK_MODE as import('@enkeep/runtime-runner').RuntimeNetworkMode) ??
+    dshDeploymentConfig?.containerNetworkMode ??
+    'none';
+
   // 3. Prepare Container Adapter (No production escape hatches)
   const containerAdapter: RuntimeContainerPort =
-    options.runtimeAdapter ?? new DockerRuntimeContainerAdapter(new SafeDockerClient());
+    options.runtimeAdapter ??
+    new DockerRuntimeContainerAdapter(new SafeDockerClient(), {
+      defaultNetworkMode: containerNetworkMode,
+    });
   const hostAdapter: RuntimeContainerPort =
     options.hostRuntimeAdapter ?? new HostRuntimePortAdapter();
 
@@ -656,6 +668,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         llmEnabled: options.llmEnabled,
         llmProvider: options.llmProvider,
         llmModel: options.llmModel,
+        networkMode: containerNetworkMode,
       });
       newlyCreatedHandles.push(userHandle);
       if (userHandle.meta) {
@@ -834,6 +847,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           mode: options.mode,
           resourceSuffix: options.resourceSuffix,
           timeoutMs: options.timeoutMs ?? 15000,
+          networkMode: containerNetworkMode,
         });
 
         // Phase 2 Binding: Bind full platform proxy & events stream handlers with authoritative user UUID
