@@ -777,6 +777,15 @@ export class PlatformServer {
     if (this.runtimeGateway instanceof DeliveryRuntimeGateway && !this.runtimeGateway.getExtensionResolver()) {
       this.runtimeGateway.setExtensionResolver(this.extensionService);
     }
+    if (this.runtimeGateway instanceof DeliveryRuntimeGateway) {
+      this.runtimeGateway.setChatCommandDeps({
+        resetSession: this.platformApi.resetSession.bind(this.platformApi),
+        compactSession: typeof (this.platformApi as any).compactSession === 'function'
+          ? (this.platformApi as any).compactSession.bind(this.platformApi)
+          : undefined,
+        taskOperations: (userId: string) => this.operationsService.forTenant(userId).tasks,
+      });
+    }
 
     this.larkEncryptedCredentialStore =
       options.larkEncryptedCredentialStore ??
@@ -1089,8 +1098,16 @@ export class PlatformServer {
         const attReport = await attRecovery.recover();
         if (attReport.errors.length > 0) {
           const codes = Array.from(new Set(attReport.errors.map((e) => e.code))).join(', ');
+          const spaceStmt = this.db.prepare('SELECT space_id FROM attachment_snapshot_journal WHERE id = ?');
+          const sample = attReport.errors
+            .slice(0, 5)
+            .map((e) => {
+              const row = spaceStmt.get(e.journalId) as { space_id?: string } | undefined;
+              return `${e.journalId} (space: ${row?.space_id ?? 'unknown'})`;
+            })
+            .join(', ');
           throw new PlatformConfigurationError(
-            `PlatformServer startup failed during attachment snapshot journal recovery: ${attReport.errors.length} unrecoverable error(s) encountered (codes: ${codes}).`
+            `PlatformServer startup failed during attachment snapshot journal recovery: ${attReport.errors.length} unrecoverable error(s) encountered (codes: ${codes}; offending: ${sample}).`
           );
         }
       } else {

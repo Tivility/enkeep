@@ -440,6 +440,32 @@ export interface DeliveryRuntimeGatewayOptions {
   fileProvider?: TenantRuntimeFileProvider;
   modelSelectionService?: ModelSelectionService;
   chatCommandService?: ChatCommandService;
+  chatCommandDeps?: {
+    resetSession?: (
+      userId: string,
+      sessionId: string,
+      options: { idempotencyKey: string; reason?: string }
+    ) => Promise<any>;
+    compactSession?: (
+      userId: string,
+      sessionId: string
+    ) => Promise<any>;
+    createTask?: (
+      userId: string,
+      input: {
+        title: string;
+        payload: Record<string, unknown>;
+        scheduleType?: string;
+        priority?: string;
+      }
+    ) => Promise<any>;
+    taskOperations?: (userId: string) => {
+      createTask: (input: any) => Promise<any>;
+    };
+  };
+  taskOperations?: (userId: string) => {
+    createTask: (input: any) => Promise<any>;
+  };
   externalInteractionService?: {
     listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
@@ -598,7 +624,25 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     this.fileService = options.fileService;
     this.fileProvider = options.fileProvider;
     this.modelSelectionService = options.modelSelectionService ?? (this.db ? new ModelSelectionServiceImpl({ db: this.db }) : undefined);
-    this.chatCommandService = options.chatCommandService ?? (this.modelSelectionService ? new ChatCommandService(this.modelSelectionService) : undefined);
+    const resetSessionFn = options.chatCommandDeps?.resetSession ?? (options as any).platformApi?.resetSession;
+    const compactSessionFn = options.chatCommandDeps?.compactSession ?? (options as any).platformApi?.compactSession;
+    const createTaskFn = options.chatCommandDeps?.createTask ?? (options as any).platformApi?.createTask;
+    const taskOps = options.chatCommandDeps?.taskOperations ?? options.taskOperations;
+    this.chatCommandService =
+      options.chatCommandService ??
+      (this.modelSelectionService
+        ? new ChatCommandService({
+            modelSelectionService: this.modelSelectionService,
+            platformApi: (resetSessionFn || compactSessionFn || createTaskFn) ? {
+              resetSession: resetSessionFn,
+              compactSession: compactSessionFn,
+              createTask: createTaskFn,
+            } : undefined,
+            taskOperations: taskOps,
+            gateway: this,
+            db: this.db,
+          })
+        : undefined);
     this.externalInteractionService = options.externalInteractionService;
     this.mountResolver = options.mountResolver;
 
@@ -641,6 +685,47 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
   public setExtensionResolver(resolver: ExtensionPlanResolver): void {
     this.extensionResolver = resolver;
+  }
+
+  public getChatCommandService(): ChatCommandService | undefined {
+    return this.chatCommandService;
+  }
+
+  public setChatCommandDeps(deps: {
+    resetSession?: (
+      userId: string,
+      sessionId: string,
+      options: { idempotencyKey: string; reason?: string }
+    ) => Promise<any>;
+    compactSession?: (
+      userId: string,
+      sessionId: string
+    ) => Promise<any>;
+    createTask?: (
+      userId: string,
+      input: {
+        title: string;
+        payload: Record<string, unknown>;
+        scheduleType?: string;
+        priority?: string;
+      }
+    ) => Promise<any>;
+    taskOperations?: (userId: string) => {
+      createTask: (input: any) => Promise<any>;
+    };
+  }): void {
+    if (this.chatCommandService) {
+      const currentPlatformApi = (this.chatCommandService as any).platformApi ?? {};
+      this.chatCommandService.setPlatformApi({
+        ...currentPlatformApi,
+        ...(deps.resetSession ? { resetSession: deps.resetSession } : {}),
+        ...(deps.compactSession ? { compactSession: deps.compactSession } : {}),
+        ...(deps.createTask ? { createTask: deps.createTask } : {}),
+      });
+      if (deps.taskOperations) {
+        this.chatCommandService.setTaskOperations(deps.taskOperations);
+      }
+    }
   }
 
   public getFileProvider(): TenantRuntimeFileProvider | undefined {
@@ -915,10 +1000,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     const authoritativeSpaceId = route.space_id;
     const currentGen = typeof route.current_generation === 'number' ? route.current_generation : 1;
 
-    // Profile resolution pre-check: fail closed if profile snapshot is tampered/corrupted
-    await this.profileResolver.resolve(userId, sessionId, currentGen);
-
-    // Chat command interception hook (before attachments, idempotency, and runtime dispatch)
+    // Chat command interception hook (before profile resolution, attachments, idempotency, and runtime dispatch)
     const chatCmd = parseChatCommand(envelope.content);
     if (chatCmd && this.chatCommandService) {
       return await this.dispatchChatCommand({
@@ -930,6 +1012,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         timestamp,
       });
     }
+
+    // Profile resolution pre-check: fail closed if profile snapshot is tampered/corrupted
+    await this.profileResolver.resolve(userId, sessionId, currentGen);
 
     // 0a. Process and validate attachments
     const canonicalAttachments = await this.processInboundAttachments(
@@ -1174,6 +1259,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       sessionId,
       spaceId,
       content: envelope.content,
+      idempotencyKey,
     });
 
     // 3. Atomically persist synthetic turn in SQLite transaction

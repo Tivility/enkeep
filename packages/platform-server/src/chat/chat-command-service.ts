@@ -1,16 +1,35 @@
+import { randomUUID } from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
 import { ValidationError, PlatformError } from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn';
+
 export interface ParsedChatCommand {
-  command: 'model' | 'effort';
-  type: 'model' | 'effort';
-  subcommand: 'list' | 'reset' | 'set' | 'show' | 'unknown';
-  action: 'list' | 'reset' | 'set' | 'show' | 'unknown';
+  command: ChatCommandType;
+  type: ChatCommandType;
+  subcommand: string;
+  action: string;
   arg?: string;
   target?: string;
   effort?: string;
   raw: string;
 }
+
+const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const HELP_USAGE = `Available commands:
+  /help - Show this help message
+  /status - Show current space, session, model, and turn status
+  /new - Start a new session generation (aliases: /reset, /clear)
+  /stop - Cancel running or queued turn
+  /compact - Force session compaction regardless of threshold
+  /model - Show, list, set, or reset session model override
+  /effort - List, set, or reset reasoning effort override
+  /sw - Start parallel background task in current space (alias: /spawn)`;
+
+const SPAWN_USAGE = `用法: /sw <任务描述>
+在当前工作区创建并行任务`;
 
 const MODEL_USAGE = `Usage:
   /model - Show current effective model
@@ -24,7 +43,7 @@ const EFFORT_USAGE = `Usage:
   /effort reset - Reset reasoning effort override`;
 
 /**
- * Parses in-chat slash commands starting with /model or /effort at a word boundary.
+ * Parses in-chat slash commands (/model, /effort, /help, /status, /new, /reset, /clear, /stop) at a word boundary.
  * Returns null if the content does not match.
  */
 export function parseChatCommand(content: unknown): ParsedChatCommand | null {
@@ -33,13 +52,88 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
   }
 
   const trimmed = content.trim();
-  const match = trimmed.match(/^\/(model|effort)(?:[\s\t\r\n]+(.*))?$/);
+  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
     return null;
   }
 
-  const cmd = match[1] as 'model' | 'effort';
+  const cmd = match[1].toLowerCase() as 'model' | 'effort' | 'help' | 'status' | 'new' | 'reset' | 'clear' | 'stop' | 'compact' | 'sw' | 'spawn';
   const rest = match[2] !== undefined ? match[2].trim() : '';
+
+  if (cmd === 'sw' || cmd === 'spawn') {
+    if (!rest) {
+      return {
+        command: 'spawn',
+        type: 'spawn',
+        subcommand: 'show',
+        action: 'show',
+        raw: trimmed,
+      };
+    }
+    return {
+      command: 'spawn',
+      type: 'spawn',
+      subcommand: 'spawn',
+      action: 'spawn',
+      arg: rest,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'help') {
+    return {
+      command: 'help',
+      type: 'help',
+      subcommand: 'show',
+      action: 'show',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'status') {
+    return {
+      command: 'status',
+      type: 'status',
+      subcommand: 'show',
+      action: 'show',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'stop') {
+    return {
+      command: 'stop',
+      type: 'stop',
+      subcommand: 'stop',
+      action: 'stop',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'new' || cmd === 'reset' || cmd === 'clear') {
+    return {
+      command: 'new',
+      type: 'new',
+      subcommand: 'new',
+      action: 'new',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'compact') {
+    return {
+      command: 'compact',
+      type: 'compact',
+      subcommand: 'compact',
+      action: 'compact',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
 
   if (cmd === 'model') {
     if (!rest) {
@@ -139,14 +233,107 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
   };
 }
 
+export interface ChatCommandServiceOptions {
+  modelSelectionService: ModelSelectionService;
+  platformApi?: {
+    resetSession: (
+      userId: string,
+      sessionId: string,
+      options: { idempotencyKey: string; reason?: string }
+    ) => Promise<{
+      session?: unknown;
+      generation: { generation: number; resetReason?: string };
+      isIdempotentHit?: boolean;
+    }>;
+    compactSession?: (
+      userId: string,
+      sessionId: string
+    ) => Promise<{
+      beforeTokens?: number;
+      afterTokens?: number;
+      eventsBefore: number;
+      eventsAfter: number;
+      summaryChars: number;
+      status?: string;
+      error?: string;
+    }>;
+    createTask?: (
+      userId: string,
+      input: {
+        title: string;
+        payload: Record<string, unknown>;
+        scheduleType?: string;
+        priority?: string;
+      }
+    ) => Promise<{
+      task: { id: string; title?: string; status?: string; [key: string]: unknown };
+      isIdempotentHit?: boolean;
+    }>;
+  };
+  taskOperations?: (userId: string) => {
+    createTask: (input: {
+      title: string;
+      payload: Record<string, unknown>;
+      scheduleType?: string;
+      priority?: string;
+      [key: string]: unknown;
+    }) => Promise<{
+      task: { id: string; title?: string; status?: string; [key: string]: unknown };
+      isIdempotentHit?: boolean;
+    }>;
+  };
+  gateway?: {
+    cancelCurrentTurn: (userId: string, sessionId: string) => Promise<boolean>;
+    getCurrentTurnStatus: (
+      userId: string,
+      sessionId: string
+    ) => Promise<{ status: string; code?: string; queuePosition?: number } | null>;
+  };
+  db?: DatabaseSync;
+}
+
 export class ChatCommandService {
-  constructor(private readonly modelSelectionService: ModelSelectionService) {}
+  private readonly modelSelectionService: ModelSelectionService;
+  private platformApi?: ChatCommandServiceOptions['platformApi'];
+  private taskOperations?: ChatCommandServiceOptions['taskOperations'];
+  private gateway?: ChatCommandServiceOptions['gateway'];
+  private db?: DatabaseSync;
+
+  constructor(optionsOrModelSelection: ModelSelectionService | ChatCommandServiceOptions) {
+    if ('resolveEffectiveModel' in optionsOrModelSelection || 'getDshCatalog' in optionsOrModelSelection) {
+      this.modelSelectionService = optionsOrModelSelection as ModelSelectionService;
+    } else {
+      const opts = optionsOrModelSelection as ChatCommandServiceOptions;
+      this.modelSelectionService = opts.modelSelectionService;
+      this.platformApi = opts.platformApi;
+      this.taskOperations = opts.taskOperations;
+      this.gateway = opts.gateway;
+      this.db = opts.db;
+    }
+  }
+
+  setPlatformApi(platformApi: ChatCommandServiceOptions['platformApi']): void {
+    this.platformApi = platformApi;
+  }
+
+  setTaskOperations(taskOperations: ChatCommandServiceOptions['taskOperations']): void {
+    this.taskOperations = taskOperations;
+  }
+
+  setGateway(gateway: ChatCommandServiceOptions['gateway']): void {
+    this.gateway = gateway;
+  }
+
+  setDb(db: DatabaseSync): void {
+    this.db = db;
+  }
 
   async execute(params: {
     userId: string;
     sessionId: string;
     spaceId: string;
     content: string;
+    idempotencyKey?: string;
   }): Promise<{ replyText: string }> {
     try {
       const parsed = parseChatCommand(params.content);
@@ -154,11 +341,27 @@ export class ChatCommandService {
         return { replyText: 'Unrecognized command.' };
       }
 
-      if (parsed.command === 'model') {
-        return await this.executeModelCommand(params, parsed);
+      switch (parsed.command) {
+        case 'help':
+          return { replyText: HELP_USAGE };
+        case 'status':
+          return await this.executeStatusCommand(params, parsed);
+        case 'stop':
+          return await this.executeStopCommand(params, parsed);
+        case 'new':
+          return await this.executeNewCommand(params, parsed);
+        case 'compact':
+          return await this.executeCompactCommand(params, parsed);
+        case 'model':
+          return await this.executeModelCommand(params, parsed);
+        case 'effort':
+          return await this.executeEffortCommand(params, parsed);
+        case 'sw':
+        case 'spawn':
+          return await this.executeSpawnCommand(params, parsed);
+        default:
+          return { replyText: 'Unrecognized command.' };
       }
-
-      return await this.executeEffortCommand(params, parsed);
     } catch (err: unknown) {
       if (err instanceof ValidationError || err instanceof PlatformError) {
         return { replyText: err.message };
@@ -167,6 +370,204 @@ export class ChatCommandService {
         return { replyText: err.message };
       }
       return { replyText: String(err) };
+    }
+  }
+
+  private async executeStatusCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId, spaceId } = params;
+
+    let spaceName = spaceId;
+    let spaceMode = 'default';
+    let sessionTitle = '(untitled)';
+    let currentGen = 1;
+    let lastActivity = 'none';
+
+    if (this.db) {
+      try {
+        const spaceRow = this.db
+          .prepare('SELECT name, execution_mode FROM spaces WHERE id = ?')
+          .get(spaceId) as { name?: string | null; execution_mode?: string | null } | undefined;
+        if (spaceRow) {
+          if (spaceRow.name) spaceName = spaceRow.name;
+          if (spaceRow.execution_mode) spaceMode = spaceRow.execution_mode;
+        }
+      } catch {}
+
+      try {
+        const routeRow = this.db
+          .prepare('SELECT title, current_generation FROM session_routes WHERE id = ?')
+          .get(sessionId) as { title?: string | null; current_generation?: number } | undefined;
+        if (routeRow) {
+          if (routeRow.title) sessionTitle = routeRow.title;
+          if (typeof routeRow.current_generation === 'number') currentGen = routeRow.current_generation;
+        }
+      } catch {}
+
+      try {
+        const actRow = this.db
+          .prepare('SELECT MAX(created_at) as last_activity FROM web_messages WHERE session_id = ?')
+          .get(sessionId) as { last_activity?: string | null } | undefined;
+        if (actRow?.last_activity) {
+          lastActivity = actRow.last_activity;
+        }
+      } catch {}
+    }
+
+    const shortId = sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
+
+    const effective = await this.modelSelectionService.resolveEffectiveModel({
+      sessionId,
+      spaceId,
+      userId,
+    });
+    const effortStr = effective.reasoningEffort ?? 'default';
+    const modelStr = `${effective.provider}/${effective.model} · ${effortStr} · ${effective.source}`;
+
+    let turnStatus = 'idle';
+    if (this.gateway?.getCurrentTurnStatus) {
+      const turnRes = await this.gateway.getCurrentTurnStatus(userId, sessionId);
+      if (turnRes?.status) {
+        turnStatus = turnRes.status;
+      }
+    } else if (this.db) {
+      try {
+        const runRow = this.db
+          .prepare(`
+            SELECT status FROM turn_runs
+            WHERE user_id = ? AND route_id = ? AND status IN ('queued', 'running')
+            ORDER BY CASE status WHEN 'running' THEN 1 WHEN 'queued' THEN 2 ELSE 3 END, created_at ASC
+            LIMIT 1
+          `)
+          .get(userId, sessionId) as { status: string } | undefined;
+        if (runRow?.status) {
+          turnStatus = runRow.status;
+        }
+      } catch {}
+    }
+
+    const lines = [
+      `space: ${spaceName} (${spaceMode})`,
+      `session: ${shortId} (${sessionTitle})`,
+      `generation: ${currentGen}`,
+      `model: ${modelStr}`,
+      `turn: ${turnStatus}`,
+      `last activity: ${lastActivity}`,
+    ];
+    return { replyText: lines.join('\n') };
+  }
+
+  private async executeStopCommand(
+    params: { userId: string; sessionId: string },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId } = params;
+    if (!this.gateway?.cancelCurrentTurn) {
+      return { replyText: 'nothing running' };
+    }
+    const cancelled = await this.gateway.cancelCurrentTurn(userId, sessionId);
+    if (cancelled) {
+      return { replyText: 'cancelled' };
+    }
+    return { replyText: 'nothing running' };
+  }
+
+  private async executeNewCommand(
+    params: { userId: string; sessionId: string; idempotencyKey?: string },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId, idempotencyKey } = params;
+
+    let hasActiveTurn = false;
+    if (this.gateway?.getCurrentTurnStatus) {
+      const turnStatus = await this.gateway.getCurrentTurnStatus(userId, sessionId);
+      if (turnStatus && (turnStatus.status === 'running' || turnStatus.status === 'queued')) {
+        hasActiveTurn = true;
+      }
+    } else if (this.db) {
+      try {
+        const row = this.db
+          .prepare(`
+            SELECT status FROM turn_runs
+            WHERE user_id = ? AND route_id = ? AND status IN ('queued', 'running')
+            LIMIT 1
+          `)
+          .get(userId, sessionId) as { status: string } | undefined;
+        if (row) {
+          hasActiveTurn = true;
+        }
+      } catch {}
+    }
+
+    if (hasActiveTurn) {
+      return { replyText: 'a turn is active, use /stop first' };
+    }
+
+    if (!this.platformApi?.resetSession) {
+      return { replyText: 'Platform API resetSession unavailable.' };
+    }
+
+    const effectiveIdempotencyKey =
+      idempotencyKey && UUID_V4_REGEX.test(idempotencyKey)
+        ? idempotencyKey.toLowerCase()
+        : randomUUID();
+
+    const resetResult = await this.platformApi.resetSession(userId, sessionId, {
+      idempotencyKey: effectiveIdempotencyKey,
+      reason: 'chat_command',
+    });
+
+    const newGen = resetResult.generation.generation;
+    const oldGen = newGen - 1;
+    return { replyText: `Started generation ${newGen} (was ${oldGen})` };
+  }
+
+  private async executeCompactCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId } = params;
+
+    let hasActiveTurn = false;
+    if (this.gateway) {
+      const currentTurn = await this.gateway.getCurrentTurnStatus(userId, sessionId);
+      hasActiveTurn = Boolean(currentTurn && (currentTurn.status === 'running' || currentTurn.status === 'queued'));
+    }
+    if (!hasActiveTurn && this.db) {
+      try {
+        const row = this.db
+          .prepare(`
+            SELECT status FROM turn_runs
+            WHERE user_id = ? AND route_id = ? AND status IN ('queued', 'running')
+            LIMIT 1
+          `)
+          .get(userId, sessionId) as { status: string } | undefined;
+        if (row) {
+          hasActiveTurn = true;
+        }
+      } catch {}
+    }
+
+    if (hasActiveTurn) {
+      return { replyText: 'a turn is active, use /stop first' };
+    }
+
+    if (!this.platformApi?.compactSession) {
+      return { replyText: 'Platform API compactSession unavailable.' };
+    }
+
+    try {
+      const res = await this.platformApi.compactSession(userId, sessionId);
+      const beforeTok = res.beforeTokens !== undefined ? `${res.beforeTokens}` : 'unknown';
+      const afterTok = res.afterTokens !== undefined ? `${res.afterTokens}` : 'unknown';
+      return {
+        replyText: `Session compacted: ${beforeTok} -> ${afterTok} tokens, ${res.eventsBefore} -> ${res.eventsAfter} events, summary ${res.summaryChars} chars.`,
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { replyText: `Compaction failed: ${message}` };
     }
   }
 
@@ -381,5 +782,58 @@ export class ChatCommandService {
     return {
       replyText: `Reasoning effort set to "${effortName}" for session (${effective.provider}/${effective.model}).`,
     };
+  }
+
+  private async executeSpawnCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const message = parsed.arg?.trim();
+    if (!message) {
+      return { replyText: SPAWN_USAGE };
+    }
+
+    const truncatedName = message.length > 30 ? message.slice(0, 30) + '…' : message;
+    const title = `⚡ ${truncatedName}`;
+
+    let task: { id: string } | undefined;
+
+    if (this.taskOperations) {
+      const ops = this.taskOperations(params.userId);
+      const result = await ops.createTask({
+        title,
+        payload: {
+          type: 'agent_prompt',
+          prompt: message,
+          sessionId: params.sessionId,
+          spaceId: params.spaceId,
+          sessionPolicy: 'isolated',
+          contextMode: 'isolated',
+        },
+        scheduleType: 'once',
+        priority: 'normal',
+      });
+      task = result.task;
+    } else if (this.platformApi?.createTask) {
+      const result = await this.platformApi.createTask(params.userId, {
+        title,
+        payload: {
+          type: 'agent_prompt',
+          prompt: message,
+          sessionId: params.sessionId,
+          spaceId: params.spaceId,
+          sessionPolicy: 'isolated',
+          contextMode: 'isolated',
+        },
+        scheduleType: 'once',
+        priority: 'normal',
+      });
+      task = result.task;
+    } else {
+      return { replyText: 'Background task scheduling is not available in current configuration.' };
+    }
+
+    const shortId = task.id.startsWith('task_') ? task.id.slice(5, 9) : task.id.slice(0, 4);
+    return { replyText: `⚡ 并行任务已启动 [${shortId}]: ${truncatedName}` };
   }
 }
