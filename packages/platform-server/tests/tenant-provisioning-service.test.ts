@@ -22,7 +22,13 @@ import {
   TenantProvisioningService,
   validateTenantQuotaDefaults,
   type TenantQuotaDefaultsConfig,
+  generateCanonicalSpaceId,
+  isCanonicalSpaceId,
+  isLegacySpaceId,
+  isUsableSpaceId,
 } from '../src/management/tenant-provisioning-service.js';
+import { SPACE_ID_REGEX, validateSpaceId as validateFileSpaceId } from '../src/files/runtime-file-api.js';
+import { validateSpaceId as validateTaskSpaceId } from '@enkeep/platform-operations';
 import { PlatformError, ValidationError } from '@enkeep/platform-core';
 
 describe('TenantProvisioningService (Transactional Onboarding Saga)', () => {
@@ -157,6 +163,8 @@ describe('TenantProvisioningService (Transactional Onboarding Saga)', () => {
       // Verify default active Space in SQLite
       const spaceRows = db.prepare('SELECT * FROM spaces WHERE user_id = ?').all(res.user.id) as any[];
       expect(spaceRows.length).toBe(1);
+      expect(spaceRows[0].id).toMatch(/^spc_[0-9a-f]{32}$/);
+      expect(res.defaultSpace?.id).toBe(spaceRows[0].id);
       expect(spaceRows[0].status).toBe('active');
       expect(spaceRows[0].folder).toMatch(/^space-[0-9a-f]{32}$/);
       expect(spaceRows[0].name).toBe('Default Space');
@@ -209,6 +217,94 @@ describe('TenantProvisioningService (Transactional Onboarding Saga)', () => {
         tempPassword: customPwd,
       });
       expect(res.tempPassword).toBe(customPwd);
+    });
+  });
+
+  describe('3. Canonical Space ID Format & Legacy Space Compatibility Invariants', () => {
+    it('provisions new tenants with canonical space IDs satisfying ^spc_[0-9a-f]{32}$ and SPACE_ID_REGEX', async () => {
+      const res = await service.provisionTenant({
+        username: 'canonical_space_user',
+        displayName: 'Canonical User',
+      });
+
+      // 1. Verify returned defaultSpace ID
+      expect(res.defaultSpace).toBeDefined();
+      expect(res.defaultSpace?.id).toMatch(/^spc_[0-9a-f]{32}$/);
+      expect(isCanonicalSpaceId(res.defaultSpace?.id)).toBe(true);
+      expect(isLegacySpaceId(res.defaultSpace?.id)).toBe(false);
+      expect(isUsableSpaceId(res.defaultSpace?.id)).toBe(true);
+
+      // 2. Verify DB row
+      const spaceRow = db.prepare('SELECT id, folder, status FROM spaces WHERE user_id = ?').get(res.user.id) as any;
+      expect(spaceRow).toBeDefined();
+      expect(spaceRow.id).toBe(res.defaultSpace?.id);
+      expect(spaceRow.id).toMatch(/^spc_[0-9a-f]{32}$/);
+
+      // 3. Verify audit log entry
+      const auditRow = db.prepare("SELECT details FROM auth_audit_log WHERE user_id = ? AND action = 'user_created'").get(res.user.id) as any;
+      const details = JSON.parse(auditRow.details);
+      expect(details.defaultSpaceId).toBe(res.defaultSpace?.id);
+      expect(details.defaultSpaceId).toMatch(/^spc_[0-9a-f]{32}$/);
+
+      // 4. Verify compatibility with runtime-file-api SPACE_ID_REGEX and validators
+      expect(SPACE_ID_REGEX.test(res.defaultSpace!.id)).toBe(true);
+      expect(validateFileSpaceId(res.defaultSpace!.id)).toBe(res.defaultSpace!.id);
+      expect(validateTaskSpaceId(res.defaultSpace!.id)).toBe(res.defaultSpace!.id);
+    });
+
+    it('retains usability and readability for legacy bare-UUID default spaces without DB rewriting', async () => {
+      const legacyUserId = 'legacy_user_uuid_001';
+      const legacySpaceId = '123e4567-e89b-12d3-a456-426614174000';
+      const legacyFolder = 'space-123e4567e89b12d3a456426614174000';
+
+      // Seed pre-existing legacy tenant and space as created by earlier provisioning
+      db.prepare(`
+        INSERT INTO users (id, username, password_hash, role, status, locale, created_at, updated_at)
+        VALUES (?, 'legacy_user', 'hash123', 'user', 'active', 'en', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+      `).run(legacyUserId);
+
+      db.prepare(`
+        INSERT INTO spaces (id, user_id, name, folder, status, created_at, updated_at)
+        VALUES (?, ?, 'Legacy Default Space', ?, 'active', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+      `).run(legacySpaceId, legacyUserId, legacyFolder);
+
+      // Helper classification check
+      expect(isLegacySpaceId(legacySpaceId)).toBe(true);
+      expect(isCanonicalSpaceId(legacySpaceId)).toBe(false);
+      expect(isUsableSpaceId(legacySpaceId)).toBe(true);
+
+      // Verify DB primary key has NOT been mutated or rewritten
+      const dbRow = db.prepare('SELECT id, name, folder, status FROM spaces WHERE user_id = ?').get(legacyUserId) as any;
+      expect(dbRow.id).toBe(legacySpaceId);
+      expect(dbRow.name).toBe('Legacy Default Space');
+      expect(dbRow.folder).toBe(legacyFolder);
+      expect(dbRow.status).toBe('active');
+
+      // Full API boundary shape accepts unchanged legacy ID
+      expect(SPACE_ID_REGEX.test(legacySpaceId)).toBe(true);
+      expect(validateFileSpaceId(legacySpaceId)).toBe(legacySpaceId);
+      expect(validateTaskSpaceId(legacySpaceId)).toBe(legacySpaceId);
+    });
+
+    it('accepts both canonical IDs and legacy UUIDs while strictly rejecting invalid path-like IDs', () => {
+      const canonicalId = generateCanonicalSpaceId();
+      const legacyUuid = 'e88a0886-f6eb-4a11-8dfb-dfbd05566dd9';
+
+      // Both canonical and legacy UUID satisfy platform SPACE_ID_REGEX and validators
+      expect(SPACE_ID_REGEX.test(canonicalId)).toBe(true);
+      expect(SPACE_ID_REGEX.test(legacyUuid)).toBe(true);
+      expect(validateFileSpaceId(canonicalId)).toBe(canonicalId);
+      expect(validateFileSpaceId(legacyUuid)).toBe(legacyUuid);
+      expect(validateTaskSpaceId(canonicalId)).toBe(canonicalId);
+      expect(validateTaskSpaceId(legacyUuid)).toBe(legacyUuid);
+
+      // Invalid path-like and malformed space IDs are strictly rejected
+      const invalidIds = ['../escape', '/root', 'workspace-1', 'default', '', '   ', ` ${canonicalId} `, 'invalid id!'];
+      for (const invalid of invalidIds) {
+        expect(SPACE_ID_REGEX.test(invalid)).toBe(false);
+        expect(() => validateFileSpaceId(invalid)).toThrow(ValidationError);
+        expect(() => validateTaskSpaceId(invalid)).toThrow(ValidationError);
+      }
     });
   });
 });

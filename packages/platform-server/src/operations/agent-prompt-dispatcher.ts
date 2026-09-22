@@ -19,6 +19,7 @@ import {
 import {
   DeliveryRuntimeGateway,
 } from '../runtime/delivery-gateway.js';
+import { SPACE_ID_REGEX } from '../files/runtime-file-api.js';
 
 export interface AgentPromptCompletedResult {
   readonly status: 'completed';
@@ -59,7 +60,7 @@ interface AuthoritativeAssistantMessageRow {
 
 const CANONICAL_TASK_ID_PATTERN = /^(?:task_[0-9a-f]{32}|task_hpc_[0-9a-f]{24})$/;
 const VALID_SESSION_ID_PATTERN = /^(?:ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
-const VALID_SPACE_ID_PATTERN = /^(?:spc_[0-9a-f]{32}|impsp_[0-9a-f]{64})$/;
+const VALID_SPACE_ID_PATTERN = SPACE_ID_REGEX;
 
 /**
  * Exact parser for SQLite turn_runs row (no unsafe casts or fabricated defaults).

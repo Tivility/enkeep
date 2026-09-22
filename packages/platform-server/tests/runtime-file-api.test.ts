@@ -12,6 +12,7 @@ import {
   validateEtag,
   validateRelativeFilePath,
   validateSpaceId,
+  SPACE_ID_REGEX,
   validateUserId,
   validateUnknownKeys,
   mapFileOpError,
@@ -109,8 +110,18 @@ describe('Safe Container Files Workbench API & Security Invariants', () => {
     it('validates spaceId strictly (raw === trim/NFC/pattern)', () => {
       const validSpc = 'spc_' + 'a'.repeat(32);
       const validImpsp = 'impsp_' + '0'.repeat(64);
+      const validLegacyUuid = '123e4567-e89b-12d3-a456-426614174000';
+      const validRandomUuid = 'e88a0886-f6eb-4a11-8dfb-dfbd05566dd9';
       expect(validateSpaceId(validSpc)).toBe(validSpc);
       expect(validateSpaceId(validImpsp)).toBe(validImpsp);
+      expect(validateSpaceId(validLegacyUuid)).toBe(validLegacyUuid);
+      expect(validateSpaceId(validRandomUuid)).toBe(validRandomUuid);
+      expect(SPACE_ID_REGEX.test(validLegacyUuid)).toBe(true);
+      expect(SPACE_ID_REGEX.test(validRandomUuid)).toBe(true);
+
+      // Enforce lowercase case constraints on canonical IDs (no /i flag)
+      expect(() => validateSpaceId(validSpc.toUpperCase())).toThrow(ValidationError);
+      expect(() => validateSpaceId(validImpsp.toUpperCase())).toThrow(ValidationError);
 
       expect(() => validateSpaceId('default')).toThrow(ValidationError);
       expect(() => validateSpaceId('workspace-1')).toThrow(ValidationError);
@@ -364,6 +375,21 @@ describe('Safe Container Files Workbench API & Security Invariants', () => {
       expect((res as any).truncated).toBe(false);
 
       expect(provider.execute).toHaveBeenCalledWith(validUserId, validSpaceId, {
+        op: 'list',
+        path: '.',
+      });
+    });
+
+    it('executes file operation successfully with legacy bare-UUID spaceId', async () => {
+      const legacySpaceId = '123e4567-e89b-12d3-a456-426614174000';
+      const provider = createMockProvider();
+      const service = new RuntimeFileApiService({ fileProvider: provider });
+
+      const res = await service.execute(validUserId, legacySpaceId, { op: 'list', path: '.' });
+      expect(res.op).toBe('list');
+      expect(res.path).toBe('.');
+      expect((res as any).entries).toHaveLength(2);
+      expect(provider.execute).toHaveBeenCalledWith(validUserId, legacySpaceId, {
         op: 'list',
         path: '.',
       });

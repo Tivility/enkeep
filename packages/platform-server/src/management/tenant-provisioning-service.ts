@@ -9,7 +9,7 @@
  *    - Creates User record (including authoritative locale).
  *    - Provisions all 5 core quota_limits metrics (turns, messages, tokens, storage_bytes, api_calls)
  *      from validated deployment configuration (including authoritative reset_interval).
- *    - Provisions default active Space with canonical folder.
+ *    - Provisions default active Space with canonical ID (spc_[0-9a-f]{32}) and canonical folder.
  *    - Records audit log entry (user_created) with zero plaintext credential leakage.
  * 4. On any failure, rolls back the entire database transaction cleanly.
  * 5. Runtime and Docker volume provisioning are explicitly decoupled from the DB transaction.
@@ -62,6 +62,32 @@ export const CORE_QUOTA_METRICS = [
 ] as const;
 
 export type CoreQuotaMetric = (typeof CORE_QUOTA_METRICS)[number];
+
+export const CANONICAL_SPACE_ID_PREFIX = 'spc_';
+export const CANONICAL_SPACE_ID_REGEX = /^spc_[0-9a-f]{32}$/;
+export const LEGACY_SPACE_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Generates a canonical space ID matching ^spc_[0-9a-f]{32}$.
+ * Aligns with SPACE_ID_REGEX across platform APIs and storage.
+ */
+export function generateCanonicalSpaceId(): string {
+  return `${CANONICAL_SPACE_ID_PREFIX}${randomBytes(16).toString('hex')}`;
+}
+
+export const generateSpaceId = generateCanonicalSpaceId;
+
+export function isCanonicalSpaceId(id: unknown): id is string {
+  return typeof id === 'string' && CANONICAL_SPACE_ID_REGEX.test(id);
+}
+
+export function isLegacySpaceId(id: unknown): id is string {
+  return typeof id === 'string' && LEGACY_SPACE_ID_REGEX.test(id);
+}
+
+export function isUsableSpaceId(id: unknown): id is string {
+  return isCanonicalSpaceId(id) || isLegacySpaceId(id);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -301,7 +327,7 @@ export class TenantProvisioningService {
 
     const passwordHash = await hashPassword(tempPassword);
     const newUserId = randomUUID();
-    const defaultSpaceId = randomUUID();
+    const defaultSpaceId = generateCanonicalSpaceId();
     const defaultSpaceFolder = `space-${randomUUID().replace(/-/g, '')}`;
 
     this.db.exec('BEGIN IMMEDIATE');

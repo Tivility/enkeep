@@ -9,6 +9,8 @@ import {
   generateTaskId,
   validateTaskId,
   validateCanonicalDueDate,
+  validateSpaceId,
+  SPACE_ID_REGEX,
 } from '../src/types/task.js';
 import {
   validateMisfirePolicy,
@@ -240,6 +242,34 @@ describe('Task Payload Contract (agent_prompt) & Due Date Hardening', () => {
       expect(task.payload?.sessionId).toBe(validSessionId);
       expect(task.payload?.sessionPolicy).toBe('existing_session');
       expect(task.payload?.spaceId).toBe(validSpaceId);
+    });
+
+    it('accepts legacy bare-UUID spaceId in task payload and validateSpaceId while rejecting invalid path-like IDs', async () => {
+      const legacySpaceId = '123e4567-e89b-12d3-a456-426614174000';
+      const ops = service.forTenant('user_1');
+
+      const { task } = await ops.tasks.createTask({
+        title: 'Task with Legacy Space',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute with legacy spaceId',
+          sessionId: validSessionId,
+          sessionPolicy: 'existing_session',
+          spaceId: legacySpaceId,
+        },
+      });
+
+      expect(task.id).toBeDefined();
+      expect(task.payload?.spaceId).toBe(legacySpaceId);
+      expect(validateSpaceId(legacySpaceId)).toBe(legacySpaceId);
+      expect(SPACE_ID_REGEX.test(legacySpaceId)).toBe(true);
+
+      // Rejects invalid path-like IDs
+      const invalidPathIds = ['../escape', '/root', 'workspace-1', 'default', '', '   ', ` ${legacySpaceId} `, 'invalid!'];
+      for (const invalid of invalidPathIds) {
+        expect(SPACE_ID_REGEX.test(invalid)).toBe(false);
+        expect(() => validateSpaceId(invalid)).toThrow(ValidationError);
+      }
     });
 
     it('requires type to be strictly "agent_prompt", sessionPolicy to be "existing_session", and prompt to be non-empty', () => {

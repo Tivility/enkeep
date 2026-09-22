@@ -20,7 +20,7 @@ export const RUN_ID_REGEX = /^run_[0-9a-f]{32}$/;
 export const TURN_ID_REGEX = /^turn_[0-9a-f]{32}$/;
 export const MESSAGE_ID_REGEX = /^msg_[0-9a-f]{32}$/;
 export const SESSION_ID_REGEX = /^(?:ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
-export const SPACE_ID_REGEX = /^(?:spc_[0-9a-f]{32}|impsp_[0-9a-f]{64})$/;
+export const SPACE_ID_REGEX = /^(?:spc_[0-9a-f]{32}|impsp_[0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 export const IDEMPOTENCY_KEY_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
