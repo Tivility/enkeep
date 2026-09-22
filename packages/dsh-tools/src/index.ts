@@ -5,6 +5,7 @@ import type { PlatformClientService, ToolDefinition } from './types.js';
 import { createSendPlatformMessageTool } from './tools/send-platform-message.js';
 import { createSendFileTool } from './tools/send-file.js';
 import { createCreateTaskTool } from './tools/create-task.js';
+import { createUpdateTaskTool } from './tools/update-task.js';
 import { createCheckQuotaTool } from './tools/check-quota.js';
 
 export * from './types.js';
@@ -29,6 +30,7 @@ export * from './tools/send-platform-message.js';
 export * from './tools/send-message.js';
 export * from './tools/send-file.js';
 export * from './tools/create-task.js';
+export { createUpdateTaskTool, isUpdateTaskResult } from './tools/update-task.js';
 export * from './tools/check-quota.js';
 
 export const name = 'enkeep-dsh-tools';
@@ -80,12 +82,14 @@ export function apply(ctx: Context, config: Config): void {
     ctx
   );
   const createTaskTool = createCreateTaskTool(getClient);
+  const updateTaskTool = createUpdateTaskTool(getClient);
   const checkQuotaTool = createCheckQuotaTool(getClient);
 
   const tools: ToolDefinition[] = [
     sendPlatformMessageTool,
     sendFileTool,
     createTaskTool,
+    updateTaskTool,
     checkQuotaTool,
   ];
 

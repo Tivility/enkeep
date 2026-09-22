@@ -69,6 +69,12 @@ export type TaskStatus =
   | 'failed'
   | 'cancelled';
 
+export type TaskScheduleType = 'once' | 'cron' | 'interval';
+
+export type TaskScheduleMisfirePolicy = 'coalesce' | 'skip';
+
+export type TaskScheduleOverlapPolicy = 'skip';
+
 /**
  * Strict TaskPayload matching canonical PlatformServer POST /api/manage/tasks body.
  * Only title, prompt, sessionId, priority, and dueDate are permitted.
@@ -87,6 +93,51 @@ export interface CreateTaskResult {
   readonly title: string;
   readonly status: TaskStatus;
   readonly isIdempotentHit: boolean;
+}
+
+/**
+ * Strict UpdateTaskPayload matching canonical PlatformServer PUT /api/manage/tasks/:id body.
+ * Task ownership (userId) and space/session bindings are strictly excluded.
+ */
+export interface UpdateTaskPayload {
+  readonly title?: string;
+  readonly prompt?: string;
+  readonly priority?: TaskPriority;
+  readonly description?: string | null;
+  readonly assignee?: string | null;
+  readonly scheduleType?: TaskScheduleType;
+  readonly cronExpression?: string | null;
+  readonly intervalSeconds?: number | null;
+  readonly dueDate?: string | null;
+  readonly timezone?: string;
+  readonly misfirePolicy?: TaskScheduleMisfirePolicy;
+  readonly overlapPolicy?: TaskScheduleOverlapPolicy;
+}
+
+export interface UpdateTaskArgs {
+  readonly taskId: string;
+  readonly title?: string;
+  readonly prompt?: string;
+  readonly priority?: TaskPriority;
+  readonly description?: string | null;
+  readonly assignee?: string | null;
+  readonly scheduleType?: TaskScheduleType;
+  readonly cronExpression?: string | null;
+  readonly intervalSeconds?: number | null;
+  readonly dueDate?: string | null;
+  readonly timezone?: string;
+  readonly misfirePolicy?: TaskScheduleMisfirePolicy;
+  readonly overlapPolicy?: TaskScheduleOverlapPolicy;
+}
+
+export interface UpdateTaskResult {
+  readonly success: true;
+  readonly taskId: string;
+  readonly status: TaskStatus;
+  readonly updated: true;
+  readonly title?: string;
+  readonly scheduleType?: TaskScheduleType;
+  readonly nextRunAt?: string | null;
 }
 
 export interface QuotaQueryPayload {
@@ -112,6 +163,7 @@ export interface PlatformClientService {
   sendMessage?(payload: MessagePayload): Promise<SendMessageResult>;
   sendFile?(payload: FilePayload): Promise<SendFileResult>;
   checkQuota?(payload: QuotaQueryPayload): Promise<CheckQuotaResult>;
+  updateTask?(taskId: string, payload: UpdateTaskPayload): Promise<UpdateTaskResult>;
   request?<T = unknown>(path: string, options?: {
     method?: string;
     body?: unknown;

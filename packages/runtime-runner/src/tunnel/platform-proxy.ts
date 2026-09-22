@@ -30,7 +30,16 @@ import { Duplex, PassThrough } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
 import type { StreamHandler, StreamMetadata } from './contract.js';
-import type { PlatformOperationsService } from '@enkeep/platform-operations';
+import type { PlatformOperationsService, UpdateTaskInput, Task } from '@enkeep/platform-operations';
+import {
+  validateUpdateTaskInput,
+  TASK_ID_REGEX,
+  ValidationError,
+  TaskNotFoundError,
+  TaskAlreadyClaimedError,
+  TaskAlreadyCompletedError,
+  TaskConflictError,
+} from '@enkeep/platform-operations';
 import type {
   PlatformStorage,
   BrowserService,
@@ -536,7 +545,7 @@ export class PlatformProxyHandler implements StreamHandler {
       return;
     }
 
-    // 5. Tasks: POST /api/manage/tasks
+    // 5. Tasks: POST /api/manage/tasks and PUT /api/manage/tasks/:id
     if (pathname === '/api/manage/tasks') {
       if (method === 'POST') {
         await this.handleCreateTask(req, stream);
@@ -544,6 +553,18 @@ export class PlatformProxyHandler implements StreamHandler {
       }
       this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
       return;
+    }
+
+    if (pathname.startsWith('/api/manage/tasks/')) {
+      const taskMatch = pathname.match(/^\/api\/manage\/tasks\/([^/]+)\/?$/);
+      if (taskMatch) {
+        if (method !== 'PUT') {
+          this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
+          return;
+        }
+        await this.handleUpdateTask(taskMatch[1], req, stream);
+        return;
+      }
     }
 
     // 6. Events / Streaming: POST /api/events, POST /events, POST /api/events/batch
@@ -1271,6 +1292,234 @@ export class PlatformProxyHandler implements StreamHandler {
         return;
       } catch (_err: unknown) {
         this.writeJsonResponse(stream, 500, { error: { code: 'TASK_ERROR', message: 'Task creation failed' } });
+        return;
+      }
+    }
+
+    this.writeJsonResponse(stream, 503, {
+      error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform Operations service is unavailable' },
+    });
+  }
+
+  /**
+   * Handles PUT /api/manage/tasks/:id
+   */
+  private async handleUpdateTask(rawTaskId: string, req: ParsedHttpRequest, stream: Duplex): Promise<void> {
+    if (!this.platformUserId) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding' },
+      });
+      return;
+    }
+
+    if (req.body.length > this.maxBodyBytes) {
+      this.writeJsonResponse(stream, 413, {
+        error: { code: 'PAYLOAD_TOO_LARGE', message: `Task payload exceeds maximum limit of ${this.maxBodyBytes} bytes` },
+      });
+      return;
+    }
+
+    let taskId: string;
+    try {
+      taskId = decodeURIComponent(rawTaskId);
+    } catch {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID encoding' },
+      });
+      return;
+    }
+
+    if (!TASK_ID_REGEX.test(taskId)) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID format' },
+      });
+      return;
+    }
+
+    let parsedBody: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(req.body.toString('utf8'));
+      if (!isRecord(parsed)) {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Request body must be an object' },
+        });
+        return;
+      }
+      parsedBody = parsed;
+    } catch {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'INVALID_JSON', message: 'Request body must be valid JSON' },
+      });
+      return;
+    }
+
+    // Intercept ownership and session/space binding spoofing
+    for (const key of Object.keys(parsedBody)) {
+      if (key === 'userId' || key === 'user_id' || key === 'owner') {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Task ownership is immutable' },
+        });
+        return;
+      }
+      if (key === 'spaceId' || key === 'sessionId') {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Task session and space bindings are immutable' },
+        });
+        return;
+      }
+    }
+
+    let validatedInput: UpdateTaskInput;
+    try {
+      validatedInput = validateUpdateTaskInput(parsedBody);
+    } catch (valErr: any) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: valErr?.message || 'Invalid task update input' },
+      });
+      return;
+    }
+
+    if (this.operations) {
+      try {
+        const updated = await this.operations.forTenant(this.platformUserId).tasks.updateTask(taskId, validatedInput);
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: {
+            id: updated.id,
+            status: updated.status,
+            updated: true,
+            task: updated,
+          },
+        });
+        return;
+      } catch (err: any) {
+        if (err instanceof TaskNotFoundError || err?.name === 'TaskNotFoundError' || err?.code === 'TASK_NOT_FOUND') {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: err.message || `Task "${taskId}" not found` },
+          });
+          return;
+        }
+        if (err instanceof TaskAlreadyClaimedError || err?.name === 'TaskAlreadyClaimedError') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_ALREADY_CLAIMED', message: err.message || `Task "${taskId}" is already claimed` },
+          });
+          return;
+        }
+        if (err instanceof TaskAlreadyCompletedError || err?.name === 'TaskAlreadyCompletedError') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_ALREADY_COMPLETED', message: err.message || `Task "${taskId}" is already completed and cannot be modified` },
+          });
+          return;
+        }
+        if (err instanceof TaskConflictError || err?.name === 'TaskConflictError' || err?.code === 'TASK_CONFLICT') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_CONFLICT', message: err.message || 'Task update conflict' },
+          });
+          return;
+        }
+        if (err instanceof ValidationError || err?.name === 'ValidationError' || err?.code === 'VALIDATION_ERROR') {
+          this.writeJsonResponse(stream, 400, {
+            error: { code: 'VALIDATION_ERROR', message: err.message || 'Validation error' },
+          });
+          return;
+        }
+        const status = typeof err?.status === 'number' && err.status >= 400 && err.status <= 599 ? err.status : 500;
+        const code = err?.code || (status === 404 ? 'NOT_FOUND' : status === 409 ? 'TASK_CONFLICT' : status === 400 ? 'VALIDATION_ERROR' : 'TASK_ERROR');
+        this.writeJsonResponse(stream, status, {
+          error: { code, message: err?.message || 'Task update failed' },
+        });
+        return;
+      }
+    }
+
+    if (this.db) {
+      try {
+        const existing = this.db.prepare(
+          'SELECT id, user_id, title, description, status, priority, due_date, payload, created_at, updated_at FROM platform_tasks WHERE id = ? LIMIT 1'
+        ).get(taskId) as any;
+
+        if (!existing || existing.user_id !== this.platformUserId) {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'NOT_FOUND', message: `Task "${taskId}" not found` },
+          });
+          return;
+        }
+
+        if (existing.status === 'claimed' || existing.status === 'running') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_ALREADY_CLAIMED', message: `Task "${taskId}" is already claimed` },
+          });
+          return;
+        }
+
+        if (existing.status === 'completed' || existing.status === 'cancelled' || existing.status === 'failed') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_ALREADY_COMPLETED', message: `Task "${taskId}" is already completed and cannot be modified` },
+          });
+          return;
+        }
+
+        const newTitle = validatedInput.title !== undefined ? validatedInput.title : existing.title;
+        const newPriority = validatedInput.priority !== undefined ? validatedInput.priority : existing.priority;
+        const newDescription = validatedInput.description !== undefined ? validatedInput.description : existing.description;
+        const newDueDate = validatedInput.dueDate !== undefined ? validatedInput.dueDate : existing.due_date;
+
+        let newPayload = existing.payload;
+        if (validatedInput.prompt !== undefined || validatedInput.payload !== undefined) {
+          let payloadObj: any = {};
+          try {
+            payloadObj = existing.payload ? JSON.parse(existing.payload) : {};
+          } catch {
+            payloadObj = {};
+          }
+          if (validatedInput.prompt !== undefined) {
+            payloadObj.prompt = validatedInput.prompt;
+          }
+          if (validatedInput.payload) {
+            payloadObj = { ...payloadObj, ...validatedInput.payload };
+          }
+          newPayload = JSON.stringify(payloadObj);
+        }
+
+        const updatedAt = new Date().toISOString();
+
+        this.db.prepare(`
+          UPDATE platform_tasks
+          SET title = ?, priority = ?, description = ?, due_date = ?, payload = ?, updated_at = ?
+          WHERE id = ? AND user_id = ?
+        `).run(
+          newTitle,
+          newPriority,
+          newDescription,
+          newDueDate ?? null,
+          newPayload,
+          updatedAt,
+          taskId,
+          this.platformUserId
+        );
+
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: {
+            id: taskId,
+            status: existing.status,
+            updated: true,
+            task: {
+              id: taskId,
+              title: newTitle,
+              status: existing.status,
+              priority: newPriority,
+              dueDate: newDueDate ?? null,
+              createdAt: existing.created_at,
+              updatedAt,
+            },
+          },
+        });
+        return;
+      } catch (err: any) {
+        this.writeJsonResponse(stream, 500, {
+          error: { code: 'TASK_ERROR', message: err?.message || 'Task update failed' },
+        });
         return;
       }
     }
@@ -2659,7 +2908,9 @@ export class PlatformProxyHandler implements StreamHandler {
         statusCode === 403 ? 'Forbidden' :
         statusCode === 404 ? 'Not Found' :
         statusCode === 405 ? 'Method Not Allowed' :
+        statusCode === 409 ? 'Conflict' :
         statusCode === 413 ? 'Payload Too Large' :
+        statusCode === 429 ? 'Too Many Requests' :
         statusCode === 500 ? 'Internal Server Error' :
         statusCode === 503 ? 'Service Unavailable' : 'Status';
 
