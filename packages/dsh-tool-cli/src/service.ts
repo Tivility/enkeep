@@ -5,7 +5,8 @@
  * 1. CliToolService on Cordis context (`ctx.cliTools`).
  * 2. `mountActivationPlan(agentCtx, plan, options)` method.
  * 3. Registers canonical `cli__<key>__run` into `agentCtx.tools`.
- * 4. Returns clean disposers for turn-by-turn lifecycle / disposal.
+ * 4. Integrates tenant-scoped Feishu CLI provider and bounds execution.
+ * 5. Returns clean disposers for turn-by-turn lifecycle / disposal.
  *
  * @module @enkeep/dsh-tool-cli/service
  */
@@ -20,6 +21,7 @@ import type {
   CliMountHandle,
 } from './types.js';
 import { createCliToolExecutor } from './executor.js';
+import { isFeishuCliTool } from './feishu-bridge.js';
 
 export class CliToolService extends Service {
   static inject = [];
@@ -62,15 +64,23 @@ export class CliToolService extends Service {
       };
     }
 
-    const toolsService = agentCtx.get('tools') ?? (agentCtx as unknown as { tools?: { register: (def: ToolDefinition) => (() => void) } }).tools;
+    const boundFeishuCli = options.boundFeishuCli ?? this.config.boundFeishuCli ?? true;
+    const larkScopedConfigProvider = options.larkScopedConfigProvider ?? this.config.larkScopedConfigProvider;
+    const toolsService =
+      (agentCtx.get ? agentCtx.get('tools') : undefined) ??
+      (agentCtx as unknown as { tools?: { register: (def: ToolDefinition) => (() => void) } }).tools;
 
     for (const contrib of cliContributions) {
       const sanitizedKey = contrib.contributionKey.replace(/[^a-zA-Z0-9_]/g, '_');
       const toolName = `cli__${sanitizedKey}__run`;
+      const isFeishu = isFeishuCliTool(contrib, toolName) && boundFeishuCli !== false;
+      const defaultDesc = isFeishu
+        ? `Run Feishu CLI tool ${contrib.name} with scoped bound Bot identity`
+        : `Run deterministic CLI tool ${contrib.name}`;
 
       const toolDef: ToolDefinition = {
         name: toolName,
-        description: contrib.description ?? `Run deterministic CLI tool ${contrib.name}`,
+        description: contrib.description ?? defaultDesc,
         parameters: {
           type: 'object',
           properties: {
@@ -107,7 +117,13 @@ export class CliToolService extends Service {
           contrib,
           toolName,
           spacePath: options.spacePath,
-          timeoutMs: options.defaultTimeoutMs ?? this.config.defaultTimeoutMs,
+          userId: options.userId,
+          spaceId: options.spaceId,
+          channelAccountId: options.channelAccountId,
+          executionMode: options.executionMode ?? contrib.executionMode,
+          larkScopedConfigProvider,
+          boundFeishuCli,
+          timeoutMs: contrib.timeoutMs ?? options.defaultTimeoutMs ?? this.config.defaultTimeoutMs,
           maxOutputBytes: options.maxOutputBytes ?? this.config.maxOutputBytes,
         }),
       };
