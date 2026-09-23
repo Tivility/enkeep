@@ -717,6 +717,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       maxExecutionBudgetMs: request.maxExecutionBudgetMs,
       mounts: request.mounts,
       extensionPlan: request.extensionPlan ?? null,
+      extraReadableRoots: request.extraReadableRoots,
     };
     return this.submitTurnAndWait(submitReq, request.timeoutMs);
   }

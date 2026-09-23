@@ -543,6 +543,7 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
             timeoutMs,
             mounts: request.mounts,
             extensionPlan: request.extensionPlan ?? null,
+            extraReadableRoots: request.extraReadableRoots,
           });
 
           if (followupRes.status === 'completed') {

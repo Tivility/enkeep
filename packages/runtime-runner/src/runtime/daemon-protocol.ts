@@ -30,6 +30,7 @@ import type {
   RuntimeMountSpec,
   ExtensionActivationPlan,
 } from '@enkeep/protocol';
+import { validateExtraReadableRoots } from '../spec/mount-security.js';
 
 export const MAX_DAEMON_FRAME_SIZE = 10 * 1024 * 1024; // 10 MiB frame limit
 export const MAX_JSON_DEPTH = 64; // Safe nested levels for deep tool schemas, session events and profile snapshots
@@ -176,6 +177,7 @@ export interface SubmitTurnRequest extends DaemonRequestBase {
   readonly maxExecutionBudgetMs?: number;
   readonly mounts?: readonly RuntimeMountSpec[] | null;
   readonly extensionPlan?: ExtensionActivationPlan | null;
+  readonly extraReadableRoots?: readonly string[];
 }
 
 export interface CancelRequest extends DaemonRequestBase {
@@ -600,7 +602,8 @@ export type DaemonEvictionReason =
   | 'lru_capacity'
   | 'profile_mismatch'
   | 'space_mismatch'
-  | 'mount_mismatch';
+  | 'mount_mismatch'
+  | 'roots_mismatch';
 
 export interface DaemonStreamAgentEvictedEvent {
   readonly type: 'event';
@@ -687,6 +690,20 @@ export function decodeDaemonRequest(raw: string | Buffer): DaemonRequest {
     );
   }
 
+  if (op === DAEMON_OPS.SUBMIT_TURN || op === 'submitTurn') {
+    if ((parsed as any).extraReadableRoots !== undefined && (parsed as any).extraReadableRoots !== null) {
+      try {
+        validateExtraReadableRoots((parsed as any).extraReadableRoots);
+      } catch (err: unknown) {
+        throw new DaemonProtocolError(
+          DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          err instanceof Error ? err.message : String(err),
+          err
+        );
+      }
+    }
+  }
+
   return parsed as unknown as DaemonRequest;
 }
 
@@ -721,6 +738,20 @@ export function decodeDaemonMessage(raw: string | Buffer): DaemonMessage {
       DAEMON_ERROR_CODES.INVALID_FRAME_STRUCTURE,
       'Message envelope must be a JSON object'
     );
+  }
+
+  if (parsed.op === DAEMON_OPS.SUBMIT_TURN || parsed.op === 'submitTurn') {
+    if ((parsed as any).extraReadableRoots !== undefined && (parsed as any).extraReadableRoots !== null) {
+      try {
+        validateExtraReadableRoots((parsed as any).extraReadableRoots);
+      } catch (err: unknown) {
+        throw new DaemonProtocolError(
+          DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          err instanceof Error ? err.message : String(err),
+          err
+        );
+      }
+    }
   }
 
   return parsed as unknown as DaemonMessage;

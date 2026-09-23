@@ -944,6 +944,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
             timeoutMs: effTimeout,
             mounts: inContainerMounts,
             extensionPlan: request.extensionPlan ?? null,
+            extraReadableRoots: request.extraReadableRoots,
           });
 
           if (followupRes.status === 'completed') {

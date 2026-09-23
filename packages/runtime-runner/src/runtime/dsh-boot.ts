@@ -112,7 +112,7 @@ import {
   TOOLS_UNAVAILABLE_DESCRIPTIONS,
 } from '../transport/types.js';
 import type { RuntimeMountSpec, ResolvedRuntimeMount } from '../spec/types.js';
-import { computeMountHash } from '../spec/mount-security.js';
+import { computeMountHash, computeExtraRootsHash, validateExtraReadableRoots } from '../spec/mount-security.js';
 import { computeExtensionPlanHash } from '../spec/extension-plan-security.js';
 import {
   type ExtensionActivationPlan,
@@ -302,7 +302,8 @@ export interface DshBootedRuntime {
     profileSnapshot?: AgentProfileSnapshot | null | unknown,
     workspaceFolder?: string,
     mounts?: readonly RuntimeMountSpec[],
-    extensionPlan?: ExtensionActivationPlan | null
+    extensionPlan?: ExtensionActivationPlan | null,
+    extraReadableRoots?: readonly string[]
   ): Promise<Agent>;
   removeAgent?(sessionIdStr: string): void;
   checkSessionArtifact(sessionIdStr: string, workspaceFolder?: string): Promise<{ exists: boolean; valid: boolean; checksum?: string; eventCount?: number }>;
@@ -1322,6 +1323,8 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   // Map to track active mounts and mount hashes by session id
   const sessionMounts = new Map<string, readonly RuntimeMountSpec[]>();
   const sessionMountHashes = new Map<string, string>();
+  // Map to track active extra readable roots hashes by session id
+  const sessionExtraRootsHashes = new Map<string, string>();
 
   // Map to track active extension plans and plan hashes by session id
   const sessionExtensionPlans = new Map<string, ExtensionActivationPlan | null>();
@@ -1453,6 +1456,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       sessionProfileHashes.delete(sessionIdStr);
       sessionExtensionPlanHashes.delete(sessionIdStr);
       sessionExtensionPlans.delete(sessionIdStr);
+      sessionExtraRootsHashes.delete(sessionIdStr);
     }
   }
 
@@ -1495,7 +1499,8 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     profileSnapshot: AgentProfileSnapshot | null | unknown = null,
     workspaceFolder?: string,
     mounts?: readonly RuntimeMountSpec[],
-    extensionPlan?: ExtensionActivationPlan | null
+    extensionPlan?: ExtensionActivationPlan | null,
+    extraReadableRoots?: readonly string[]
   ): Promise<Agent> {
     if (!isValidSessionId(sessionIdStr)) {
       throw new TypeError('Invalid session ID format: must match canonical session ID pattern');
@@ -1517,6 +1522,16 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       validatedPlan = validateExtensionActivationPlan(effectivePlanInput);
     }
     const currentPlanHash = computeExtensionPlanHash(validatedPlan);
+
+    let validatedTurnRoots: readonly string[] | undefined;
+    if (extraReadableRoots !== undefined && extraReadableRoots !== null) {
+      validatedTurnRoots = validateExtraReadableRoots(extraReadableRoots);
+    }
+    const baselineRoots = validConfig.extraReadableRoots ?? [];
+    const perTurnRoots = validatedTurnRoots ?? [];
+    const mergedRoots = Array.from(new Set([...baselineRoots, ...perTurnRoots]));
+    const effectiveExtraRoots = mergedRoots.length > 0 ? mergedRoots : undefined;
+    const currentExtraRootsHash = computeExtraRootsHash(effectiveExtraRoots);
 
     let spacePath: string;
     if (workspaceFolder) {
@@ -1548,6 +1563,12 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       if (mounts !== undefined) {
         const recordedMountHash = sessionMountHashes.get(sessionIdStr);
         if (recordedMountHash !== currentMountHash) {
+          shouldEvict = true;
+        }
+      }
+      if (extraReadableRoots !== undefined) {
+        const recordedRootsHash = sessionExtraRootsHashes.get(sessionIdStr) ?? computeExtraRootsHash(validConfig.extraReadableRoots);
+        if (recordedRootsHash !== currentExtraRootsHash) {
           shouldEvict = true;
         }
       }
@@ -1598,6 +1619,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         sessionProfileHashes.delete(sessionIdStr);
         sessionExtensionPlanHashes.delete(sessionIdStr);
         sessionExtensionPlans.delete(sessionIdStr);
+        sessionExtraRootsHashes.delete(sessionIdStr);
       } else {
         return existingHandle.agent;
       }
@@ -1615,6 +1637,12 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       if (mounts !== undefined) {
         const recordedMountHash = sessionMountHashes.get(sessionIdStr);
         if (recordedMountHash !== currentMountHash) {
+          matches = false;
+        }
+      }
+      if (extraReadableRoots !== undefined) {
+        const recordedRootsHash = sessionExtraRootsHashes.get(sessionIdStr);
+        if (recordedRootsHash !== currentExtraRootsHash) {
           matches = false;
         }
       }
@@ -1677,7 +1705,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           subagents: validConfig.subagents,
           extensionPlan: validatedPlan,
           web: validConfig.web,
-          extraReadableRoots: validConfig.extraReadableRoots,
+          extraReadableRoots: effectiveExtraRoots,
           extraWritableRoots: validConfig.extraWritableRoots,
           onExtensionPlanUpdated: async (newPlan) => {
             const oldPlan = sessionExtensionPlans.get(sessionIdStr);
@@ -1807,6 +1835,8 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     if (validatedProfile) {
       sessionProfileHashes.set(sessionIdStr, validatedProfile.promptHash);
     }
+
+    sessionExtraRootsHashes.set(sessionIdStr, currentExtraRootsHash);
 
     agentHandles.set(sessionIdStr, handle);
     // Clear dirty marker ONLY once rebuild success
@@ -2882,6 +2912,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
     let effMounts: readonly RuntimeMountSpec[] | undefined;
     let effExtensionPlan: ExtensionActivationPlan | null | undefined;
+    let effExtraReadableRoots: readonly string[] | undefined;
 
     if (typeof requestOrPrompt === 'object' && requestOrPrompt !== null) {
       const req = requestOrPrompt as any;
@@ -2895,6 +2926,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       effReplyReference = req.replyReference;
       effMounts = req.mounts ?? undefined;
       effExtensionPlan = req.extensionPlan !== undefined ? req.extensionPlan : undefined;
+      effExtraReadableRoots = req.extraReadableRoots !== undefined ? req.extraReadableRoots : undefined;
     } else {
       effPrompt = requestOrPrompt;
       effSessionId = sessionId!;
@@ -2906,6 +2938,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       effReplyReference = undefined;
       effMounts = undefined;
       effExtensionPlan = undefined;
+      effExtraReadableRoots = undefined;
     }
 
     if (typeof effPrompt !== 'string') {
@@ -2936,7 +2969,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
     let currentAgent: any;
     try {
-      currentAgent = await getOrCreateAgent(effSessionId, effProfile, effWorkspaceFolder, effMounts, effExtensionPlan);
+      currentAgent = await getOrCreateAgent(
+        effSessionId,
+        effProfile,
+        effWorkspaceFolder,
+        effMounts,
+        effExtensionPlan,
+        effExtraReadableRoots
+      );
       turnInfo.agent = currentAgent;
     } catch (err: unknown) {
       activeTurns.delete(assignedTurnId);
@@ -3218,6 +3258,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           sessionProfileHashes.delete(effSessionId);
           sessionExtensionPlanHashes.delete(effSessionId);
           sessionExtensionPlans.delete(effSessionId);
+          sessionExtraRootsHashes.delete(effSessionId);
         }
       }
     }
@@ -3481,6 +3522,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     sessionMounts.delete(sessionIdStr);
     sessionExtensionPlanHashes.delete(sessionIdStr);
     sessionExtensionPlans.delete(sessionIdStr);
+    sessionExtraRootsHashes.delete(sessionIdStr);
     dirtySessions.delete(sessionIdStr);
     pendingSessionPlans.delete(sessionIdStr);
   }

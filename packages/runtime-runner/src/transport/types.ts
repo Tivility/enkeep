@@ -219,6 +219,8 @@ export interface AgentFollowupRequest {
   mounts?: readonly RuntimeMountSpec[] | null;
   /** Optional generic extension activation plan */
   extensionPlan?: ExtensionActivationPlan | null;
+  /** Optional extra readable roots for sandbox boundary allowlist */
+  extraReadableRoots?: readonly string[];
 }
 
 export interface AgentFollowupCompletedResponse {

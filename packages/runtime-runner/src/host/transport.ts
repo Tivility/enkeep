@@ -523,6 +523,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       maxExecutionBudgetMs: rawBudgetMs,
       mounts: request.mounts,
       extensionPlan: request.extensionPlan ?? null,
+      extraReadableRoots: request.extraReadableRoots,
     };
 
     try {
