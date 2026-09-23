@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
+import {
+  SqlitePlatformStorage,
+  SqlitePlatformOperationsStorage,
+} from '@enkeep/platform-storage-sqlite';
+import {
+  PlatformOperationsService,
+  validateTaskPriority,
+} from '@enkeep/platform-operations';
 import {
   PlatformServerMigrationRunner,
   ALL_PLATFORM_MIGRATIONS,
@@ -696,8 +703,9 @@ describe('Chat Slash Commands (/model and /effort)', () => {
           contextMode: 'isolated',
         },
         scheduleType: 'once',
-        priority: 'normal',
       });
+      // Verify validator accepts default medium priority when priority is omitted
+      expect(validateTaskPriority(capturedInput.priority ?? 'medium')).toBe('medium');
 
       // 3. Truncation of task description > 30 chars
       const longPrompt = 'this is a very long prompt description exceeding thirty characters threshold';
@@ -711,6 +719,69 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       const expectedTruncated = longPrompt.slice(0, 30) + '…';
       expect(longSpawnRes.replyText).toBe(`⚡ 并行任务已启动 [abcd]: ${expectedTruncated}`);
       expect(capturedInput.title).toBe(`⚡ ${expectedTruncated}`);
+    });
+
+    it('proves /sw creates and persists task through real TaskOperationService with valid default priority', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_test_real_ops';
+      const spaceId = 'spc_11112222333344445555666677778888';
+      const sessionId = 'ses_aaaabbbbccccddddeeeeffff00001111';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1)").run(sessionId, userId, spaceId);
+
+      const opsStorage = new SqlitePlatformOperationsStorage(db);
+      const opsService = new PlatformOperationsService({ storage: opsStorage });
+
+      const modelSelectionService = new ModelSelectionService({ db });
+      const chatCommandService = new ChatCommandService({
+        modelSelectionService,
+        taskOperations: (uId: string) => opsService.forTenant(uId).tasks,
+      });
+
+      const cmdRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/sw benchmark task',
+      });
+
+      expect(cmdRes.replyText).toMatch(/^⚡ 并行任务已启动 \[([0-9a-f]{4})\]: benchmark task$/);
+      const match = cmdRes.replyText.match(/^⚡ 并行任务已启动 \[([0-9a-f]{4})\]/);
+      expect(match).not.toBeNull();
+      const shortId = match![1];
+
+      // Verify task actually persisted in SQLite platform_tasks table with valid default medium priority
+      const rows = db.prepare('SELECT * FROM platform_tasks WHERE user_id = ?').all(userId) as any[];
+      expect(rows).toHaveLength(1);
+      const row = rows[0];
+      expect(row.id).toBeDefined();
+      expect(row.id.startsWith('task_')).toBe(true);
+      expect(row.id.slice(5, 9)).toBe(shortId);
+      expect(row.title).toBe('⚡ benchmark task');
+      expect(row.priority).toBe('medium');
+      expect(row.status).toBe('pending');
+      expect(row.schedule_type).toBe('once');
+
+      // Verify task retrieval via real TaskOperationService
+      const fetchedTask = await opsService.forTenant(userId).tasks.getTask(row.id);
+      expect(fetchedTask).toBeDefined();
+      expect(fetchedTask?.priority).toBe('medium');
+      expect(fetchedTask?.payload.prompt).toBe('benchmark task');
+      expect(fetchedTask?.payload.sessionPolicy).toBe('isolated');
+      expect(fetchedTask?.payload.contextMode).toBe('isolated');
+    });
+
+    it('rejects invalid priority "normal" in validator and ensures omission defaults to medium', () => {
+      expect(() => validateTaskPriority('normal')).toThrow('Invalid task priority');
+      expect(validateTaskPriority('medium')).toBe('medium');
+      expect(validateTaskPriority('low')).toBe('low');
+      expect(validateTaskPriority('high')).toBe('high');
+      expect(validateTaskPriority('urgent')).toBe('urgent');
     });
   });
 
@@ -1055,6 +1126,73 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       expect(turnRun).toBeDefined();
       expect(turnRun.execution_mode).toBe('command');
       expect(turnRun.status).toBe('completed');
+    });
+
+    it('handles gateway-level /sw with real TaskOperationService: creates and persists task in database', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_test_gw_real';
+      const spaceId = 'spc_22223333444455556666777788889999';
+      const sessionId = 'ses_bbbbccccddddeeeeffff000011112222';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1)").run(sessionId, userId, spaceId);
+
+      const storage = new SqlitePlatformStorage(db);
+      const messageStore = new SqliteWebMessageStore(db);
+      const profileResolver = { resolve: async () => null };
+      const modelSelectionService = new ModelSelectionService({ db });
+      const opsStorage = new SqlitePlatformOperationsStorage(db);
+      const opsService = new PlatformOperationsService({ storage: opsStorage });
+
+      const executor = {
+        execute: vi.fn(async () => ({ replyText: 'runtime reply', usage: { totalTokens: 50 } })),
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        database: db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+        modelSelectionService,
+        chatCommandDeps: {
+          taskOperations: (uId: string) => opsService.forTenant(uId).tasks,
+        },
+      });
+
+      const dispatchResult = await gateway.dispatchInbound({
+        id: 'deliv_sw_real_001',
+        channel: 'web',
+        userId,
+        sessionId,
+        content: '/sw gateway task',
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(dispatchResult.accepted).toBe(true);
+      expect(dispatchResult.executionMode).toBe('command');
+      expect(executor.execute).not.toHaveBeenCalled();
+
+      // Verify task row persisted in platform_tasks via real TaskOperationService
+      const tasks = await opsService.forTenant(userId).tasks.listTasks();
+      expect(tasks).toHaveLength(1);
+      const persistedTask = tasks[0];
+      expect(persistedTask.title).toBe('⚡ gateway task');
+      expect(persistedTask.priority).toBe('medium');
+      expect(persistedTask.status).toBe('pending');
+
+      // Verify receipt message persisted in messageStore
+      const history = await messageStore.listMessages(userId, sessionId);
+      const assistantMsg = history.messages.find((m) => m.role === 'assistant');
+      expect(assistantMsg).toBeDefined();
+      const shortId = persistedTask.id.slice(5, 9);
+      expect(assistantMsg?.content).toBe(`⚡ 并行任务已启动 [${shortId}]: gateway task`);
     });
   });
 });

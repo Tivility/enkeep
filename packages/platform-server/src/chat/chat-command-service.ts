@@ -811,7 +811,6 @@ export class ChatCommandService {
           contextMode: 'isolated',
         },
         scheduleType: 'once',
-        priority: 'normal',
       });
       task = result.task;
     } else if (this.platformApi?.createTask) {
@@ -826,7 +825,6 @@ export class ChatCommandService {
           contextMode: 'isolated',
         },
         scheduleType: 'once',
-        priority: 'normal',
       });
       task = result.task;
     } else {
