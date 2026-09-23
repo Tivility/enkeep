@@ -103,6 +103,7 @@ import {
   type SubagentsMountConfig,
   type WebMountConfig,
 } from './official-plugins.js';
+import type { LarkScopedConfigProvider } from '@enkeep/dsh-tool-cli';
 import {
   type RuntimeHealthStatus,
   type PluginReadinessStatus,
@@ -272,6 +273,8 @@ export interface DshRuntimeBootConfig {
   readonly extraWritableRoots?: string[];
   /** Optional web seam configuration */
   readonly web?: WebMountConfig;
+  /** Optional host platform service provider for Lark/Feishu scoped CLI configurations */
+  readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
 }
 
 export interface ActiveTurnInfo {
@@ -1148,6 +1151,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     extraReadableRoots: validConfig.extraReadableRoots,
     extraWritableRoots: validConfig.extraWritableRoots,
     contextWindow: resolvedContextWindow,
+    larkScopedConfigProvider: validConfig.larkScopedConfigProvider,
   });
 
   function isFiberActive(fiber: Fiber | undefined): boolean {
@@ -1707,6 +1711,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           web: validConfig.web,
           extraReadableRoots: effectiveExtraRoots,
           extraWritableRoots: validConfig.extraWritableRoots,
+          larkScopedConfigProvider: validConfig.larkScopedConfigProvider,
           onExtensionPlanUpdated: async (newPlan) => {
             const oldPlan = sessionExtensionPlans.get(sessionIdStr);
             if (haveSkillsChanged(oldPlan, newPlan)) {
@@ -2792,6 +2797,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
             web: validConfig.web,
             extraReadableRoots: validConfig.extraReadableRoots,
             extraWritableRoots: validConfig.extraWritableRoots,
+            larkScopedConfigProvider: validConfig.larkScopedConfigProvider,
           });
           await disposeSessionWorkspace(sessionIdStr);
           sessionWorkspaceHandles.set(sessionIdStr, wsHandle);

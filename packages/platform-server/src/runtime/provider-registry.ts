@@ -15,13 +15,25 @@
  */
 
 import type { DatabaseSync } from 'node:sqlite';
+import type { Context } from '@deepseek-ai/cordis';
 import {
   PlatformError,
   NotFoundError,
   ValidationError,
   type ExecutionMode,
   type RuntimeMountResolver,
+  type PlatformStorage,
 } from '@enkeep/platform-core';
+import {
+  resolveLarkCliScopedConfig,
+  type LarkCredentialResolver,
+  type LarkChannelBindingSource,
+} from '@enkeep/channel-lark';
+import type {
+  LarkScopedConfigOptions,
+  LarkScopedConfigProvider,
+  LarkScopedConfigHandle,
+} from '@enkeep/dsh-tool-cli';
 import type {
   DeliveryTurnExecutor,
   DeliveryExecutionRequest,
@@ -721,3 +733,91 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
     return null;
   }
 }
+
+/**
+ * Options for constructing a platform-level Lark/Feishu scoped CLI config provider.
+ */
+export interface LarkScopedConfigProviderFactoryOptions {
+  readonly credentialResolver: LarkCredentialResolver;
+  readonly channelRepo?: LarkChannelBindingSource | ((userId: string) => LarkChannelBindingSource | Promise<LarkChannelBindingSource>);
+  readonly storage?: PlatformStorage;
+  readonly db?: DatabaseSync | any;
+  readonly scratchRoot?: string;
+}
+
+/**
+ * Creates a standard LarkScopedConfigProvider backed by platform encrypted credential resolver
+ * and tenant-scoped channel binding repository.
+ */
+export function createPlatformLarkScopedConfigProvider(
+  options: LarkScopedConfigProviderFactoryOptions
+): LarkScopedConfigProvider {
+  return async (scopedOpts: LarkScopedConfigOptions): Promise<LarkScopedConfigHandle | null> => {
+    let channelRepo = scopedOpts.channelRepo ?? scopedOpts.channelBindingSource;
+    if (!channelRepo) {
+      if (typeof options.channelRepo === 'function') {
+        channelRepo = await options.channelRepo(scopedOpts.userId);
+      } else if (options.channelRepo) {
+        channelRepo = options.channelRepo;
+      } else if (options.storage) {
+        channelRepo = options.storage.forTenant(scopedOpts.userId).channels as any;
+      }
+    }
+
+    return resolveLarkCliScopedConfig({
+      userId: scopedOpts.userId,
+      spaceId: scopedOpts.spaceId,
+      channelAccountId: scopedOpts.channelAccountId,
+      trustedContext: scopedOpts.trustedContext as any,
+      channelBindingSource: (scopedOpts.channelBindingSource as any) ?? (channelRepo as any),
+      channelRepo: channelRepo as any,
+      resolver: (scopedOpts.resolver as LarkCredentialResolver) ?? options.credentialResolver,
+      db: scopedOpts.db ?? options.db,
+      scratchRoot: scopedOpts.scratchRoot ?? options.scratchRoot,
+      baseDir: scopedOpts.baseDir,
+      strict: scopedOpts.strict,
+    });
+  };
+}
+
+/**
+ * Registration options for host platform Cordis context providers.
+ */
+export interface PlatformProviderRegistrationOptions {
+  readonly credentialResolver?: LarkCredentialResolver;
+  readonly channelRepo?: LarkChannelBindingSource | ((userId: string) => LarkChannelBindingSource | Promise<LarkChannelBindingSource>);
+  readonly storage?: PlatformStorage;
+  readonly db?: DatabaseSync | any;
+  readonly scratchRoot?: string;
+  readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
+}
+
+/**
+ * Registers platform-level capability providers (e.g. larkScopedConfigProvider)
+ * onto a Cordis context.
+ */
+export function registerPlatformProviders(
+  ctx: Context,
+  options: PlatformProviderRegistrationOptions
+): void {
+  const provider =
+    options.larkScopedConfigProvider ??
+    (options.credentialResolver
+      ? createPlatformLarkScopedConfigProvider({
+          credentialResolver: options.credentialResolver,
+          channelRepo: options.channelRepo,
+          storage: options.storage,
+          db: options.db,
+          scratchRoot: options.scratchRoot,
+        })
+      : undefined);
+
+  if (provider) {
+    if (typeof (ctx as any).provide === 'function') {
+      (ctx as any).provide('larkScopedConfigProvider', provider);
+    } else {
+      (ctx as any).larkScopedConfigProvider = provider;
+    }
+  }
+}
+

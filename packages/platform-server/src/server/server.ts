@@ -125,6 +125,11 @@ import { SqliteStreamEventSource } from '../channels/sqlite-stream-event-source.
 import { LarkEncryptedCredentialStore } from '../channels/lark-encrypted-credentials.js';
 import { LarkOnboardingService } from '../channels/lark-onboarding-service.js';
 import type { LarkCredentialResolver, StreamEventSource } from '@enkeep/channel-lark';
+import {
+  createPlatformLarkScopedConfigProvider,
+  type LarkScopedConfigProviderFactoryOptions,
+} from '../runtime/provider-registry.js';
+import type { LarkScopedConfigProvider } from '@enkeep/dsh-tool-cli';
 import type { ChannelAccount } from '@enkeep/platform-core';
 import {
   cleanupStaleGitTempDirs,
@@ -242,6 +247,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'larkOnboardingService',
   'larkEncryptedCredentialStore',
   'larkCredentialKeyFilePath',
+  'larkScopedConfigProvider',
   'streamEventSource',
   'dataRoot',
   'pipelineManifestPath',
@@ -408,6 +414,8 @@ export interface PlatformServerOptions {
   larkEncryptedCredentialStore?: LarkEncryptedCredentialStore;
   /** Optional explicit 0600 key file path outside workspace for Lark encrypted credentials */
   larkCredentialKeyFilePath?: string;
+  /** Optional platform-level Lark scoped configuration provider for Feishu CLI tool execution */
+  larkScopedConfigProvider?: LarkScopedConfigProvider;
   /** Optional stream event source for Lark interactive reply cards */
   streamEventSource?: StreamEventSource;
 }
@@ -466,6 +474,7 @@ export class PlatformServer {
   public readonly channelRuntimeManager?: ChannelRuntimeManager;
   public readonly larkEncryptedCredentialStore?: LarkEncryptedCredentialStore;
   public readonly larkOnboardingService?: LarkOnboardingService;
+  public readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
   public readonly externalInteractionService?: IExternalInteractionService;
   public readonly mountReconciler?: RuntimeMountReconciler;
   public readonly spaceMountService?: SpaceMountService;
@@ -804,6 +813,14 @@ export class PlatformServer {
         return this.larkEncryptedCredentialStore ? this.larkEncryptedCredentialStore.resolve(userId, credentialRef) : null;
       },
     };
+
+    this.larkScopedConfigProvider =
+      options.larkScopedConfigProvider ??
+      createPlatformLarkScopedConfigProvider({
+        credentialResolver: effectiveLarkCredentialResolver,
+        storage: this.storage,
+        db,
+      });
 
     this.channelService =
       options.channelService ??

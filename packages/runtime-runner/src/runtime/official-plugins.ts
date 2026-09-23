@@ -89,6 +89,7 @@ import * as HttpFetchProviderPlugin from '@deepseek-ai/dsh-web-fetch-http';
 import * as ToolWebPlugin from '@deepseek-ai/dsh-tool-web';
 import * as McpGovernancePlugin from '@enkeep/dsh-mcp-governance';
 import * as CliToolsPlugin from '@enkeep/dsh-tool-cli';
+import type { LarkScopedConfigProvider } from '@enkeep/dsh-tool-cli';
 import { validateTrustedPluginDescriptor, type TrustedPluginDefinition } from '@enkeep/dsh-enkeep-bundle';
 import type { ResolvedRuntimeMount } from '../spec/types.js';
 import { verifyMountTOCTOU, sanitizePathInError } from '../spec/mount-security.js';
@@ -173,6 +174,7 @@ export interface OfficialPluginsConfig {
   readonly fs?: FsMountConfig;
   readonly approval?: ApprovalMountConfig;
   readonly web?: WebMountConfig;
+  readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
 }
 
 export interface WorkspaceToolsMountOptions {
@@ -191,6 +193,7 @@ export interface WorkspaceToolsMountOptions {
   readonly defaultPreset?: string;
   readonly extensionPlan?: ExtensionActivationPlan | null;
   readonly onExtensionPlanUpdated?: (newPlan: ExtensionActivationPlan | null) => Promise<void> | void;
+  readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
 }
 
 export interface WorkspaceToolsHandle {
@@ -1135,6 +1138,7 @@ export async function mountWorkspaceTools(
           sessionId: options.sessionId,
           userId: options.userId,
           spaceId: options.spaceId,
+          larkScopedConfigProvider: options.larkScopedConfigProvider,
         });
       }
     }
@@ -1268,6 +1272,7 @@ export async function mountWorkspaceTools(
             sessionId: options.sessionId,
             userId: options.userId,
             spaceId: options.spaceId,
+            larkScopedConfigProvider: options.larkScopedConfigProvider,
           });
         }
 
@@ -1454,6 +1459,15 @@ export async function mountOfficialPlugins(
     const mcpGovFiber = await ctx.plugin(McpGovernancePlugin);
     fibers.push(mcpGovFiber);
     mountedPlugins.set('mcp-governance', mcpGovFiber);
+
+    // 7.1 Host-level Lark Scoped Configuration Provider (if provided)
+    if (config.larkScopedConfigProvider) {
+      if (typeof (ctx as any).provide === 'function') {
+        (ctx as any).provide('larkScopedConfigProvider', config.larkScopedConfigProvider);
+      } else {
+        (ctx as any).larkScopedConfigProvider = config.larkScopedConfigProvider;
+      }
+    }
 
     // 7.5 Process-global Web Access Seam (WebRuntime + HttpFetchProvider + optional WebSearchProvider)
     let webService: any = ctx.get ? ctx.get('web') : undefined;

@@ -28,6 +28,7 @@
     "@enkeep/channel-lark": "workspace:*",
     "@enkeep/dsh-enkeep-bundle": "workspace:*",
     "@enkeep/dsh-external-interaction": "workspace:*",
+    "@enkeep/dsh-tool-cli": "workspace:*",
     "@enkeep/import-happyclaw": "workspace:*",
     "@enkeep/platform-auth": "workspace:*",
     "@enkeep/platform-core": "workspace:*",

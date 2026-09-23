@@ -136,6 +136,7 @@ export {
   estimateInboundTokens,
   computeTurnReservationTokens,
   extractActualUsage,
+  DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
 } from './runtime/delivery-gateway.js';
 
 // Handler and HTTP Server
@@ -556,7 +557,11 @@ export {
   CompositeTenantRuntimeFileProvider,
   CompositeRuntimeArtifactPort,
   CompositeManagementRuntimeProvider,
+  createPlatformLarkScopedConfigProvider,
+  registerPlatformProviders,
   type RuntimeProvider,
+  type LarkScopedConfigProviderFactoryOptions,
+  type PlatformProviderRegistrationOptions,
 } from './runtime/provider-registry.js';
 
 // Space Mounts and Reconciler
