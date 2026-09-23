@@ -119,6 +119,8 @@ import {
   type ListApprovalsResponse,
   type ShutdownRequest,
   type ShutdownResponse,
+  type CompactSessionRequest,
+  type CompactSessionResponse,
   type DaemonErrorResponse,
   type DaemonEvictionReason,
 } from './daemon-protocol.js';
@@ -503,6 +505,9 @@ export class RuntimeDaemon extends EventEmitter {
 
         case DAEMON_OPS.SHUTDOWN:
           return await this.handleShutdown(request as ShutdownRequest);
+
+        case DAEMON_OPS.COMPACT_SESSION:
+          return await this.handleCompactSession(request as CompactSessionRequest);
 
         default: {
           const raw = request as any;
@@ -1308,6 +1313,126 @@ export class RuntimeDaemon extends EventEmitter {
       ok: true,
       status: 'shutting_down',
     };
+  }
+
+  public async handleCompactSession(
+    request: CompactSessionRequest
+  ): Promise<CompactSessionResponse | DaemonErrorResponse> {
+    const { sessionId } = request;
+
+    if (!sessionId || typeof sessionId !== 'string') {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          message: 'Invalid or missing sessionId',
+        },
+      };
+    }
+
+    if (this.currentTurns.has(sessionId)) {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: 'TURN_ACTIVE',
+          message: `Cannot compact session "${sessionId}" while a turn is active`,
+        },
+      };
+    }
+
+    let entry = this.agents.get(sessionId);
+    if (entry && (entry.currentTurn || entry.status === 'running')) {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: 'TURN_ACTIVE',
+          message: `Cannot compact session "${sessionId}" while a turn is active`,
+        },
+      };
+    }
+
+    if (!entry) {
+      const artifactCheck = await this.bootedRuntime.checkSessionArtifact(sessionId);
+      if (!artifactCheck.exists) {
+        return {
+          id: request.id,
+          op: 'compactSession',
+          ok: false,
+          error: {
+            code: DAEMON_ERROR_CODES.SESSION_NOT_FOUND,
+            message: `Session "${sessionId}" not found`,
+          },
+        };
+      }
+      entry = await this.getOrCreateManagedAgent(sessionId);
+    }
+
+    const compaction = this.bootedRuntime.context.get('compaction');
+    if (!compaction || typeof compaction.compactNow !== 'function') {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: 'COMPACTION_UNSUPPORTED',
+          message: 'Explicit compaction is unsupported: ctx.compaction service unavailable in current runtime',
+        },
+      };
+    }
+
+    const tokenMeter = this.bootedRuntime.context.get('tokenMeter');
+    const beforeMeasurement = tokenMeter ? tokenMeter.measure(entry.agent.session) : undefined;
+    const beforeTokens = beforeMeasurement?.totalTokens;
+    const eventsBefore = entry.agent.session.snapshotEvents().length;
+
+    try {
+      const abortController = new AbortController();
+      const result = await compaction.compactNow(entry.agent, abortController.signal);
+
+      const afterMeasurement = tokenMeter ? tokenMeter.measure(entry.agent.session) : undefined;
+      const afterTokens = afterMeasurement?.totalTokens;
+      const eventsAfter = entry.agent.session.snapshotEvents().length;
+
+      let summaryChars = 0;
+      if (result && Array.isArray(result.summary)) {
+        for (const block of result.summary) {
+          if (typeof (block as any).text === 'string') {
+            summaryChars += (block as any).text.length;
+          }
+        }
+      }
+
+      entry.lastUsed = Date.now();
+
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: true,
+        beforeTokens,
+        afterTokens,
+        eventsBefore,
+        eventsAfter,
+        summaryChars,
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isBusy = (err as any)?.code === 'busy' || message.includes('idle');
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: isBusy ? 'TURN_ACTIVE' : DAEMON_ERROR_CODES.INTERNAL_ERROR,
+          message: `Compaction failed: ${message}`,
+        },
+      };
+    }
   }
 
   // ---------------------------------------------------------------------------
