@@ -121,6 +121,10 @@ import {
   ensureLarkTestResources,
   getLarkTestCredentialRef,
 } from '../utils/lark-credentials.js';
+import {
+  resolveSiblingExtraReadableRoots,
+  type ResolveSiblingRootsOptions,
+} from './sibling-roots.js';
 import type {
   DemoUpOptions,
   DemoUpResult,
@@ -148,6 +152,11 @@ export interface RunningDemoSystem {
   createHostSession(userId: string, input: { spaceId: string; title?: string }): Promise<import('@enkeep/platform-core').SessionRoute>;
   close(options?: { removeVolumes?: boolean; crash?: boolean }): Promise<void>;
 }
+
+export {
+  resolveSiblingExtraReadableRoots,
+  type ResolveSiblingRootsOptions,
+};
 
 export async function upDemo(options: DemoUpOptions = {}): Promise<RunningDemoSystem> {
   return launchDemoSystem(options);
@@ -994,6 +1003,15 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         }
       }
 
+      const extraReadableRoots = resolveSiblingExtraReadableRoots({
+        db: db!,
+        userId,
+        currentSpaceId: platformSpaceId,
+        currentSpaceFolder: spaceFolder,
+        isHost,
+        dataRoot: paths.dataRoot,
+      });
+
       const res = await userHandle.sendTurn({
         prompt,
         sessionId: dshSessionId,
@@ -1005,6 +1023,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         mounts: spaceMountSpecs,
         extensionPlan: request.extensionPlan ?? null,
         timeoutMs,
+        extraReadableRoots,
       });
       if (typeof res.replyText !== 'string' || res.replyText.trim().length === 0) {
         throw new Error('FAIL-CLOSED: DSH runtime returned empty or invalid replyText');

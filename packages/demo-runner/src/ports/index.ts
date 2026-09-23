@@ -430,7 +430,7 @@ function createUserRuntimeHandle(
       if (!request || typeof request !== 'object' || Array.isArray(request)) {
         throw new Error('FAIL-CLOSED: sendTurn requires a RuntimeTurnRequest object');
       }
-      const { prompt, sessionId, turnId, profileSnapshot, workspaceFolder, timeoutMs, attachments, modelSelection, mounts, extensionPlan } = request;
+      const { prompt, sessionId, turnId, profileSnapshot, workspaceFolder, timeoutMs, attachments, modelSelection, mounts, extensionPlan, extraReadableRoots } = request;
       validateTurnPrompt(prompt);
       if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
         throw new Error('FAIL-CLOSED: sendTurn requires a non-empty sessionId');
@@ -463,6 +463,7 @@ function createUserRuntimeHandle(
           timeoutMs,
           mounts,
           extensionPlan,
+          extraReadableRoots: extraReadableRoots ?? undefined,
         });
         if (followupRes.status === 'completed') {
           res = {
@@ -495,6 +496,7 @@ function createUserRuntimeHandle(
           modelSelection,
           mounts,
           extensionPlan,
+          extraReadableRoots: extraReadableRoots ?? undefined,
         });
       }
       if (res.status !== 'completed') {
