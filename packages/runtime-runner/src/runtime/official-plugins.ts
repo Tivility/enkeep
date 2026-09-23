@@ -35,6 +35,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { Context, type Fiber } from '@deepseek-ai/cordis';
 import {
@@ -97,7 +98,14 @@ import { VirtualMountResolver, VirtualMountPathResolver, type ResolvedVirtualTar
 import type { ExtensionActivationPlan, ExtensionDshPluginContributionActivation } from '@enkeep/protocol';
 export { VirtualMountResolver, VirtualMountPathResolver };
 
+export function deriveCompactionThresholdRatio(thresholdTokens: number, contextWindow: number): number {
+  if (contextWindow <= 0) return 0.2;
+  const ratio = thresholdTokens / contextWindow;
+  return Math.min(0.8, Math.max(0.2, ratio));
+}
+
 export interface CompactionMountConfig {
+  readonly thresholdTokens?: number;
   readonly thresholdRatio?: number;
   readonly retainRatio?: number;
   readonly retainTokens?: number;
@@ -137,10 +145,8 @@ export interface FsMountConfig {
   readonly readLimit?: number;
   readonly readMaxLineLength?: number;
   readonly readMaxBytes?: number;
-}
-
-export interface ApprovalMountConfig {
-  readonly policy?: ApprovalPolicy;
+  readonly extraReadableRoots?: string[];
+  readonly extraWritableRoots?: string[];
 }
 
 export interface WebMountConfig {
@@ -160,6 +166,10 @@ export interface WebMountConfig {
   };
 }
 
+export interface ApprovalMountConfig {
+  readonly policy?: ApprovalPolicy;
+}
+
 export interface OfficialPluginsConfig {
   readonly dshHome: string;
   readonly spacesDir: string;
@@ -174,6 +184,9 @@ export interface OfficialPluginsConfig {
   readonly fs?: FsMountConfig;
   readonly approval?: ApprovalMountConfig;
   readonly web?: WebMountConfig;
+  readonly extraReadableRoots?: string[];
+  readonly extraWritableRoots?: string[];
+  readonly contextWindow?: number;
   readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
 }
 
@@ -190,6 +203,8 @@ export interface WorkspaceToolsMountOptions {
   readonly shell?: ShellMountConfig;
   readonly fs?: FsMountConfig;
   readonly web?: WebMountConfig;
+  readonly extraReadableRoots?: string[];
+  readonly extraWritableRoots?: string[];
   readonly defaultPreset?: string;
   readonly extensionPlan?: ExtensionActivationPlan | null;
   readonly onExtensionPlanUpdated?: (newPlan: ExtensionActivationPlan | null) => Promise<void> | void;
@@ -341,6 +356,8 @@ export interface SpaceIsolatedFsConfig {
   cwd: string;
   dshHome?: string;
   mounts?: readonly ResolvedRuntimeMount[];
+  extraReadableRoots?: string[];
+  extraWritableRoots?: string[];
   diffBasisMaxBytes?: number;
 }
 
@@ -355,13 +372,17 @@ export class SpaceIsolatedFileSystem extends LocalFileSystem {
   private readonly mountResolver: VirtualMountResolver;
 
   constructor(ctx: Context, config: SpaceIsolatedFsConfig) {
-    const { mounts, dshHome, ...baseConfig } = config || {};
+    const { mounts, dshHome, extraReadableRoots, extraWritableRoots, ...baseConfig } = config || {};
     super(ctx, {
       cwd: baseConfig.cwd,
       diffBasisMaxBytes: baseConfig.diffBasisMaxBytes ?? 1024 * 1024,
     } as any);
     this.spaceFsConfig = config || { cwd: process.cwd() };
-    this.mountResolver = new VirtualMountResolver(this.spaceFsConfig.cwd, this.spaceFsConfig.mounts);
+    this.mountResolver = new VirtualMountResolver(this.spaceFsConfig.cwd, this.spaceFsConfig.mounts, {
+      extraReadableRoots: this.spaceFsConfig.extraReadableRoots,
+      extraWritableRoots: this.spaceFsConfig.extraWritableRoots,
+      deniedRoots: dshHome ? [dshHome] : [],
+    });
   }
 
   override get sandboxMode(): SandboxMode | undefined {
@@ -385,7 +406,7 @@ export class SpaceIsolatedFileSystem extends LocalFileSystem {
       };
     }
 
-    if (resolved.isMount) {
+    if (resolved.isMount || resolved.isExtraRoot) {
       return {
         displayPath: resolved.displayPath,
         targetKey: FsTargetKey(resolved.physicalPath!),
@@ -415,7 +436,7 @@ export class SpaceIsolatedFileSystem extends LocalFileSystem {
       };
     }
 
-    if (resolved.isMount) {
+    if (resolved.isMount || resolved.isExtraRoot) {
       try {
         const stat = await fs.promises.lstat(resolved.physicalPath!);
         return {
@@ -522,6 +543,26 @@ export class InstructionsFileSystem extends LocalFileSystem {
       } catch {}
     }
 
+    if (!isAllowed && path.isAbsolute(filePath)) {
+      const extraRoots = [
+        ...(this.config.extraWritableRoots ?? [os.tmpdir(), '/tmp', '/private/tmp']),
+        ...(this.config.extraReadableRoots ?? [os.homedir()]),
+      ];
+      for (const root of extraRoots) {
+        if (!root) continue;
+        let realRoot: string;
+        try {
+          realRoot = await fs.promises.realpath(root);
+        } catch {
+          realRoot = path.resolve(root);
+        }
+        if (isPathInside(targetRealPath, realRoot)) {
+          isAllowed = true;
+          break;
+        }
+      }
+    }
+
     if (!isAllowed) {
       throw new FsError(
         `Access denied: path "${filePath}" resolves outside instructions boundary`,
@@ -581,10 +622,32 @@ export class InstructionsFileSystem extends LocalFileSystem {
           return super.lstat(filePath, opts, signal);
         }
         if (!isPathInside(candidatePath, realCwd)) {
-          throw new FsError(
-            `Access denied: lstat path "${filePath}" is outside space boundary "${cwd}"`,
-            'FS_SANDBOX_DENIED'
-          );
+          let allowedMissing = false;
+          if (path.isAbsolute(filePath)) {
+            const extraRoots = [
+              ...(this.config.extraWritableRoots ?? [os.tmpdir(), '/tmp', '/private/tmp']),
+              ...(this.config.extraReadableRoots ?? [os.homedir()]),
+            ];
+            for (const root of extraRoots) {
+              if (!root) continue;
+              let realRoot: string;
+              try {
+                realRoot = await fs.promises.realpath(root);
+              } catch {
+                realRoot = path.resolve(root);
+              }
+              if (isPathInside(candidatePath, realRoot)) {
+                allowedMissing = true;
+                break;
+              }
+            }
+          }
+          if (!allowedMissing) {
+            throw new FsError(
+              `Access denied: lstat path "${filePath}" is outside space boundary "${cwd}"`,
+              'FS_SANDBOX_DENIED'
+            );
+          }
         }
         return super.lstat(filePath, opts, signal);
       }
@@ -595,7 +658,28 @@ export class InstructionsFileSystem extends LocalFileSystem {
       return super.lstat(filePath, opts, signal);
     }
 
-    if (!isPathInside(realCandidate, realCwd)) {
+    let isCandidateAllowed = isPathInside(realCandidate, realCwd);
+    if (!isCandidateAllowed && path.isAbsolute(filePath)) {
+      const extraRoots = [
+        ...(this.config.extraWritableRoots ?? [os.tmpdir(), '/tmp', '/private/tmp']),
+        ...(this.config.extraReadableRoots ?? [os.homedir()]),
+      ];
+      for (const root of extraRoots) {
+        if (!root) continue;
+        let realRoot: string;
+        try {
+          realRoot = await fs.promises.realpath(root);
+        } catch {
+          realRoot = path.resolve(root);
+        }
+        if (isPathInside(realCandidate, realRoot)) {
+          isCandidateAllowed = true;
+          break;
+        }
+      }
+    }
+
+    if (!isCandidateAllowed) {
       throw new FsError(
         `Access denied: lstat path "${filePath}" resolves outside space boundary "${cwd}"`,
         'FS_SANDBOX_DENIED'
@@ -609,6 +693,8 @@ export class InstructionsFileSystem extends LocalFileSystem {
 export interface SpaceIsolatedBashConfig {
   cwd?: string;
   mounts?: readonly ResolvedRuntimeMount[];
+  /** DSH home; always denied for shell workdir resolution. */
+  dshHome?: string;
   timeoutMs?: number;
   maxTimeoutMs?: number;
   maxOutputBytes?: number;
@@ -626,7 +712,7 @@ export class SpaceIsolatedBashExecutor extends LocalBashExecutor {
   private readonly mountResolver: VirtualMountResolver;
 
   constructor(ctx: Context, config: SpaceIsolatedBashConfig) {
-    const { mounts, ...baseConfig } = config || {};
+    const { mounts, dshHome: bashDshHome, ...baseConfig } = config || {};
     super(ctx, {
       cwd: baseConfig.cwd ?? process.cwd(),
       timeoutMs: baseConfig.timeoutMs ?? 60000,
@@ -638,7 +724,8 @@ export class SpaceIsolatedBashExecutor extends LocalBashExecutor {
     this.spaceBashConfig = config || {};
     this.mountResolver = new VirtualMountResolver(
       this.spaceBashConfig.cwd ?? this.config.cwd ?? process.cwd(),
-      this.spaceBashConfig.mounts
+      this.spaceBashConfig.mounts,
+      { deniedRoots: bashDshHome ? [bashDshHome] : [] }
     );
   }
 
@@ -816,10 +903,14 @@ export async function mountWorkspaceTools(
 
   try {
     // 1. Filesystem capability scoped to spacePath and controlled mounts
+    const extraReadableRoots = options.extraReadableRoots ?? options.fs?.extraReadableRoots;
+    const extraWritableRoots = options.extraWritableRoots ?? options.fs?.extraWritableRoots;
     const fsFiber = await agentCtx.plugin(SpaceIsolatedFileSystem, {
       cwd: spacePath,
       dshHome,
       mounts: options.mounts,
+      extraReadableRoots,
+      extraWritableRoots,
     } as any);
     fibers.push(fsFiber);
 
@@ -853,7 +944,11 @@ export async function mountWorkspaceTools(
     fibers.push(toolFsFiber);
 
     // 4. Subprocess capability with automatic virtual mount path translation
-    const mountResolver = new VirtualMountResolver(spacePath, options.mounts);
+    const mountResolver = new VirtualMountResolver(spacePath, options.mounts, {
+      extraReadableRoots,
+      extraWritableRoots,
+      deniedRoots: [dshHome],
+    });
     const subprocessFiber = await agentCtx.plugin(SpaceIsolatedSubprocessRuntime, mountResolver as any);
     fibers.push(subprocessFiber);
 
@@ -872,6 +967,7 @@ export async function mountWorkspaceTools(
     // 7. Space-isolated Bash executor scoped to spacePath and controlled mounts
     const bashExecutorFiber = await agentCtx.plugin(SpaceIsolatedBashExecutor, {
       cwd: spacePath,
+      dshHome,
       mounts: options.mounts,
       timeoutMs: options.shell?.timeoutMs ?? 60000,
       maxTimeoutMs: options.shell?.maxTimeoutMs ?? 600000,
@@ -921,6 +1017,8 @@ export async function mountWorkspaceTools(
     const instructionsFsFiber = await instructionsCtx.plugin(InstructionsFileSystem, {
       cwd: spacePath,
       dshHome,
+      extraReadableRoots,
+      extraWritableRoots,
     } as any);
     fibers.push(instructionsFsFiber);
 
@@ -939,30 +1037,14 @@ export async function mountWorkspaceTools(
     // 13. Skills scoped to spacePath/.skills and bundled
     // If an authoritative ExtensionActivationPlan is provided, configure active skill directories from plan
     const userSpaceSkillsDir = path.join(spacePath, '.skills');
-    let customSkillDirs: string[];
-    if (options.extensionPlan !== undefined) {
-      if (options.extensionPlan && options.extensionPlan.skills && options.extensionPlan.skills.length > 0) {
-        const activeSkills = options.extensionPlan.skills.filter((s) => s.enabled);
-        if (activeSkills.length > 0) {
-          customSkillDirs = options.skills?.customSkillDirs
-            ? [...options.skills.customSkillDirs]
-            : [userSpaceSkillsDir];
-          if (!customSkillDirs.includes(userSpaceSkillsDir)) {
-            customSkillDirs.push(userSpaceSkillsDir);
-          }
-        } else {
-          customSkillDirs = options.skills?.customSkillDirs ? [...options.skills.customSkillDirs] : [];
-        }
-      } else {
-        customSkillDirs = options.skills?.customSkillDirs ? [...options.skills.customSkillDirs] : [];
-      }
-    } else {
-      customSkillDirs = options.skills?.customSkillDirs
-        ? [...options.skills.customSkillDirs]
-        : [userSpaceSkillsDir];
-      if (!customSkillDirs.includes(userSpaceSkillsDir)) {
-        customSkillDirs.push(userSpaceSkillsDir);
-      }
+    // The space-local `.skills` directory is always a discovery root; an extension
+    // activation plan (even one with zero enabled skills) must not remove it —
+    // otherwise the model-facing skill catalog is silently empty.
+    const customSkillDirs: string[] = options.skills?.customSkillDirs
+      ? [...options.skills.customSkillDirs]
+      : [];
+    if (!customSkillDirs.includes(userSpaceSkillsDir)) {
+      customSkillDirs.push(userSpaceSkillsDir);
     }
 
     const adminBundledSkillDir =
@@ -1388,9 +1470,14 @@ export async function mountOfficialPlugins(
     mountedPlugins.set('tool-result-pruner', prunerFiber);
 
     // 1.3 BasicCompactionEngine (provides ctx.compaction)
+    let thresholdRatio = config.compaction?.thresholdRatio;
+    if (thresholdRatio === undefined && config.compaction?.thresholdTokens !== undefined) {
+      const effectiveContextWindow = config.contextWindow ?? 1000000;
+      thresholdRatio = deriveCompactionThresholdRatio(config.compaction.thresholdTokens, effectiveContextWindow);
+    }
     const compactionFiber = await ctx.plugin(BasicCompactionEngine, {
       auto: config.compaction?.auto ?? true,
-      thresholdRatio: config.compaction?.thresholdRatio,
+      thresholdRatio,
       retainRatio: config.compaction?.retainRatio,
       retainTokens: config.compaction?.retainTokens,
     });

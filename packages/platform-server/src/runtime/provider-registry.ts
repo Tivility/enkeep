@@ -523,6 +523,28 @@ export class CompositeRuntimeArtifactPort implements RuntimeArtifactPort {
     }
     return null;
   }
+
+  async compactSession(options: {
+    userId: string;
+    dshSessionId: string;
+    workspaceFolder?: string;
+  }): Promise<{
+    status: string;
+    sessionId: string;
+    beforeTokens?: number;
+    afterTokens?: number;
+    eventsBefore: number;
+    eventsAfter: number;
+    summaryChars: number;
+    error?: string;
+  }> {
+    const mode = this.resolveSessionMode(options.userId, options.dshSessionId, options.workspaceFolder);
+    const provider = this.registry.requireProvider(mode);
+    if (!provider.runtimeArtifactPort?.compactSession) {
+      throw new PlatformError(`Compaction unavailable for execution mode "${mode}"`, 'RUNTIME_UNAVAILABLE', 503);
+    }
+    return provider.runtimeArtifactPort.compactSession(options);
+  }
 }
 
 /**

@@ -137,6 +137,7 @@ export interface ActiveRuntimeHandle {
   ): Promise<ExecCliEnvelope>;
   cancelTurn(turnId: string): Promise<ExecCliEnvelope>;
   inspectTurn?(turnId: string): Promise<ExecCliEnvelope>;
+  compactSession?(sessionId: string): Promise<ExecCliEnvelope>;
   fileOperation(request: FileOperationRequest): Promise<ExecCliEnvelope>;
   instructionsRead?(request: {
     target: 'global' | 'space';

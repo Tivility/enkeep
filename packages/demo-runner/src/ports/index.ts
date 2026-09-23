@@ -131,6 +131,16 @@ export interface UserRuntimeHandle {
   meta?: SignedContainerMetadata;
   rawHandle?: ActiveRuntimeHandle;
   checkHealth(): Promise<UserRuntimeHealthInfo>;
+  compactSession?(sessionId: string): Promise<{
+    status: string;
+    sessionId: string;
+    beforeTokens?: number;
+    afterTokens?: number;
+    eventsBefore: number;
+    eventsAfter: number;
+    summaryChars: number;
+    error?: string;
+  }>;
   checkSessionArtifact?(sessionId: string, workspaceFolder?: string): Promise<{ exists: boolean; valid: boolean; checksum?: string; eventCount?: number }>;
   inspectSessionCorruption?(sessionId: string, workspaceFolder?: string): Promise<any>;
   recoverSessionPrefix?(options: { sourceSessionId: string; targetSessionId: string; workspaceFolder?: string; maxValidSeq?: number }): Promise<any>;
@@ -306,6 +316,24 @@ function createUserRuntimeHandle(
         userId: health.userId,
       };
     },
+    compactSession: activeHandle.compactSession
+      ? async (sessionId: string) => {
+          if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+            throw new Error('FAIL-CLOSED: compactSession requires a non-empty sessionId');
+          }
+          const res = await activeHandle.compactSession!(sessionId);
+          return {
+            status: res.status ?? 'ok',
+            sessionId,
+            beforeTokens: (res as any).beforeTokens,
+            afterTokens: (res as any).afterTokens,
+            eventsBefore: ((res as any).eventsBefore as number) ?? 0,
+            eventsAfter: ((res as any).eventsAfter as number) ?? 0,
+            summaryChars: ((res as any).summaryChars as number) ?? 0,
+            error: res.error,
+          };
+        }
+      : undefined,
     checkSessionArtifact: activeHandle.checkSessionArtifact
       ? async (sessionId: string, workspaceFolder?: string) => {
           if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
@@ -676,7 +704,6 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       existingContainer.id === existingContainerMeta.containerId
     );
 
-
     if (isExistingContainerReconnect && existingContainer) {
       const existingMode = (existingContainer.networkMode as RuntimeNetworkMode) || 'none';
       const desiredMode = networkMode;
@@ -796,6 +823,8 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       ? createInContainerProvidersSpec(dshConfig.providers)
       : undefined;
 
+    const compactionThreshold = process.env.DSH_COMPACTION_THRESHOLD_TOKENS || '200000';
+
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
       image: options.image ?? 'enkeep-demo-runtime:latest',
@@ -808,6 +837,9 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       llmModel,
       llmProviders: inContainerProviders,
     });
+    if (spec.environment) {
+      spec.environment.DSH_COMPACTION_THRESHOLD_TOKENS = compactionThreshold;
+    }
     if (options.mounts && options.mounts.length > 0) {
       spec.mounts = [...options.mounts];
     }
@@ -1211,6 +1243,7 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
 
     const runId = generateRunId();
     const storageId = `vol_host_${randomBytes(16).toString('hex').toLowerCase()}`;
+    const compactionThreshold = process.env.DSH_COMPACTION_THRESHOLD_TOKENS || '200000';
 
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
@@ -1225,6 +1258,9 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
       platformProxyOptions: options.platformProxyOptions,
       platformProxyHandler: options.platformProxyHandler,
       mounts: options.mounts ? [...options.mounts] : undefined,
+      extraEnv: {
+        DSH_COMPACTION_THRESHOLD_TOKENS: compactionThreshold,
+      },
     });
 
     let activeHandle: ActiveRuntimeHandle;

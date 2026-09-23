@@ -2554,6 +2554,31 @@ fs.appendFileSync(p, corruptData);
       }
       return { corrupted: true };
     },
+
+    async compactSession(opts: { userId: string; dshSessionId: string; workspaceFolder?: string }) {
+      const targetUserId = opts.userId;
+      let handle = await resolveArtifactHandle(targetUserId, opts.workspaceFolder);
+      if (!handle) {
+        throw new Error('User runtime handle is unavailable');
+      }
+      if (typeof handle.compactSession === 'function') {
+        return handle.compactSession(opts.dshSessionId);
+      }
+      if (handle.rawHandle && typeof handle.rawHandle.compactSession === 'function') {
+        const res = await handle.rawHandle.compactSession(opts.dshSessionId);
+        return {
+          status: res.status ?? 'ok',
+          sessionId: opts.dshSessionId,
+          beforeTokens: (res as any).beforeTokens,
+          afterTokens: (res as any).afterTokens,
+          eventsBefore: ((res as any).eventsBefore as number) ?? 0,
+          eventsAfter: ((res as any).eventsAfter as number) ?? 0,
+          summaryChars: ((res as any).summaryChars as number) ?? 0,
+          error: res.error,
+        };
+      }
+      throw new Error('User runtime handle does not support compactSession');
+    },
   };
 
   // 8. Start Platform Server
