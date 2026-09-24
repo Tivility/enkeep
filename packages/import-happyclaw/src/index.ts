@@ -40,6 +40,7 @@ export {
   sessionIdFor,
   deterministicSessionId,
   messageIdFor,
+  deterministicMessageId,
   deterministicSpaceId,
   deterministicSourceProvenanceId,
   folderSlug,
@@ -166,6 +167,11 @@ export {
 } from './multi-user/orchestrator.js'
 
 export {
+  detectIdCollisions,
+  type DetectIdCollisionsOptions,
+} from './multi-user/collision.js'
+
+export {
   mapUserSpaces,
   type RawWorkspaceRow,
 } from './multi-user/space-mapper.js'
@@ -207,6 +213,8 @@ export type {
   MemoryFilePlanItem,
   ChannelAccountPlanItem,
   DisambiguatedSpaceMapping,
+  IdCollisionReason,
+  IdCollisionDetail,
 } from './multi-user/types.js'
 
 

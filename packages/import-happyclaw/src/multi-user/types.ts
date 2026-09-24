@@ -100,6 +100,19 @@ export interface UserMigrationPlan {
   }
 }
 
+export type IdCollisionReason = 'within_batch' | 'against_enkeep'
+
+export interface IdCollisionDetail {
+  readonly table: string
+  readonly id: string
+  readonly reason: IdCollisionReason
+  readonly message: string
+  readonly sourceChatJid?: string
+  readonly sourceMessageId?: string
+  readonly targetUserId?: string
+  readonly conflictingUserId?: string
+}
+
 export interface MultiUserMigrationPlan {
   readonly sourcePath: string
   readonly sourceFingerprint: string
@@ -119,6 +132,7 @@ export interface MultiUserMigrationPlan {
     readonly totalChannelAccounts: number
   }
   readonly warnings: readonly string[]
+  readonly collisions: readonly IdCollisionDetail[]
 }
 
 export interface MultiUserMigrateOptions {
@@ -144,6 +158,8 @@ export interface MultiUserMigrateOptions {
   readonly masterKey?: Buffer | string
   /** Deterministic timestamp for byte-stable testing */
   readonly deterministicCreatedAt?: string
+  /** Whether to throw immediately when collisions are detected (defaults to false in plan, true in execute) */
+  readonly throwOnCollision?: boolean
 }
 
 export interface MultiUserMigrationResult {

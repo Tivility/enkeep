@@ -32,6 +32,16 @@ export function messageIdFor(chatJid: string, messageId: string): string {
 }
 
 /**
+ * Deterministic message ID for an imported HappyClaw message based on chatJid and messageId composite key.
+ * Derives deterministically from both chatJid and messageId using sha256 with canonical prefix msg_hpc_.
+ * Always returns `msg_hpc_${digestHex.slice(0, 24)}`.
+ */
+export function deterministicMessageId(chatJid: string, messageId: string): string {
+  const digest = createHash('sha256').update(`${chatJid}:${messageId}`).digest('hex').slice(0, 24)
+  return `msg_hpc_${digest}`
+}
+
+/**
  * Deterministic space ID for an imported/forked folder.
  * Returns `impsp_${digestHex}`.
  */

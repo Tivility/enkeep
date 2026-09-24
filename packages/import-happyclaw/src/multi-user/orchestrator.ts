@@ -3,10 +3,11 @@ import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { assertNotProductionData, validateSourceFile } from '../guard.js'
-import { deterministicSessionId, deterministicSpaceId } from '../ids.js'
+import { deterministicMessageId, deterministicSessionId, deterministicSpaceId } from '../ids.js'
 import { computeSourceFingerprint } from '../manifest.js'
 import { introspectSource } from '../introspection.js'
 import { compileChats } from '../seed.js'
+import { detectIdCollisions } from './collision.js'
 import {
   prepareChannelAccountCredential,
   resolveMasterEncryptionKey,
@@ -302,6 +303,23 @@ export function planMultiUserMigration(options: MultiUserMigrateOptions): MultiU
 
     const plannedPasswordsFile = options.passwordFile || getDefaultPasswordFilePath()
 
+    // Run collision detection against batch and Enkeep database
+    const collisions = detectIdCollisions({
+      userPlans,
+      sourceDb: srcDb,
+      targetDbPath: options.targetDbPath,
+      sourceFingerprint: fingerprint,
+    })
+
+    for (const c of collisions) {
+      warnings.push(`[ID Collision] [${c.table}] ${c.id} (${c.reason}): ${c.message}`)
+    }
+
+    if (options.throwOnCollision && collisions.length > 0) {
+      const details = collisions.map((c) => `[${c.table}] ${c.id} (${c.reason}): ${c.message}`).join('; ')
+      throw new Error(`ID collision detected: ${details}`)
+    }
+
     return {
       sourcePath: options.sourcePath,
       sourceFingerprint: fingerprint,
@@ -321,6 +339,7 @@ export function planMultiUserMigration(options: MultiUserMigrateOptions): MultiU
         totalChannelAccounts,
       },
       warnings,
+      collisions,
     }
   } finally {
     srcDb.close()
@@ -335,6 +354,11 @@ export async function executeMultiUserMigration(
   options: MultiUserMigrateOptions
 ): Promise<MultiUserMigrationResult> {
   const plan = planMultiUserMigration(options)
+
+  if (plan.collisions && plan.collisions.length > 0) {
+    const details = plan.collisions.map((c) => `[${c.table}] ${c.id} (${c.reason}): ${c.message}`).join('; ')
+    throw new Error(`ID collision detected: ${details}`)
+  }
 
   if (options.dryRun) {
     return {
@@ -421,6 +445,7 @@ export async function executeMultiUserMigration(
           'delivery_inbox',
           'fixed_import_provenance',
           'fixed_import_receipts',
+          'message_attachments',
           'web_events',
           'web_messages',
           'session_sources',
@@ -575,17 +600,18 @@ export async function executeMultiUserMigration(
           for (const m of msgs) {
             const role = m.is_from_me ? 'assistant' : 'user'
             const content = m.content || ''
-            const eventId = `ev_${sha256Hex(`${targetUserId}:${ses.targetSessionId}:${m.id}`).slice(0, 24)}`
+            const targetMsgId = deterministicMessageId(ses.chatJid, m.id)
+            const eventId = `ev_${sha256Hex(`${targetUserId}:${ses.targetSessionId}:${targetMsgId}`).slice(0, 24)}`
             const provId = `prov_${sha256Hex(`${targetUserId}:${ses.chatJid}:${m.id}`).slice(0, 24)}`
 
-            msgStmt?.run(m.id, ses.targetSessionId, targetUserId, role, content, ses.targetRouteKey, createdAt)
+            msgStmt?.run(targetMsgId, ses.targetSessionId, targetUserId, role, content, ses.targetRouteKey, createdAt)
 
             eventStmt?.run(
               eventId,
               ses.targetSessionId,
               targetUserId,
               JSON.stringify({
-                id: m.id,
+                id: targetMsgId,
                 sessionId: ses.targetSessionId,
                 role,
                 content,
@@ -603,7 +629,7 @@ export async function executeMultiUserMigration(
               ses.spaceId,
               ses.targetSessionId,
               ses.targetSessionId,
-              m.id,
+              targetMsgId,
               eventId,
               createdAt
             )
