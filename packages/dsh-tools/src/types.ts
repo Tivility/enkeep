@@ -145,6 +145,48 @@ export interface UpdateTaskResult {
   readonly nextRunAt?: string | null;
 }
 
+export interface CancelTaskArgs {
+  readonly taskId: string;
+}
+
+export interface CancelTaskResult {
+  readonly success: true;
+  readonly taskId: string;
+  readonly status: TaskStatus;
+  readonly cancelled: true;
+}
+
+export interface TaskSummary {
+  readonly taskId: string;
+  readonly title: string;
+  readonly status: TaskStatus;
+  readonly priority?: TaskPriority;
+  readonly nextRunAt?: string | null;
+  readonly dueDate?: string | null;
+  readonly createdAt?: string;
+}
+
+export interface ListTasksArgs {
+  readonly status?: TaskStatus;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+export interface ListTasksResult {
+  readonly success: true;
+  readonly tasks: readonly TaskSummary[];
+  readonly count: number;
+}
+
+export interface GetTaskArgs {
+  readonly taskId: string;
+}
+
+export interface GetTaskResult {
+  readonly success: true;
+  readonly task: TaskSummary;
+}
+
 export interface QuotaQueryPayload {
   resource?: string;
   limit?: number;
@@ -169,6 +211,9 @@ export interface PlatformClientService {
   sendFile?(payload: FilePayload): Promise<SendFileResult>;
   checkQuota?(payload: QuotaQueryPayload): Promise<CheckQuotaResult>;
   updateTask?(taskId: string, payload: UpdateTaskPayload): Promise<UpdateTaskResult>;
+  cancelTask?(taskId: string): Promise<CancelTaskResult>;
+  listTasks?(options?: ListTasksArgs): Promise<ListTasksResult>;
+  getTask?(taskId: string): Promise<GetTaskResult>;
   request?<T = unknown>(path: string, options?: {
     method?: string;
     body?: unknown;

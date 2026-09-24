@@ -437,8 +437,10 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     }
 
     // 5. Execution / Polling Promise race with one awaited cancellation routine
+    let dispatchResult: AgentPromptDispatchResult | undefined;
+    let dispatchError: unknown;
     try {
-      return await this.pollTurnExecution({
+      dispatchResult = await this.pollTurnExecution({
         tenantId,
         turnId,
         routeId: dispatchRoute.id,
@@ -446,8 +448,25 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
         signal,
         maxWaitMs: effectiveMaxWaitMs,
       });
+      return dispatchResult;
+    } catch (err: unknown) {
+      dispatchError = err;
+      throw err;
     } finally {
       if (ephemeralRoute) {
+        try {
+          await this.notifySourceSessionOnIsolatedCompletion({
+            tenantId,
+            sourceSessionId: payload.sessionId,
+            ephemeralRouteId: ephemeralRoute.id,
+            turnId,
+            task,
+            dispatchError,
+          });
+        } catch {
+          // Failure to notify should not mask original outcome
+        }
+
         try {
           await tenantStorage.sessionRoutes.archive(ephemeralRoute.id);
         } catch {
@@ -678,6 +697,94 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     };
 
     return result;
+  }
+
+  /**
+   * Notifies the source session when an isolated session (/sw background task) completes or fails.
+   * Inserts into web_messages and web_events for the source session if active.
+   * Strictly truncates notification card to <= 2000 characters.
+   */
+  private async notifySourceSessionOnIsolatedCompletion(params: {
+    tenantId: string;
+    sourceSessionId: string;
+    ephemeralRouteId: string;
+    turnId: string;
+    task: { id: string; title: string };
+    dispatchError?: unknown;
+  }): Promise<void> {
+    const { tenantId, sourceSessionId, ephemeralRouteId, turnId, task, dispatchError } = params;
+
+    const tenantStorage = this.storage.forTenant(tenantId);
+    const targetRoute = await tenantStorage.sessionRoutes.findById(sourceSessionId);
+    if (!targetRoute || targetRoute.status !== 'active') {
+      return;
+    }
+
+    const shortId = task.id.startsWith('task_') ? task.id.slice(5, 9) : task.id.slice(0, 4);
+    const displayTitle = task.title ? task.title.replace(/^⚡\s*/, '') : '';
+
+    let notifyContent: string;
+    if (!dispatchError) {
+      const assistantMsg = this.queryAuthoritativeAssistantMessage(tenantId, ephemeralRouteId, turnId);
+      const rawContent = assistantMsg?.content ?? '';
+      const header = `⚡ 并行任务已完成 [${shortId}] ${displayTitle}\n\n`;
+      const maxSummaryLen = Math.max(0, 2000 - header.length);
+      const summary = rawContent.length > maxSummaryLen ? rawContent.slice(0, maxSummaryLen) : rawContent;
+      notifyContent = `${header}${summary}`;
+    } else {
+      const errMsg = dispatchError instanceof Error ? dispatchError.message : String(dispatchError);
+      const header = `⚡ 并行任务失败 [${shortId}] ${displayTitle}\n\n`;
+      const maxErrLen = Math.max(0, 2000 - header.length);
+      const errSummary = errMsg.length > maxErrLen ? errMsg.slice(0, maxErrLen) : errMsg;
+      notifyContent = `${header}${errSummary}`;
+    }
+
+    if (notifyContent.length > 2000) {
+      notifyContent = notifyContent.slice(0, 2000);
+    }
+
+    const nowIso = new Date().toISOString();
+    const messageId = `msg_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+    const eventId = `evt_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+    const routeKey = `${tenantId}:web:${targetRoute.spaceId}:${sourceSessionId}`;
+
+    const messageRecord = {
+      id: messageId,
+      sessionId: sourceSessionId,
+      userId: tenantId,
+      role: 'assistant',
+      content: notifyContent,
+      status: 'delivered',
+      createdAt: nowIso,
+    };
+
+    try {
+      this.db.prepare(`
+        INSERT INTO web_messages (
+          id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+        ) VALUES (?, ?, ?, 'assistant', ?, 'delivered', ?, NULL, ?)
+      `).run(
+        messageId,
+        sourceSessionId,
+        tenantId,
+        notifyContent,
+        routeKey,
+        nowIso
+      );
+
+      this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'message', ?, ?)
+      `).run(
+        eventId,
+        sourceSessionId,
+        tenantId,
+        JSON.stringify({ message: messageRecord }),
+        nowIso
+      );
+    } catch {
+      // Notification insertion error should not break dispatcher
+    }
   }
 }
 

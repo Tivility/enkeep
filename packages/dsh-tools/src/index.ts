@@ -6,6 +6,9 @@ import { createSendPlatformMessageTool } from './tools/send-platform-message.js'
 import { createSendFileTool } from './tools/send-file.js';
 import { createCreateTaskTool } from './tools/create-task.js';
 import { createUpdateTaskTool } from './tools/update-task.js';
+import { createCancelTaskTool } from './tools/cancel-task.js';
+import { createListTasksTool } from './tools/list-tasks.js';
+import { createGetTaskTool } from './tools/get-task.js';
 import { createCheckQuotaTool } from './tools/check-quota.js';
 
 export * from './types.js';
@@ -31,6 +34,9 @@ export * from './tools/send-message.js';
 export * from './tools/send-file.js';
 export * from './tools/create-task.js';
 export { createUpdateTaskTool, isUpdateTaskResult } from './tools/update-task.js';
+export { createCancelTaskTool, isCancelTaskResult } from './tools/cancel-task.js';
+export { createListTasksTool, isListTasksResult } from './tools/list-tasks.js';
+export { createGetTaskTool, isGetTaskResult } from './tools/get-task.js';
 export * from './tools/check-quota.js';
 
 export const name = 'enkeep-dsh-tools';
@@ -43,12 +49,14 @@ export interface Config {
   workspaceRoot?: string;
   maxFileSizeBytes?: number;
   hooks?: import('./file-security.js').FileSecurityHooks;
+  enableTaskManagementTools?: boolean;
 }
 
 export const Config: Schema<Config> = Schema.object({
   workspaceBoundaryRoot: Schema.string().description('Required absolute boundary root path for workspace containment (e.g. /home/dsh/spaces)'),
   workspaceRoot: Schema.string().description('Legacy alias for workspaceBoundaryRoot'),
   maxFileSizeBytes: Schema.natural().description('Maximum allowed file size in bytes for send_file'),
+  enableTaskManagementTools: Schema.boolean().description('Enable task management tools (cancel_task, list_tasks, get_task)'),
 });
 
 /**
@@ -92,6 +100,16 @@ export function apply(ctx: Context, config: Config): void {
     updateTaskTool,
     checkQuotaTool,
   ];
+
+  const enableTaskManagementTools =
+    config?.enableTaskManagementTools ?? (config?.workspaceBoundaryRoot !== undefined);
+  if (enableTaskManagementTools) {
+    tools.push(
+      createCancelTaskTool(getClient),
+      createListTasksTool(getClient),
+      createGetTaskTool(getClient)
+    );
+  }
 
   ctx.inject(['tools'], (toolsCtx) => {
     toolsCtx.effect(() => {

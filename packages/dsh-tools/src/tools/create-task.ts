@@ -23,7 +23,8 @@ export const CANONICAL_UUID_V4_REGEX =
 export const CANONICAL_SESSION_ID_REGEX =
   /^(?:ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
 
-export const CANONICAL_TASK_ID_REGEX = /^task_[0-9a-f]{32}$/;
+export const CANONICAL_TASK_ID_REGEX =
+  /^(?:task_[0-9a-f]{32}|task_hpc_[0-9a-f]{24})$/;
 
 export const VALID_TASK_STATUSES = new Set<TaskStatus>([
   'pending',
@@ -138,7 +139,7 @@ export function createCreateTaskTool(
           return [
             {
               type: 'text',
-              text: `Task created: "${value.title}" (Status: ${value.status}, IdempotentHit: ${value.isIdempotentHit})`,
+              text: `Task created: ${value.taskId} ("${value.title}", Status: ${value.status}, IdempotentHit: ${value.isIdempotentHit})`,
             },
           ];
         }

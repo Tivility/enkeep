@@ -567,10 +567,14 @@ export class PlatformProxyHandler implements StreamHandler {
       return;
     }
 
-    // 5. Tasks: POST /api/manage/tasks and PUT /api/manage/tasks/:id
+    // 5. Tasks: POST /api/manage/tasks, GET /api/manage/tasks, PUT /api/manage/tasks/:id, GET /api/manage/tasks/:id, POST /api/manage/tasks/:id/cancel
     if (pathname === '/api/manage/tasks') {
       if (method === 'POST') {
         await this.handleCreateTask(req, stream);
+        return;
+      }
+      if (method === 'GET') {
+        await this.handleListTasks(searchParams, stream);
         return;
       }
       this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
@@ -578,13 +582,27 @@ export class PlatformProxyHandler implements StreamHandler {
     }
 
     if (pathname.startsWith('/api/manage/tasks/')) {
-      const taskMatch = pathname.match(/^\/api\/manage\/tasks\/([^/]+)\/?$/);
-      if (taskMatch) {
-        if (method !== 'PUT') {
+      const cancelMatch = pathname.match(/^\/api\/manage\/tasks\/([^/]+)\/cancel\/?$/);
+      if (cancelMatch) {
+        if (method !== 'POST') {
           this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
           return;
         }
-        await this.handleUpdateTask(taskMatch[1], req, stream);
+        await this.handleCancelTask(cancelMatch[1], req, stream);
+        return;
+      }
+
+      const taskMatch = pathname.match(/^\/api\/manage\/tasks\/([^/]+)\/?$/);
+      if (taskMatch) {
+        if (method === 'PUT') {
+          await this.handleUpdateTask(taskMatch[1], req, stream);
+          return;
+        }
+        if (method === 'GET') {
+          await this.handleGetTask(taskMatch[1], stream);
+          return;
+        }
+        this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
         return;
       }
     }
@@ -1606,6 +1624,382 @@ export class PlatformProxyHandler implements StreamHandler {
       } catch (err: any) {
         this.writeJsonResponse(stream, 500, {
           error: { code: 'TASK_ERROR', message: err?.message || 'Task update failed' },
+        });
+        return;
+      }
+    }
+
+    this.writeJsonResponse(stream, 503, {
+      error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform Operations service is unavailable' },
+    });
+  }
+
+  /**
+   * Handles POST /api/manage/tasks/:id/cancel
+   */
+  private async handleCancelTask(rawTaskId: string, _req: ParsedHttpRequest, stream: Duplex): Promise<void> {
+    if (!this.platformUserId) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding' },
+      });
+      return;
+    }
+
+    let taskId: string;
+    try {
+      taskId = decodeURIComponent(rawTaskId);
+    } catch {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID encoding' },
+      });
+      return;
+    }
+
+    if (!TASK_ID_REGEX.test(taskId)) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID format' },
+      });
+      return;
+    }
+
+    if (this.operations) {
+      try {
+        const cancelled = await this.operations.forTenant(this.platformUserId).tasks.cancelTask(taskId);
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: {
+            id: cancelled.id,
+            status: cancelled.status,
+            cancelled: true,
+            task: cancelled,
+          },
+        });
+        return;
+      } catch (err: any) {
+        if (err instanceof TaskNotFoundError || err?.name === 'TaskNotFoundError' || err?.code === 'TASK_NOT_FOUND') {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: err.message || `Task "${taskId}" not found` },
+          });
+          return;
+        }
+        if (err instanceof TaskAlreadyCompletedError || err?.name === 'TaskAlreadyCompletedError') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_ALREADY_COMPLETED', message: err.message || `Task "${taskId}" is already completed and cannot be modified` },
+          });
+          return;
+        }
+        const status = typeof err?.status === 'number' && err.status >= 400 && err.status <= 599 ? err.status : 500;
+        this.writeJsonResponse(stream, status, {
+          error: { code: err?.code || 'TASK_ERROR', message: err?.message || 'Task cancellation failed' },
+        });
+        return;
+      }
+    }
+
+    if (this.db) {
+      try {
+        const existing = this.db.prepare(
+          'SELECT id, user_id, title, status FROM platform_tasks WHERE id = ? LIMIT 1'
+        ).get(taskId) as any;
+
+        if (!existing || existing.user_id !== this.platformUserId) {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: `Task "${taskId}" not found` },
+          });
+          return;
+        }
+
+        if (existing.status === 'completed' || existing.status === 'cancelled' || existing.status === 'failed') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_ALREADY_COMPLETED', message: `Task "${taskId}" is already completed and cannot be modified` },
+          });
+          return;
+        }
+
+        const now = new Date().toISOString();
+        this.db.prepare(`
+          UPDATE platform_tasks
+          SET status = 'cancelled', updated_at = ?
+          WHERE id = ? AND user_id = ?
+        `).run(now, taskId, this.platformUserId);
+
+        const updated = this.db.prepare(
+          'SELECT id, user_id, title, description, status, priority, due_date, payload, result, created_at, updated_at FROM platform_tasks WHERE id = ?'
+        ).get(taskId) as any;
+
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: {
+            id: taskId,
+            status: 'cancelled',
+            cancelled: true,
+            task: updated,
+          },
+        });
+        return;
+      } catch (err: any) {
+        this.writeJsonResponse(stream, 500, {
+          error: { code: 'TASK_ERROR', message: err?.message || 'Task cancellation failed' },
+        });
+        return;
+      }
+    }
+
+    this.writeJsonResponse(stream, 503, {
+      error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform Operations service is unavailable' },
+    });
+  }
+
+  /**
+   * Handles GET /api/manage/tasks/:id
+   */
+  private async handleGetTask(rawTaskId: string, stream: Duplex): Promise<void> {
+    if (!this.platformUserId) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding' },
+      });
+      return;
+    }
+
+    let taskId: string;
+    try {
+      taskId = decodeURIComponent(rawTaskId);
+    } catch {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID encoding' },
+      });
+      return;
+    }
+
+    if (!TASK_ID_REGEX.test(taskId)) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID format' },
+      });
+      return;
+    }
+
+    if (this.operations) {
+      try {
+        const task = await this.operations.forTenant(this.platformUserId).tasks.getTask(taskId);
+        if (!task) {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: `Task "${taskId}" not found` },
+          });
+          return;
+        }
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: task,
+        });
+        return;
+      } catch (err: any) {
+        if (err instanceof TaskNotFoundError || err?.name === 'TaskNotFoundError' || err?.code === 'TASK_NOT_FOUND') {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: err.message || `Task "${taskId}" not found` },
+          });
+          return;
+        }
+        const status = typeof err?.status === 'number' && err.status >= 400 && err.status <= 599 ? err.status : 500;
+        this.writeJsonResponse(stream, status, {
+          error: { code: err?.code || 'TASK_ERROR', message: err?.message || 'Task retrieval failed' },
+        });
+        return;
+      }
+    }
+
+    if (this.db) {
+      try {
+        const existing = this.db.prepare(
+          'SELECT id, user_id, title, description, status, priority, due_date, payload, result, created_at, updated_at FROM platform_tasks WHERE id = ? LIMIT 1'
+        ).get(taskId) as any;
+
+        if (!existing || existing.user_id !== this.platformUserId) {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: `Task "${taskId}" not found` },
+          });
+          return;
+        }
+
+        let parsedPayload: any = undefined;
+        if (existing.payload) {
+          try { parsedPayload = JSON.parse(existing.payload); } catch {}
+        }
+        let parsedResult: any = undefined;
+        if (existing.result) {
+          try { parsedResult = JSON.parse(existing.result); } catch {}
+        }
+
+        const task = {
+          id: existing.id,
+          userId: existing.user_id,
+          title: existing.title,
+          description: existing.description ?? undefined,
+          status: existing.status,
+          priority: existing.priority,
+          dueDate: existing.due_date ?? null,
+          payload: parsedPayload,
+          result: parsedResult,
+          createdAt: existing.created_at,
+          updatedAt: existing.updated_at,
+        };
+
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: task,
+        });
+        return;
+      } catch (err: any) {
+        this.writeJsonResponse(stream, 500, {
+          error: { code: 'TASK_ERROR', message: err?.message || 'Task retrieval failed' },
+        });
+        return;
+      }
+    }
+
+    this.writeJsonResponse(stream, 503, {
+      error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform Operations service is unavailable' },
+    });
+  }
+
+  /**
+   * Handles GET /api/manage/tasks
+   */
+  private async handleListTasks(searchParams: URLSearchParams, stream: Duplex): Promise<void> {
+    if (!this.platformUserId) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding' },
+      });
+      return;
+    }
+
+    const statusParam = searchParams.get('status');
+    const priorityParam = searchParams.get('priority');
+    const limitParam = searchParams.get('limit');
+    const offsetParam = searchParams.get('offset');
+
+    const validStatuses = new Set(['pending', 'claimed', 'running', 'completed', 'failed', 'cancelled']);
+    if (statusParam !== null && !validStatuses.has(statusParam)) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task status filter' },
+      });
+      return;
+    }
+
+    const validPriorities = new Set(['low', 'medium', 'high', 'urgent']);
+    if (priorityParam !== null && !validPriorities.has(priorityParam)) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task priority filter' },
+      });
+      return;
+    }
+
+    let limit: number | undefined;
+    if (limitParam !== null) {
+      const parsed = parseInt(limitParam, 10);
+      if (Number.isNaN(parsed) || parsed < 1 || parsed > 100) {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Limit must be an integer between 1 and 100' },
+        });
+        return;
+      }
+      limit = parsed;
+    }
+
+    let offset: number | undefined;
+    if (offsetParam !== null) {
+      const parsed = parseInt(offsetParam, 10);
+      if (Number.isNaN(parsed) || parsed < 0) {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'VALIDATION_ERROR', message: 'Offset must be a non-negative integer' },
+        });
+        return;
+      }
+      offset = parsed;
+    }
+
+    if (this.operations) {
+      try {
+        const tasks = await this.operations.forTenant(this.platformUserId).tasks.listTasks({
+          status: statusParam as any || undefined,
+          priority: priorityParam as any || undefined,
+          limit,
+          offset,
+        });
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: tasks,
+        });
+        return;
+      } catch (err: any) {
+        const status = typeof err?.status === 'number' && err.status >= 400 && err.status <= 599 ? err.status : 500;
+        this.writeJsonResponse(stream, status, {
+          error: { code: err?.code || 'TASK_ERROR', message: err?.message || 'Failed to list tasks' },
+        });
+        return;
+      }
+    }
+
+    if (this.db) {
+      try {
+        let query = 'SELECT id, user_id, title, description, status, priority, due_date, payload, result, created_at, updated_at FROM platform_tasks WHERE user_id = ?';
+        const params: any[] = [this.platformUserId];
+
+        if (statusParam) {
+          query += ' AND status = ?';
+          params.push(statusParam);
+        }
+        if (priorityParam) {
+          query += ' AND priority = ?';
+          params.push(priorityParam);
+        }
+
+        query += ' ORDER BY created_at DESC';
+
+        if (limit !== undefined) {
+          query += ' LIMIT ?';
+          params.push(limit);
+          if (offset !== undefined) {
+            query += ' OFFSET ?';
+            params.push(offset);
+          }
+        } else if (offset !== undefined) {
+          query += ' LIMIT -1 OFFSET ?';
+          params.push(offset);
+        }
+
+        const rows = this.db.prepare(query).all(...params) as any[];
+        const tasks = rows.map((r) => {
+          let parsedPayload: any = undefined;
+          if (r.payload) {
+            try { parsedPayload = JSON.parse(r.payload); } catch {}
+          }
+          let parsedResult: any = undefined;
+          if (r.result) {
+            try { parsedResult = JSON.parse(r.result); } catch {}
+          }
+          return {
+            id: r.id,
+            userId: r.user_id,
+            title: r.title,
+            description: r.description ?? undefined,
+            status: r.status,
+            priority: r.priority,
+            dueDate: r.due_date ?? null,
+            payload: parsedPayload,
+            result: parsedResult,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at,
+          };
+        });
+
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: tasks,
+        });
+        return;
+      } catch (err: any) {
+        this.writeJsonResponse(stream, 500, {
+          error: { code: 'TASK_ERROR', message: err?.message || 'Failed to list tasks' },
         });
         return;
       }
