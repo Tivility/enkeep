@@ -23,7 +23,12 @@ import {
   type ILarkApiClient,
   type ILarkWSClient,
 } from './types.js';
-import { optimizeMarkdownStyle, chunkMarkdown } from './markdown-card.js';
+import {
+  optimizeMarkdownStyle,
+  chunkMarkdown,
+  markdownToCardElements,
+  type LarkCardBodyElement,
+} from './markdown-card.js';
 
 export const SAFE_RESOURCE_ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
 export const MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-image cap
@@ -698,9 +703,7 @@ export class FakeLarkTransport implements LarkTransport {
         if (this.finalizeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, this.finalizeDelayMs));
         }
-        const optimized = optimizeMarkdownStyle(finalText);
-        const chunks = chunkMarkdown(optimized, 4000);
-        const bodyElements: Array<Record<string, unknown>> = [];
+        const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
 
         const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
         if (formattedToolStatus) {
@@ -723,14 +726,19 @@ export class FakeLarkTransport implements LarkTransport {
           );
         }
 
-        if (chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')) {
+        const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
+        const contentElements = markdownToCardElements(finalText, {
+          maxChunkLen: 4000,
+          emptyFallback,
+        });
+        if (contentElements.length === 0) {
           bodyElements.push({
             tag: 'markdown',
-            content: status === 'stopped' ? '(已停止回复)' : '(空回复)',
+            content: emptyFallback,
           });
         } else {
-          for (const c of chunks) {
-            bodyElements.push({ tag: 'markdown', content: c });
+          for (const el of contentElements) {
+            bodyElements.push(el);
           }
         }
 
@@ -1791,9 +1799,7 @@ export class CredentialedLarkTransport implements LarkTransport {
           }
 
           // Build final card JSON
-          const optimized = optimizeMarkdownStyle(finalText);
-          const chunks = chunkMarkdown(optimized, 4000);
-          const bodyElements: Array<Record<string, unknown>> = [];
+          const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
 
           const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
           if (formattedToolStatus) {
@@ -1816,14 +1822,19 @@ export class CredentialedLarkTransport implements LarkTransport {
             );
           }
 
-          if (chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')) {
+          const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
+          const contentElements = markdownToCardElements(finalText, {
+            maxChunkLen: 4000,
+            emptyFallback,
+          });
+          if (contentElements.length === 0) {
             bodyElements.push({
               tag: 'markdown',
-              content: status === 'stopped' ? '(已停止回复)' : '(空回复)',
+              content: emptyFallback,
             });
           } else {
-            for (const c of chunks) {
-              bodyElements.push({ tag: 'markdown', content: c });
+            for (const el of contentElements) {
+              bodyElements.push(el);
             }
           }
 

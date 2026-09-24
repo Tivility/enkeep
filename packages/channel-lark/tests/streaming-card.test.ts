@@ -830,4 +830,172 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       }
     });
   });
+
+  describe('C5W: Native Table Conversion in Finalized Cards (card-native-table)', () => {
+    it('CredentialedLarkTransport: finalize converts markdown tables into Schema 2.0 native table elements', async () => {
+      const { client, calls } = createMockApiClient();
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_c5w_cred',
+          userId: 'usr_c5w',
+          appId: 'cli_mock_c5w',
+          appSecret: 'sec_mock_c5w',
+        },
+        clientFactory: {
+          createClient: () => client,
+        } as LarkSdkClientFactory,
+      });
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_c5w_test',
+        title: 'C5W Test Bot',
+      });
+      expect(session).not.toBeNull();
+
+      const markdownWithTable = `
+### Task Summary
+Here is the performance report:
+
+| Metric | Target | Actual | Notes |
+| :--- | :---: | ---: | --- |
+| Latency | 100ms | 45ms | Optimal |
+| Error Rate | < 0.1% | 0.00% | Zero errors |
+
+All criteria met.
+`;
+
+      await session!.finalize(markdownWithTable, 'completed');
+
+      expect(calls.cardUpdate.length).toBe(1);
+      const finalCard = JSON.parse(calls.cardUpdate[0].data.card.data);
+      expect(finalCard.schema).toBe('2.0');
+      expect(finalCard.header.template).toBe('green');
+
+      const elements = finalCard.body.elements;
+      // Should have: [markdown (summary), table, markdown (closing)]
+      expect(elements.length).toBe(3);
+
+      // Element 0: Markdown
+      expect(elements[0].tag).toBe('markdown');
+      expect(elements[0].content).toContain('##### Task Summary');
+      expect(elements[0].content).toContain('Here is the performance report:');
+
+      // Element 1: Native Schema 2.0 Table
+      expect(elements[1].tag).toBe('table');
+      expect(elements[1].row_height).toBe('low');
+      expect(elements[1].header_style.bold).toBe(true);
+      expect(elements[1].header_style.background_style).toBe('grey');
+      expect(elements[1].columns).toHaveLength(4);
+      expect(elements[1].columns[0]).toEqual({
+        name: 'c0',
+        display_name: 'Metric',
+        data_type: 'lark_md',
+        width: 'auto',
+        align: 'left',
+      });
+      expect(elements[1].columns[1].align).toBe('center');
+      expect(elements[1].columns[2].align).toBe('right');
+      expect(elements[1].rows).toHaveLength(2);
+      expect(elements[1].rows[0]).toEqual({
+        c0: 'Latency',
+        c1: '100ms',
+        c2: '45ms',
+        c3: 'Optimal',
+      });
+      expect(elements[1].rows[1]).toEqual({
+        c0: 'Error Rate',
+        c1: '< 0.1%',
+        c2: '0.00%',
+        c3: 'Zero errors',
+      });
+
+      // Element 2: Markdown
+      expect(elements[2].tag).toBe('markdown');
+      expect(elements[2].content).toContain('All criteria met.');
+    });
+
+    it('CredentialedLarkTransport: coexists with C4 status panel, C2 footer, and C1 chunking', async () => {
+      const { client, calls } = createMockApiClient();
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_c5w_coexist',
+          userId: 'usr_c5w',
+          appId: 'cli_mock_c5w',
+          appSecret: 'sec_mock_c5w',
+        },
+        clientFactory: {
+          createClient: () => client,
+        } as LarkSdkClientFactory,
+      });
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_c5w_coexist',
+        withStatusPanel: true,
+      });
+
+      const toolEntries: CardToolStatusEntry[] = [
+        { toolName: 'web_search', status: 'completed' },
+      ];
+      const metadata: CardFinalMetadata = {
+        model: 'deepseek-chat',
+        durationSeconds: 1.5,
+        totalTokens: 50,
+      };
+
+      const markdownWithTable = `
+| Service | Status |
+| --- | --- |
+| DB | Online |
+| API | Online |
+`;
+
+      await session!.finalize(markdownWithTable, 'completed', metadata, toolEntries);
+
+      const finalCard = JSON.parse(calls.cardUpdate[0].data.card.data);
+      const elements = finalCard.body.elements;
+
+      // 0: C4 collapsible status panel
+      expect(elements[0].tag).toBe('collapsible_panel');
+      expect(elements[0].expanded).toBe(false);
+
+      // 1: C5 Native table
+      expect(elements[1].tag).toBe('table');
+      expect(elements[1].columns).toHaveLength(2);
+      expect(elements[1].rows).toHaveLength(2);
+
+      // 2: C2 Usage footer
+      expect(elements[2].tag).toBe('markdown');
+      expect(elements[2].content).toContain('🤖 deepseek-chat · ⏱ 1.5s · 💡 50 tokens');
+    });
+
+    it('FakeLarkTransport: finalize generates native table element in recorded card', async () => {
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_c5w_fake',
+      });
+      expect(session).not.toBeNull();
+
+      const markdownWithTable = `
+| Key | Value |
+| --- | --- |
+| A | 1 |
+`;
+
+      await session!.finalize(markdownWithTable, 'completed');
+
+      const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+      expect(finalizeCall).toBeDefined();
+      expect(finalizeCall?.card).toBeDefined();
+
+      const elements = finalizeCall?.card.body.elements;
+      expect(elements.length).toBe(1);
+      expect(elements[0].tag).toBe('table');
+      expect(elements[0].columns[0].display_name).toBe('Key');
+      expect(elements[0].rows[0]).toEqual({ c0: 'A', c1: '1' });
+    });
+  });
 });
