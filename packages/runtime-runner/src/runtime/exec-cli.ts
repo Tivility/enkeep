@@ -836,6 +836,63 @@ async function runIdleDaemon(): Promise<void> {
   });
 }
 
+export interface ValidatedExecEnvironment {
+  userId: string;
+  dshHome: string;
+  spacesDir: string;
+}
+
+/**
+ * Validates and extracts canonical runtime execution environment variables (DSH_USER, DSH_HOME, DSH_SPACES).
+ * Accepts DSH_SPACES residing directly under DSH_HOME or parent of DSH_HOME (e.g. /home/dsh/spaces with DSH_HOME=/home/dsh or /home/dsh/.dsh).
+ */
+export function validateExecEnvironment(env: NodeJS.ProcessEnv = process.env): ValidatedExecEnvironment {
+  const rawUser = env.DSH_USER;
+  if (!rawUser || !isValidUserId(rawUser)) {
+    throw new TypedCliError(
+      'INVALID_ENV',
+      'DSH_USER environment variable is required and must be a valid canonical identifier'
+    );
+  }
+  const userId = rawUser;
+
+  const rawHome = env.DSH_HOME;
+  if (!rawHome || typeof rawHome !== 'string' || !path.isAbsolute(rawHome) || path.normalize(rawHome) !== rawHome) {
+    throw new TypedCliError(
+      'INVALID_ENV',
+      'DSH_HOME environment variable is mandatory and must be an absolute normalized path'
+    );
+  }
+  const dshHome = rawHome;
+
+  if (env.DSH_SPACES_DIR !== undefined) {
+    throw new TypedCliError(
+      'INVALID_ENV',
+      'Deprecated environment variable "DSH_SPACES_DIR" is forbidden. Use "DSH_SPACES" instead.'
+    );
+  }
+
+  const rawSpaces = env.DSH_SPACES;
+  if (!rawSpaces || typeof rawSpaces !== 'string' || !path.isAbsolute(rawSpaces) || path.normalize(rawSpaces) !== rawSpaces) {
+    throw new TypedCliError(
+      'INVALID_ENV',
+      'DSH_SPACES environment variable is mandatory and must be an absolute normalized path'
+    );
+  }
+  const spacesDir = rawSpaces;
+
+  const expectedSpacesParent = path.dirname(dshHome);
+  const validSpacesParent = path.dirname(spacesDir) === dshHome || path.dirname(spacesDir) === expectedSpacesParent;
+  if (path.basename(spacesDir) !== 'spaces' || !validSpacesParent) {
+    throw new TypedCliError(
+      'INVALID_ENV',
+      'DSH_SPACES directory must reside directly under DSH_HOME or parent of DSH_HOME and end with "spaces"'
+    );
+  }
+
+  return { userId, dshHome, spacesDir };
+}
+
 /**
  * Main Exec CLI entry point.
  */
@@ -862,47 +919,7 @@ export async function runExecCli(argv: string[] = process.argv.slice(2)): Promis
       );
     }
 
-    const rawUser = process.env.DSH_USER;
-    if (!rawUser || !isValidUserId(rawUser)) {
-      throw new TypedCliError(
-        'INVALID_ENV',
-        'DSH_USER environment variable is required and must be a valid canonical identifier'
-      );
-    }
-    const userId = rawUser;
-
-    const rawHome = process.env.DSH_HOME;
-    if (!rawHome || typeof rawHome !== 'string' || !path.isAbsolute(rawHome) || path.normalize(rawHome) !== rawHome) {
-      throw new TypedCliError(
-        'INVALID_ENV',
-        'DSH_HOME environment variable is mandatory and must be an absolute normalized path'
-      );
-    }
-    const dshHome = rawHome;
-
-    if (process.env.DSH_SPACES_DIR !== undefined) {
-      throw new TypedCliError(
-        'INVALID_ENV',
-        'Deprecated environment variable "DSH_SPACES_DIR" is forbidden. Use "DSH_SPACES" instead.'
-      );
-    }
-
-    const rawSpaces = process.env.DSH_SPACES;
-    if (!rawSpaces || typeof rawSpaces !== 'string' || !path.isAbsolute(rawSpaces) || path.normalize(rawSpaces) !== rawSpaces) {
-      throw new TypedCliError(
-        'INVALID_ENV',
-        'DSH_SPACES environment variable is mandatory and must be an absolute normalized path'
-      );
-    }
-    const spacesDir = rawSpaces;
-
-    const expectedSpacesParent = path.dirname(dshHome);
-    if (path.basename(spacesDir) !== 'spaces' || path.dirname(spacesDir) !== expectedSpacesParent) {
-      throw new TypedCliError(
-        'INVALID_ENV',
-        'DSH_SPACES directory must reside directly under parent of DSH_HOME and end with "spaces"'
-      );
-    }
+    const { userId, dshHome, spacesDir } = validateExecEnvironment(process.env);
 
     const activeTurnsDir = path.join(dshHome, 'active-turns');
     fs.mkdirSync(activeTurnsDir, { recursive: true, mode: 0o700 });

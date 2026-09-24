@@ -1445,6 +1445,80 @@ describe('P1 Production File Transport & Streaming Integration Tests', () => {
       expect(serverInstance.listeningUrl).toBeUndefined();
     });
 
+    it('staged entry whose inspect fails -> startup continues and entry aborted (D7)', async () => {
+      const testDb = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(testDb);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const testStorage = new SqlitePlatformStorage(testDb);
+      const authService = new DefaultAuthService(testStorage, {
+        cookieSecret: 'test-secret-32-chars-long-valid!',
+      });
+      const messageStore = new SqliteWebMessageStore(testDb);
+      const testGateway = new TestOnlyRuntimeGateway({ storage: testStorage, messageStore });
+      const operationsStore = new SqlitePlatformOperationsStorage(testDb);
+      const operations = createPlatformOperations({ storage: operationsStore });
+
+      const user = await testStorage.users.create({
+        username: 'unrecoverable_user',
+        passwordHash: 'dummy',
+        displayName: 'Unrecoverable User',
+        role: 'user',
+        status: 'active',
+      });
+      const space = await testStorage.forTenant(user.id).spaces.create({
+        name: 'Unrecoverable Space',
+        folder: 'spc_unrecoverable',
+        executionMode: 'container',
+      });
+
+      // Insert staged entry whose inspect will fail
+      const journalId = `jrn_${randomUUID().replace(/-/g, '')}`;
+      testDb.prepare(`
+        INSERT INTO file_transfer_journal (
+          id, user_id, space_id, relative_path, stage_token, rollback_token, overwrite, expected_etag, content_sha256, size, idempotency_key, status, response_payload, created_at, updated_at
+        ) VALUES (?, ?, ?, 'failing_inspect.pdf', '.stage.123.tmp', NULL, 0, NULL, 'f6bd5b542e5bd6cf3888fa77c7ff7e5857c669ba20e46b3a654b221487208d4f', 5000000, 'idemp_failing_inspect', 'staged', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(journalId, user.id, space.id);
+
+      // Create a mock file provider whose inspectTransferState throws PROVIDER_PROTOCOL_ERROR (502 Bad Gateway)
+      const failingInspectFileProvider = {
+        ...streamingMockFileProvider,
+        async inspectTransferState() {
+          throw new PlatformError('Bad gateway: invalid provider response', 'PROVIDER_PROTOCOL_ERROR', 502);
+        },
+        async abortStage() {
+          return { op: 'abort_stage', space: space.id, path: 'failing_inspect.pdf', aborted: true };
+        },
+      };
+
+      const serverInstance = new PlatformServer({
+        port: 0,
+        host: '127.0.0.1',
+        database: testDb,
+        storage: testStorage,
+        authService,
+        runtimeGateway: testGateway,
+        cookieSecret: 'test-secret-at-least-32-chars-long-ok!',
+        csrfToken: 'test-csrf-token-at-least-32-chars-ok!',
+        operationsService: operations,
+        fileProvider: failingInspectFileProvider as any,
+      });
+
+      // Startup must continue without throwing PlatformConfigurationError
+      const addressInfo = await serverInstance.start();
+      expect(addressInfo.port).toBeGreaterThan(0);
+      expect(serverInstance.getUrl()).toContain('http://127.0.0.1:');
+
+      // The unrecoverable staged entry must be marked with terminal status 'aborted'
+      const updatedRow = testDb.prepare('SELECT status, response_payload FROM file_transfer_journal WHERE id = ?').get(journalId) as { status: string; response_payload: string };
+      expect(updatedRow).toBeDefined();
+      expect(updatedRow.status).toBe('aborted');
+      expect(updatedRow.response_payload).toContain('INSPECT_STAGE_FAILED');
+      expect(updatedRow.response_payload).toContain('Bad gateway');
+
+      await serverInstance.stop();
+    });
+
     it('verifies static code constraints: handler SET committed exists, recovery uses inspectTransferState, no stream read/as any/empty catch', async () => {
       const fs = await import('node:fs');
       const path = await import('node:path');
