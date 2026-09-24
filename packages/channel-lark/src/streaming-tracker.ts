@@ -47,6 +47,9 @@ export interface StreamingReplyTrackerCardParams {
   title?: string;
   withStatusPanel?: boolean;
   collapsibleToolStatus?: boolean;
+  withStopButton?: boolean;
+  turnId?: string;
+  sessionId?: string;
 }
 
 export interface StreamingReplyTrackerOptions {
@@ -58,12 +61,14 @@ export interface StreamingReplyTrackerOptions {
   maxDurationMs?: number;
   initialCursor?: number;
   detached?: boolean;
-  onFinalized?: (finalText: string, status: 'completed' | 'failed', messageId?: string) => Promise<void> | void;
+  onFinalized?: (finalText: string, status: any, messageId?: string) => Promise<void> | void;
   turnId?: string;
   maxStreamingLength?: number;
   metadata?: CardFinalMetadata;
   withStatusPanel?: boolean;
   collapsibleToolStatus?: boolean;
+  withStopButton?: boolean;
+  senderId?: string;
 }
 
 /**
@@ -273,10 +278,12 @@ export class StreamingReplyTracker {
   private readonly pollIntervalMs: number;
   private readonly maxDurationMs: number;
   private readonly detached: boolean;
-  private readonly onFinalized?: (finalText: string, status: 'completed' | 'failed', messageId?: string) => Promise<void> | void;
+  private readonly onFinalized?: (finalText: string, status: any, messageId?: string) => Promise<void> | void;
   private readonly turnId?: string;
   private readonly maxStreamingLength: number;
   private readonly initialMetadata?: CardFinalMetadata;
+  private readonly withStopButton?: boolean;
+  private readonly senderId?: string;
   private isWaiting = false;
 
   private cardSessionPromise: Promise<LarkStreamingCardSession | null> | null = null;
@@ -311,6 +318,8 @@ export class StreamingReplyTracker {
     this.turnId = options.turnId;
     this.maxStreamingLength = options.maxStreamingLength ?? STREAMING_MAX_CONTENT_LENGTH;
     this.initialMetadata = options.metadata;
+    this.withStopButton = options.withStopButton ?? options.cardParams?.withStopButton;
+    this.senderId = options.senderId;
     this.withStatusPanel = Boolean(
       options.withStatusPanel ??
       options.collapsibleToolStatus ??
@@ -343,6 +352,22 @@ export class StreamingReplyTracker {
     return this.sessionRouteId;
   }
 
+  getTurnId(): string | undefined {
+    return this.turnId;
+  }
+
+  getSenderId(): string | undefined {
+    return this.senderId;
+  }
+
+  getMessageId(): string | undefined {
+    return this.cardSession?.messageId;
+  }
+
+  getCardId(): string | undefined {
+    return this.cardSession?.cardId;
+  }
+
   isActive(): boolean {
     return !this.isStopped && !this.terminalReached;
   }
@@ -354,9 +379,13 @@ export class StreamingReplyTracker {
   private initStreamingCard(): void {
     if (this.cardSessionPromise) return;
     if (this.transport.createStreamingCard) {
-      const cardParams = this.withStatusPanel
-        ? { ...this.cardParams, withStatusPanel: true }
-        : this.cardParams;
+      const cardParams = {
+        ...this.cardParams,
+        ...(this.withStatusPanel ? { withStatusPanel: true } : {}),
+        withStopButton: this.withStopButton ?? this.cardParams?.withStopButton,
+        turnId: this.turnId ?? this.cardParams?.turnId,
+        sessionId: this.sessionRouteId ?? this.cardParams?.sessionId,
+      };
       this.cardSessionPromise = this.transport.createStreamingCard(cardParams).then(
         (session) => {
           this.cardSession = session;
@@ -658,7 +687,7 @@ export class StreamingReplyTracker {
 
   private async doFinalize(
     finalText: string,
-    status: 'completed' | 'failed',
+    status: 'completed' | 'failed' | 'stopped',
     metadata?: CardFinalMetadata,
     toolStatus?: string | readonly CardToolStatusEntry[]
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
@@ -735,16 +764,19 @@ export class StreamingReplyTracker {
       } catch {}
     }
 
-    const textToFinalize = finalText || this.accumulatedText || (status === 'failed' ? 'Execution failed' : '');
+    const textToFinalize =
+      finalText ||
+      this.accumulatedText ||
+      (status === 'failed' ? 'Execution failed' : status === 'stopped' ? '(已停止回复)' : '');
     const finalMetadata = await this.resolveMetadata(metadata);
 
-    // If turn completed successfully, mark any remaining running tool entries as completed
-    if (status === 'completed') {
+    // If turn completed or stopped, settle any remaining running tool entries
+    if (status === 'completed' || status === 'stopped') {
       for (let i = 0; i < this.toolStatusEntries.length; i++) {
         if (this.toolStatusEntries[i].status === 'running' || this.toolStatusEntries[i].status === 'started') {
           this.toolStatusEntries[i] = {
             ...this.toolStatusEntries[i],
-            status: 'completed',
+            status: status === 'stopped' ? 'failed' : 'completed',
           };
         }
       }
@@ -812,7 +844,7 @@ export class StreamingReplyTracker {
 
   async finalize(
     finalText: string,
-    status: 'completed' | 'failed',
+    status: 'completed' | 'failed' | 'stopped',
     metadata?: CardFinalMetadata,
     toolStatus?: string | readonly CardToolStatusEntry[]
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {

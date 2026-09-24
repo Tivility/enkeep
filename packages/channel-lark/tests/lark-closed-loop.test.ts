@@ -1228,4 +1228,258 @@ describe('Lark Channel Closed-Loop Communication', () => {
       expect(failRes.error).toBeDefined();
     });
   });
+
+  describe('10. C3: Streaming Card Stop Reply Button & Operator Authorization (card-stop-reply-button)', () => {
+    it('streaming card includes stop button on creation, rejects unauthorized operator with toast, allows original sender, and is idempotent', async () => {
+      const account = await channelRepo.createAccount({
+        type: 'lark',
+        groupActivationMode: 'always',
+        defaultSpaceId: spaceId,
+      });
+
+      const chatId = 'oc_c3_closed_loop';
+      await channelRepo.createBinding({
+        accountId: account.id,
+        spaceId,
+        nativeContextId: chatId,
+        activationMode: 'always',
+        chatType: 'group',
+      });
+
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      let cancelTurnCalledWith: { userId: string; sessionId: string } | null = null;
+      const mockRuntimeGateway: any = {
+        dispatchInbound: vi.fn().mockImplementation(async (env) => {
+          return {
+            turnId: 'turn_c3_exec_001',
+            executionMode: 'agent',
+          };
+        }),
+        cancelCurrentTurn: vi.fn().mockImplementation(async (uId, sId) => {
+          cancelTurnCalledWith = { userId: uId, sessionId: sId };
+          return true;
+        }),
+        cancelTurn: vi.fn().mockImplementation(async (uId, tId) => {
+          cancelTurnCalledWith = { userId: uId, sessionId: tId };
+          return true;
+        }),
+      };
+
+      const fakeStreamSource: StreamEventSource = {
+        listAssistantEvents: vi.fn().mockResolvedValue([
+          { rowId: 1, type: 'assistant_delta', delta: 'Calculating prime numbers...' },
+        ]),
+      };
+
+      const gateway = new LarkChannelGateway({
+        account: { id: account.id, userId },
+        transport,
+        channelRepo,
+        sessionRouteRepo,
+        spaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        streamEventSource: fakeStreamSource,
+      });
+
+      // 1. Inbound user prompt dispatches turn
+      const originalSenderId = 'ou_original_prompter_888';
+      const inboundEvent = {
+        header: {
+          event_id: 'evt_c3_inbound_001',
+          event_type: 'im.message.receive_v1',
+          create_time: '1700000000000',
+        },
+        event: {
+          sender: {
+            sender_id: { open_id: originalSenderId },
+            sender_type: 'user',
+          },
+          message: {
+            message_id: 'om_c3_user_msg_001',
+            chat_id: chatId,
+            chat_type: 'group',
+            message_type: 'text',
+            content: JSON.stringify({ text: 'List all primes from 1 to 1000' }),
+            create_time: '1700000000000',
+          },
+        },
+      };
+
+      const inboundRes = await gateway.handleInboundEvent(inboundEvent);
+      expect(inboundRes.handled).toBe(true);
+
+      // Verify streaming card was created with stop button
+      const cardCreate = transport.streamingCalls.find((c) => c.type === 'card_create');
+      expect(cardCreate).toBeDefined();
+      expect(cardCreate?.card).toBeDefined();
+      const elements = cardCreate?.card.body.elements;
+      const stopBtn = elements.find((e: any) => e.tag === 'button' && e.element_id === 'stop_reply_button');
+      expect(stopBtn).toBeDefined();
+      expect(stopBtn.type).toBe('danger');
+      expect(stopBtn.text.content).toBe('⏹ 停止回复');
+      expect(stopBtn.value.action).toBe('stop_reply');
+      expect(stopBtn.value.turnId).toBe('turn_c3_exec_001');
+      expect(stopBtn.value.sessionId).toBe(inboundRes.sessionRouteId);
+
+      const cardMessageId = cardCreate?.messageId;
+
+      // 2. Unauthorized operator (intruder) tries to stop the turn
+      const unauthorizedAction = {
+        header: {
+          event_id: 'evt_act_unauthorized',
+          event_type: 'card.action.trigger',
+        },
+        action: {
+          value: {
+            action: 'stop_reply',
+            turnId: 'turn_c3_exec_001',
+            sessionId: inboundRes.sessionRouteId,
+          },
+          tag: 'button',
+        },
+        operator: {
+          open_id: 'ou_intruder_999',
+        },
+        context: {
+          open_message_id: cardMessageId,
+          open_chat_id: chatId,
+        },
+      };
+
+      const unauthorizedRes = await gateway.handleInboundEvent(unauthorizedAction as any);
+      expect(unauthorizedRes.handled).toBe(true);
+      expect(unauthorizedRes.ignoredReason).toBe('permission_denied');
+      expect(unauthorizedRes.toast?.type).toBe('warning');
+      expect(unauthorizedRes.toast?.content).toBe('无权停止他人发起的任务');
+      // Assert cancellation was NOT called
+      expect(mockRuntimeGateway.cancelTurn).not.toHaveBeenCalled();
+      expect(mockRuntimeGateway.cancelCurrentTurn).not.toHaveBeenCalled();
+
+      // 3. Authorized operator (original message sender) stops the turn
+      const authorizedAction = {
+        header: {
+          event_id: 'evt_act_authorized',
+          event_type: 'card.action.trigger',
+        },
+        action: {
+          value: {
+            action: 'stop_reply',
+            turnId: 'turn_c3_exec_001',
+            sessionId: inboundRes.sessionRouteId,
+          },
+          tag: 'button',
+        },
+        operator: {
+          open_id: originalSenderId,
+        },
+        context: {
+          open_message_id: cardMessageId,
+          open_chat_id: chatId,
+        },
+      };
+
+      const authorizedRes = await gateway.handleInboundEvent(authorizedAction as any);
+      expect(authorizedRes.handled).toBe(true);
+      expect(authorizedRes.toast?.type).toBe('info');
+      expect(authorizedRes.toast?.content).toBe('已停止回复');
+
+      // Assert runtime cancellation API was invoked
+      expect(cancelTurnCalledWith).not.toBeNull();
+
+      // Assert card is updated to stopped state with grey header and '已中止'
+      const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+      expect(finalizeCall).toBeDefined();
+      expect(finalizeCall?.status).toBe('stopped');
+      expect(finalizeCall?.card.header.template).toBe('grey');
+      expect(finalizeCall?.card.header.title.content).toContain('已中止');
+      // Assert stop button is stripped from final stopped card
+      const finalElements = finalizeCall?.card.body.elements;
+      const finalBtn = finalElements.find((e: any) => e.tag === 'button');
+      expect(finalBtn).toBeUndefined();
+
+      // 4. Repeated click on stop button: idempotent, returns already stopped toast without re-cancelling
+      cancelTurnCalledWith = null;
+      mockRuntimeGateway.cancelTurn.mockClear();
+      mockRuntimeGateway.cancelCurrentTurn.mockClear();
+
+      const repeatAction = {
+        ...authorizedAction,
+        header: { event_id: 'evt_act_repeat_click' },
+      };
+      const repeatRes = await gateway.handleInboundEvent(repeatAction as any);
+      expect(repeatRes.handled).toBe(true);
+      expect(repeatRes.toast?.content).toBe('回复已停止');
+      expect(mockRuntimeGateway.cancelTurn).not.toHaveBeenCalled();
+      expect(mockRuntimeGateway.cancelCurrentTurn).not.toHaveBeenCalled();
+    });
+
+    it('custom isOperatorAllowed callback can grant stop permission to chat administrators', async () => {
+      const account = await channelRepo.createAccount({
+        type: 'lark',
+        groupActivationMode: 'always',
+        defaultSpaceId: spaceId,
+      });
+
+      const chatId = 'oc_admin_group';
+      await channelRepo.createBinding({
+        accountId: account.id,
+        spaceId,
+        nativeContextId: chatId,
+        activationMode: 'always',
+        chatType: 'group',
+      });
+
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      let cancelTurnCalled = false;
+      const mockRuntimeGateway: any = {
+        dispatchInbound: vi.fn().mockResolvedValue({ turnId: 'turn_admin_test_1', executionMode: 'agent' }),
+        cancelTurn: vi.fn().mockImplementation(async () => {
+          cancelTurnCalled = true;
+          return true;
+        }),
+      };
+
+      const fakeStreamSource: StreamEventSource = {
+        listAssistantEvents: vi.fn().mockResolvedValue([]),
+      };
+
+      const gateway = new LarkChannelGateway({
+        account: { id: account.id, userId },
+        transport,
+        channelRepo,
+        sessionRouteRepo,
+        spaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        streamEventSource: fakeStreamSource,
+        isOperatorAllowed: async ({ operatorId }) => {
+          return operatorId === 'ou_group_admin_1';
+        },
+      });
+
+      // Dispatch turn from normal user
+      await gateway.handleInboundEvent({
+        header: { event_id: 'evt_admin_1', event_type: 'im.message.receive_v1', create_time: '1700000000000' },
+        event: {
+          sender: { sender_id: { open_id: 'ou_regular_member' }, sender_type: 'user' },
+          message: { message_id: 'om_reg_1', chat_id: chatId, chat_type: 'group', message_type: 'text', content: '{"text":"test"}', create_time: '1700000000000' },
+        },
+      });
+
+      // Group admin clicks stop button
+      const adminStopAction = {
+        action: { value: { action: 'stop_reply', turnId: 'turn_admin_test_1' } },
+        operator: { open_id: 'ou_group_admin_1' },
+        context: { open_chat_id: chatId },
+      };
+
+      const res = await gateway.handleInboundEvent(adminStopAction as any);
+      expect(res.handled).toBe(true);
+      expect(res.toast?.content).toBe('已停止回复');
+      expect(cancelTurnCalled).toBe(true);
+    });
+  });
 });

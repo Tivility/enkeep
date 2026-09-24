@@ -58,13 +58,52 @@ export interface LarkRawEventHeader {
 export interface LarkRawEvent {
   header?: LarkRawEventHeader;
   event?: {
-    sender: LarkEventSender;
-    message: LarkEventMessage;
+    sender?: LarkEventSender;
+    message?: LarkEventMessage;
+    operator?: any;
+    action?: any;
+    context?: any;
   };
   // Flat format compatibility for test payloads
   sender?: LarkEventSender;
   message?: LarkEventMessage;
   uuid?: string;
+  action?: any;
+  operator?: any;
+  context?: any;
+  open_message_id?: string;
+  open_chat_id?: string;
+  open_id?: string;
+}
+
+export interface LarkCardActionTriggerEvent {
+  action?: {
+    value?: Record<string, any>;
+    tag?: string;
+    option?: string;
+  };
+  operator?: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+  };
+  context?: {
+    open_message_id?: string;
+    open_chat_id?: string;
+  };
+}
+
+export interface LarkParsedCardAction {
+  readonly eventType: 'card.action.trigger';
+  readonly actionType: string;
+  readonly actionValue: Record<string, any>;
+  readonly turnId?: string;
+  readonly sessionId?: string;
+  readonly messageId: string;
+  readonly chatId?: string;
+  readonly operatorId: string;
+  readonly operatorUserId?: string;
+  readonly operatorUnionId?: string;
 }
 
 export interface LarkMention {
@@ -184,13 +223,13 @@ export interface LarkStreamingCardSession {
   pushToolStatus?(statusText: string): Promise<void>;
   finalize(
     finalText: string,
-    status: 'completed' | 'failed',
+    status: 'completed' | 'failed' | 'stopped',
     metadata?: CardFinalMetadata,
     toolStatus?: string | readonly CardToolStatusEntry[]
   ): Promise<void>;
 }
 
-export type LarkEventHandler = (event: LarkRawEvent) => Promise<void>;
+export type LarkEventHandler = (event: LarkRawEvent) => Promise<any>;
 
 export interface LarkTransport {
   readonly connected: boolean;
@@ -215,6 +254,9 @@ export interface LarkTransport {
     title?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
+    withStopButton?: boolean;
+    turnId?: string;
+    sessionId?: string;
   }): Promise<LarkStreamingCardSession | null>;
   addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;

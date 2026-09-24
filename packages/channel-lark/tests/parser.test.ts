@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { stripBotMentions, extractTextAndResources } from '../src/parser.js';
+import {
+  stripBotMentions,
+  extractTextAndResources,
+  isCardActionEvent,
+  parseLarkCardAction,
+} from '../src/parser.js';
 
 describe('parser: stripBotMentions', () => {
   const botOpenId = 'ou_bot_123';
@@ -135,5 +140,125 @@ describe('parser: extractTextAndResources image handling', () => {
     expect(res.resources[0].name).not.toContain('..');
     expect(res.resources[0].name).not.toContain('\x00');
     expect(res.resources[0].name).toBe('passwd.pdf');
+  });
+});
+
+describe('parser: card.action.trigger (C3: card-stop-reply-button)', () => {
+  it('isCardActionEvent correctly identifies card.action.trigger events', () => {
+    expect(isCardActionEvent({ header: { event_type: 'card.action.trigger' } as any })).toBe(true);
+    expect(isCardActionEvent({ action: { value: { action: 'stop_reply' } } } as any)).toBe(true);
+    expect(isCardActionEvent({ event: { action: { value: { action: 'stop_reply' } } } } as any)).toBe(true);
+    expect(isCardActionEvent({ header: { event_type: 'im.message.receive_v1' } as any })).toBe(false);
+    expect(isCardActionEvent(null)).toBe(false);
+    expect(isCardActionEvent(undefined)).toBe(false);
+  });
+
+  it('parses flattened Lark SDK card.action.trigger callback format', () => {
+    const raw = {
+      action: {
+        value: {
+          action: 'stop_reply',
+          turnId: 'turn_c3_test_001',
+          sessionId: 'ses_c3_test_001',
+        },
+        tag: 'button',
+      },
+      operator: {
+        open_id: 'ou_operator_test_1',
+        user_id: 'usr_operator_1',
+        union_id: 'on_operator_1',
+      },
+      context: {
+        open_message_id: 'om_card_msg_123',
+        open_chat_id: 'oc_group_chat_456',
+      },
+    };
+
+    const parsed = parseLarkCardAction(raw as any);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.eventType).toBe('card.action.trigger');
+    expect(parsed?.actionType).toBe('stop_reply');
+    expect(parsed?.turnId).toBe('turn_c3_test_001');
+    expect(parsed?.sessionId).toBe('ses_c3_test_001');
+    expect(parsed?.messageId).toBe('om_card_msg_123');
+    expect(parsed?.chatId).toBe('oc_group_chat_456');
+    expect(parsed?.operatorId).toBe('ou_operator_test_1');
+    expect(parsed?.operatorUserId).toBe('usr_operator_1');
+    expect(parsed?.operatorUnionId).toBe('on_operator_1');
+  });
+
+  it('parses Schema 2.0 v2 header + event card.action.trigger format', () => {
+    const raw = {
+      header: {
+        event_id: 'evt_c3_v2_999',
+        event_type: 'card.action.trigger',
+        create_time: '2026-03-30T10:00:00Z',
+      },
+      event: {
+        action: {
+          value: {
+            action: 'stop_reply',
+            turnId: 'turn_v2_002',
+            sessionId: 'ses_v2_002',
+          },
+          tag: 'button',
+        },
+        operator: {
+          operator_id: {
+            open_id: 'ou_v2_user',
+            user_id: 'usr_v2_user',
+            union_id: 'on_v2_user',
+          },
+        },
+        context: {
+          open_message_id: 'om_v2_msg_002',
+          open_chat_id: 'oc_v2_chat_002',
+        },
+      },
+    };
+
+    const parsed = parseLarkCardAction(raw as any);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.actionType).toBe('stop_reply');
+    expect(parsed?.turnId).toBe('turn_v2_002');
+    expect(parsed?.sessionId).toBe('ses_v2_002');
+    expect(parsed?.messageId).toBe('om_v2_msg_002');
+    expect(parsed?.chatId).toBe('oc_v2_chat_002');
+    expect(parsed?.operatorId).toBe('ou_v2_user');
+  });
+
+  it('handles stringified JSON in action.value gracefully', () => {
+    const raw = {
+      header: { event_type: 'card.action.trigger' },
+      action: {
+        value: JSON.stringify({
+          action: 'stop_reply',
+          turn_id: 'turn_str_003',
+          session_id: 'ses_str_003',
+        }),
+      },
+      operator: { open_id: 'ou_str_user' },
+      open_message_id: 'om_str_msg',
+      open_chat_id: 'oc_str_chat',
+    };
+
+    const parsed = parseLarkCardAction(raw as any);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.actionType).toBe('stop_reply');
+    expect(parsed?.turnId).toBe('turn_str_003');
+    expect(parsed?.sessionId).toBe('ses_str_003');
+    expect(parsed?.messageId).toBe('om_str_msg');
+    expect(parsed?.operatorId).toBe('ou_str_user');
+  });
+
+  it('returns null for non-card-action events', () => {
+    expect(parseLarkCardAction(null)).toBeNull();
+    expect(parseLarkCardAction(undefined)).toBeNull();
+    expect(
+      parseLarkCardAction({
+        header: { event_type: 'im.message.receive_v1' },
+        message: { content: 'hello' },
+      } as any)
+    ).toBeNull();
   });
 });

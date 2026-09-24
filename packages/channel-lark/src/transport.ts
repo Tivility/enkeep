@@ -231,7 +231,7 @@ export interface FakeStreamingCallRecord {
   readonly messageId?: string;
   readonly content?: string;
   readonly toolStatus?: string | readonly CardToolStatusEntry[];
-  readonly status?: 'completed' | 'failed';
+  readonly status?: 'completed' | 'failed' | 'stopped';
   readonly metadata?: CardFinalMetadata;
   readonly card?: any;
   readonly params?: any;
@@ -307,6 +307,27 @@ export function buildCollapsibleStatusPanel(opts: {
   }
 
   return panel;
+}
+
+/**
+ * Build Schema 2.0 stop reply danger button element.
+ * Statically strips in final cards to prevent post-completion clicks.
+ */
+export function buildStopReplyButton(turnId?: string, sessionId?: string): Record<string, unknown> {
+  return {
+    tag: 'button',
+    element_id: 'stop_reply_button',
+    text: {
+      tag: 'plain_text',
+      content: '⏹ 停止回复',
+    },
+    type: 'danger',
+    value: {
+      action: 'stop_reply',
+      ...(turnId ? { turnId } : {}),
+      ...(sessionId ? { sessionId } : {}),
+    },
+  };
 }
 
 /**
@@ -422,12 +443,13 @@ export class FakeLarkTransport implements LarkTransport {
     this.handlers.delete(handler);
   }
 
-  async simulateInboundEvent(event: LarkRawEvent): Promise<void> {
+  async simulateInboundEvent(event: LarkRawEvent): Promise<any> {
     if (!this._connected) {
       throw new Error('FakeLarkTransport is disconnected; cannot receive inbound events');
     }
     const promises = Array.from(this.handlers).map((h) => h(event));
-    await Promise.all(promises);
+    const results = await Promise.all(promises);
+    return results.find((r) => r && typeof r === 'object') ?? results[0];
   }
 
   async addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }> {
@@ -577,6 +599,9 @@ export class FakeLarkTransport implements LarkTransport {
     title?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
+    withStopButton?: boolean;
+    turnId?: string;
+    sessionId?: string;
   }): Promise<LarkStreamingCardSession | null> {
     if (!this._connected || !this.streamingCardsEnabled || this.failStreamingCard) {
       console.warn('[lark-stream] createStreamingCard returned null', {
@@ -590,12 +615,55 @@ export class FakeLarkTransport implements LarkTransport {
     const cardId = `crd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const messageId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+    const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
+
+    const initialElements: Array<Record<string, unknown>> = [];
+    if (withStatus) {
+      initialElements.push(
+        buildCollapsibleStatusPanel({
+          content: '正在准备…',
+          expanded: true,
+          elementId: 'tool_status_panel',
+          contentElementId: 'tool_status_content',
+          title: '**🔧 执行过程**',
+          backgroundColor: 'wathet-50',
+        })
+      );
+    }
+    initialElements.push({
+      tag: 'markdown',
+      element_id: 'main_content',
+      content: '正在思考…',
+    });
+    if (withStop) {
+      initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
+    }
+
+    const initialCard = {
+      schema: '2.0',
+      config: {
+        update_multi: true,
+        streaming_mode: true,
+      },
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: params.title ?? 'Enkeep',
+        },
+        template: 'blue',
+      },
+      body: {
+        direction: 'vertical',
+        elements: initialElements,
+      },
+    };
 
     this._streamingCalls.push({
       type: 'card_create',
       cardId,
       messageId,
       params,
+      card: initialCard,
       timestamp: new Date().toISOString(),
     });
 
@@ -623,7 +691,7 @@ export class FakeLarkTransport implements LarkTransport {
       },
       finalize: async (
         finalText: string,
-        status: 'completed' | 'failed',
+        status: 'completed' | 'failed' | 'stopped',
         metadata?: CardFinalMetadata,
         toolStatus?: string | readonly CardToolStatusEntry[]
       ): Promise<void> => {
@@ -656,7 +724,10 @@ export class FakeLarkTransport implements LarkTransport {
         }
 
         if (chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')) {
-          bodyElements.push({ tag: 'markdown', content: '(空回复)' });
+          bodyElements.push({
+            tag: 'markdown',
+            content: status === 'stopped' ? '(已停止回复)' : '(空回复)',
+          });
         } else {
           for (const c of chunks) {
             bodyElements.push({ tag: 'markdown', content: c });
@@ -679,10 +750,18 @@ export class FakeLarkTransport implements LarkTransport {
                   title: { tag: 'plain_text', content: params.title ?? 'Enkeep' },
                   template: 'green',
                 }
-              : {
-                  title: { tag: 'plain_text', content: '处理失败' },
-                  template: 'red',
-                },
+              : status === 'stopped'
+                ? {
+                    title: {
+                      tag: 'plain_text',
+                      content: params.title ? `${params.title} (已中止)` : '已中止',
+                    },
+                    template: 'grey',
+                  }
+                : {
+                    title: { tag: 'plain_text', content: '处理失败' },
+                    template: 'red',
+                  },
           body: {
             direction: 'vertical',
             elements: bodyElements,
@@ -877,6 +956,27 @@ export class CredentialedLarkTransport implements LarkTransport {
         };
         const promises = Array.from(this.handlers).map((h) => h(rawEvent));
         await Promise.all(promises);
+      },
+      'card.action.trigger': async (data: any) => {
+        const rawEvent: LarkRawEvent = {
+          header: data.header ?? {
+            event_id: data.event_id ?? (data.context?.open_message_id ? `act_${data.context.open_message_id}_${Date.now()}` : undefined),
+            event_type: 'card.action.trigger',
+            create_time: data.create_time,
+            token: data.token,
+            app_id: data.app_id,
+            tenant_key: data.tenant_key,
+          },
+          action: data.action,
+          operator: data.operator,
+          context: data.context,
+          open_message_id: data.open_message_id ?? data.context?.open_message_id,
+          open_chat_id: data.open_chat_id ?? data.context?.open_chat_id,
+          open_id: data.operator?.open_id ?? data.open_id,
+        };
+        const results = await Promise.all(Array.from(this.handlers).map((h) => h(rawEvent)));
+        const resWithToast = results.find((r) => r && typeof r === 'object' && ('toast' in r || 'card' in r));
+        return resWithToast ?? {};
       },
     });
 
@@ -1336,6 +1436,9 @@ export class CredentialedLarkTransport implements LarkTransport {
     title?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
+    withStopButton?: boolean;
+    turnId?: string;
+    sessionId?: string;
   }): Promise<LarkStreamingCardSession | null> {
     if (!this.apiClient) {
       this.logger.warn('[lark-stream] createStreamingCard failed: no apiClient');
@@ -1350,6 +1453,7 @@ export class CredentialedLarkTransport implements LarkTransport {
       }
 
       const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+      const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
       const initialElements: Array<Record<string, unknown>> = [];
       if (withStatus) {
         initialElements.push(
@@ -1368,6 +1472,9 @@ export class CredentialedLarkTransport implements LarkTransport {
         element_id: 'main_content',
         content: '正在思考…',
       });
+      if (withStop) {
+        initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
+      }
 
       // 1. Build schema 2.0 card JSON
       const initialCard = {
@@ -1659,7 +1766,7 @@ export class CredentialedLarkTransport implements LarkTransport {
         },
         finalize: async (
           finalText: string,
-          status: 'completed' | 'failed',
+          status: 'completed' | 'failed' | 'stopped',
           metadata?: CardFinalMetadata,
           toolStatus?: string | readonly CardToolStatusEntry[]
         ): Promise<void> => {
@@ -1710,7 +1817,10 @@ export class CredentialedLarkTransport implements LarkTransport {
           }
 
           if (chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')) {
-            bodyElements.push({ tag: 'markdown', content: '(空回复)' });
+            bodyElements.push({
+              tag: 'markdown',
+              content: status === 'stopped' ? '(已停止回复)' : '(空回复)',
+            });
           } else {
             for (const c of chunks) {
               bodyElements.push({ tag: 'markdown', content: c });
@@ -1733,10 +1843,18 @@ export class CredentialedLarkTransport implements LarkTransport {
                     title: { tag: 'plain_text', content: params.title ?? 'Enkeep' },
                     template: 'green',
                   }
-                : {
-                    title: { tag: 'plain_text', content: '处理失败' },
-                    template: 'red',
-                  },
+                : status === 'stopped'
+                  ? {
+                      title: {
+                        tag: 'plain_text',
+                        content: params.title ? `${params.title} (已中止)` : '已中止',
+                      },
+                      template: 'grey',
+                    }
+                  : {
+                      title: { tag: 'plain_text', content: '处理失败' },
+                      template: 'red',
+                    },
             body: {
               direction: 'vertical',
               elements: bodyElements,

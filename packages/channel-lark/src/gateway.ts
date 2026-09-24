@@ -26,7 +26,9 @@ import type {
 } from '@enkeep/web-channel';
 import {
   buildNativeContextId,
+  isCardActionEvent,
   messageMentionsBot,
+  parseLarkCardAction,
   parseLarkEvent,
   stripBotMentions,
   stripLeadingMentions,
@@ -34,6 +36,7 @@ import {
 import type {
   LarkAccountConfig,
   LarkImageAttachmentIngestor,
+  LarkParsedCardAction,
   LarkParsedMessage,
   LarkRawEvent,
   LarkStreamingCardSession,
@@ -55,6 +58,13 @@ export interface LarkChannelGatewayOptions {
   groupActivationMode?: ChannelActivationMode;
   streamEventSource?: StreamEventSource;
   imageAttachmentIngestor?: LarkImageAttachmentIngestor;
+  isOperatorAllowed?: (params: {
+    operatorId: string;
+    chatId?: string;
+    turnId?: string;
+    sessionId?: string;
+    senderId?: string;
+  }) => Promise<boolean> | boolean;
 }
 
 export interface InboundHandlingResult {
@@ -68,12 +78,17 @@ export interface InboundHandlingResult {
     | 'account_disabled'
     | 'account_not_found'
     | 'empty_after_mention_strip'
-    | 'unsupported_file';
+    | 'unsupported_file'
+    | 'permission_denied';
   readonly inboxItem?: ChannelInboxItem;
   readonly sessionRouteId?: string;
   readonly turnId?: string;
   readonly outboxItem?: ChannelOutboxItem;
   readonly replyText?: string;
+  readonly toast?: {
+    readonly type: 'info' | 'warning' | 'error' | 'success';
+    readonly content: string;
+  };
 }
 
 export class LarkChannelGateway {
@@ -94,6 +109,15 @@ export class LarkChannelGateway {
   private readonly lastInboundTargets = new Map<string, ContinuationTarget>();
   private readonly continuationWatchers = new Map<string, ContinuationWatcher>();
   private readonly inFlightTurns = new Set<string>();
+  private readonly turnSenders = new Map<string, string>();
+  private readonly stoppedTurns = new Set<string>();
+  private readonly isOperatorAllowedCallback?: (params: {
+    operatorId: string;
+    chatId?: string;
+    turnId?: string;
+    sessionId?: string;
+    senderId?: string;
+  }) => Promise<boolean> | boolean;
 
   constructor(options: LarkChannelGatewayOptions) {
     this.account = options.account;
@@ -106,11 +130,12 @@ export class LarkChannelGateway {
     this.defaultSpaceId = options.defaultSpaceId;
     this.groupActivationMode = options.groupActivationMode;
     this.streamEventSource = options.streamEventSource;
+    this.isOperatorAllowedCallback = options.isOperatorAllowed;
 
     // Register event listener with transport
     this.transport.onEvent(async (rawEvent: LarkRawEvent) => {
       if (!this.isDisposed) {
-        await this.handleInboundEvent(rawEvent);
+        return await this.handleInboundEvent(rawEvent);
       }
     });
   }
@@ -341,7 +366,12 @@ export class LarkChannelGateway {
       return { handled: false, ignoredReason: 'account_disabled' };
     }
 
-    // 0. Verify active account state dynamically
+    // 0a. Check if event is card action trigger (e.g. stop reply button click)
+    if (isCardActionEvent(rawEvent)) {
+      return await this.handleCardAction(rawEvent);
+    }
+
+    // 0b. Verify active account state dynamically
     const isActive = await this.checkAccountActive();
     if (!isActive) {
       return { handled: false, ignoredReason: 'account_disabled' };
@@ -1129,6 +1159,14 @@ export class LarkChannelGateway {
       turnId = dispatchResult.turnId || platformIdempotencyKey;
       inboxItem = await this.channelRepo.updateInboxStatus(inboxItem.id, 'delivered');
 
+      if (parsed.senderId) {
+        this.recordTurnSender(turnId, parsed.senderId);
+        this.recordTurnSender(route.id, parsed.senderId);
+        if (dispatchResult.turnId) {
+          this.recordTurnSender(dispatchResult.turnId, parsed.senderId);
+        }
+      }
+
       if (dispatchResult.executionMode !== 'command' && this.streamEventSource && typeof this.transport.createStreamingCard === 'function') {
         let initialCursor: number | undefined;
         if (typeof this.streamEventSource.getLatestRowId === 'function') {
@@ -1142,11 +1180,14 @@ export class LarkChannelGateway {
           sessionRouteId: route.id,
           initialCursor,
           turnId: dispatchResult.turnId,
+          senderId: parsed.senderId,
           cardParams: {
             chatId: parsed.chatId,
             replyToMessageId: parsed.messageId,
             rootId: parsed.rootId,
             threadId: parsed.threadId,
+            turnId: dispatchResult.turnId,
+            sessionId: route.id,
           },
         });
         tracker.start();
@@ -1162,6 +1203,249 @@ export class LarkChannelGateway {
       inboxItem,
       sessionRouteId: route.id,
       turnId,
+    };
+  }
+
+  private recordTurnSender(key: string, senderId: string): void {
+    if (this.turnSenders.size >= 500) {
+      const oldest = this.turnSenders.keys().next().value;
+      if (oldest) this.turnSenders.delete(oldest);
+    }
+    this.turnSenders.set(key, senderId);
+  }
+
+  private recordStoppedTurn(key: string): void {
+    if (this.stoppedTurns.size >= 500) {
+      const oldest = this.stoppedTurns.values().next().value;
+      if (oldest) this.stoppedTurns.delete(oldest);
+    }
+    this.stoppedTurns.add(key);
+  }
+
+  private findActiveTracker(params: {
+    turnId?: string;
+    sessionId?: string;
+    messageId?: string;
+  }): StreamingReplyTracker | undefined {
+    const { turnId, sessionId, messageId } = params;
+
+    // Search activeTrackers
+    for (const tracker of this.activeTrackers.values()) {
+      if (turnId && tracker.getTurnId() === turnId) return tracker;
+      if (messageId && tracker.getMessageId() === messageId) return tracker;
+      if (sessionId && tracker.getRouteId() === sessionId && tracker.isActive()) return tracker;
+    }
+
+    // Search continuationWatchers
+    for (const watcher of this.continuationWatchers.values()) {
+      const tracker = watcher.getActiveTracker();
+      if (tracker) {
+        if (turnId && tracker.getTurnId() === turnId) return tracker;
+        if (messageId && tracker.getMessageId() === messageId) return tracker;
+        if (sessionId && tracker.getRouteId() === sessionId && tracker.isActive()) return tracker;
+      }
+    }
+
+    return undefined;
+  }
+
+  private async checkChatOwnerOrAdmin(chatId: string, operatorId: string): Promise<boolean> {
+    const apiClient = (this.transport as any).apiClient;
+    if (!apiClient) return false;
+
+    try {
+      const getChatFn = apiClient.im?.v1?.chat?.get || apiClient.im?.chat?.get;
+      if (typeof getChatFn === 'function') {
+        const res = await getChatFn({ path: { chat_id: chatId } });
+        const ownerId = res?.data?.owner_id;
+        if (ownerId && ownerId === operatorId) {
+          return true;
+        }
+      }
+    } catch {}
+
+    try {
+      const getMembersFn = apiClient.im?.v1?.chatMembers?.get || apiClient.im?.chatMembers?.get;
+      if (typeof getMembersFn === 'function') {
+        const res = await getMembersFn({ path: { chat_id: chatId } });
+        const items = res?.data?.items || [];
+        const member = items.find((m: any) => m.member_id === operatorId || m.open_id === operatorId);
+        if (member && (member.role === 'owner' || member.role === 'administrator')) {
+          return true;
+        }
+      }
+    } catch {}
+
+    return false;
+  }
+
+  private async verifyOperatorPermission(params: {
+    operatorId: string;
+    chatId?: string;
+    turnId?: string;
+    sessionId?: string;
+    senderId?: string;
+  }): Promise<boolean> {
+    const { operatorId, senderId, chatId, sessionId } = params;
+    if (!operatorId) return false;
+
+    // 1. If custom validator provided in options
+    if (this.isOperatorAllowedCallback) {
+      try {
+        const allowed = await this.isOperatorAllowedCallback(params);
+        if (allowed) return true;
+      } catch {}
+    }
+
+    // 2. Original sender of the triggering message is always authorized
+    if (senderId && operatorId === senderId) {
+      return true;
+    }
+
+    // 3. Fallback: query route peerId if senderId was not cached
+    if (!senderId && sessionId) {
+      try {
+        const route = await this.sessionRouteRepo.findById(sessionId);
+        if (route && (route.peerId === operatorId || route.peerId?.startsWith(operatorId))) {
+          return true;
+        }
+      } catch {}
+    }
+
+    // 4. In group chat: check if operator is chat owner or administrator via Lark API
+    if (chatId) {
+      const isOwnerOrAdmin = await this.checkChatOwnerOrAdmin(chatId, operatorId);
+      if (isOwnerOrAdmin) return true;
+    }
+
+    // Fail closed if senderId was known and not matched, or senderId was unknown
+    return false;
+  }
+
+  /**
+   * Handles interactive card action callbacks (e.g. stop reply button click).
+   * Verifies operator permission, performs idempotent cancellation, and finalizes card to stopped state.
+   */
+  async handleCardAction(rawEvent: LarkRawEvent): Promise<InboundHandlingResult> {
+    if (this.isDisposed) {
+      return { handled: false, ignoredReason: 'account_disabled' };
+    }
+
+    // 0. Verify active account state dynamically
+    const isActive = await this.checkAccountActive();
+    if (!isActive) {
+      return { handled: false, ignoredReason: 'account_disabled' };
+    }
+
+    // 1. Parse card action
+    const parsedAction = parseLarkCardAction(rawEvent);
+    if (!parsedAction) {
+      return { handled: false, ignoredReason: 'parse_error' };
+    }
+
+    // 2. Only handle stop_reply action
+    if (parsedAction.actionType !== 'stop_reply') {
+      return { handled: false, ignoredReason: 'parse_error' };
+    }
+
+    const { turnId, sessionId, messageId, operatorId, chatId } = parsedAction;
+
+    // 3. Find associated active tracker / sender
+    const tracker = this.findActiveTracker({ turnId, sessionId, messageId });
+    const resolvedSenderId =
+      (turnId ? this.turnSenders.get(turnId) : undefined) ??
+      (sessionId ? this.turnSenders.get(sessionId) : undefined) ??
+      tracker?.getSenderId();
+
+    // 4. Operator permission check
+    const isAllowed = await this.verifyOperatorPermission({
+      operatorId,
+      chatId,
+      turnId,
+      sessionId,
+      senderId: resolvedSenderId,
+    });
+
+    if (!isAllowed) {
+      return {
+        handled: true,
+        ignoredReason: 'permission_denied',
+        toast: {
+          type: 'warning',
+          content: '无权停止他人发起的任务',
+        },
+      };
+    }
+
+    // 5. Idempotent check on repeated clicks
+    const dedupeKey = turnId || sessionId || messageId;
+    if (dedupeKey && this.stoppedTurns.has(dedupeKey)) {
+      return {
+        handled: true,
+        toast: {
+          type: 'info',
+          content: '回复已停止',
+        },
+      };
+    }
+    if (dedupeKey) {
+      this.recordStoppedTurn(dedupeKey);
+      if (turnId) this.recordStoppedTurn(turnId);
+      if (sessionId) this.recordStoppedTurn(sessionId);
+      if (messageId) this.recordStoppedTurn(messageId);
+    }
+
+    // 6. Cancel in-flight turn via runtimeGateway
+    try {
+      if (turnId && typeof this.runtimeGateway.cancelTurn === 'function') {
+        await this.runtimeGateway.cancelTurn(this.userId, turnId);
+      } else if (sessionId && typeof this.runtimeGateway.cancelCurrentTurn === 'function') {
+        await this.runtimeGateway.cancelCurrentTurn(this.userId, sessionId);
+      } else if (typeof this.runtimeGateway.cancelCurrentTurn === 'function') {
+        const resolvedSessionId = tracker?.getRouteId() ?? sessionId;
+        if (resolvedSessionId) {
+          await this.runtimeGateway.cancelCurrentTurn(this.userId, resolvedSessionId);
+        }
+      }
+    } catch (err) {
+      console.warn('[lark-card-action] cancel turn returned error (continuing to finalize card):', err);
+    }
+
+    // 7. Update card to stopped state
+    if (tracker && tracker.isActive()) {
+      const currentText = tracker.getAccumulatedText();
+      const stoppedText =
+        currentText && currentText.trim().length > 0
+          ? `${currentText}\n\n*(已停止回复)*`
+          : '(已停止回复)';
+      await tracker.finalize(stoppedText, 'stopped');
+      tracker.stop();
+    }
+
+    // Clean up reactions (remove OnIt if present)
+    const pendingKey =
+      (turnId ? this.deriveIdempotencyKey(turnId) : undefined) ??
+      (messageId ? this.deriveIdempotencyKey(messageId) : undefined);
+    if (pendingKey) {
+      const pending = this.pendingReactions.get(pendingKey);
+      if (pending) {
+        this.pendingReactions.delete(pendingKey);
+        pending.reactionIdPromise
+          .then((rxId) => {
+            if (rxId) this.transport.removeReaction(pending.messageId, rxId).catch(() => {});
+          })
+          .catch(() => {});
+      }
+    }
+
+    return {
+      handled: true,
+      turnId,
+      sessionRouteId: sessionId ?? tracker?.getRouteId(),
+      toast: {
+        type: 'info',
+        content: '已停止回复',
+      },
     };
   }
 
