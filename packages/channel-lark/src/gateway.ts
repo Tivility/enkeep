@@ -46,6 +46,7 @@ import type {
 } from './types.js';
 import { StreamingReplyTracker } from './streaming-tracker.js';
 import { ContinuationWatcher, type ContinuationTarget } from './continuation-watcher.js';
+import { LarkCotManager, type LarkCotApiClient, type CotEntry } from './cot.js';
 
 export interface LarkChannelGatewayOptions {
   account: ChannelAccount | LarkAccountConfig;
@@ -58,6 +59,9 @@ export interface LarkChannelGatewayOptions {
   groupActivationMode?: ChannelActivationMode;
   streamEventSource?: StreamEventSource;
   imageAttachmentIngestor?: LarkImageAttachmentIngestor;
+  enableCot?: boolean;
+  cotApiClient?: LarkCotApiClient;
+  noCotChats?: string[];
   isOperatorAllowed?: (params: {
     operatorId: string;
     chatId?: string;
@@ -111,6 +115,7 @@ export class LarkChannelGateway {
   private readonly inFlightTurns = new Set<string>();
   private readonly turnSenders = new Map<string, string>();
   private readonly stoppedTurns = new Set<string>();
+  readonly cotManager: LarkCotManager;
   private readonly isOperatorAllowedCallback?: (params: {
     operatorId: string;
     chatId?: string;
@@ -131,6 +136,11 @@ export class LarkChannelGateway {
     this.groupActivationMode = options.groupActivationMode;
     this.streamEventSource = options.streamEventSource;
     this.isOperatorAllowedCallback = options.isOperatorAllowed;
+    this.cotManager = new LarkCotManager({
+      enabled: options.enableCot ?? false,
+      apiClient: options.cotApiClient ?? ((this.transport as any).apiClient || (this.transport as any).getApiClient?.()),
+      noCotChats: options.noCotChats,
+    });
 
     // Register event listener with transport
     this.transport.onEvent(async (rawEvent: LarkRawEvent) => {
@@ -1322,6 +1332,26 @@ export class LarkChannelGateway {
     return false;
   }
 
+  setChatCotMode(chatId: string, enabled: boolean): void {
+    this.cotManager.setChatCotMode(chatId, enabled);
+  }
+
+  isCotEnabledForChat(chatId?: string): boolean {
+    return this.cotManager.isCotEnabledForChat(chatId);
+  }
+
+  async handleCotThinkingUpdate(params: {
+    turnId: string;
+    chatId: string;
+    sessionId?: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    entries: CotEntry[];
+  }): Promise<boolean> {
+    return await this.cotManager.handleThinkingUpdate(params);
+  }
+
   /**
    * Handles interactive card action callbacks (e.g. stop reply button click).
    * Verifies operator permission, performs idempotent cancellation, and finalizes card to stopped state.
@@ -1420,6 +1450,11 @@ export class LarkChannelGateway {
           : '(已停止回复)';
       await tracker.finalize(stoppedText, 'stopped');
       tracker.stop();
+    }
+
+    // Stop/abort CoT bubble if active
+    if (turnId) {
+      this.cotManager.abortTurn(turnId).catch(() => {});
     }
 
     // Clean up reactions (remove OnIt if present)
@@ -1550,6 +1585,10 @@ export class LarkChannelGateway {
         streamingHandled = true;
         streamingMessageId = r.messageId;
       }
+    }
+
+    if (params.turnId) {
+      await this.cotManager.finalizeTurn(params.turnId, 'completed').catch(() => {});
     }
 
     const outboxId = this.deriveOutboxId(params.turnId);
@@ -1930,6 +1969,10 @@ export class LarkChannelGateway {
       }
     }
 
+    if (params.turnId) {
+      await this.cotManager.finalizeTurn(params.turnId, 'failed').catch(() => {});
+    }
+
     const outboxId = this.deriveOutboxId(params.turnId);
 
     if (streamingHandled) {
@@ -2090,6 +2133,7 @@ export class LarkChannelGateway {
    */
   async dispose(): Promise<void> {
     this.isDisposed = true;
+    this.cotManager.dispose();
     for (const tracker of this.activeTrackers.values()) {
       tracker.stop();
     }
