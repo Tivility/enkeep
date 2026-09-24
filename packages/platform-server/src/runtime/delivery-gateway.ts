@@ -1899,6 +1899,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             ceiling: this.quotaTokenCeiling,
           });
 
+          const effectiveTimeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
+          const reservationTtlSeconds = Math.ceil(effectiveTimeoutMs / 1000) + 300;
+
           const quotaRequest: QuotaReservationRequest = {
             userId,
             sessionId,
@@ -1907,6 +1910,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             messages: 1,
             tokens: reservationTokens,
             isEstimateTokens: true,
+            ttlSeconds: reservationTtlSeconds,
           };
 
           try {
@@ -2431,11 +2435,21 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
       // 6. Commit quota in same transaction
       if (reservationBundle) {
-        reservationBundle.commitInTransaction(this.db, {
-          turns: 1,
-          messages: 1,
-          tokens: tokenUsage.tokens,
-        });
+        try {
+          reservationBundle.commitInTransaction(this.db, {
+            turns: 1,
+            messages: 1,
+            tokens: tokenUsage.tokens,
+          });
+        } catch (quotaErr) {
+          this.recordSettledError(quotaErr);
+          console.warn('[delivery-gateway] quota commit failed; preserving delivered assistant reply', { turnId, error: quotaErr });
+          try {
+            reservationBundle.releaseInTransaction(this.db);
+          } catch (relErr) {
+            this.recordSettledError(relErr);
+          }
+        }
       }
 
       // 7. Release active lease in session_execution_leases
