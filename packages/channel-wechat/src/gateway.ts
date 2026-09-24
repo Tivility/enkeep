@@ -1,0 +1,407 @@
+/**
+ * WeChat Channel Gateway.
+ * Manages inbound WeChat events, CAS durable inbox transitions,
+ * session route resolution, runtime dispatch, context_token caching, and outbound delivery.
+ *
+ * @module @enkeep/channel-wechat/gateway
+ */
+
+import type { WeChatParsedMessage, WeChatTransport } from './types.js';
+import { ContextTokenStore } from './context-token-store.js';
+import type {
+  WeChatChannelAccount,
+  WeChatChannelBinding,
+  WeChatChannelInboxItem,
+  WeChatChannelOutboxItem,
+  WeChatChannelRepo,
+  WeChatChannelGatewayOptions,
+  WeChatInboundEnvelope,
+  WeChatInboundHandlingResult,
+  WeChatRuntimeGateway,
+  WeChatSessionRoute,
+  WeChatSessionRouteRepo,
+  WeChatSpaceRepo,
+} from './gateway-types.js';
+
+export class WeChatChannelGateway {
+  readonly account: WeChatChannelAccount;
+  readonly transport: WeChatTransport;
+  readonly channelRepo: WeChatChannelRepo;
+  readonly sessionRouteRepo: WeChatSessionRouteRepo;
+  readonly spaceRepo?: WeChatSpaceRepo;
+  readonly runtimeGateway: WeChatRuntimeGateway;
+  readonly contextTokenStore: ContextTokenStore;
+  readonly defaultSpaceId?: string | null;
+
+  private isDisposed = false;
+  private readonly inFlightTurns = new Set<string>();
+  private readonly messageHandler: (msg: WeChatParsedMessage) => Promise<void>;
+  private readonly cursorCommitHandler?: (cursor: string) => Promise<void> | void;
+
+  constructor(options: WeChatChannelGatewayOptions) {
+    this.account = options.account;
+    this.transport = options.transport;
+    this.channelRepo = options.channelRepo;
+    this.sessionRouteRepo = options.sessionRouteRepo;
+    this.spaceRepo = options.spaceRepo;
+    this.runtimeGateway = options.runtimeGateway;
+    this.contextTokenStore = options.contextTokenStore ?? new ContextTokenStore();
+    this.defaultSpaceId = options.defaultSpaceId ?? this.account.defaultSpaceId;
+
+    // 1. Attach message listener to transport
+    this.messageHandler = async (msg: WeChatParsedMessage) => {
+      if (!this.isDisposed) {
+        await this.handleInboundMessage(msg);
+      }
+    };
+    if (typeof (this.transport as any).onMessage === 'function') {
+      (this.transport as any).onMessage(this.messageHandler);
+    }
+
+    // 2. Attach cursor commit listener if requested
+    if (options.onCursorCommit && typeof (this.transport as any).onCursorCommit === 'function') {
+      this.cursorCommitHandler = options.onCursorCommit;
+      (this.transport as any).onCursorCommit(this.cursorCommitHandler);
+    }
+  }
+
+  get userId(): string {
+    return this.account.userId;
+  }
+
+  get accountId(): string {
+    return this.account.id;
+  }
+
+  get disposed(): boolean {
+    return this.isDisposed;
+  }
+
+  /**
+   * Checks whether the account is currently marked active in the database.
+   */
+  async checkAccountActive(): Promise<boolean> {
+    if (this.isDisposed) return false;
+    try {
+      const liveAccount = await this.channelRepo.findAccountById(this.accountId);
+      if (!liveAccount) return false;
+      return liveAccount.status === 'active';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Processes an incoming parsed WeChat message:
+   * 1. Validates active status
+   * 2. Caches context_token
+   * 3. Resolves channel binding (auto-bind to default space for p2p)
+   * 4. CAS idempotency claim into channel_inbox
+   * 5. Resolves session route
+   * 6. Dispatches to RuntimeGateway
+   */
+  async handleInboundMessage(msg: WeChatParsedMessage): Promise<WeChatInboundHandlingResult> {
+    if (this.isDisposed) {
+      return { handled: false, ignoredReason: 'account_disabled' };
+    }
+
+    const isActive = await this.checkAccountActive();
+    if (!isActive) {
+      return { handled: false, ignoredReason: 'account_disabled' };
+    }
+
+    if (!msg || !msg.senderId) {
+      return { handled: false, ignoredReason: 'parse_error' };
+    }
+
+    if (msg.isFromBot) {
+      return { handled: false, ignoredReason: 'duplicate_event' };
+    }
+
+    // Cache context_token immediately
+    if (msg.contextToken) {
+      await this.contextTokenStore.set(msg.senderId, msg.contextToken);
+    }
+
+    const nativeContextId = `wechat:${msg.senderId}`;
+    const nativeEventId = msg.messageId || msg.dedupKey;
+
+    // 1. Resolve channel binding
+    let binding = await this.channelRepo.findBindingByContext(this.accountId, nativeContextId);
+    if (!binding && msg.chatId && msg.chatId !== nativeContextId) {
+      binding = await this.channelRepo.findBindingByContext(this.accountId, msg.chatId);
+    }
+
+    // Auto-create binding to default space if missing
+    if (!binding) {
+      const targetSpaceId = this.defaultSpaceId ?? this.account.defaultSpaceId ?? null;
+      if (targetSpaceId) {
+        let isSpaceActive = true;
+        if (this.spaceRepo) {
+          const space = await this.spaceRepo.findById(targetSpaceId);
+          if (!space || space.status !== 'active') {
+            isSpaceActive = false;
+          }
+        }
+
+        if (isSpaceActive) {
+          binding = await this.channelRepo.createBinding({
+            accountId: this.accountId,
+            spaceId: targetSpaceId,
+            nativeContextId,
+            activationMode: 'always',
+            chatType: 'p2p',
+          });
+        }
+      }
+    }
+
+    if (!binding) {
+      return { handled: false, ignoredReason: 'no_binding' };
+    }
+
+    // 2. Durable Channel Inbox Idempotency & CAS Transition
+    const existingInbox = await this.channelRepo.findInboxByEvent(this.accountId, nativeEventId);
+    let inboxItem: WeChatChannelInboxItem;
+
+    if (existingInbox) {
+      if (existingInbox.status === 'delivered' || existingInbox.status === 'processing') {
+        return { handled: false, ignoredReason: 'duplicate_event', inboxItem: existingInbox };
+      }
+      const claimed = await this.channelRepo.claimInboxForProcessing(existingInbox.id);
+      if (!claimed) {
+        return { handled: false, ignoredReason: 'duplicate_event', inboxItem: existingInbox };
+      }
+      inboxItem = claimed;
+    } else {
+      const { item, isDuplicate } = await this.channelRepo.createInboxItem({
+        accountId: this.accountId,
+        nativeEventId,
+        nativeContextId,
+        payloadJson: JSON.stringify({ parsed: msg }),
+        status: 'held',
+      });
+
+      if (isDuplicate && item.status === 'delivered') {
+        return { handled: false, ignoredReason: 'duplicate_event', inboxItem: item };
+      }
+
+      const claimed = await this.channelRepo.claimInboxForProcessing(item.id);
+      inboxItem = claimed || item;
+    }
+
+    // 3. Resolve Session Route per nativeContextId
+    let route: WeChatSessionRoute;
+    const existingRoute = await this.sessionRouteRepo.findByRouteIdentity(
+      'wechat',
+      this.accountId,
+      nativeContextId
+    );
+    if (existingRoute) {
+      route = existingRoute;
+    } else {
+      const dshSessionId = `ses_${Math.random().toString(36).slice(2, 10)}${Date.now()}`;
+      route = await this.sessionRouteRepo.create({
+        spaceId: binding.spaceId,
+        channel: 'wechat',
+        accountId: this.accountId,
+        nativeContextId,
+        peerId: msg.senderId,
+        dshSessionId,
+        title: `WeChat ${msg.senderName || msg.senderId}`,
+      });
+    }
+
+    // 4. Clean Content & Build Inbound Envelope
+    const platformIdempotencyKey = `idem_wechat_${this.accountId}_${nativeEventId}`;
+    let effectiveContent = msg.text?.trim() || '';
+    if (!effectiveContent && msg.mediaItems && msg.mediaItems.length > 0) {
+      effectiveContent = msg.mediaItems.some((m) => m.type === 'image') ? '[图片]' : '[多媒体消息]';
+    }
+    if (!effectiveContent) {
+      effectiveContent = '[消息]';
+    }
+
+    const envelope: WeChatInboundEnvelope = {
+      id: platformIdempotencyKey,
+      userId: this.userId,
+      sessionId: route.id,
+      content: effectiveContent,
+      timestamp: new Date().toISOString(),
+      channelContext: {
+        channel: 'wechat',
+        accountId: this.accountId,
+        chatId: msg.chatId || msg.senderId,
+        nativeContextId,
+        nativeEventId,
+        replyToMessageId: msg.messageId,
+      },
+    };
+
+    // 5. Dispatch Inbound to Runtime
+    let turnId = platformIdempotencyKey;
+    try {
+      const dispatchResult = await this.runtimeGateway.dispatchInbound(envelope);
+      turnId = dispatchResult.turnId || platformIdempotencyKey;
+      inboxItem = await this.channelRepo.updateInboxStatus(inboxItem.id, 'delivered');
+      return {
+        handled: true,
+        inboxItem,
+        sessionRouteId: route.id,
+        turnId,
+      };
+    } catch (err: any) {
+      await this.channelRepo.updateInboxStatus(
+        inboxItem.id,
+        'failed',
+        JSON.stringify({ parsed: msg, error: err?.message || String(err) })
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * Handles agent turn completion event:
+   * 1. Verifies turn origin and active account
+   * 2. Resolves recipient user ID
+   * 3. Retrieves cached context_token
+   * 4. Creates outbox record
+   * 5. Sends outbound reply via transport
+   */
+  async handleTurnCompleted(params: {
+    sessionId: string;
+    turnId: string;
+    replyText: string;
+    idempotencyKey?: string;
+    nativeContextId?: string;
+    replyToMessageId?: string;
+    nativeEventId?: string;
+  }): Promise<WeChatChannelOutboxItem | null> {
+    if (this.isDisposed) return null;
+
+    const outboxId = `out_wechat_${params.turnId}`;
+    if (typeof this.channelRepo.findOutboxById === 'function') {
+      const existing = await this.channelRepo.findOutboxById(outboxId);
+      if (existing && (existing.status === 'delivered' || existing.status === 'sending')) {
+        return existing;
+      }
+    }
+
+    const inFlightKey = params.turnId || params.idempotencyKey;
+    if (inFlightKey) {
+      if (this.inFlightTurns.has(inFlightKey)) {
+        return null;
+      }
+      this.inFlightTurns.add(inFlightKey);
+    }
+
+    try {
+      const isActive = await this.checkAccountActive();
+      if (!isActive) return null;
+
+      // 1. Resolve route and recipient ID
+      const route = await this.sessionRouteRepo.findById(params.sessionId);
+      const nativeContextId = route?.nativeContextId || params.nativeContextId || '';
+
+      let toUserId = route?.peerId || '';
+      if (!toUserId && nativeContextId.startsWith('wechat:')) {
+        toUserId = nativeContextId.slice(7);
+      }
+      if (!toUserId) {
+        toUserId = nativeContextId;
+      }
+
+      // 2. Resolve cached context_token
+      let contextToken = await this.contextTokenStore.get(toUserId);
+
+      // Fallback: check inbox payload if not found in store
+      if (!contextToken && params.nativeEventId) {
+        const inbox = await this.channelRepo.findInboxByEvent(this.accountId, params.nativeEventId);
+        if (inbox) {
+          try {
+            const p = JSON.parse(inbox.payloadJson);
+            contextToken = p?.parsed?.contextToken;
+            if (contextToken) {
+              await this.contextTokenStore.set(toUserId, contextToken);
+            }
+          } catch {}
+        }
+      }
+
+      if (!contextToken) {
+        // Cannot deliver without context_token
+        return await this.channelRepo.createOutboxItem({
+          id: outboxId,
+          accountId: this.accountId,
+          sessionId: params.sessionId,
+          nativeContextId,
+          replyToNativeId: params.replyToMessageId,
+          payloadJson: JSON.stringify({
+            toUserId,
+            text: params.replyText,
+            turnId: params.turnId,
+            error: `Missing cached context_token for recipient ${toUserId}`,
+          }),
+          status: 'failed',
+        });
+      }
+
+      // 3. Create pending outbox item
+      let outboxItem = await this.channelRepo.createOutboxItem({
+        id: outboxId,
+        accountId: this.accountId,
+        sessionId: params.sessionId,
+        nativeContextId,
+        replyToNativeId: params.replyToMessageId,
+        payloadJson: JSON.stringify({
+          toUserId,
+          contextToken,
+          text: params.replyText,
+          turnId: params.turnId,
+        }),
+        status: 'pending',
+      });
+
+      // 4. Send reply via transport
+      try {
+        const replyResult = await this.transport.sendReply(toUserId, contextToken, params.replyText);
+        if (replyResult.success) {
+          outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'delivered');
+        } else {
+          outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
+        }
+      } catch (err: any) {
+        outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
+      }
+
+      return outboxItem;
+    } finally {
+      if (inFlightKey) {
+        this.inFlightTurns.delete(inFlightKey);
+      }
+    }
+  }
+
+  /**
+   * Disposes the gateway and unregisters transport handlers.
+   */
+  async dispose(): Promise<void> {
+    this.isDisposed = true;
+    if (typeof (this.transport as any).removeMessageHandler === 'function') {
+      (this.transport as any).removeMessageHandler(this.messageHandler);
+    }
+    if (
+      this.cursorCommitHandler &&
+      typeof (this.transport as any).removeCursorCommitHandler === 'function'
+    ) {
+      (this.transport as any).removeCursorCommitHandler(this.cursorCommitHandler);
+    }
+    if (typeof this.transport.stop === 'function') {
+      try {
+        await this.transport.stop();
+      } catch {
+        // Ignore stop error during disposal
+      }
+    }
+  }
+}
