@@ -1,11 +1,20 @@
 import { randomUUID } from 'node:crypto';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import type {
   Task,
+  TaskPayload,
   AgentPromptTaskPayload,
+  ScriptTaskPayload,
   TaskRecoveryResult,
+  TaskDispatchResult,
   AgentPromptDispatchResult,
+  ScriptTaskDispatchResult,
 } from '../types/task.js';
 import {
+  validateTaskPayload,
+  validateTaskResult,
+  validateScriptTaskPayload,
+  validateScriptTaskResult,
   validateAgentPromptPayload,
   validateAgentPromptResult,
   validateTaskId,
@@ -123,6 +132,20 @@ export interface TaskWorkerOptions {
   channelRuntimeManager?: any;
   db?: any;
   getReplyText?: (params: { tenantId: string; sessionId: string; taskId: string }) => Promise<string | null> | string | null;
+  resolveSpaceCwd?: (params: { tenantId: string; spaceId: string; spaceFolder?: string }) => Promise<string> | string;
+  runScript?: (params: {
+    command: string;
+    cwd: string;
+    timeoutMs: number;
+    signal?: AbortSignal;
+  }) => Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+    timedOut: boolean;
+    aborted: boolean;
+    durationMs: number;
+  }>;
 }
 
 export interface TenantDiagnostic {
@@ -137,7 +160,7 @@ export interface TaskWorkerTickResult {
   taskId?: string;
   tenantId?: string;
   status?: 'completed' | 'failed' | 'aborted' | 'lease_lost';
-  result?: AgentPromptDispatchResult | null;
+  result?: TaskDispatchResult | null;
   error?: string;
   reason?: 'task_executed' | 'no_due_tasks' | 'busy' | 'stopped' | 'tenant_error' | 'enumeration_error';
   scannedTenantsCount?: number;
@@ -148,7 +171,7 @@ export interface TaskWorkerExecutionResult {
   taskId: string;
   tenantId: string;
   status: 'completed' | 'failed' | 'aborted' | 'lease_lost';
-  result?: AgentPromptDispatchResult | null;
+  result?: TaskDispatchResult | null;
   error?: string | null;
 }
 
@@ -184,6 +207,8 @@ export class AgentPromptTaskWorker {
   public channelRuntimeManager?: any;
   private readonly db?: any;
   private readonly getReplyText?: (params: { tenantId: string; sessionId: string; taskId: string }) => Promise<string | null> | string | null;
+  private readonly resolveSpaceCwd?: (params: { tenantId: string; spaceId: string; spaceFolder?: string }) => Promise<string> | string;
+  private readonly runScriptOverride?: TaskWorkerOptions['runScript'];
 
   private _status: TaskWorkerStatus = 'idle';
   private pollTimer: NodeJS.Timeout | null = null;
@@ -211,6 +236,8 @@ export class AgentPromptTaskWorker {
     this.channelRuntimeManager = options.channelRuntimeManager;
     this.db = options.db;
     this.getReplyText = options.getReplyText;
+    this.resolveSpaceCwd = options.resolveSpaceCwd;
+    this.runScriptOverride = options.runScript;
   }
 
   get status(): TaskWorkerStatus {
@@ -742,9 +769,9 @@ export class AgentPromptTaskWorker {
       let leaseLost = false;
 
       // 1. Strict payload validation
-      let payload: AgentPromptTaskPayload;
+      let payload: TaskPayload;
       try {
-        payload = validateAgentPromptPayload(task.payload);
+        payload = validateTaskPayload(task.payload);
       } catch (_validationErr: unknown) {
         const protocolCode = TASK_PROTOCOL_ERROR_CODES.PAYLOAD_INVALID;
         try {
@@ -859,6 +886,18 @@ export class AgentPromptTaskWorker {
           heartbeatTimeoutHandle = null;
         }
       };
+
+      if (payload.type === 'script') {
+        return await this.executeScriptTask({
+          tenantId,
+          task,
+          payload,
+          ops,
+          abortController,
+          stopHeartbeat,
+          getLeaseLost: () => leaseLost,
+        });
+      }
 
       // 2b. Optional trusted pre-dispatch input preparation
       let effectivePayload = payload;
@@ -1374,5 +1413,359 @@ export class AgentPromptTaskWorker {
       this.activeAbortController = null;
       this.activeExecutionPromise = null;
     }
+  }
+
+  private async executeScriptTask(params: {
+    tenantId: string;
+    task: Task;
+    payload: ScriptTaskPayload;
+    ops: WorkerTenantOperations;
+    abortController: AbortController;
+    stopHeartbeat: () => void;
+    getLeaseLost: () => boolean;
+  }): Promise<TaskWorkerExecutionResult> {
+    const { tenantId, task, payload, ops, abortController, stopHeartbeat, getLeaseLost } = params;
+
+    // 1. Resolve space cwd and verify host mode
+    let cwd: string;
+    try {
+      if (this.resolveSpaceCwd) {
+        cwd = await this.resolveSpaceCwd({
+          tenantId,
+          spaceId: payload.spaceId,
+          spaceFolder: payload.spaceFolder,
+        });
+      } else if (this.db) {
+        const spaceRow = this.db
+          .prepare('SELECT folder, execution_mode FROM spaces WHERE id = ? AND user_id = ?')
+          .get(payload.spaceId, tenantId) as { folder: string; execution_mode: string } | undefined;
+        if (!spaceRow || spaceRow.execution_mode !== 'host') {
+          throw new Error('Script tasks can only execute in host mode spaces');
+        }
+        cwd = process.cwd();
+      } else {
+        cwd = process.cwd();
+      }
+    } catch (spaceErr) {
+      stopHeartbeat();
+      const failCode = TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED;
+      try {
+        if (ops.tasks instanceof TaskOperationService) {
+          await ops.tasks.failTask(task.id, {
+            claimantId: this.workerId,
+            error: spaceErr instanceof Error ? spaceErr.message : String(spaceErr),
+            retryable: false,
+            runId: task.currentRun?.id,
+            errorCode: failCode,
+          });
+        } else {
+          await (ops.tasks as TenantScopedTaskRepository).fail(
+            task.id,
+            this.workerId,
+            spaceErr instanceof Error ? spaceErr.message : String(spaceErr),
+            false,
+            task.currentRun?.id,
+            failCode
+          );
+        }
+      } catch {}
+      return {
+        taskId: task.id,
+        tenantId,
+        status: 'failed',
+        error: failCode,
+      };
+    }
+
+    // 2. Execute script on host
+    const startTime = Date.now();
+    const MAX_BUFFER = 1024 * 1024; // 1MB
+    const envTimeout = parseInt(process.env.DSH_SCRIPT_TASK_TIMEOUT_MS || '300000', 10);
+    const configuredTimeout = Number.isSafeInteger(envTimeout) && envTimeout > 0 ? envTimeout : 300000;
+    const timeoutMs = Math.min(
+      Math.max(payload.timeoutMs ?? configuredTimeout, 1000),
+      1800000
+    );
+
+    let scriptResult: {
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+      timedOut: boolean;
+      aborted: boolean;
+      durationMs: number;
+    };
+
+    if (this.runScriptOverride) {
+      scriptResult = await this.runScriptOverride({
+        command: payload.command,
+        cwd,
+        timeoutMs,
+        signal: abortController.signal,
+      });
+    } else {
+      scriptResult = await new Promise((resolve) => {
+        let stdout = '';
+        let stderr = '';
+        let timedOut = false;
+        let aborted = false;
+        let finished = false;
+
+        let child: ChildProcess;
+        try {
+          child = spawn(payload.command, {
+            cwd,
+            env: {
+              ...process.env,
+              LANG: process.env.LANG || 'en_US.UTF-8',
+              TZ: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
+              SPACE_ID: payload.spaceId,
+              SPACE_FOLDER: payload.spaceFolder || '',
+              HOME: process.env.HOME || cwd,
+            },
+            shell: '/bin/sh',
+            detached: process.platform !== 'win32',
+          });
+        } catch (spawnErr) {
+          const durationMs = Date.now() - startTime;
+          return resolve({
+            stdout: '',
+            stderr: spawnErr instanceof Error ? spawnErr.message : String(spawnErr),
+            exitCode: 1,
+            timedOut: false,
+            aborted: false,
+            durationMs,
+          });
+        }
+
+        const killTree = () => {
+          const pid = child.pid;
+          if (!pid) return;
+          if (process.platform === 'win32') {
+            execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => undefined);
+            return;
+          }
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {
+            try {
+              child.kill('SIGKILL');
+            } catch {}
+          }
+        };
+
+        const timer = setTimeout(() => {
+          timedOut = true;
+          killTree();
+        }, timeoutMs);
+        timer.unref?.();
+
+        const onAbort = () => {
+          aborted = true;
+          killTree();
+        };
+
+        if (abortController.signal.aborted) {
+          onAbort();
+        } else {
+          abortController.signal.addEventListener('abort', onAbort, { once: true });
+        }
+
+        child.stdout?.on('data', (chunk: Buffer | string) => {
+          if (stdout.length < MAX_BUFFER) {
+            stdout += chunk.toString();
+            if (stdout.length > MAX_BUFFER) stdout = stdout.slice(0, MAX_BUFFER);
+          }
+        });
+
+        child.stderr?.on('data', (chunk: Buffer | string) => {
+          if (stderr.length < MAX_BUFFER) {
+            stderr += chunk.toString();
+            if (stderr.length > MAX_BUFFER) stderr = stderr.slice(0, MAX_BUFFER);
+          }
+        });
+
+        const finish = (code: number | null, err?: Error) => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          abortController.signal.removeEventListener('abort', onAbort);
+          const durationMs = Date.now() - startTime;
+          resolve({
+            stdout: stdout.slice(0, MAX_BUFFER),
+            stderr: (err?.message || stderr).slice(0, MAX_BUFFER),
+            exitCode: timedOut || aborted ? null : (code ?? (err ? 1 : 0)),
+            timedOut,
+            aborted,
+            durationMs,
+          });
+        };
+
+        child.once('error', (err) => finish(1, err));
+        child.once('close', (code) => finish(code));
+      });
+    }
+
+    stopHeartbeat();
+
+    if (getLeaseLost()) {
+      let currentTask: Task | null = null;
+      try {
+        if (ops.tasks instanceof TaskOperationService) {
+          currentTask = await ops.tasks.getTask(task.id);
+        } else {
+          currentTask = await (ops.tasks as TenantScopedTaskRepository).findById(task.id);
+        }
+      } catch {}
+      if (currentTask?.status === 'cancelled') {
+        return {
+          taskId: task.id,
+          tenantId,
+          status: 'aborted',
+          error: TASK_PROTOCOL_ERROR_CODES.CANCELLED,
+        };
+      }
+      return {
+        taskId: task.id,
+        tenantId,
+        status: 'lease_lost',
+        error: TASK_PROTOCOL_ERROR_CODES.LEASE_EXPIRED,
+      };
+    }
+
+    if (abortController.signal.aborted || scriptResult.aborted) {
+      return {
+        taskId: task.id,
+        tenantId,
+        status: 'aborted',
+        error: TASK_PROTOCOL_ERROR_CODES.ABORTED,
+      };
+    }
+
+    if (scriptResult.timedOut) {
+      const timeoutCode = TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED;
+      try {
+        const errorMsg = `Script execution timed out after ${timeoutMs}ms`;
+        if (ops.tasks instanceof TaskOperationService) {
+          await ops.tasks.failTask(task.id, {
+            claimantId: this.workerId,
+            error: errorMsg,
+            retryable: false,
+            runId: task.currentRun?.id,
+            errorCode: timeoutCode,
+          });
+        } else {
+          await (ops.tasks as TenantScopedTaskRepository).fail(
+            task.id,
+            this.workerId,
+            errorMsg,
+            false,
+            task.currentRun?.id,
+            timeoutCode
+          );
+        }
+      } catch {}
+      return {
+        taskId: task.id,
+        tenantId,
+        status: 'failed',
+        error: timeoutCode,
+      };
+    }
+
+    const validatedResult: ScriptTaskDispatchResult = {
+      status: 'completed',
+      completedAt: new Date().toISOString(),
+      stdout: scriptResult.stdout,
+      stderr: scriptResult.stderr,
+      exitCode: scriptResult.exitCode ?? 0,
+      durationMs: scriptResult.durationMs,
+    };
+
+    // Authoritative completion with 0 Token usage
+    try {
+      if (ops.tasks instanceof TaskOperationService) {
+        await ops.tasks.completeTask(task.id, {
+          claimantId: this.workerId,
+          result: validatedResult,
+          runId: task.currentRun?.id,
+          tokenUsage: {
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+          },
+        });
+      } else {
+        await (ops.tasks as TenantScopedTaskRepository).complete(
+          task.id,
+          this.workerId,
+          validatedResult,
+          task.currentRun?.id,
+          {
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+          }
+        );
+      }
+    } catch (settlementErr: unknown) {
+      if (settlementErr instanceof TaskAlreadyCompletedError) {
+        // Idempotent completion hit
+      } else if (settlementErr instanceof TaskLeaseExpiredError) {
+        return {
+          taskId: task.id,
+          tenantId,
+          status: 'lease_lost',
+          error: TASK_PROTOCOL_ERROR_CODES.LEASE_EXPIRED,
+        };
+      } else {
+        const settlementCode = TASK_PROTOCOL_ERROR_CODES.SETTLEMENT_FAILED;
+        return {
+          taskId: task.id,
+          tenantId,
+          status: 'failed',
+          error: settlementCode,
+        };
+      }
+    }
+
+    // Delivery to Lark if configured
+    if (
+      !payload.silent &&
+      payload.delivery?.channel === 'lark' &&
+      payload.delivery.accountId &&
+      payload.delivery.nativeContextId
+    ) {
+      try {
+        const crm = this.channelRuntimeManager;
+        const gateway = crm?.getActiveGateway?.(tenantId, payload.delivery.accountId);
+        if (gateway && typeof gateway.sendProactiveMessage === 'function') {
+          const chatId = payload.delivery.nativeContextId.includes(':')
+            ? payload.delivery.nativeContextId.split(':')[0]
+            : payload.delivery.nativeContextId;
+          const deliveryText = validatedResult.stdout.trim()
+            ? `[脚本输出]\n${validatedResult.stdout.slice(0, 1000)}`
+            : `任务 "${task.title}" 脚本执行完成 (退出码 ${validatedResult.exitCode})。`;
+          const stableRunId = task.currentRun?.id || task.id;
+          const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
+          await gateway.sendProactiveMessage({
+            chatId,
+            text: deliveryText,
+            title: task.title,
+            outboxId,
+            accountId: payload.delivery.accountId,
+          });
+        }
+      } catch (deliveryErr) {
+        console.warn('[lark-task] Failed to deliver script task result to Lark:', deliveryErr);
+      }
+    }
+
+    return {
+      taskId: task.id,
+      tenantId,
+      status: 'completed',
+      result: validatedResult,
+    };
   }
 }

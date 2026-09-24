@@ -67,6 +67,16 @@ export const ALLOWED_AGENT_PROMPT_PAYLOAD_KEYS = new Set([
   'silent',
 ]);
 
+export const ALLOWED_SCRIPT_TASK_PAYLOAD_KEYS = new Set([
+  'type',
+  'command',
+  'spaceId',
+  'spaceFolder',
+  'timeoutMs',
+  'delivery',
+  'silent',
+]);
+
 export const ALLOWED_AGENT_PROMPT_RESULT_KEYS = new Set([
   'status',
   'completedAt',
@@ -74,6 +84,17 @@ export const ALLOWED_AGENT_PROMPT_RESULT_KEYS = new Set([
   'sessionId',
   'spaceId',
   'messageId',
+]);
+
+export const ALLOWED_SCRIPT_TASK_RESULT_KEYS = new Set([
+  'status',
+  'completedAt',
+  'stdout',
+  'stderr',
+  'exitCode',
+  'durationMs',
+  'timedOut',
+  'aborted',
 ]);
 
 export const MAX_PROMPT_BYTES = 65_536; // 64 KiB
@@ -233,6 +254,18 @@ export interface AgentPromptTaskPayload {
   silent?: boolean;
 }
 
+export interface ScriptTaskPayload {
+  type: 'script';
+  command: string;
+  spaceId: string;
+  spaceFolder?: string;
+  timeoutMs?: number;
+  delivery?: TaskDeliveryTarget;
+  silent?: boolean;
+}
+
+export type TaskPayload = AgentPromptTaskPayload | ScriptTaskPayload;
+
 export const SPACE_FOLDER_REGEX = /^[a-zA-Z0-9._-]+$/;
 
 export function validateSpaceFolder(folder: unknown): string {
@@ -257,6 +290,10 @@ export function validateAgentPromptPayload(payload: unknown): AgentPromptTaskPay
   }
 
   const obj = payload as Record<string, unknown>;
+  if (obj.type === 'script') {
+    return validateScriptTaskPayload(payload) as unknown as AgentPromptTaskPayload;
+  }
+
   const keys = Object.keys(obj);
 
   for (const key of keys) {
@@ -361,6 +398,109 @@ export function validateAgentPromptPayload(payload: unknown): AgentPromptTaskPay
   };
 }
 
+export function validateScriptTaskPayload(payload: unknown): ScriptTaskPayload {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new ValidationError('Task payload must be a plain object');
+  }
+
+  const obj = payload as Record<string, unknown>;
+  const keys = Object.keys(obj);
+
+  for (const key of keys) {
+    if (!ALLOWED_SCRIPT_TASK_PAYLOAD_KEYS.has(key)) {
+      throw new ValidationError('Task payload contains unrecognized or forbidden fields');
+    }
+  }
+
+  if (obj.type !== 'script') {
+    throw new ValidationError('Invalid task payload type');
+  }
+
+  if (typeof obj.command !== 'string') {
+    throw new ValidationError('Task payload command must be a string');
+  }
+  if (obj.command.trim().length === 0) {
+    throw new ValidationError('Task payload command must not be empty');
+  }
+  if (Buffer.byteLength(obj.command, 'utf-8') > MAX_PROMPT_BYTES) {
+    throw new ValidationError('Task payload command exceeds maximum allowed size');
+  }
+
+  const spaceId = validateSpaceId(obj.spaceId);
+
+  let spaceFolder: string | undefined;
+  if (obj.spaceFolder !== undefined) {
+    spaceFolder = validateSpaceFolder(obj.spaceFolder);
+  }
+
+  let timeoutMs: number | undefined;
+  if (obj.timeoutMs !== undefined) {
+    if (
+      typeof obj.timeoutMs !== 'number' ||
+      !Number.isSafeInteger(obj.timeoutMs) ||
+      obj.timeoutMs <= 0 ||
+      obj.timeoutMs > 1_800_000
+    ) {
+      throw new ValidationError('Invalid timeoutMs: must be a positive integer <= 1800000');
+    }
+    timeoutMs = obj.timeoutMs;
+  }
+
+  let silent: boolean | undefined;
+  if (obj.silent !== undefined) {
+    if (typeof obj.silent !== 'boolean') {
+      throw new ValidationError('Task payload silent must be a boolean');
+    }
+    silent = obj.silent;
+  }
+
+  let delivery: TaskDeliveryTarget | undefined;
+  if (obj.delivery !== undefined && obj.delivery !== null) {
+    if (silent === true) {
+      throw new ValidationError('Task payload cannot specify both silent=true and a delivery target');
+    }
+    if (typeof obj.delivery !== 'object' || Array.isArray(obj.delivery)) {
+      throw new ValidationError('Task payload delivery must be an object');
+    }
+    const del = obj.delivery as Record<string, unknown>;
+    if (typeof del.channel !== 'string' || !del.channel.trim()) {
+      throw new ValidationError('Task payload delivery channel must be a non-empty string');
+    }
+    if (typeof del.accountId !== 'string' || !del.accountId.trim()) {
+      throw new ValidationError('Task payload delivery accountId must be a non-empty string');
+    }
+    if (typeof del.nativeContextId !== 'string' || !del.nativeContextId.trim()) {
+      throw new ValidationError('Task payload delivery nativeContextId must be a non-empty string');
+    }
+    delivery = {
+      channel: del.channel.trim(),
+      accountId: del.accountId.trim(),
+      nativeContextId: del.nativeContextId.trim(),
+    };
+  }
+
+  return {
+    type: 'script',
+    command: obj.command,
+    spaceId,
+    ...(spaceFolder !== undefined ? { spaceFolder } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(delivery !== undefined ? { delivery } : {}),
+    ...(silent !== undefined ? { silent } : {}),
+  };
+}
+
+export function validateTaskPayload(payload: unknown): TaskPayload {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new ValidationError('Task payload must be a plain object');
+  }
+  const obj = payload as Record<string, unknown>;
+  if (obj.type === 'script') {
+    return validateScriptTaskPayload(payload);
+  }
+  return validateAgentPromptPayload(payload);
+}
+
 export interface AgentPromptDispatchResult {
   status: 'completed';
   completedAt: string;
@@ -372,12 +512,95 @@ export interface AgentPromptDispatchResult {
 
 export type AgentPromptCompletedResult = AgentPromptDispatchResult;
 
+export interface ScriptTaskDispatchResult {
+  status: 'completed';
+  completedAt: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  durationMs: number;
+  timedOut?: boolean;
+  aborted?: boolean;
+}
+
+export type TaskDispatchResult = AgentPromptDispatchResult | ScriptTaskDispatchResult;
+
+export function validateScriptTaskResult(result: unknown): ScriptTaskDispatchResult {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+    throw new ValidationError('Task dispatch result must be a plain object');
+  }
+
+  const obj = result as Record<string, unknown>;
+  const keys = Object.keys(obj);
+
+  for (const key of keys) {
+    if (!ALLOWED_SCRIPT_TASK_RESULT_KEYS.has(key)) {
+      throw new ValidationError('Task dispatch result contains unrecognized or forbidden fields');
+    }
+  }
+
+  if (obj.status !== 'completed') {
+    throw new ValidationError('Task dispatch result status must be completed');
+  }
+
+  if (
+    typeof obj.completedAt !== 'string' ||
+    obj.completedAt.length === 0 ||
+    obj.completedAt !== obj.completedAt.trim()
+  ) {
+    throw new ValidationError('Task dispatch result completedAt must be a canonical ISO timestamp');
+  }
+  const parsedDate = new Date(obj.completedAt);
+  if (Number.isNaN(parsedDate.getTime()) || parsedDate.toISOString() !== obj.completedAt) {
+    throw new ValidationError('Task dispatch result completedAt must be a canonical ISO timestamp');
+  }
+
+  if (typeof obj.stdout !== 'string') {
+    throw new ValidationError('Task dispatch result stdout must be a string');
+  }
+  if (typeof obj.stderr !== 'string') {
+    throw new ValidationError('Task dispatch result stderr must be a string');
+  }
+  if (typeof obj.exitCode !== 'number' || !Number.isInteger(obj.exitCode)) {
+    throw new ValidationError('Task dispatch result exitCode must be an integer');
+  }
+  if (typeof obj.durationMs !== 'number' || obj.durationMs < 0) {
+    throw new ValidationError('Task dispatch result durationMs must be a non-negative number');
+  }
+
+  return {
+    status: 'completed',
+    completedAt: obj.completedAt,
+    stdout: obj.stdout,
+    stderr: obj.stderr,
+    exitCode: obj.exitCode,
+    durationMs: obj.durationMs,
+    ...(typeof obj.timedOut === 'boolean' ? { timedOut: obj.timedOut } : {}),
+    ...(typeof obj.aborted === 'boolean' ? { aborted: obj.aborted } : {}),
+  };
+}
+
+export function validateTaskResult(result: unknown): TaskDispatchResult {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+    throw new ValidationError('Task dispatch result must be a plain object');
+  }
+  const obj = result as Record<string, unknown>;
+  if ('stdout' in obj || 'exitCode' in obj) {
+    return validateScriptTaskResult(result);
+  }
+  return validateAgentPromptResult(result);
+}
+
 export function validateAgentPromptResult(result: unknown): AgentPromptDispatchResult {
   if (result === null || typeof result !== 'object' || Array.isArray(result)) {
     throw new ValidationError('Task dispatch result must be a plain object');
   }
 
   const obj = result as Record<string, unknown>;
+  if ('stdout' in obj || 'exitCode' in obj) {
+    return validateScriptTaskResult(result) as unknown as AgentPromptDispatchResult;
+  }
+
   const keys = Object.keys(obj);
 
   for (const key of keys) {
@@ -463,8 +686,8 @@ export interface Task {
   assignee?: string | null;
   priority: TaskPriority;
   status: TaskStatus;
-  payload: AgentPromptTaskPayload;
-  result?: AgentPromptDispatchResult | null;
+  payload: TaskPayload;
+  result?: TaskDispatchResult | null;
   error?: string | null;
   claimantId?: string | null;
   leaseExpiresAt?: string | null;
@@ -490,6 +713,9 @@ export const ALLOWED_UPDATE_TASK_KEYS = new Set([
   'assignee',
   'priority',
   'prompt',
+  'command',
+  'script_command',
+  'timeoutMs',
   'payload',
   'dueDate',
   'scheduleType',
@@ -589,6 +815,33 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
     hasEditableField = true;
   }
 
+  let command: string | undefined;
+  if (obj.command !== undefined || obj.script_command !== undefined) {
+    const rawCmd = (obj.command ?? obj.script_command) as unknown;
+    if (typeof rawCmd !== 'string' || rawCmd.trim().length === 0) {
+      throw new ValidationError('Task command must be a non-empty string');
+    }
+    if (Buffer.byteLength(rawCmd, 'utf-8') > MAX_PROMPT_BYTES) {
+      throw new ValidationError('Task command exceeds maximum allowed size');
+    }
+    command = rawCmd;
+    hasEditableField = true;
+  }
+
+  let timeoutMs: number | undefined;
+  if (obj.timeoutMs !== undefined) {
+    if (
+      typeof obj.timeoutMs !== 'number' ||
+      !Number.isSafeInteger(obj.timeoutMs) ||
+      obj.timeoutMs <= 0 ||
+      obj.timeoutMs > 1_800_000
+    ) {
+      throw new ValidationError('Invalid timeoutMs: must be a positive integer <= 1800000');
+    }
+    timeoutMs = obj.timeoutMs;
+    hasEditableField = true;
+  }
+
   if (obj.payload !== undefined && obj.payload !== null) {
     if (typeof obj.payload !== 'object' || Array.isArray(obj.payload)) {
       throw new ValidationError('Task payload must be a plain object');
@@ -606,11 +859,21 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
       ) {
         throw new ValidationError('Task session and space bindings are immutable');
       }
-      if (k !== 'prompt' && k !== 'type') {
+      if (
+        k !== 'prompt' &&
+        k !== 'type' &&
+        k !== 'command' &&
+        k !== 'script_command' &&
+        k !== 'timeoutMs'
+      ) {
         throw new ValidationError(`Field "payload.${k}" is immutable and cannot be updated`);
       }
     }
-    if (payloadObj.type !== undefined && payloadObj.type !== 'agent_prompt') {
+    if (
+      payloadObj.type !== undefined &&
+      payloadObj.type !== 'agent_prompt' &&
+      payloadObj.type !== 'script'
+    ) {
       throw new ValidationError('Task payload type is immutable');
     }
     if (payloadObj.prompt !== undefined) {
@@ -624,6 +887,34 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
         throw new ValidationError('Conflicting prompt values provided in root and payload');
       }
       prompt = payloadObj.prompt;
+      hasEditableField = true;
+    }
+    if (payloadObj.command !== undefined) {
+      if (typeof payloadObj.command !== 'string' || payloadObj.command.trim().length === 0) {
+        throw new ValidationError('Task payload command must be a non-empty string');
+      }
+      if (Buffer.byteLength(payloadObj.command, 'utf-8') > MAX_PROMPT_BYTES) {
+        throw new ValidationError('Task payload command exceeds maximum allowed size');
+      }
+      if (command !== undefined && command !== payloadObj.command) {
+        throw new ValidationError('Conflicting command values provided in root and payload');
+      }
+      command = payloadObj.command;
+      hasEditableField = true;
+    }
+    if (payloadObj.timeoutMs !== undefined) {
+      if (
+        typeof payloadObj.timeoutMs !== 'number' ||
+        !Number.isSafeInteger(payloadObj.timeoutMs) ||
+        payloadObj.timeoutMs <= 0 ||
+        payloadObj.timeoutMs > 1_800_000
+      ) {
+        throw new ValidationError('Invalid timeoutMs: must be a positive integer <= 1800000');
+      }
+      if (timeoutMs !== undefined && timeoutMs !== payloadObj.timeoutMs) {
+        throw new ValidationError('Conflicting timeoutMs values provided in root and payload');
+      }
+      timeoutMs = payloadObj.timeoutMs;
       hasEditableField = true;
     }
   }
@@ -674,12 +965,21 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
     throw new ValidationError('At least one editable field must be provided for task update');
   }
 
+  const returnPayload: Record<string, unknown> = {};
+  if (prompt !== undefined) returnPayload.prompt = prompt;
+  if (command !== undefined) returnPayload.command = command;
+  if (timeoutMs !== undefined) returnPayload.timeoutMs = timeoutMs;
+  const hasPayload = Object.keys(returnPayload).length > 0;
+
   return {
     ...(title !== undefined ? { title } : {}),
     ...(description !== undefined ? { description } : {}),
     ...(assignee !== undefined ? { assignee } : {}),
     ...(priority !== undefined ? { priority } : {}),
-    ...(prompt !== undefined ? { prompt, payload: { prompt } } : {}),
+    ...(prompt !== undefined ? { prompt } : {}),
+    ...(command !== undefined ? { command } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(hasPayload ? { payload: returnPayload as any } : {}),
     ...(dueDate !== undefined ? { dueDate } : {}),
     ...(scheduleType !== undefined ? { scheduleType } : {}),
     ...(cronExpression !== undefined ? { cronExpression } : {}),
@@ -697,7 +997,7 @@ export interface CreateTaskInput {
   description?: string;
   assignee?: string;
   priority?: TaskPriority;
-  payload: AgentPromptTaskPayload;
+  payload: TaskPayload;
   leaseDurationMs?: number;
   maxRetries?: number;
   dueDate?: string;
@@ -715,8 +1015,13 @@ export interface UpdateTaskInput {
   assignee?: string | null;
   priority?: TaskPriority;
   prompt?: string;
+  command?: string;
+  script_command?: string;
+  timeoutMs?: number;
   payload?: {
     prompt?: string;
+    command?: string;
+    timeoutMs?: number;
   };
   dueDate?: string | null;
   scheduleType?: TaskScheduleType;
@@ -742,7 +1047,7 @@ export interface RenewLeaseInput {
 
 export interface CompleteTaskInput {
   claimantId: string;
-  result: AgentPromptDispatchResult;
+  result: TaskDispatchResult;
   runId?: string;
   tokenUsage?: {
     promptTokens?: number;
