@@ -12,6 +12,30 @@ import type {
   StreamEventSource,
 } from './types.js';
 
+export const STREAMING_MAX_CONTENT_LENGTH = 3800;
+export const STREAMING_MAX_LENGTH = STREAMING_MAX_CONTENT_LENGTH;
+export const STREAMING_TRUNCATION_NOTICE = '... (内容超长，流式阶段仅展示最新部分，完整内容将在生成完毕后呈现)\n\n';
+
+/**
+ * Guard streaming text to safe maximum length (default 3800 characters) for Feishu CardKit.
+ * When text exceeds maxLength, slides a window to display the latest content with a truncation notice,
+ * preventing Lark error code 200570 while retaining full text for finalization.
+ */
+export function applyStreamingLengthGuard(
+  text: string,
+  maxLength: number = STREAMING_MAX_CONTENT_LENGTH,
+  notice: string = STREAMING_TRUNCATION_NOTICE
+): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  if (notice.length >= maxLength) {
+    return text.slice(text.length - maxLength);
+  }
+  const allowed = maxLength - notice.length;
+  return notice + text.slice(text.length - allowed);
+}
+
 export interface StreamingReplyTrackerCardParams {
   chatId: string;
   replyToMessageId?: string;
@@ -31,6 +55,7 @@ export interface StreamingReplyTrackerOptions {
   detached?: boolean;
   onFinalized?: (finalText: string, status: 'completed' | 'failed', messageId?: string) => Promise<void> | void;
   turnId?: string;
+  maxStreamingLength?: number;
 }
 
 export class StreamingReplyTracker {
@@ -43,6 +68,7 @@ export class StreamingReplyTracker {
   private readonly detached: boolean;
   private readonly onFinalized?: (finalText: string, status: 'completed' | 'failed', messageId?: string) => Promise<void> | void;
   private readonly turnId?: string;
+  private readonly maxStreamingLength: number;
   private isWaiting = false;
 
   private cardSessionPromise: Promise<LarkStreamingCardSession | null> | null = null;
@@ -72,6 +98,7 @@ export class StreamingReplyTracker {
     this.detached = options.detached ?? false;
     this.onFinalized = options.onFinalized;
     this.turnId = options.turnId;
+    this.maxStreamingLength = options.maxStreamingLength ?? STREAMING_MAX_CONTENT_LENGTH;
     this.isWaiting = !this.detached && Boolean(this.turnId && typeof this.streamEventSource.getPlatformTurnState === 'function');
     if (this.isWaiting) {
       this.cursor = 0;
@@ -287,10 +314,11 @@ export class StreamingReplyTracker {
         const session = this.cardSession ?? (await this.cardSessionPromise);
         if (session && !this.isStopped) {
           const subagentCount = this.runningTools.get('subagent') ?? 0;
-          const textToPush =
+          const rawTextToPush =
             subagentCount > 0
               ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
               : this.accumulatedText;
+          const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
           if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
             this.lastPushedText = textToPush;
             await session.pushText(textToPush);
@@ -373,10 +401,11 @@ export class StreamingReplyTracker {
           this.terminalReached = true;
         }
         const subagentCount = this.runningTools.get('subagent') ?? 0;
-        const textToPush =
+        const rawTextToPush =
           subagentCount > 0
             ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
             : this.accumulatedText;
+        const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
         if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
           this.lastPushedText = textToPush;
           await session.pushText(textToPush);
@@ -411,7 +440,8 @@ export class StreamingReplyTracker {
       });
       if (textToFinalize && textToFinalize.trim().length > 0) {
         try {
-          await session.pushText(textToFinalize);
+          const guardedText = applyStreamingLengthGuard(textToFinalize, this.maxStreamingLength);
+          await session.pushText(guardedText);
         } catch (pushErr) {
           console.warn('[lark-stream] pushText fallback error', {
             code: (pushErr as any)?.code,
