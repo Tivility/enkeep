@@ -10,6 +10,7 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import {
   REAL_LARK_CREDENTIAL_ACCEPTANCE,
   REAL_LARK_CREDENTIAL_SKIP_REASON,
+  type CardFinalMetadata,
   type LarkAccountConfig,
   type LarkCredentialResolver,
   type LarkEventHandler,
@@ -229,8 +230,67 @@ export interface FakeStreamingCallRecord {
   readonly messageId?: string;
   readonly content?: string;
   readonly status?: 'completed' | 'failed';
+  readonly metadata?: CardFinalMetadata;
+  readonly card?: any;
   readonly params?: any;
   readonly timestamp: string;
+}
+
+/**
+ * Format compact usage footer metadata for final Lark cards.
+ * Template: <font color='grey'>🤖 ${model} · ⏱ ${duration}s · 💡 ${promptTokens}+${completionTokens} tokens · 💰 $${cost}</font>
+ * Gracefully degrades when fields are missing; returns null if no valid fields exist.
+ */
+export function formatCardUsageFooter(metadata?: CardFinalMetadata): string | null {
+  if (!metadata) return null;
+
+  const parts: string[] = [];
+
+  // 1. Model
+  if (typeof metadata.model === 'string' && metadata.model.trim().length > 0) {
+    parts.push(`🤖 ${metadata.model.trim()}`);
+  }
+
+  // 2. Elapsed time / duration
+  let durationSec: number | undefined;
+  if (typeof metadata.durationSeconds === 'number' && Number.isFinite(metadata.durationSeconds) && metadata.durationSeconds >= 0) {
+    durationSec = metadata.durationSeconds;
+  } else if (typeof metadata.durationMs === 'number' && Number.isFinite(metadata.durationMs) && metadata.durationMs >= 0) {
+    durationSec = metadata.durationMs / 1000;
+  }
+  if (durationSec !== undefined) {
+    const rounded = Math.round(durationSec * 10) / 10;
+    parts.push(`⏱ ${rounded}s`);
+  }
+
+  // 3. Tokens (prompt + completion or total)
+  const hasPrompt = typeof metadata.promptTokens === 'number' && Number.isFinite(metadata.promptTokens) && metadata.promptTokens >= 0;
+  const hasCompletion = typeof metadata.completionTokens === 'number' && Number.isFinite(metadata.completionTokens) && metadata.completionTokens >= 0;
+  const hasTotal = typeof metadata.totalTokens === 'number' && Number.isFinite(metadata.totalTokens) && metadata.totalTokens >= 0;
+
+  if (hasPrompt && hasCompletion) {
+    parts.push(`💡 ${metadata.promptTokens}+${metadata.completionTokens} tokens`);
+  } else if (hasTotal) {
+    parts.push(`💡 ${metadata.totalTokens} tokens`);
+  } else if (hasPrompt) {
+    parts.push(`💡 ${metadata.promptTokens} tokens`);
+  } else if (hasCompletion) {
+    parts.push(`💡 ${metadata.completionTokens} tokens`);
+  }
+
+  // 4. Cost (only if available from existing turn metadata; no fabricated numbers)
+  if (typeof metadata.cost === 'number' && Number.isFinite(metadata.cost) && metadata.cost >= 0) {
+    const formattedCost = Number.isInteger(metadata.cost)
+      ? String(metadata.cost)
+      : String(Number(metadata.cost.toFixed(4)));
+    parts.push(`💰 $${formattedCost}`);
+  }
+
+  if (parts.length === 0) {
+    return null;
+  }
+
+  return `<font color='grey'>${parts.join(' · ')}</font>`;
 }
 
 export class FakeLarkTransport implements LarkTransport {
@@ -475,16 +535,55 @@ export class FakeLarkTransport implements LarkTransport {
           timestamp: new Date().toISOString(),
         });
       },
-      finalize: async (finalText: string, status: 'completed' | 'failed'): Promise<void> => {
+      finalize: async (
+        finalText: string,
+        status: 'completed' | 'failed',
+        metadata?: CardFinalMetadata
+      ): Promise<void> => {
         if (this.finalizeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, this.finalizeDelayMs));
         }
+        const optimized = optimizeMarkdownStyle(finalText);
+        const chunks = chunkMarkdown(optimized, 4000);
+        const bodyElements: Array<Record<string, unknown>> =
+          chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')
+            ? [{ tag: 'markdown', content: '(空回复)' }]
+            : chunks.map((c) => ({ tag: 'markdown', content: c }));
+
+        const footer = formatCardUsageFooter(metadata);
+        if (footer) {
+          bodyElements.push({
+            tag: 'markdown',
+            content: footer,
+          });
+        }
+
+        const card = {
+          schema: '2.0',
+          header:
+            status === 'completed'
+              ? {
+                  title: { tag: 'plain_text', content: params.title ?? 'Enkeep' },
+                  template: 'green',
+                }
+              : {
+                  title: { tag: 'plain_text', content: '处理失败' },
+                  template: 'red',
+                },
+          body: {
+            direction: 'vertical',
+            elements: bodyElements,
+          },
+        };
+
         this._streamingCalls.push({
           type: 'finalize',
           cardId,
           messageId,
           content: finalText,
           status,
+          metadata,
+          card,
           timestamp: new Date().toISOString(),
         });
       },
@@ -1391,7 +1490,11 @@ export class CredentialedLarkTransport implements LarkTransport {
             });
           }
         },
-        finalize: async (finalText: string, status: 'completed' | 'failed'): Promise<void> => {
+        finalize: async (
+          finalText: string,
+          status: 'completed' | 'failed',
+          metadata?: CardFinalMetadata
+        ): Promise<void> => {
           // Close streaming mode via card.settings (swallow errors)
           try {
             const settingsFn = client.cardkit?.v1?.card?.settings;
@@ -1415,10 +1518,18 @@ export class CredentialedLarkTransport implements LarkTransport {
           // Build final card JSON
           const optimized = optimizeMarkdownStyle(finalText);
           const chunks = chunkMarkdown(optimized, 4000);
-          const bodyElements =
+          const bodyElements: Array<Record<string, unknown>> =
             chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')
               ? [{ tag: 'markdown', content: '(空回复)' }]
               : chunks.map((c) => ({ tag: 'markdown', content: c }));
+
+          const footer = formatCardUsageFooter(metadata);
+          if (footer) {
+            bodyElements.push({
+              tag: 'markdown',
+              content: footer,
+            });
+          }
 
           const finalCard = {
             schema: '2.0',

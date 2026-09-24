@@ -135,6 +135,16 @@ export interface StreamAssistantEvent {
   originTurnId?: string;
 }
 
+export interface CardFinalMetadata {
+  readonly model?: string;
+  readonly durationSeconds?: number;
+  readonly durationMs?: number;
+  readonly promptTokens?: number;
+  readonly completionTokens?: number;
+  readonly totalTokens?: number;
+  readonly cost?: number;
+}
+
 export interface StreamEventSource {
   getLatestRowId?(sessionRouteId: string): Promise<number>;
   listAssistantEvents(
@@ -148,6 +158,10 @@ export interface StreamEventSource {
   ): Promise<'queued' | 'running' | 'completed' | 'failed' | 'unknown'>;
   hasPendingPlatformTurn?(sessionRouteId: string): Promise<boolean>;
   resolveTurnOrigin?(turnId: string): Promise<ChannelTurnOrigin | null>;
+  getTurnMetrics?(
+    sessionRouteId: string,
+    turnId: string
+  ): Promise<CardFinalMetadata | null>;
 }
 
 export interface OutboundReplyResult {
@@ -160,7 +174,11 @@ export interface LarkStreamingCardSession {
   readonly cardId: string;
   readonly messageId: string;
   pushText(accumulatedText: string): Promise<void>;
-  finalize(finalText: string, status: 'completed' | 'failed'): Promise<void>;
+  finalize(
+    finalText: string,
+    status: 'completed' | 'failed',
+    metadata?: CardFinalMetadata
+  ): Promise<void>;
 }
 
 export type LarkEventHandler = (event: LarkRawEvent) => Promise<void>;

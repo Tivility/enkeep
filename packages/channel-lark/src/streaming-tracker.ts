@@ -7,6 +7,7 @@
  */
 
 import type {
+  CardFinalMetadata,
   LarkStreamingCardSession,
   LarkTransport,
   StreamEventSource,
@@ -56,6 +57,206 @@ export interface StreamingReplyTrackerOptions {
   onFinalized?: (finalText: string, status: 'completed' | 'failed', messageId?: string) => Promise<void> | void;
   turnId?: string;
   maxStreamingLength?: number;
+  metadata?: CardFinalMetadata;
+}
+
+/**
+ * Extract turn execution metrics (duration, model, tokens, cost) from SQLite database.
+ * Strictly avoids fabricated numbers: only returns fields that exist in authoritative records.
+ */
+export function extractTurnMetricsFromDb(
+  db: any,
+  sessionRouteId: string,
+  turnId: string
+): CardFinalMetadata | null {
+  if (!db || typeof db.prepare !== 'function' || !turnId) {
+    return null;
+  }
+
+  try {
+    let turnRow: any;
+    try {
+      turnRow = db
+        .prepare('SELECT * FROM turn_runs WHERE (turn_id = ? OR id = ?) AND route_id = ? LIMIT 1')
+        .get(turnId, turnId, sessionRouteId);
+      if (!turnRow) {
+        turnRow = db
+          .prepare('SELECT * FROM turn_runs WHERE turn_id = ? OR id = ? LIMIT 1')
+          .get(turnId, turnId);
+      }
+    } catch {}
+
+    let durationSeconds: number | undefined;
+    if (turnRow?.started_at && turnRow?.finished_at) {
+      const s = new Date(turnRow.started_at).getTime();
+      const f = new Date(turnRow.finished_at).getTime();
+      if (!isNaN(s) && !isNaN(f) && f >= s) {
+        durationSeconds = (f - s) / 1000;
+      }
+    } else if (turnRow?.created_at && turnRow?.finished_at) {
+      const s = new Date(turnRow.created_at).getTime();
+      const f = new Date(turnRow.finished_at).getTime();
+      if (!isNaN(s) && !isNaN(f) && f >= s) {
+        durationSeconds = (f - s) / 1000;
+      }
+    }
+
+    let model: string | undefined =
+      typeof turnRow?.model === 'string' && turnRow.model.trim().length > 0
+        ? turnRow.model.trim()
+        : undefined;
+    let promptTokens: number | undefined =
+      typeof turnRow?.prompt_tokens === 'number'
+        ? turnRow.prompt_tokens
+        : typeof turnRow?.promptTokens === 'number'
+          ? turnRow.promptTokens
+          : undefined;
+    let completionTokens: number | undefined =
+      typeof turnRow?.completion_tokens === 'number'
+        ? turnRow.completion_tokens
+        : typeof turnRow?.completionTokens === 'number'
+          ? turnRow.completionTokens
+          : undefined;
+    let totalTokens: number | undefined =
+      typeof turnRow?.total_tokens === 'number'
+        ? turnRow.total_tokens
+        : typeof turnRow?.totalTokens === 'number'
+          ? turnRow.totalTokens
+          : undefined;
+    let cost: number | undefined =
+      typeof turnRow?.cost === 'number' ? turnRow.cost : undefined;
+
+    // Check model overrides if model is not in turn_runs
+    if (!model) {
+      try {
+        const spaceId = turnRow?.space_id ?? '';
+        const userId = turnRow?.user_id ?? '';
+        const overrideRow = db
+          .prepare(
+            `SELECT model FROM model_selection_overrides
+             WHERE (owner_type = 'session' AND owner_id = ?)
+                OR (owner_type = 'space' AND owner_id = ?)
+                OR (owner_type = 'user' AND owner_id = ?)
+                OR (owner_type = 'platform' AND owner_id = 'default')
+             ORDER BY CASE owner_type
+               WHEN 'session' THEN 1
+               WHEN 'space' THEN 2
+               WHEN 'user' THEN 3
+               WHEN 'platform' THEN 4
+             END LIMIT 1`
+          )
+          .get(sessionRouteId, spaceId, userId) as { model?: string } | undefined;
+        if (overrideRow?.model && overrideRow.model.trim().length > 0) {
+          model = overrideRow.model.trim();
+        }
+      } catch {}
+    }
+
+    if (!model) {
+      try {
+        const cfgRow = db
+          .prepare(
+            `SELECT model FROM model_config_overrides
+             WHERE user_id = ? OR user_id IS NULL
+             ORDER BY user_id DESC LIMIT 1`
+          )
+          .get(turnRow?.user_id ?? '') as { model?: string } | undefined;
+        if (cfgRow?.model && cfgRow.model.trim().length > 0) {
+          model = cfgRow.model.trim();
+        }
+      } catch {}
+    }
+
+    // Check task_runs if tokens missing
+    if (promptTokens === undefined && completionTokens === undefined && totalTokens === undefined) {
+      try {
+        const taskRow = db
+          .prepare(
+            `SELECT prompt_tokens, completion_tokens, total_tokens
+             FROM task_runs
+             WHERE id = ? OR task_id = ?
+             LIMIT 1`
+          )
+          .get(turnId, turnId) as
+          | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+          | undefined;
+        if (taskRow) {
+          if (typeof taskRow.prompt_tokens === 'number' && taskRow.prompt_tokens >= 0) {
+            promptTokens = taskRow.prompt_tokens;
+          }
+          if (typeof taskRow.completion_tokens === 'number' && taskRow.completion_tokens >= 0) {
+            completionTokens = taskRow.completion_tokens;
+          }
+          if (typeof taskRow.total_tokens === 'number' && taskRow.total_tokens >= 0) {
+            totalTokens = taskRow.total_tokens;
+          }
+        }
+      } catch {}
+    }
+
+    // Check quota_bundles for committed tokens
+    if (totalTokens === undefined) {
+      try {
+        const bundleRow = db
+          .prepare(
+            `SELECT qb.tokens_committed
+             FROM quota_bundles qb
+             INNER JOIN delivery_inbox di ON di.delivery_id = qb.delivery_id
+             WHERE di.turn_id = ? AND qb.status = 'committed'
+             LIMIT 1`
+          )
+          .get(turnId) as { tokens_committed?: number } | undefined;
+        if (bundleRow && typeof bundleRow.tokens_committed === 'number' && bundleRow.tokens_committed >= 0) {
+          totalTokens = bundleRow.tokens_committed;
+        }
+      } catch {}
+    }
+
+    // Check assistant web_messages metadata
+    try {
+      const msgRow = db
+        .prepare(
+          `SELECT metadata FROM web_messages
+           WHERE turn_id = ? AND role = 'assistant' AND metadata IS NOT NULL
+           LIMIT 1`
+        )
+        .get(turnId) as { metadata?: string } | undefined;
+      if (msgRow?.metadata) {
+        const metaObj = JSON.parse(msgRow.metadata);
+        if (!model && typeof metaObj.model === 'string' && metaObj.model.trim().length > 0) {
+          model = metaObj.model.trim();
+        }
+        if (metaObj.usage && typeof metaObj.usage === 'object') {
+          if (promptTokens === undefined && typeof metaObj.usage.promptTokens === 'number') {
+            promptTokens = metaObj.usage.promptTokens;
+          }
+          if (completionTokens === undefined && typeof metaObj.usage.completionTokens === 'number') {
+            completionTokens = metaObj.usage.completionTokens;
+          }
+          if (totalTokens === undefined && typeof metaObj.usage.totalTokens === 'number') {
+            totalTokens = metaObj.usage.totalTokens;
+          }
+        }
+        if (cost === undefined && typeof metaObj.cost === 'number') {
+          cost = metaObj.cost;
+        }
+      }
+    } catch {}
+
+    const result: CardFinalMetadata = {
+      model,
+      durationSeconds,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      cost,
+    };
+
+    const hasAny = Object.values(result).some((v) => v !== undefined);
+    return hasAny ? result : null;
+  } catch {
+    return null;
+  }
 }
 
 export class StreamingReplyTracker {
@@ -69,6 +270,7 @@ export class StreamingReplyTracker {
   private readonly onFinalized?: (finalText: string, status: 'completed' | 'failed', messageId?: string) => Promise<void> | void;
   private readonly turnId?: string;
   private readonly maxStreamingLength: number;
+  private readonly initialMetadata?: CardFinalMetadata;
   private isWaiting = false;
 
   private cardSessionPromise: Promise<LarkStreamingCardSession | null> | null = null;
@@ -99,6 +301,7 @@ export class StreamingReplyTracker {
     this.onFinalized = options.onFinalized;
     this.turnId = options.turnId;
     this.maxStreamingLength = options.maxStreamingLength ?? STREAMING_MAX_CONTENT_LENGTH;
+    this.initialMetadata = options.metadata;
     this.isWaiting = !this.detached && Boolean(this.turnId && typeof this.streamEventSource.getPlatformTurnState === 'function');
     if (this.isWaiting) {
       this.cursor = 0;
@@ -351,9 +554,53 @@ export class StreamingReplyTracker {
     }
   }
 
+  private async resolveMetadata(explicitMetadata?: CardFinalMetadata): Promise<CardFinalMetadata | undefined> {
+    let queried: CardFinalMetadata | undefined;
+
+    // 1. Check if streamEventSource provides getTurnMetrics
+    if (this.turnId && typeof this.streamEventSource.getTurnMetrics === 'function') {
+      try {
+        const res = await this.streamEventSource.getTurnMetrics(this.sessionRouteId, this.turnId);
+        if (res) queried = res;
+      } catch {}
+    }
+
+    // 2. Query SQLite DB if available on streamEventSource
+    if (this.turnId && (this.streamEventSource as any)?.db) {
+      try {
+        const fromDb = extractTurnMetricsFromDb(
+          (this.streamEventSource as any).db,
+          this.sessionRouteId,
+          this.turnId
+        );
+        if (fromDb) {
+          queried = { ...fromDb, ...queried };
+        }
+      } catch {}
+    }
+
+    // 3. Merge initial tracker metadata if provided
+    let combined: CardFinalMetadata | undefined = queried;
+    if (this.initialMetadata) {
+      combined = { ...combined, ...this.initialMetadata };
+    }
+    if (explicitMetadata) {
+      combined = { ...combined, ...explicitMetadata };
+    }
+
+    // 4. Elapsed time calculation fallback: if neither durationSeconds nor durationMs is set
+    if (combined?.durationSeconds === undefined && combined?.durationMs === undefined && this.startTime > 0) {
+      const durationSeconds = Math.max(0, (Date.now() - this.startTime) / 1000);
+      combined = { ...combined, durationSeconds };
+    }
+
+    return combined;
+  }
+
   private async doFinalize(
     finalText: string,
-    status: 'completed' | 'failed'
+    status: 'completed' | 'failed',
+    metadata?: CardFinalMetadata
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
     if (this.finalizedResult) {
       return this.finalizedResult;
@@ -414,9 +661,10 @@ export class StreamingReplyTracker {
     }
 
     const textToFinalize = finalText || this.accumulatedText || (status === 'failed' ? 'Execution failed' : '');
+    const finalMetadata = await this.resolveMetadata(metadata);
 
     try {
-      await session.finalize(textToFinalize, status);
+      await session.finalize(textToFinalize, status, finalMetadata);
       const res = { handled: true, messageId: session.messageId };
       this.finalizedResult = res;
       if (this.detached) {
@@ -470,7 +718,8 @@ export class StreamingReplyTracker {
 
   async finalize(
     finalText: string,
-    status: 'completed' | 'failed'
+    status: 'completed' | 'failed',
+    metadata?: CardFinalMetadata
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
     if (this.finalizedResult) {
       return this.finalizedResult;
@@ -483,6 +732,6 @@ export class StreamingReplyTracker {
       } catch {}
     }
 
-    return this.doFinalize(finalText, status);
+    return this.doFinalize(finalText, status, metadata);
   }
 }
