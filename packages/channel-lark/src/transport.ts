@@ -11,6 +11,7 @@ import {
   REAL_LARK_CREDENTIAL_ACCEPTANCE,
   REAL_LARK_CREDENTIAL_SKIP_REASON,
   type CardFinalMetadata,
+  type CardToolStatusEntry,
   type LarkAccountConfig,
   type LarkCredentialResolver,
   type LarkEventHandler,
@@ -225,15 +226,87 @@ export interface FakeRemovedReactionRecord {
 }
 
 export interface FakeStreamingCallRecord {
-  readonly type: 'card_create' | 'push' | 'finalize';
+  readonly type: 'card_create' | 'push' | 'push_status' | 'finalize';
   readonly cardId?: string;
   readonly messageId?: string;
   readonly content?: string;
+  readonly toolStatus?: string | readonly CardToolStatusEntry[];
   readonly status?: 'completed' | 'failed';
   readonly metadata?: CardFinalMetadata;
   readonly card?: any;
   readonly params?: any;
   readonly timestamp: string;
+}
+
+/**
+ * Format tool status entries into Lark Schema 2.0 markdown content.
+ * Displays tool name and short status, e.g. 🔨 web_search: 正在执行… / ✅ web_search: 已完成.
+ */
+export function formatToolStatusMarkdown(
+  toolStatus?: string | readonly CardToolStatusEntry[]
+): string | null {
+  if (!toolStatus) return null;
+  if (typeof toolStatus === 'string') {
+    const trimmed = toolStatus.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (!Array.isArray(toolStatus) || toolStatus.length === 0) {
+    return null;
+  }
+
+  return toolStatus
+    .map((entry) => {
+      const isSubagent = entry.toolName === 'subagent';
+      if (entry.status === 'started' || entry.status === 'running') {
+        const icon = isSubagent ? '🤖' : '🔨';
+        return `${icon} **${entry.toolName}**: 正在执行…`;
+      } else if (entry.status === 'completed') {
+        const icon = isSubagent ? '🤖' : '✅';
+        return `${icon} **${entry.toolName}**: 已完成`;
+      } else if (entry.status === 'failed') {
+        return `❌ **${entry.toolName}**: 执行失败`;
+      }
+      return `• **${entry.toolName}**: ${entry.status}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Build Schema 2.0 collapsible_panel element.
+ * Header uses valid enum colors: "wathet-50", "blue-50", "grey", etc.
+ */
+export function buildCollapsibleStatusPanel(opts: {
+  content: string;
+  expanded?: boolean;
+  elementId?: string;
+  contentElementId?: string;
+  title?: string;
+  backgroundColor?: string;
+}): Record<string, unknown> {
+  const panel: Record<string, unknown> = {
+    tag: 'collapsible_panel',
+    expanded: opts.expanded ?? false,
+    header: {
+      title: {
+        tag: 'markdown',
+        content: opts.title ?? '**🔧 执行过程**',
+      },
+      background_color: opts.backgroundColor ?? 'wathet-50',
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: opts.content,
+        ...(opts.contentElementId ? { element_id: opts.contentElementId } : {}),
+      },
+    ],
+  };
+
+  if (opts.elementId) {
+    panel.element_id = opts.elementId;
+  }
+
+  return panel;
 }
 
 /**
@@ -502,6 +575,8 @@ export class FakeLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    withStatusPanel?: boolean;
+    collapsibleToolStatus?: boolean;
   }): Promise<LarkStreamingCardSession | null> {
     if (!this._connected || !this.streamingCardsEnabled || this.failStreamingCard) {
       console.warn('[lark-stream] createStreamingCard returned null', {
@@ -514,6 +589,7 @@ export class FakeLarkTransport implements LarkTransport {
 
     const cardId = `crd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const messageId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
 
     this._streamingCalls.push({
       type: 'card_create',
@@ -526,29 +602,66 @@ export class FakeLarkTransport implements LarkTransport {
     const session: LarkStreamingCardSession = {
       cardId,
       messageId,
-      pushText: async (accumulatedText: string): Promise<void> => {
+      pushText: async (accumulatedText: string, toolStatus?: string): Promise<void> => {
         this._streamingCalls.push({
           type: 'push',
           cardId,
           messageId,
           content: accumulatedText,
+          toolStatus,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      pushToolStatus: async (statusText: string): Promise<void> => {
+        this._streamingCalls.push({
+          type: 'push_status',
+          cardId,
+          messageId,
+          content: statusText,
           timestamp: new Date().toISOString(),
         });
       },
       finalize: async (
         finalText: string,
         status: 'completed' | 'failed',
-        metadata?: CardFinalMetadata
+        metadata?: CardFinalMetadata,
+        toolStatus?: string | readonly CardToolStatusEntry[]
       ): Promise<void> => {
         if (this.finalizeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, this.finalizeDelayMs));
         }
         const optimized = optimizeMarkdownStyle(finalText);
         const chunks = chunkMarkdown(optimized, 4000);
-        const bodyElements: Array<Record<string, unknown>> =
-          chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')
-            ? [{ tag: 'markdown', content: '(空回复)' }]
-            : chunks.map((c) => ({ tag: 'markdown', content: c }));
+        const bodyElements: Array<Record<string, unknown>> = [];
+
+        const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
+        if (formattedToolStatus) {
+          bodyElements.push(
+            buildCollapsibleStatusPanel({
+              content: formattedToolStatus,
+              expanded: false, // collapsed on completion
+              title: '**🔧 执行过程**',
+              backgroundColor: 'wathet-50',
+            })
+          );
+        } else if (withStatus) {
+          bodyElements.push(
+            buildCollapsibleStatusPanel({
+              content: '暂无工具调用',
+              expanded: false,
+              title: '**🔧 执行过程**',
+              backgroundColor: 'wathet-50',
+            })
+          );
+        }
+
+        if (chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')) {
+          bodyElements.push({ tag: 'markdown', content: '(空回复)' });
+        } else {
+          for (const c of chunks) {
+            bodyElements.push({ tag: 'markdown', content: c });
+          }
+        }
 
         const footer = formatCardUsageFooter(metadata);
         if (footer) {
@@ -583,6 +696,7 @@ export class FakeLarkTransport implements LarkTransport {
           content: finalText,
           status,
           metadata,
+          toolStatus,
           card,
           timestamp: new Date().toISOString(),
         });
@@ -1220,6 +1334,8 @@ export class CredentialedLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    withStatusPanel?: boolean;
+    collapsibleToolStatus?: boolean;
   }): Promise<LarkStreamingCardSession | null> {
     if (!this.apiClient) {
       this.logger.warn('[lark-stream] createStreamingCard failed: no apiClient');
@@ -1232,6 +1348,26 @@ export class CredentialedLarkTransport implements LarkTransport {
         this.logger.warn('[lark-stream] createStreamingCard failed: cardkit.v1.card.create is not a function');
         return null;
       }
+
+      const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+      const initialElements: Array<Record<string, unknown>> = [];
+      if (withStatus) {
+        initialElements.push(
+          buildCollapsibleStatusPanel({
+            content: '正在准备…',
+            expanded: true,
+            elementId: 'tool_status_panel',
+            contentElementId: 'tool_status_content',
+            title: '**🔧 执行过程**',
+            backgroundColor: 'wathet-50',
+          })
+        );
+      }
+      initialElements.push({
+        tag: 'markdown',
+        element_id: 'main_content',
+        content: '正在思考…',
+      });
 
       // 1. Build schema 2.0 card JSON
       const initialCard = {
@@ -1249,13 +1385,7 @@ export class CredentialedLarkTransport implements LarkTransport {
         },
         body: {
           direction: 'vertical',
-          elements: [
-            {
-              tag: 'markdown',
-              element_id: 'main_content',
-              content: '正在思考…',
-            },
-          ],
+          elements: initialElements,
         },
       };
 
@@ -1391,7 +1521,7 @@ export class CredentialedLarkTransport implements LarkTransport {
       const session: LarkStreamingCardSession = {
         cardId,
         messageId: boundMessageId,
-        pushText: async (accumulatedText: string): Promise<void> => {
+        pushText: async (accumulatedText: string, toolStatus?: string): Promise<void> => {
           try {
             const contentFn = client.cardkit?.v1?.cardElement?.content;
             if (typeof contentFn !== 'function') return;
@@ -1483,8 +1613,45 @@ export class CredentialedLarkTransport implements LarkTransport {
                 },
               });
             }
+
+            if (toolStatus) {
+              seq += 1;
+              await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: 'tool_status_content',
+                },
+                data: {
+                  content: toolStatus,
+                  sequence: seq,
+                },
+              });
+            }
           } catch (err) {
             logger.warn('[lark-stream] pushText error', {
+              code: (err as any)?.code,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        },
+        pushToolStatus: async (statusText: string): Promise<void> => {
+          try {
+            const contentFn = client.cardkit?.v1?.cardElement?.content;
+            if (typeof contentFn !== 'function') return;
+
+            seq += 1;
+            await contentFn({
+              path: {
+                card_id: cardId,
+                element_id: 'tool_status_content',
+              },
+              data: {
+                content: statusText,
+                sequence: seq,
+              },
+            });
+          } catch (err) {
+            logger.warn('[lark-stream] pushToolStatus error', {
               code: (err as any)?.code,
               message: err instanceof Error ? err.message : String(err),
             });
@@ -1493,7 +1660,8 @@ export class CredentialedLarkTransport implements LarkTransport {
         finalize: async (
           finalText: string,
           status: 'completed' | 'failed',
-          metadata?: CardFinalMetadata
+          metadata?: CardFinalMetadata,
+          toolStatus?: string | readonly CardToolStatusEntry[]
         ): Promise<void> => {
           // Close streaming mode via card.settings (swallow errors)
           try {
@@ -1518,10 +1686,36 @@ export class CredentialedLarkTransport implements LarkTransport {
           // Build final card JSON
           const optimized = optimizeMarkdownStyle(finalText);
           const chunks = chunkMarkdown(optimized, 4000);
-          const bodyElements: Array<Record<string, unknown>> =
-            chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')
-              ? [{ tag: 'markdown', content: '(空回复)' }]
-              : chunks.map((c) => ({ tag: 'markdown', content: c }));
+          const bodyElements: Array<Record<string, unknown>> = [];
+
+          const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
+          if (formattedToolStatus) {
+            bodyElements.push(
+              buildCollapsibleStatusPanel({
+                content: formattedToolStatus,
+                expanded: false, // collapsed on completion
+                title: '**🔧 执行过程**',
+                backgroundColor: 'wathet-50',
+              })
+            );
+          } else if (withStatus) {
+            bodyElements.push(
+              buildCollapsibleStatusPanel({
+                content: '暂无工具调用',
+                expanded: false,
+                title: '**🔧 执行过程**',
+                backgroundColor: 'wathet-50',
+              })
+            );
+          }
+
+          if (chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')) {
+            bodyElements.push({ tag: 'markdown', content: '(空回复)' });
+          } else {
+            for (const c of chunks) {
+              bodyElements.push({ tag: 'markdown', content: c });
+            }
+          }
 
           const footer = formatCardUsageFooter(metadata);
           if (footer) {

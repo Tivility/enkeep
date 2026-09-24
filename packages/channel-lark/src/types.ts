@@ -135,6 +135,13 @@ export interface StreamAssistantEvent {
   originTurnId?: string;
 }
 
+export interface CardToolStatusEntry {
+  readonly toolName: string;
+  readonly status: 'started' | 'running' | 'completed' | 'failed';
+  readonly timestamp?: string;
+  readonly detail?: string;
+}
+
 export interface CardFinalMetadata {
   readonly model?: string;
   readonly durationSeconds?: number;
@@ -173,11 +180,13 @@ export interface OutboundReplyResult {
 export interface LarkStreamingCardSession {
   readonly cardId: string;
   readonly messageId: string;
-  pushText(accumulatedText: string): Promise<void>;
+  pushText(accumulatedText: string, toolStatus?: string): Promise<void>;
+  pushToolStatus?(statusText: string): Promise<void>;
   finalize(
     finalText: string,
     status: 'completed' | 'failed',
-    metadata?: CardFinalMetadata
+    metadata?: CardFinalMetadata,
+    toolStatus?: string | readonly CardToolStatusEntry[]
   ): Promise<void>;
 }
 
@@ -204,6 +213,8 @@ export interface LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    withStatusPanel?: boolean;
+    collapsibleToolStatus?: boolean;
   }): Promise<LarkStreamingCardSession | null>;
   addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;

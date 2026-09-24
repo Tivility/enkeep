@@ -8,8 +8,12 @@ import {
   CredentialedLarkTransport,
   FakeLarkTransport,
   resolveReplyTarget,
+  formatToolStatusMarkdown,
+  buildCollapsibleStatusPanel,
+  formatCardUsageFooter,
 } from '../src/transport.js';
-import type { LarkSdkClientFactory, ILarkApiClient } from '../src/types.js';
+import type { LarkSdkClientFactory, ILarkApiClient, CardToolStatusEntry, CardFinalMetadata, StreamEventSource } from '../src/types.js';
+import { StreamingReplyTracker } from '../src/streaming-tracker.js';
 
 describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
   function createMockApiClient(overrides: {
@@ -551,6 +555,279 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       });
       expect(calls.imReply[1].path.message_id).toBe('om_y');
       expect(calls.imReply[1].data.reply_in_thread).toBe(false);
+    });
+  });
+
+  describe('C4: Feishu Schema 2.0 Collapsible Tool Status Panel (card-collapsible-tool-status)', () => {
+    it('formatToolStatusMarkdown formats single running tool, subagent, and completed steps', () => {
+      const entries: CardToolStatusEntry[] = [
+        { toolName: 'web_search', status: 'running' },
+        { toolName: 'subagent', status: 'running' },
+      ];
+      const md = formatToolStatusMarkdown(entries);
+      expect(md).toContain('🔨 **web_search**: 正在执行…');
+      expect(md).toContain('🤖 **subagent**: 正在执行…');
+
+      const completedEntries: CardToolStatusEntry[] = [
+        { toolName: 'read_file', status: 'completed' },
+        { toolName: 'subagent', status: 'completed' },
+        { toolName: 'bash', status: 'failed' },
+      ];
+      const completedMd = formatToolStatusMarkdown(completedEntries);
+      expect(completedMd).toContain('✅ **read_file**: 已完成');
+      expect(completedMd).toContain('🤖 **subagent**: 已完成');
+      expect(completedMd).toContain('❌ **bash**: 执行失败');
+
+      // Graceful degradation for string and empty entries
+      expect(formatToolStatusMarkdown('🔨 Custom Tool Running')).toBe('🔨 Custom Tool Running');
+      expect(formatToolStatusMarkdown([])).toBeNull();
+      expect(formatToolStatusMarkdown(undefined)).toBeNull();
+    });
+
+    it('buildCollapsibleStatusPanel builds valid Schema 2.0 collapsible_panel with valid enum color', () => {
+      const livePanel = buildCollapsibleStatusPanel({
+        content: '🔨 **web_search**: 正在执行…',
+        expanded: true,
+        elementId: 'tool_status_panel',
+        contentElementId: 'tool_status_content',
+        backgroundColor: 'wathet-50',
+      });
+      expect(livePanel.tag).toBe('collapsible_panel');
+      expect(livePanel.expanded).toBe(true);
+      expect(livePanel.element_id).toBe('tool_status_panel');
+      const header = livePanel.header as any;
+      expect(header.title.tag).toBe('markdown');
+      expect(header.title.content).toBe('**🔧 执行过程**');
+      expect(header.background_color).toBe('wathet-50');
+      const elements = livePanel.elements as any[];
+      expect(elements.length).toBe(1);
+      expect(elements[0].tag).toBe('markdown');
+      expect(elements[0].element_id).toBe('tool_status_content');
+      expect(elements[0].content).toBe('🔨 **web_search**: 正在执行…');
+
+      // Collapsed panel on completion
+      const finalPanel = buildCollapsibleStatusPanel({
+        content: '✅ **web_search**: 已完成',
+        expanded: false,
+        backgroundColor: 'wathet-50',
+      });
+      expect(finalPanel.tag).toBe('collapsible_panel');
+      expect(finalPanel.expanded).toBe(false);
+      expect((finalPanel.header as any).background_color).toBe('wathet-50');
+    });
+
+    it('CredentialedLarkTransport: withStatusPanel creates live collapsible_panel above main_content and collapses on completion', async () => {
+      const { client, calls } = createMockApiClient();
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_c4_cred',
+          userId: 'usr_c4',
+          appId: 'cli_mock_c4',
+          appSecret: 'sec_mock_c4',
+        },
+        clientFactory: {
+          createClient: () => client,
+        } as LarkSdkClientFactory,
+      });
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_c4_test',
+        title: 'C4 Test Bot',
+        withStatusPanel: true,
+      });
+      expect(session).not.toBeNull();
+
+      // 1. Initial card creation has collapsible_panel at index 0 (above main_content)
+      expect(calls.cardCreate.length).toBe(1);
+      const initialCard = JSON.parse(calls.cardCreate[0].data.data);
+      expect(initialCard.schema).toBe('2.0');
+      expect(initialCard.config.streaming_mode).toBe(true);
+      const initialElements = initialCard.body.elements;
+      expect(initialElements.length).toBe(2);
+      expect(initialElements[0].tag).toBe('collapsible_panel');
+      expect(initialElements[0].expanded).toBe(true);
+      expect(initialElements[0].header.background_color).toBe('wathet-50');
+      expect(initialElements[0].elements[0].element_id).toBe('tool_status_content');
+      expect(initialElements[1].tag).toBe('markdown');
+      expect(initialElements[1].element_id).toBe('main_content');
+
+      // 2. Push tool status update
+      await session!.pushToolStatus?.('🔨 **web_search**: 正在检索相关资料…');
+      expect(calls.cardElementContent.length).toBe(1);
+      expect(calls.cardElementContent[0].path.element_id).toBe('tool_status_content');
+      expect(calls.cardElementContent[0].data.content).toBe('🔨 **web_search**: 正在检索相关资料…');
+
+      // 3. Push streaming answer text
+      await session!.pushText('Here is the streaming answer');
+      expect(calls.cardElementContent.length).toBe(2);
+      expect(calls.cardElementContent[1].path.element_id).toBe('main_content');
+      expect(calls.cardElementContent[1].data.content).toBe('Here is the streaming answer');
+
+      // 4. Finalize: final card has collapsible_panel with expanded: false above the answer
+      const toolEntries: CardToolStatusEntry[] = [
+        { toolName: 'web_search', status: 'completed' },
+      ];
+      const metadata: CardFinalMetadata = {
+        model: 'deepseek-chat',
+        durationSeconds: 2.5,
+        totalTokens: 120,
+      };
+
+      await session!.finalize('Here is the completed final answer', 'completed', metadata, toolEntries);
+      expect(calls.cardUpdate.length).toBe(1);
+      const finalCard = JSON.parse(calls.cardUpdate[0].data.card.data);
+      expect(finalCard.schema).toBe('2.0');
+      expect(finalCard.header.template).toBe('green');
+      const finalElements = finalCard.body.elements;
+
+      // Element 0: Collapsed tool status panel ABOVE answer
+      expect(finalElements[0].tag).toBe('collapsible_panel');
+      expect(finalElements[0].expanded).toBe(false);
+      expect(finalElements[0].header.background_color).toBe('wathet-50');
+      expect(finalElements[0].elements[0].content).toContain('✅ **web_search**: 已完成');
+
+      // Element 1: Final answer content
+      expect(finalElements[1].tag).toBe('markdown');
+      expect(finalElements[1].content).toBe('Here is the completed final answer');
+
+      // Element 2: Usage footer
+      expect(finalElements[2].tag).toBe('markdown');
+      expect(finalElements[2].content).toContain("🤖 deepseek-chat · ⏱ 2.5s · 💡 120 tokens");
+    });
+
+    it('FakeLarkTransport: withStatusPanel produces Schema 2.0 collapsible_panel above answer collapsed on completion', async () => {
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_c4_fake',
+        withStatusPanel: true,
+      });
+      expect(session).not.toBeNull();
+
+      await session!.pushToolStatus?.('🤖 **subagent**: 运行中…');
+      await session!.pushText('Subagent generated answer');
+
+      const toolEntries: CardToolStatusEntry[] = [
+        { toolName: 'subagent', status: 'completed' },
+      ];
+      await session!.finalize('Final report', 'completed', undefined, toolEntries);
+
+      const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+      expect(finalizeCall).toBeDefined();
+      expect(finalizeCall?.card).toBeDefined();
+
+      const elements = finalizeCall?.card.body.elements;
+      expect(elements.length).toBe(2);
+      // Panel is above answer
+      expect(elements[0].tag).toBe('collapsible_panel');
+      expect(elements[0].expanded).toBe(false);
+      expect(elements[0].header.background_color).toBe('wathet-50');
+      expect(elements[0].elements[0].content).toContain('🤖 **subagent**: 已完成');
+      // Answer
+      expect(elements[1].tag).toBe('markdown');
+      expect(elements[1].content).toBe('Final report');
+    });
+
+    it('StreamingReplyTracker: live tool calls update status panel and card finalizes collapsed above answer', async () => {
+      vi.useFakeTimers();
+      try {
+        const transport = new FakeLarkTransport();
+        await transport.start();
+
+        const events: Array<{
+          rowId: number;
+          type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status';
+          delta?: string;
+          streamId?: string;
+          status?: string;
+          toolName?: string;
+        }> = [
+          { rowId: 1, type: 'assistant_delta', delta: 'Initial draft answer. ', streamId: 's1' },
+          { rowId: 2, type: 'tool_status', toolName: 'web_search', status: 'started' },
+        ];
+
+        const fakeSource: StreamEventSource = {
+          listAssistantEvents: vi.fn().mockImplementation(async (_r, after) => {
+            return events.filter((e) => e.rowId > after);
+          }),
+        };
+
+        const tracker = new StreamingReplyTracker({
+          transport,
+          streamEventSource: fakeSource,
+          sessionRouteId: 'session_c4_tracker',
+          cardParams: {
+            chatId: 'oc_test_c4',
+            withStatusPanel: true,
+          },
+          initialCursor: 0,
+          pollIntervalMs: 100,
+        });
+
+        tracker.start();
+        await vi.advanceTimersByTimeAsync(0);
+
+        // Pushed status call should exist
+        const statusPushes = transport.streamingCalls.filter((c) => c.type === 'push_status');
+        expect(statusPushes.length).toBeGreaterThanOrEqual(1);
+        expect(statusPushes[0].content).toContain('🔨 **web_search**: 正在执行…');
+
+        // The answer text itself should be clean without "⏳ 后台任务运行中：subagent ×N"
+        const textPushes = transport.streamingCalls.filter((c) => c.type === 'push');
+        expect(textPushes.length).toBeGreaterThanOrEqual(1);
+        expect(textPushes[textPushes.length - 1].content).toBe('Initial draft answer. ');
+        expect(textPushes[textPushes.length - 1].content).not.toContain('⏳ 后台任务运行中');
+
+        // Tool completes and another subagent runs
+        events.push({ rowId: 3, type: 'tool_status', toolName: 'web_search', status: 'completed' });
+        events.push({ rowId: 4, type: 'tool_status', toolName: 'subagent', status: 'started' });
+        events.push({ rowId: 5, type: 'assistant_delta', delta: 'More analysis details.', streamId: 's1' });
+
+        await vi.advanceTimersByTimeAsync(100);
+
+        const statusPushes2 = transport.streamingCalls.filter((c) => c.type === 'push_status');
+        const latestStatus = statusPushes2[statusPushes2.length - 1];
+        expect(latestStatus.content).toContain('✅ **web_search**: 已完成');
+        expect(latestStatus.content).toContain('🤖 **subagent**: 正在执行…');
+
+        // Subagent finishes and turn completes
+        events.push({ rowId: 6, type: 'tool_status', toolName: 'subagent', status: 'completed' });
+        events.push({ rowId: 7, type: 'turn_status', status: 'completed' });
+
+        await vi.advanceTimersByTimeAsync(100);
+
+        const metadata: CardFinalMetadata = {
+          model: 'gpt-4o',
+          durationSeconds: 3.1,
+        };
+
+        const res = await tracker.finalize('Final polished answer', 'completed', metadata);
+        expect(res.handled).toBe(true);
+
+        const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+        expect(finalizeCall).toBeDefined();
+        expect(finalizeCall?.card).toBeDefined();
+
+        const finalElements = finalizeCall?.card.body.elements;
+        // 0: Collapsed panel above answer
+        expect(finalElements[0].tag).toBe('collapsible_panel');
+        expect(finalElements[0].expanded).toBe(false);
+        expect(finalElements[0].header.background_color).toBe('wathet-50');
+        expect(finalElements[0].elements[0].content).toContain('✅ **web_search**: 已完成');
+        expect(finalElements[0].elements[0].content).toContain('🤖 **subagent**: 已完成');
+
+        // 1: Main answer
+        expect(finalElements[1].tag).toBe('markdown');
+        expect(finalElements[1].content).toBe('Final polished answer');
+
+        // 2: Footer
+        expect(finalElements[2].tag).toBe('markdown');
+        expect(finalElements[2].content).toContain('🤖 gpt-4o · ⏱ 3.1s');
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

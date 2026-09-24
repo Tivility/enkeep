@@ -8,10 +8,12 @@
 
 import type {
   CardFinalMetadata,
+  CardToolStatusEntry,
   LarkStreamingCardSession,
   LarkTransport,
   StreamEventSource,
 } from './types.js';
+import { formatToolStatusMarkdown } from './transport.js';
 
 export const STREAMING_MAX_CONTENT_LENGTH = 3800;
 export const STREAMING_MAX_LENGTH = STREAMING_MAX_CONTENT_LENGTH;
@@ -43,6 +45,8 @@ export interface StreamingReplyTrackerCardParams {
   rootId?: string;
   threadId?: string;
   title?: string;
+  withStatusPanel?: boolean;
+  collapsibleToolStatus?: boolean;
 }
 
 export interface StreamingReplyTrackerOptions {
@@ -58,6 +62,8 @@ export interface StreamingReplyTrackerOptions {
   turnId?: string;
   maxStreamingLength?: number;
   metadata?: CardFinalMetadata;
+  withStatusPanel?: boolean;
+  collapsibleToolStatus?: boolean;
 }
 
 /**
@@ -283,6 +289,9 @@ export class StreamingReplyTracker {
   private accumulatedText = '';
   private lastPushedText = '';
   private readonly runningTools = new Map<string, number>();
+  private readonly withStatusPanel: boolean;
+  private readonly toolStatusEntries: CardToolStatusEntry[] = [];
+  private lastPushedToolStatus = '';
   private currentStreamId: string | null = null;
   private streamEnded = false;
   private startTime = 0;
@@ -302,6 +311,12 @@ export class StreamingReplyTracker {
     this.turnId = options.turnId;
     this.maxStreamingLength = options.maxStreamingLength ?? STREAMING_MAX_CONTENT_LENGTH;
     this.initialMetadata = options.metadata;
+    this.withStatusPanel = Boolean(
+      options.withStatusPanel ??
+      options.collapsibleToolStatus ??
+      options.cardParams?.withStatusPanel ??
+      options.cardParams?.collapsibleToolStatus
+    );
     this.isWaiting = !this.detached && Boolean(this.turnId && typeof this.streamEventSource.getPlatformTurnState === 'function');
     if (this.isWaiting) {
       this.cursor = 0;
@@ -320,6 +335,10 @@ export class StreamingReplyTracker {
     return this.accumulatedText;
   }
 
+  getToolStatusEntries(): readonly CardToolStatusEntry[] {
+    return [...this.toolStatusEntries];
+  }
+
   getRouteId(): string {
     return this.sessionRouteId;
   }
@@ -335,7 +354,10 @@ export class StreamingReplyTracker {
   private initStreamingCard(): void {
     if (this.cardSessionPromise) return;
     if (this.transport.createStreamingCard) {
-      this.cardSessionPromise = this.transport.createStreamingCard(this.cardParams).then(
+      const cardParams = this.withStatusPanel
+        ? { ...this.cardParams, withStatusPanel: true }
+        : this.cardParams;
+      this.cardSessionPromise = this.transport.createStreamingCard(cardParams).then(
         (session) => {
           this.cardSession = session;
           return session;
@@ -425,8 +447,29 @@ export class StreamingReplyTracker {
         const current = this.runningTools.get(name) ?? 0;
         if (evt.status === 'started') {
           this.runningTools.set(name, current + 1);
+          this.toolStatusEntries.push({
+            toolName: name,
+            status: 'running',
+            timestamp: new Date().toISOString(),
+          });
         } else if (evt.status === 'completed' || evt.status === 'failed') {
           this.runningTools.set(name, Math.max(0, current - 1));
+          const runningIdx = [...this.toolStatusEntries]
+            .reverse()
+            .findIndex((e) => e.toolName === name && (e.status === 'running' || e.status === 'started'));
+          if (runningIdx !== -1) {
+            const actualIdx = this.toolStatusEntries.length - 1 - runningIdx;
+            this.toolStatusEntries[actualIdx] = {
+              ...this.toolStatusEntries[actualIdx],
+              status: evt.status as 'completed' | 'failed',
+            };
+          } else {
+            this.toolStatusEntries.push({
+              toolName: name,
+              status: evt.status as 'completed' | 'failed',
+              timestamp: new Date().toISOString(),
+            });
+          }
         }
       } else if (evt.type === 'turn_status') {
         if (evt.status === 'completed' || evt.status === 'failed') {
@@ -516,15 +559,31 @@ export class StreamingReplyTracker {
         // Wait for card session to be available if still pending
         const session = this.cardSession ?? (await this.cardSessionPromise);
         if (session && !this.isStopped) {
-          const subagentCount = this.runningTools.get('subagent') ?? 0;
-          const rawTextToPush =
-            subagentCount > 0
-              ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
-              : this.accumulatedText;
-          const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
-          if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
-            this.lastPushedText = textToPush;
-            await session.pushText(textToPush);
+          if (this.withStatusPanel) {
+            const statusMarkdown = formatToolStatusMarkdown(this.toolStatusEntries);
+            if (statusMarkdown && statusMarkdown !== this.lastPushedToolStatus) {
+              this.lastPushedToolStatus = statusMarkdown;
+              if (typeof session.pushToolStatus === 'function') {
+                await session.pushToolStatus(statusMarkdown);
+              }
+            }
+
+            const textToPush = applyStreamingLengthGuard(this.accumulatedText, this.maxStreamingLength);
+            if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
+              this.lastPushedText = textToPush;
+              await session.pushText(textToPush, statusMarkdown ?? undefined);
+            }
+          } else {
+            const subagentCount = this.runningTools.get('subagent') ?? 0;
+            const rawTextToPush =
+              subagentCount > 0
+                ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
+                : this.accumulatedText;
+            const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
+            if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
+              this.lastPushedText = textToPush;
+              await session.pushText(textToPush);
+            }
           }
         }
 
@@ -600,7 +659,8 @@ export class StreamingReplyTracker {
   private async doFinalize(
     finalText: string,
     status: 'completed' | 'failed',
-    metadata?: CardFinalMetadata
+    metadata?: CardFinalMetadata,
+    toolStatus?: string | readonly CardToolStatusEntry[]
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
     if (this.finalizedResult) {
       return this.finalizedResult;
@@ -647,15 +707,30 @@ export class StreamingReplyTracker {
         if (terminalStatus) {
           this.terminalReached = true;
         }
-        const subagentCount = this.runningTools.get('subagent') ?? 0;
-        const rawTextToPush =
-          subagentCount > 0
-            ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
-            : this.accumulatedText;
-        const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
-        if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
-          this.lastPushedText = textToPush;
-          await session.pushText(textToPush);
+        if (this.withStatusPanel) {
+          const statusMarkdown = formatToolStatusMarkdown(this.toolStatusEntries);
+          if (statusMarkdown && statusMarkdown !== this.lastPushedToolStatus) {
+            this.lastPushedToolStatus = statusMarkdown;
+            if (typeof session.pushToolStatus === 'function') {
+              await session.pushToolStatus(statusMarkdown);
+            }
+          }
+          const textToPush = applyStreamingLengthGuard(this.accumulatedText, this.maxStreamingLength);
+          if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
+            this.lastPushedText = textToPush;
+            await session.pushText(textToPush, statusMarkdown ?? undefined);
+          }
+        } else {
+          const subagentCount = this.runningTools.get('subagent') ?? 0;
+          const rawTextToPush =
+            subagentCount > 0
+              ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
+              : this.accumulatedText;
+          const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
+          if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
+            this.lastPushedText = textToPush;
+            await session.pushText(textToPush);
+          }
         }
       } catch {}
     }
@@ -663,8 +738,27 @@ export class StreamingReplyTracker {
     const textToFinalize = finalText || this.accumulatedText || (status === 'failed' ? 'Execution failed' : '');
     const finalMetadata = await this.resolveMetadata(metadata);
 
+    // If turn completed successfully, mark any remaining running tool entries as completed
+    if (status === 'completed') {
+      for (let i = 0; i < this.toolStatusEntries.length; i++) {
+        if (this.toolStatusEntries[i].status === 'running' || this.toolStatusEntries[i].status === 'started') {
+          this.toolStatusEntries[i] = {
+            ...this.toolStatusEntries[i],
+            status: 'completed',
+          };
+        }
+      }
+    }
+
+    const finalToolStatus =
+      toolStatus !== undefined
+        ? toolStatus
+        : this.withStatusPanel && this.toolStatusEntries.length > 0
+          ? this.toolStatusEntries
+          : undefined;
+
     try {
-      await session.finalize(textToFinalize, status, finalMetadata);
+      await session.finalize(textToFinalize, status, finalMetadata, finalToolStatus);
       const res = { handled: true, messageId: session.messageId };
       this.finalizedResult = res;
       if (this.detached) {
@@ -719,7 +813,8 @@ export class StreamingReplyTracker {
   async finalize(
     finalText: string,
     status: 'completed' | 'failed',
-    metadata?: CardFinalMetadata
+    metadata?: CardFinalMetadata,
+    toolStatus?: string | readonly CardToolStatusEntry[]
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
     if (this.finalizedResult) {
       return this.finalizedResult;
@@ -732,6 +827,6 @@ export class StreamingReplyTracker {
       } catch {}
     }
 
-    return this.doFinalize(finalText, status, metadata);
+    return this.doFinalize(finalText, status, metadata, toolStatus);
   }
 }
