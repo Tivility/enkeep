@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { ValidationError, PlatformError } from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 
-export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn';
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind';
 
 export interface ParsedChatCommand {
   command: ChatCommandType;
@@ -26,7 +26,10 @@ const HELP_USAGE = `Available commands:
   /compact - Force session compaction regardless of threshold
   /model - Show, list, set, or reset session model override
   /effort - List, set, or reset reasoning effort override
-  /sw - Start parallel background task in current space (alias: /spawn)`;
+  /sw - Start parallel background task in current space (alias: /spawn)
+  /where - Show current workspace binding and context
+  /bind - Bind channel context to workspace (alias: /bind <space>)
+  /unbind - Revert channel context to default workspace`;
 
 const SPAWN_USAGE = `用法: /sw <任务描述>
 在当前工作区创建并行任务`;
@@ -34,7 +37,7 @@ const SPAWN_USAGE = `用法: /sw <任务描述>
 const MODEL_USAGE = `Usage:
   /model - Show current effective model
   /model list - List available models
-  /model <provider/model> or <modelId> - Set session model override
+  /model <provider/model> or <modelId> - Set session model override (alias: /model use <id>)
   /model reset - Reset session model override`;
 
 const EFFORT_USAGE = `Usage:
@@ -52,12 +55,12 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
   }
 
   const trimmed = content.trim();
-  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn)(?:[\s\t\r\n]+([\s\S]*))?$/i);
+  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
     return null;
   }
 
-  const cmd = match[1].toLowerCase() as 'model' | 'effort' | 'help' | 'status' | 'new' | 'reset' | 'clear' | 'stop' | 'compact' | 'sw' | 'spawn';
+  const cmd = match[1].toLowerCase() as 'model' | 'effort' | 'help' | 'status' | 'new' | 'reset' | 'clear' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind';
   const rest = match[2] !== undefined ? match[2].trim() : '';
 
   if (cmd === 'sw' || cmd === 'spawn') {
@@ -135,6 +138,40 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
     };
   }
 
+  if (cmd === 'where') {
+    return {
+      command: 'where',
+      type: 'where',
+      subcommand: 'show',
+      action: 'show',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'bind') {
+    return {
+      command: 'bind',
+      type: 'bind',
+      subcommand: rest ? 'bind' : 'show',
+      action: rest ? 'bind' : 'show',
+      arg: rest || undefined,
+      target: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'unbind') {
+    return {
+      command: 'unbind',
+      type: 'unbind',
+      subcommand: 'unbind',
+      action: 'unbind',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
   if (cmd === 'model') {
     if (!rest) {
       return {
@@ -160,6 +197,29 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
         type: 'model',
         subcommand: 'reset',
         action: 'reset',
+        raw: trimmed,
+      };
+    }
+    const useMatch = rest.match(/^use(?:\s+([\s\S]*))?$/i);
+    if (useMatch) {
+      const useTarget = useMatch[1]?.trim();
+      if (!useTarget || /\s/.test(useTarget)) {
+        return {
+          command: 'model',
+          type: 'model',
+          subcommand: 'unknown',
+          action: 'unknown',
+          arg: rest,
+          raw: trimmed,
+        };
+      }
+      return {
+        command: 'model',
+        type: 'model',
+        subcommand: 'set',
+        action: 'set',
+        arg: useTarget,
+        target: useTarget,
         raw: trimmed,
       };
     }
@@ -359,6 +419,12 @@ export class ChatCommandService {
         case 'sw':
         case 'spawn':
           return await this.executeSpawnCommand(params, parsed);
+        case 'where':
+          return await this.executeWhereCommand(params, parsed);
+        case 'bind':
+          return await this.executeBindCommand(params, parsed);
+        case 'unbind':
+          return await this.executeUnbindCommand(params, parsed);
         default:
           return { replyText: 'Unrecognized command.' };
       }
@@ -427,10 +493,45 @@ export class ChatCommandService {
     const modelStr = `${effective.provider}/${effective.model} · ${effortStr} · ${effective.source}`;
 
     let turnStatus = 'idle';
+    let activeCount = 0;
+    let queuedCount = 0;
+    let queuePosition: number | null = null;
+
+    if (this.db) {
+      try {
+        const qRow = this.db.prepare(`
+          SELECT
+            COUNT(CASE WHEN status = 'running' THEN 1 END) as active_count,
+            COUNT(CASE WHEN status = 'queued' THEN 1 END) as queued_count
+          FROM turn_runs
+          WHERE user_id = ?
+        `).get(userId) as { active_count?: number; queued_count?: number } | undefined;
+        if (qRow) {
+          activeCount = Number(qRow.active_count || 0);
+          queuedCount = Number(qRow.queued_count || 0);
+        }
+
+        const posRow = this.db.prepare(`
+          SELECT COUNT(*) as pos
+          FROM turn_runs
+          WHERE user_id = ? AND status = 'queued' AND created_at <= (
+            SELECT MIN(created_at) FROM turn_runs
+            WHERE user_id = ? AND route_id = ? AND status = 'queued'
+          )
+        `).get(userId, userId, sessionId) as { pos?: number } | undefined;
+        if (posRow?.pos && posRow.pos > 0) {
+          queuePosition = Number(posRow.pos);
+        }
+      } catch {}
+    }
+
     if (this.gateway?.getCurrentTurnStatus) {
       const turnRes = await this.gateway.getCurrentTurnStatus(userId, sessionId);
       if (turnRes?.status) {
         turnStatus = turnRes.status;
+      }
+      if (typeof turnRes?.queuePosition === 'number') {
+        queuePosition = turnRes.queuePosition;
       }
     } else if (this.db) {
       try {
@@ -448,15 +549,339 @@ export class ChatCommandService {
       } catch {}
     }
 
+    let resourcesStr = 'n/a (idle)';
+    if (this.db) {
+      try {
+        const diagRow = this.db.prepare(`
+          SELECT cpu_percent, memory_usage_bytes, memory_limit_bytes, pids_count
+          FROM runtime_diagnostics
+          WHERE user_id = ? AND (cpu_percent IS NOT NULL OR memory_usage_bytes IS NOT NULL OR pids_count IS NOT NULL)
+          ORDER BY created_at DESC
+          LIMIT 1
+        `).get(userId) as {
+          cpu_percent?: number | null;
+          memory_usage_bytes?: number | null;
+          memory_limit_bytes?: number | null;
+          pids_count?: number | null;
+        } | undefined;
+
+        if (diagRow) {
+          let memStr = 'n/a';
+          if (typeof diagRow.memory_usage_bytes === 'number') {
+            const usedMb = (diagRow.memory_usage_bytes / (1024 * 1024)).toFixed(1);
+            if (typeof diagRow.memory_limit_bytes === 'number' && diagRow.memory_limit_bytes > 0) {
+              const limitMb = (diagRow.memory_limit_bytes / (1024 * 1024)).toFixed(0);
+              memStr = `${usedMb}MB / ${limitMb}MB`;
+            } else {
+              memStr = `${usedMb}MB`;
+            }
+          }
+          const cpuStr = typeof diagRow.cpu_percent === 'number'
+            ? `${diagRow.cpu_percent.toFixed(1)}%`
+            : 'n/a';
+          const pidsStr = typeof diagRow.pids_count === 'number'
+            ? `${diagRow.pids_count}`
+            : 'n/a';
+
+          resourcesStr = `mem ${memStr}, cpu ${cpuStr}, pids ${pidsStr}`;
+        }
+      } catch {}
+    }
+
+    const queuePosText = queuePosition !== null && turnStatus === 'queued' ? ` (#${queuePosition})` : '';
     const lines = [
       `space: ${spaceName} (${spaceMode})`,
       `session: ${shortId} (${sessionTitle})`,
       `generation: ${currentGen}`,
       `model: ${modelStr}`,
-      `turn: ${turnStatus}`,
+      `turn: ${turnStatus}${queuePosText}`,
+      `queue: ${turnStatus}${queuePosText} (user queue: ${activeCount} running, ${queuedCount} queued)`,
+      `resources: ${resourcesStr}`,
       `last activity: ${lastActivity}`,
     ];
     return { replyText: lines.join('\n') };
+  }
+
+  private async executeWhereCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId, spaceId } = params;
+
+    let targetSpaceId = spaceId;
+    let channel = 'web';
+    let accountId: string | null = null;
+    let nativeContextId: string | null = null;
+    let agentProfileId: string | null = null;
+
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT space_id, channel, account_id, native_context_id, agent_profile_id FROM session_routes WHERE id = ?')
+          .get(sessionId) as {
+            space_id?: string;
+            channel?: string;
+            account_id?: string | null;
+            native_context_id?: string | null;
+            agent_profile_id?: string | null;
+          } | undefined;
+        if (routeRow) {
+          if (routeRow.space_id) targetSpaceId = routeRow.space_id;
+          if (routeRow.channel) channel = routeRow.channel;
+          accountId = routeRow.account_id ?? null;
+          nativeContextId = routeRow.native_context_id ?? null;
+          agentProfileId = routeRow.agent_profile_id ?? null;
+        }
+      } catch {}
+    }
+
+    let spaceName = targetSpaceId;
+    let folder = targetSpaceId;
+    let spaceMode = 'default';
+
+    if (this.db) {
+      try {
+        const spaceRow = this.db
+          .prepare('SELECT name, folder, execution_mode FROM spaces WHERE id = ?')
+          .get(targetSpaceId) as { name?: string | null; folder?: string | null; execution_mode?: string | null } | undefined;
+        if (spaceRow) {
+          if (spaceRow.name) spaceName = spaceRow.name;
+          if (spaceRow.folder) folder = spaceRow.folder;
+          if (spaceRow.execution_mode) spaceMode = spaceRow.execution_mode;
+        }
+      } catch {}
+    }
+
+    let profileName = 'default';
+    if (agentProfileId && this.db) {
+      try {
+        const profRow = this.db
+          .prepare('SELECT name FROM agent_profiles WHERE id = ?')
+          .get(agentProfileId) as { name?: string | null } | undefined;
+        if (profRow?.name) {
+          profileName = profRow.name;
+        } else {
+          profileName = agentProfileId;
+        }
+      } catch {}
+    }
+
+    if (channel === 'web') {
+      const lines = [
+        `space: ${spaceName} (${targetSpaceId})`,
+        `folder: ${folder}`,
+        `mode: ${spaceMode}`,
+        `profile: ${profileName}`,
+        'channel: web (workspace binding is immutable)',
+      ];
+      return { replyText: lines.join('\n') };
+    }
+
+    // Non-web channel (e.g. lark)
+    let activationMode = 'mention';
+    if (this.db && accountId && nativeContextId) {
+      try {
+        const bindingRow = this.db
+          .prepare('SELECT activation_mode FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
+          .get(userId, accountId, nativeContextId) as { activation_mode?: string } | undefined;
+        if (bindingRow?.activation_mode) {
+          activationMode = bindingRow.activation_mode;
+        }
+      } catch {}
+    }
+
+    const lines = [
+      `space: ${spaceName} (${targetSpaceId})`,
+      `folder: ${folder}`,
+      `mode: ${spaceMode}`,
+      `profile: ${profileName}`,
+      `channel: ${channel} (context: ${nativeContextId || 'default'}, mode: ${activationMode})`,
+    ];
+    return { replyText: lines.join('\n') };
+  }
+
+  private async executeBindCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId } = params;
+
+    let channel = 'web';
+    let accountId: string | null = null;
+    let nativeContextId: string | null = null;
+
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT channel, account_id, native_context_id FROM session_routes WHERE id = ?')
+          .get(sessionId) as {
+            channel?: string;
+            account_id?: string | null;
+            native_context_id?: string | null;
+          } | undefined;
+        if (routeRow) {
+          if (routeRow.channel) channel = routeRow.channel;
+          accountId = routeRow.account_id ?? null;
+          nativeContextId = routeRow.native_context_id ?? null;
+        }
+      } catch {}
+    }
+
+    if (channel === 'web') {
+      return { replyText: 'Web 会话工作区绑定固定，请在目标工作区新建会话。' };
+    }
+
+    const rawTarget = parsed.target?.trim() || parsed.arg?.trim();
+    if (!rawTarget) {
+      return { replyText: '用法: /bind <workspace>' };
+    }
+
+    if (!this.db) {
+      return { replyText: '数据库未连接，无法执行绑定。' };
+    }
+
+    if (!accountId || !nativeContextId) {
+      return { replyText: '当前会话缺少渠道上下文，无法绑定。' };
+    }
+
+    const cleanTarget = rawTarget.replace(/^["']|["']$/g, '').trim();
+
+    // Resolve target space: priority id -> folder -> name
+    let targetSpace: { id: string; name: string; folder: string; execution_mode: string } | undefined;
+    try {
+      const byId = this.db
+        .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND id = ?')
+        .get(userId, cleanTarget) as { id: string; name: string; folder: string; execution_mode: string } | undefined;
+      if (byId) {
+        targetSpace = byId;
+      } else {
+        const byFolder = this.db
+          .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND folder = ?')
+          .get(userId, cleanTarget) as { id: string; name: string; folder: string; execution_mode: string } | undefined;
+        if (byFolder) {
+          targetSpace = byFolder;
+        } else {
+          const byName = this.db
+            .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND name = ?')
+            .all(userId, cleanTarget) as Array<{ id: string; name: string; folder: string; execution_mode: string }>;
+          if (byName.length === 1) {
+            targetSpace = byName[0];
+          } else if (byName.length > 1) {
+            return { replyText: `工作区名称 "${cleanTarget}" 存在歧义，请使用准确的工作区 ID。` };
+          }
+        }
+      }
+    } catch {}
+
+    if (!targetSpace) {
+      return { replyText: `未找到工作区 "${cleanTarget}"。` };
+    }
+
+    // Update channel_bindings and session_routes
+    try {
+      const existing = this.db
+        .prepare('SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
+        .get(userId, accountId, nativeContextId) as { id: string } | undefined;
+
+      if (existing) {
+        this.db
+          .prepare('UPDATE channel_bindings SET space_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .run(targetSpace.id, existing.id);
+      } else {
+        const newId = `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+        this.db
+          .prepare(`
+            INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'mention', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+          `)
+          .run(newId, userId, accountId, targetSpace.id, nativeContextId);
+      }
+
+      this.db
+        .prepare('UPDATE session_routes SET space_id = ?, execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+        .run(targetSpace.id, targetSpace.execution_mode || 'container', sessionId, userId);
+
+      return { replyText: `已成功绑定到工作区: ${targetSpace.name} (${targetSpace.folder || targetSpace.id})` };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { replyText: `绑定失败: ${msg}` };
+    }
+  }
+
+  private async executeUnbindCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId } = params;
+
+    let channel = 'web';
+    let accountId: string | null = null;
+    let nativeContextId: string | null = null;
+
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT channel, account_id, native_context_id FROM session_routes WHERE id = ?')
+          .get(sessionId) as {
+            channel?: string;
+            account_id?: string | null;
+            native_context_id?: string | null;
+          } | undefined;
+        if (routeRow) {
+          if (routeRow.channel) channel = routeRow.channel;
+          accountId = routeRow.account_id ?? null;
+          nativeContextId = routeRow.native_context_id ?? null;
+        }
+      } catch {}
+    }
+
+    if (channel === 'web') {
+      return { replyText: 'Web 会话工作区绑定固定，无需解除绑定。' };
+    }
+
+    if (!this.db) {
+      return { replyText: '数据库未连接，无法解除绑定。' };
+    }
+
+    if (!accountId || !nativeContextId) {
+      return { replyText: '当前会话缺少渠道上下文，无法解除绑定。' };
+    }
+
+    try {
+      const accRow = this.db
+        .prepare('SELECT default_space_id FROM channel_accounts WHERE id = ? AND user_id = ?')
+        .get(accountId, userId) as { default_space_id?: string | null } | undefined;
+
+      if (!accRow?.default_space_id) {
+        return { replyText: '渠道账号未设置默认工作区，已保留当前绑定。' };
+      }
+
+      const defaultSpace = this.db
+        .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE id = ? AND user_id = ?')
+        .get(accRow.default_space_id, userId) as {
+          id: string;
+          name: string;
+          folder: string;
+          execution_mode: string;
+        } | undefined;
+
+      if (!defaultSpace) {
+        return { replyText: '默认工作区不存在，已保留当前绑定。' };
+      }
+
+      this.db
+        .prepare('DELETE FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
+        .run(userId, accountId, nativeContextId);
+
+      this.db
+        .prepare('UPDATE session_routes SET space_id = ?, execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+        .run(defaultSpace.id, defaultSpace.execution_mode || 'container', sessionId, userId);
+
+      return { replyText: `已恢复渠道默认工作区: ${defaultSpace.name} (${defaultSpace.folder || defaultSpace.id})` };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { replyText: `解除绑定失败: ${msg}` };
+    }
   }
 
   private async executeStopCommand(
