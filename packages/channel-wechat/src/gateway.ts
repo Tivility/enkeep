@@ -6,6 +6,7 @@
  * @module @enkeep/channel-wechat/gateway
  */
 
+import { randomBytes } from 'node:crypto';
 import type { WeChatParsedMessage, WeChatTransport } from './types.js';
 import { ContextTokenStore } from './context-token-store.js';
 import { downloadAndDecryptMedia } from './crypto.js';
@@ -258,7 +259,7 @@ export class WeChatChannelGateway {
     if (existingRoute) {
       route = existingRoute;
     } else {
-      const dshSessionId = `ses_${Math.random().toString(36).slice(2, 10)}${Date.now()}`;
+      const dshSessionId = `ses_${randomBytes(16).toString('hex')}`;
       route = await this.sessionRouteRepo.create({
         spaceId: binding.spaceId,
         channel: 'wechat',

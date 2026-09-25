@@ -236,6 +236,7 @@ describe('WeChatChannelGateway', () => {
           accountId: input.accountId,
           nativeContextId: input.nativeContextId,
           peerId: input.peerId,
+          dshSessionId: input.dshSessionId,
           title: input.title,
         };
         routeMap.set(route.id, route);
@@ -298,6 +299,31 @@ describe('WeChatChannelGateway', () => {
         chatType: 'p2p',
       })
     );
+  });
+
+  it('generates runtime-valid dshSessionId matching canonical session id regex (ses_ + 32 lowercase hex)', async () => {
+    // Exact pattern used by packages/runtime-runner/src/runtime/dsh-boot.ts:127
+    // and validated in packages/runtime-runner/src/runtime/daemon.ts:569
+    const CANONICAL_SESSION_ID_PATTERN = /^(ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
+
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+
+    const result = await gateway.handleInboundMessage(sampleParsedMessage);
+    expect(result.handled).toBe(true);
+
+    expect(mockSessionRouteRepo.create).toHaveBeenCalledTimes(1);
+    const createdRouteInput = (mockSessionRouteRepo.create as any).mock.calls[0][0];
+    expect(createdRouteInput.dshSessionId).toBeDefined();
+    expect(createdRouteInput.dshSessionId).toMatch(CANONICAL_SESSION_ID_PATTERN);
+    expect(createdRouteInput.dshSessionId).toMatch(/^ses_[0-9a-f]{32}$/);
   });
 
   it('handles inbound image message and falls back to placeholder content', async () => {

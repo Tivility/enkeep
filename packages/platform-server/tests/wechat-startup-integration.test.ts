@@ -261,9 +261,14 @@ describe('WeChat Channel Production Startup & Lifecycle Integration', () => {
     `).run('bind_wechat_001', adminUserId, accountId, adminSpaceId, nativeContextId);
 
     // 5. Construct DeliveryRuntimeGateway delegating execution to mock turn executor
+    // Enforces daemon parameter validation matching packages/runtime-runner/src/runtime/dsh-boot.ts:127 & daemon.ts:569
+    const CANONICAL_SESSION_ID_PATTERN = /^(ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
     const executedTurns: DeliveryExecutionRequest[] = [];
     const executor = {
       execute: async (req: DeliveryExecutionRequest) => {
+        if (!req.dshSessionId || !CANONICAL_SESSION_ID_PATTERN.test(req.dshSessionId)) {
+          throw new Error(`[INVALID_PARAMETERS] Invalid sessionId format: "${req.dshSessionId}"`);
+        }
         executedTurns.push(req);
         return {
           replyText: `[WeChat Bot Echo] ${req.content}`,
@@ -347,7 +352,27 @@ describe('WeChat Channel Production Startup & Lifecycle Integration', () => {
         expect(executedTurns.length).toBe(1);
       }, { timeout: 10000 });
 
+      // Verify turn execution succeeded and was NOT failed due to parameter validation
       expect(executedTurns[0].content).toBe(inboundText);
+      expect(executedTurns[0].dshSessionId).toBeDefined();
+      expect(executedTurns[0].dshSessionId).toMatch(CANONICAL_SESSION_ID_PATTERN);
+      expect(executedTurns[0].dshSessionId).toMatch(/^ses_[0-9a-f]{32}$/);
+
+      // Verify turn_runs status in database is completed and NOT failed due to parameter validation
+      const turnRunRow = db.prepare(
+        'SELECT * FROM turn_runs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1'
+      ).get(adminUserId) as any;
+      expect(turnRunRow).toBeDefined();
+      expect(turnRunRow.status).toBe('completed');
+      expect(turnRunRow.error).toBeNull();
+
+      // Verify session_routes was populated with canonical dsh_session_id
+      const sessionRouteRow = db.prepare(
+        'SELECT * FROM session_routes WHERE account_id = ? AND channel = ?'
+      ).get(accountId, 'wechat') as any;
+      expect(sessionRouteRow).toBeDefined();
+      expect(sessionRouteRow.dsh_session_id).toMatch(CANONICAL_SESSION_ID_PATTERN);
+      expect(sessionRouteRow.dsh_session_id).toMatch(/^ses_[0-9a-f]{32}$/);
 
       // Verify channel_inbox row was created in SQLite
       const inboxRow = db.prepare(
