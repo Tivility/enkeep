@@ -130,6 +130,7 @@ export interface TaskWorkerOptions {
   systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   onError?: TaskWorkerErrorHandler;
   channelRuntimeManager?: any;
+  wechatRuntimeManager?: any;
   db?: any;
   getReplyText?: (params: { tenantId: string; sessionId: string; taskId: string }) => Promise<string | null> | string | null;
   resolveSpaceCwd?: (params: { tenantId: string; spaceId: string; spaceFolder?: string }) => Promise<string> | string;
@@ -205,6 +206,7 @@ export class AgentPromptTaskWorker {
   private readonly systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   private readonly onErrorCallback?: TaskWorkerErrorHandler;
   public channelRuntimeManager?: any;
+  public wechatRuntimeManager?: any;
   private readonly db?: any;
   private readonly getReplyText?: (params: { tenantId: string; sessionId: string; taskId: string }) => Promise<string | null> | string | null;
   private readonly resolveSpaceCwd?: (params: { tenantId: string; spaceId: string; spaceFolder?: string }) => Promise<string> | string;
@@ -234,6 +236,7 @@ export class AgentPromptTaskWorker {
     this.systemRecovery = options.systemRecovery;
     this.onErrorCallback = options.onError;
     this.channelRuntimeManager = options.channelRuntimeManager;
+    this.wechatRuntimeManager = options.wechatRuntimeManager;
     this.db = options.db;
     this.getReplyText = options.getReplyText;
     this.resolveSpaceCwd = options.resolveSpaceCwd;
@@ -1170,12 +1173,15 @@ export class AgentPromptTaskWorker {
           };
         }
 
-        // 6. Proactive Lark delivery if configured in payload
+        // 6. Proactive channel delivery (Lark & WeChat supported) if configured in payload
+        const delivery = payload.delivery;
+        const deliveryChannel = delivery?.channel;
         if (
           !payload.silent &&
-          payload.delivery?.channel === 'lark' &&
-          payload.delivery.accountId &&
-          payload.delivery.nativeContextId
+          delivery &&
+          (deliveryChannel === 'lark' || deliveryChannel === 'wechat') &&
+          delivery.accountId &&
+          delivery.nativeContextId
         ) {
           try {
             // Validate tenant account and binding if DB is present
@@ -1187,14 +1193,14 @@ export class AgentPromptTaskWorker {
                   SELECT id, status FROM channel_accounts
                   WHERE id = ? AND user_id = ?
                   LIMIT 1
-                `).get(payload.delivery.accountId, tenantId) as { id?: string; status?: string } | undefined;
+                `).get(delivery.accountId, tenantId) as { id?: string; status?: string } | undefined;
 
                 if (accountRow) {
                   if (accountRow.status !== 'active') {
                     deliveryAllowed = false;
-                    console.warn('[lark-task] Channel account is not active for tenant:', {
+                    console.warn(`[${deliveryChannel}-task] Channel account is not active for tenant:`, {
                       tenantId,
-                      accountId: payload.delivery.accountId,
+                      accountId: delivery.accountId,
                     });
                   } else {
                     // Resolve target space ID authoritatively
@@ -1213,28 +1219,28 @@ export class AgentPromptTaskWorker {
                     }
 
                     // Validate binding exists for this account, context, AND exact target space
-                    const baseContext = payload.delivery.nativeContextId.includes(':')
-                      ? payload.delivery.nativeContextId.split(':')[0]
-                      : payload.delivery.nativeContextId;
+                    const baseContext = delivery.nativeContextId.includes(':')
+                      ? delivery.nativeContextId.split(':')[0]
+                      : delivery.nativeContextId;
                     const bindingRow = this.db.prepare(`
                       SELECT id, space_id FROM channel_bindings
                       WHERE user_id = ? AND account_id = ? AND (native_context_id = ? OR native_context_id = ?)
                       LIMIT 1
-                    `).get(tenantId, payload.delivery.accountId, payload.delivery.nativeContextId, baseContext) as { id?: string; space_id?: string } | undefined;
+                    `).get(tenantId, delivery.accountId, delivery.nativeContextId, baseContext) as { id?: string; space_id?: string } | undefined;
 
                     if (!bindingRow) {
                       deliveryAllowed = false;
-                      console.warn('[lark-task] No channel binding found for tenant account and context:', {
+                      console.warn(`[${deliveryChannel}-task] No channel binding found for tenant account and context:`, {
                         tenantId,
-                        accountId: payload.delivery.accountId,
-                        context: payload.delivery.nativeContextId,
+                        accountId: delivery.accountId,
+                        context: delivery.nativeContextId,
                       });
                     } else if (resolvedSpaceId && bindingRow.space_id !== resolvedSpaceId) {
                       // Binding belongs to another space: fail closed before external dispatch
                       deliveryAllowed = false;
-                      console.warn('[lark-task] Channel binding space_id mismatch against resolved target space:', {
+                      console.warn(`[${deliveryChannel}-task] Channel binding space_id mismatch against resolved target space:`, {
                         tenantId,
-                        accountId: payload.delivery.accountId,
+                        accountId: delivery.accountId,
                         bindingSpaceId: bindingRow.space_id,
                         targetSpaceId: resolvedSpaceId,
                       });
@@ -1260,7 +1266,7 @@ export class AgentPromptTaskWorker {
                     replyText = row.content;
                   }
                 } catch (dbErr) {
-                  console.warn('[lark-task] Failed to read assistant message from web_messages:', dbErr);
+                  console.warn(`[${deliveryChannel}-task] Failed to read assistant message from web_messages:`, dbErr);
                 }
               }
               if (!replyText && this.getReplyText) {
@@ -1269,15 +1275,65 @@ export class AgentPromptTaskWorker {
                 } catch {}
               }
 
-              const crm = typeof this.channelRuntimeManager === 'function'
-                ? this.channelRuntimeManager()
-                : this.channelRuntimeManager;
-              const gateway = crm?.getActiveGateway?.(tenantId, payload.delivery.accountId);
+              const rawCrm = (deliveryChannel === 'wechat' && this.wechatRuntimeManager)
+                ? (typeof this.wechatRuntimeManager === 'function' ? this.wechatRuntimeManager() : this.wechatRuntimeManager)
+                : (typeof this.channelRuntimeManager === 'function' ? this.channelRuntimeManager() : this.channelRuntimeManager);
+
+              const crm = (rawCrm && typeof rawCrm === 'object' && deliveryChannel in rawCrm && (rawCrm as any)[deliveryChannel])
+                ? (rawCrm as any)[deliveryChannel]
+                : rawCrm;
+
+              const gateway = crm?.getActiveGateway?.(tenantId, delivery.accountId);
+
+              if (deliveryChannel === 'wechat') {
+                let toUserId = delivery.nativeContextId;
+                if (toUserId.startsWith('wechat:')) toUserId = toUserId.slice(7);
+                if (toUserId.includes(':')) toUserId = toUserId.split(':')[0];
+                toUserId = toUserId.trim();
+
+                let hasContextToken = false;
+                if (this.db) {
+                  try {
+                    const tokenRow = this.db.prepare(`
+                      SELECT context_token FROM channel_wechat_context_tokens
+                      WHERE sender_id = ?
+                      LIMIT 1
+                    `).get(toUserId) as { context_token?: string } | undefined;
+                    if (tokenRow?.context_token) {
+                      hasContextToken = true;
+                    }
+                  } catch {}
+                }
+                if (!hasContextToken && (gateway as any)?.contextTokenStore) {
+                  try {
+                    const token = await (gateway as any).contextTokenStore.get(toUserId);
+                    if (token) hasContextToken = true;
+                  } catch {}
+                }
+                if (!hasContextToken && (crm as any)?.contextTokenStore) {
+                  try {
+                    const token = await (crm as any).contextTokenStore.get(toUserId);
+                    if (token) hasContextToken = true;
+                  } catch {}
+                }
+
+                // If DB or store exists and no context token was found: fail clearly
+                if (!hasContextToken && (this.db || (gateway as any)?.contextTokenStore || (crm as any)?.contextTokenStore)) {
+                  const noTokenErr = new Error(`WeChat proactive delivery failed: missing context_token for recipient "${toUserId}". User must message the bot first.`);
+                  console.warn(`[wechat-task] ${noTokenErr.message}`, {
+                    tenantId,
+                    accountId: delivery.accountId,
+                    toUserId,
+                    taskId: task.id,
+                  });
+                  throw noTokenErr;
+                }
+              }
 
               if (gateway && typeof gateway.sendProactiveMessage === 'function') {
-                const chatId = payload.delivery.nativeContextId.includes(':')
-                  ? payload.delivery.nativeContextId.split(':')[0]
-                  : payload.delivery.nativeContextId;
+                const chatId = delivery.nativeContextId.includes(':')
+                  ? delivery.nativeContextId.split(':')[0]
+                  : delivery.nativeContextId;
                 const deliveryText = replyText ?? `Task "${task.title}" completed successfully.`;
                 const stableRunId = task.currentRun?.id || task.id;
                 const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
@@ -1287,17 +1343,19 @@ export class AgentPromptTaskWorker {
                   title: task.title,
                   sessionId: payload.sessionId,
                   outboxId,
+                  accountId: delivery.accountId,
                 });
               } else {
-                console.warn('[lark-task] Active LarkChannelGateway not found for account:', {
+                console.warn(`[${deliveryChannel}-task] Active ChannelGateway not found for account:`, {
                   tenantId,
-                  accountId: payload.delivery.accountId,
+                  channel: deliveryChannel,
+                  accountId: delivery.accountId,
                   taskId: task.id,
                 });
               }
             }
           } catch (deliveryErr) {
-            console.warn('[lark-task] Failed to deliver task result to Lark:', deliveryErr);
+            console.warn(`[${deliveryChannel}-task] Failed to deliver task result to ${deliveryChannel}:`, deliveryErr);
           }
         }
 
@@ -1729,20 +1787,75 @@ export class AgentPromptTaskWorker {
       }
     }
 
-    // Delivery to Lark if configured
+    // Delivery to channel (Lark & WeChat supported) if configured
+    const delivery = payload.delivery;
+    const deliveryChannel = delivery?.channel;
     if (
       !payload.silent &&
-      payload.delivery?.channel === 'lark' &&
-      payload.delivery.accountId &&
-      payload.delivery.nativeContextId
+      delivery &&
+      (deliveryChannel === 'lark' || deliveryChannel === 'wechat') &&
+      delivery.accountId &&
+      delivery.nativeContextId
     ) {
       try {
-        const crm = this.channelRuntimeManager;
-        const gateway = crm?.getActiveGateway?.(tenantId, payload.delivery.accountId);
+        const rawCrm = (deliveryChannel === 'wechat' && this.wechatRuntimeManager)
+          ? (typeof this.wechatRuntimeManager === 'function' ? this.wechatRuntimeManager() : this.wechatRuntimeManager)
+          : (typeof this.channelRuntimeManager === 'function' ? this.channelRuntimeManager() : this.channelRuntimeManager);
+
+        const crm = (rawCrm && typeof rawCrm === 'object' && deliveryChannel in rawCrm && (rawCrm as any)[deliveryChannel])
+          ? (rawCrm as any)[deliveryChannel]
+          : rawCrm;
+
+        const gateway = crm?.getActiveGateway?.(tenantId, delivery.accountId);
+
+        if (deliveryChannel === 'wechat') {
+          let toUserId = delivery.nativeContextId;
+          if (toUserId.startsWith('wechat:')) toUserId = toUserId.slice(7);
+          if (toUserId.includes(':')) toUserId = toUserId.split(':')[0];
+          toUserId = toUserId.trim();
+
+          let hasContextToken = false;
+          if (this.db) {
+            try {
+              const tokenRow = this.db.prepare(`
+                SELECT context_token FROM channel_wechat_context_tokens
+                WHERE sender_id = ?
+                LIMIT 1
+              `).get(toUserId) as { context_token?: string } | undefined;
+              if (tokenRow?.context_token) {
+                hasContextToken = true;
+              }
+            } catch {}
+          }
+          if (!hasContextToken && (gateway as any)?.contextTokenStore) {
+            try {
+              const token = await (gateway as any).contextTokenStore.get(toUserId);
+              if (token) hasContextToken = true;
+            } catch {}
+          }
+          if (!hasContextToken && (crm as any)?.contextTokenStore) {
+            try {
+              const token = await (crm as any).contextTokenStore.get(toUserId);
+              if (token) hasContextToken = true;
+            } catch {}
+          }
+
+          if (!hasContextToken && (this.db || (gateway as any)?.contextTokenStore || (crm as any)?.contextTokenStore)) {
+            const noTokenErr = new Error(`WeChat proactive delivery failed: missing context_token for recipient "${toUserId}". User must message the bot first.`);
+            console.warn(`[wechat-task] ${noTokenErr.message}`, {
+              tenantId,
+              accountId: delivery.accountId,
+              toUserId,
+              taskId: task.id,
+            });
+            throw noTokenErr;
+          }
+        }
+
         if (gateway && typeof gateway.sendProactiveMessage === 'function') {
-          const chatId = payload.delivery.nativeContextId.includes(':')
-            ? payload.delivery.nativeContextId.split(':')[0]
-            : payload.delivery.nativeContextId;
+          const chatId = delivery.nativeContextId.includes(':')
+            ? delivery.nativeContextId.split(':')[0]
+            : delivery.nativeContextId;
           const deliveryText = validatedResult.stdout.trim()
             ? `[脚本输出]\n${validatedResult.stdout.slice(0, 1000)}`
             : `任务 "${task.title}" 脚本执行完成 (退出码 ${validatedResult.exitCode})。`;
@@ -1753,11 +1866,11 @@ export class AgentPromptTaskWorker {
             text: deliveryText,
             title: task.title,
             outboxId,
-            accountId: payload.delivery.accountId,
+            accountId: delivery.accountId,
           });
         }
       } catch (deliveryErr) {
-        console.warn('[lark-task] Failed to deliver script task result to Lark:', deliveryErr);
+        console.warn(`[${deliveryChannel}-task] Failed to deliver script task result to ${deliveryChannel}:`, deliveryErr);
       }
     }
 

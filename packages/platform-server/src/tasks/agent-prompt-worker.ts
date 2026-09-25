@@ -59,6 +59,7 @@ export interface PlatformServerTaskWorkerOptions {
   operationsStorage?: SqlitePlatformOperationsStorage;
   taskNotificationService?: TaskNotificationService;
   channelRuntimeManager?: any;
+  wechatRuntimeManager?: any;
   prepareTaskInput?: TaskWorkerOptions['prepareTaskInput'];
   pipelineTaskPreparer?: PipelineTaskInputPreparerService;
   pipelineManifestPath?: string;
@@ -248,6 +249,7 @@ export function createPlatformServerTaskWorker(
     heartbeatIntervalMs: options.heartbeatIntervalMs,
     systemRecovery: () => operationsStorage.recoverAfterRestart(),
     channelRuntimeManager: options.channelRuntimeManager,
+    wechatRuntimeManager: options.wechatRuntimeManager,
     prepareTaskInput: taskPreparerHook,
     resolveSpaceCwd,
     db: options.db,

@@ -6,7 +6,7 @@
  * @module @enkeep/platform-server/channels/wechat-runtime
  */
 
-import { createHash, createDecipheriv } from 'node:crypto';
+import { createHash, createDecipheriv, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type {
   PlatformStorage,
@@ -18,6 +18,7 @@ import {
   type DeliveryRuntimeGateway,
   type TurnExecutionResult,
 } from '../runtime/delivery-gateway.js';
+import { TenantScopedLarkImageIngestor } from './lark-image-ingestor.js';
 import {
   WeChatChannelGateway,
   ContextTokenStore,
@@ -25,6 +26,7 @@ import {
   type WeChatConnectionState,
   type WeChatTransport,
   type WeChatTransportConfig,
+  type WeChatMediaAttachmentIngestor,
 } from '../../../channel-wechat/dist/index.js';
 
 export interface WeChatResolvedCredentials {
@@ -61,6 +63,8 @@ export interface WeChatRuntimeManagerOptions {
   readonly masterKey?: Buffer | string;
   readonly workerIntervalMs?: number;
   readonly autoStart?: boolean;
+  readonly mediaAttachmentIngestor?: WeChatMediaAttachmentIngestor;
+  readonly imageAttachmentIngestor?: WeChatMediaAttachmentIngestor;
 }
 
 export class WeChatRuntimeManager {
@@ -72,6 +76,7 @@ export class WeChatRuntimeManager {
   private readonly defaultSpaceResolver?: WeChatDefaultSpaceResolver;
   private readonly masterKey?: Buffer;
   private readonly workerIntervalMs: number;
+  private readonly mediaAttachmentIngestor?: WeChatMediaAttachmentIngestor;
 
   private isRunning = false;
   private isDisposing = false;
@@ -134,6 +139,15 @@ export class WeChatRuntimeManager {
           options.masterKey.length === 32
             ? options.masterKey
             : createHash('sha256').update(options.masterKey).digest();
+      }
+    }
+
+    if (options.mediaAttachmentIngestor || options.imageAttachmentIngestor) {
+      this.mediaAttachmentIngestor = options.mediaAttachmentIngestor ?? options.imageAttachmentIngestor;
+    } else {
+      const fp = this.deliveryGateway.getFileProvider();
+      if (fp) {
+        this.mediaAttachmentIngestor = new TenantScopedLarkImageIngestor({ fileProvider: fp });
       }
     }
 
@@ -422,6 +436,7 @@ export class WeChatRuntimeManager {
     let initialCursor = this.getPersistedCursor(accountId);
     if (!initialCursor && creds?.getUpdatesBuf) {
       initialCursor = creds.getUpdatesBuf;
+      this.setPersistedCursor(accountId, initialCursor);
     }
 
     // 6. Create transport
@@ -496,10 +511,81 @@ export class WeChatRuntimeManager {
       runtimeGateway: this.deliveryGateway,
       contextTokenStore: this.contextTokenStore,
       defaultSpaceId: account.defaultSpaceId,
+      mediaAttachmentIngestor: this.mediaAttachmentIngestor,
       onCursorCommit: async (cursor: string) => {
         this.setPersistedCursor(accountId, cursor);
       },
     });
+
+    // Attach proactive delivery method to gateway for task-worker and external triggers
+    (gateway as any).sendProactiveMessage = async (params: {
+      chatId: string;
+      text: string;
+      title?: string;
+      sessionId?: string;
+      outboxId?: string;
+      accountId?: string;
+    }): Promise<{ success: boolean; messageId?: string; error?: string }> => {
+      let toUserId = params.chatId;
+      if (toUserId.startsWith('wechat:')) toUserId = toUserId.slice(7);
+      if (toUserId.includes(':')) toUserId = toUserId.split(':')[0];
+      toUserId = toUserId.trim();
+
+      // 1. Resolve persisted context_token
+      const contextToken = await this.contextTokenStore.get(toUserId);
+      if (!contextToken) {
+        const errorMsg = `Missing cached context_token for recipient "${toUserId}". User must message the bot first before proactive delivery is allowed.`;
+        if (params.outboxId) {
+          try {
+            await tenant.channels.createOutboxItem({
+              id: params.outboxId,
+              accountId,
+              sessionId: params.sessionId || '',
+              nativeContextId: params.chatId,
+              replyToNativeId: null,
+              payloadJson: JSON.stringify({
+                toUserId,
+                text: params.text,
+                error: errorMsg,
+              }),
+              status: 'failed',
+            });
+          } catch {}
+        }
+        throw new Error(`WeChat proactive delivery failed: ${errorMsg}`);
+      }
+
+      // 2. Create pending outbox item
+      const outboxId = params.outboxId || `out_wechat_proactive_${randomUUID()}`;
+      let outboxItem = await tenant.channels.createOutboxItem({
+        id: outboxId,
+        accountId,
+        sessionId: params.sessionId || '',
+        nativeContextId: params.chatId,
+        replyToNativeId: null,
+        payloadJson: JSON.stringify({
+          toUserId,
+          contextToken,
+          text: params.text,
+        }),
+        status: 'pending',
+      });
+
+      // 3. Send outbound reply via transport
+      try {
+        const replyResult = await transport.sendReply(toUserId, contextToken, params.text);
+        if (replyResult.success) {
+          await tenant.channels.updateOutboxStatus(outboxItem.id, 'delivered');
+          return { success: true };
+        } else {
+          await tenant.channels.updateOutboxStatus(outboxItem.id, 'failed', true);
+          return { success: false, error: replyResult.error || 'Failed to send proactive message' };
+        }
+      } catch (err: any) {
+        await tenant.channels.updateOutboxStatus(outboxItem.id, 'failed', true);
+        throw err;
+      }
+    };
 
     // 10. Start transport poller
     await transport.start();
@@ -573,26 +659,59 @@ export class WeChatRuntimeManager {
   }): Promise<void> {
     const { userId, sessionId, turnId, idempotencyKey, executionResult } = event;
     const tenant = this.storage.forTenant(userId);
-
     const route = await tenant.sessionRoutes.findById(sessionId);
+
+    // 1. Resolve turn origin: check channel_turn_origins, idempotencyKey prefix, or idempotency_records (mirroring Lark)
     let accountId: string | undefined;
     let nativeEventId: string | undefined;
+    let replyToMessageId: string | undefined;
+    let nativeContextId: string | undefined;
 
-    if (route && route.channel === 'wechat' && route.accountId) {
-      accountId = route.accountId;
+    if (this.db) {
+      try {
+        const originRow = this.db.prepare(
+          'SELECT account_id, channel, native_event_id, reply_to_message_id, native_context_id FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? LIMIT 1'
+        ).get(turnId, userId) as {
+          account_id?: string;
+          channel?: string;
+          native_event_id?: string;
+          reply_to_message_id?: string;
+          native_context_id?: string;
+        } | undefined;
+        if (originRow && originRow.channel === 'wechat' && originRow.account_id) {
+          accountId = originRow.account_id;
+          nativeEventId = originRow.native_event_id || undefined;
+          replyToMessageId = originRow.reply_to_message_id || undefined;
+          nativeContextId = originRow.native_context_id || undefined;
+        }
+      } catch {}
     }
 
-    if (idempotencyKey && idempotencyKey.startsWith('idem_wechat_')) {
-      const rest = idempotencyKey.slice('idem_wechat_'.length);
-      if (accountId && rest.startsWith(`${accountId}_`)) {
-        nativeEventId = rest.slice(accountId.length + 1);
-      } else {
-        const lastUnderscore = rest.lastIndexOf('_');
-        if (lastUnderscore > 0) {
-          if (!accountId) accountId = rest.slice(0, lastUnderscore);
-          nativeEventId = rest.slice(lastUnderscore + 1);
-        }
+    if (!accountId && idempotencyKey) {
+      const match = idempotencyKey.match(/^idem_wechat_([^_]+)_(.+)$/);
+      if (match) {
+        accountId = match[1];
+        nativeEventId = match[2];
       }
+    }
+
+    if (!accountId && this.db) {
+      try {
+        const row = this.db.prepare(
+          'SELECT idempotency_key FROM idempotency_records WHERE turn_id = ? AND user_id = ? LIMIT 1'
+        ).get(turnId, userId) as { idempotency_key?: string } | undefined;
+        if (row?.idempotency_key) {
+          const match = row.idempotency_key.match(/^idem_wechat_([^_]+)_(.+)$/);
+          if (match) {
+            accountId = match[1];
+            nativeEventId = match[2];
+          }
+        }
+      } catch {}
+    }
+
+    if (!accountId && route && route.channel === 'wechat' && route.accountId) {
+      accountId = route.accountId;
     }
 
     if (!accountId) {
@@ -600,6 +719,40 @@ export class WeChatRuntimeManager {
       return;
     }
 
+    // 2. Query exact inbox item to resolve context_token and reply metadata (mirroring Lark's findInboxByEvent)
+    let toUserId: string | undefined;
+    const effectiveNativeContextId = nativeContextId || route?.nativeContextId || '';
+    if (effectiveNativeContextId) {
+      toUserId = effectiveNativeContextId.startsWith('wechat:')
+        ? effectiveNativeContextId.slice(7)
+        : effectiveNativeContextId;
+      if (toUserId.includes(':')) {
+        toUserId = toUserId.split(':')[0];
+      }
+    }
+
+    if (nativeEventId) {
+      try {
+        const inboxItem = await tenant.channels.findInboxByEvent(accountId, nativeEventId);
+        if (inboxItem) {
+          try {
+            const parsedPayload = JSON.parse(inboxItem.payloadJson);
+            const parsed = parsedPayload?.parsed;
+            if (parsed) {
+              if (!replyToMessageId && parsed.messageId) {
+                replyToMessageId = String(parsed.messageId);
+              }
+              const senderId = parsed.senderId || toUserId;
+              if (parsed.contextToken && senderId) {
+                await this.contextTokenStore.set(senderId, parsed.contextToken);
+              }
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    // 3. Ensure gateway is active
     let gateway = this.getActiveGateway(userId, accountId);
     if (!gateway) {
       gateway = (await this.syncAccount(userId, accountId)) ?? undefined;
@@ -610,13 +763,15 @@ export class WeChatRuntimeManager {
       return;
     }
 
+    // 4. Delegate to gateway to create structured outbox item and deliver using persisted context_token
     await gateway.handleTurnCompleted({
       sessionId,
       turnId,
       replyText: executionResult.replyText,
       idempotencyKey: idempotencyKey || `idem_wechat_${accountId}_${nativeEventId || turnId}`,
-      nativeContextId: route?.nativeContextId || '',
+      nativeContextId: effectiveNativeContextId,
       nativeEventId,
+      replyToMessageId,
     });
   }
 
@@ -633,7 +788,84 @@ export class WeChatRuntimeManager {
     code: PublicEventCode;
     reason: string;
   }): Promise<void> {
-    // WeChat failure reporting (silent or log)
+    if (!this.isRunning || this.isDisposing) return;
+    if (event.code === 'TURN_TIMEOUT') return;
+
+    const { userId, sessionId, turnId, idempotencyKey } = event;
+    const tenant = this.storage.forTenant(userId);
+    const route = await tenant.sessionRoutes.findById(sessionId);
+
+    let accountId: string | undefined;
+    let nativeEventId: string | undefined;
+
+    if (this.db) {
+      try {
+        const originRow = this.db.prepare(
+          'SELECT account_id, channel, native_event_id FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? LIMIT 1'
+        ).get(turnId, userId) as { account_id?: string; channel?: string; native_event_id?: string } | undefined;
+        if (originRow && originRow.channel === 'wechat' && originRow.account_id) {
+          accountId = originRow.account_id;
+          nativeEventId = originRow.native_event_id || undefined;
+        }
+      } catch {}
+    }
+
+    if (!accountId && idempotencyKey) {
+      const match = idempotencyKey.match(/^idem_wechat_([^_]+)_(.+)$/);
+      if (match) {
+        accountId = match[1];
+        nativeEventId = match[2];
+      }
+    }
+
+    if (!accountId && route && route.channel === 'wechat' && route.accountId) {
+      accountId = route.accountId;
+    }
+
+    if (!accountId) return;
+
+    let gateway = this.getActiveGateway(userId, accountId);
+    if (!gateway) {
+      gateway = (await this.syncAccount(userId, accountId)) ?? undefined;
+    }
+    if (!gateway) return;
+
+    const errorReply = '抱歉，当前处理遇到问题，请稍后重试。';
+    await gateway.handleTurnCompleted({
+      sessionId,
+      turnId: `${turnId}_err`,
+      replyText: errorReply,
+      idempotencyKey: `idem_wechat_err_${accountId}_${nativeEventId || turnId}`,
+      nativeContextId: route?.nativeContextId || '',
+      nativeEventId,
+    });
+  }
+
+  /**
+   * Proactively sends a message to a WeChat user via an active account gateway.
+   * Fails clearly with an Error if context_token has not been established yet.
+   */
+  async sendProactiveMessage(params: {
+    userId: string;
+    accountId: string;
+    chatId: string;
+    text: string;
+    title?: string;
+    sessionId?: string;
+    outboxId?: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const { userId, accountId } = params;
+    let gateway = this.getActiveGateway(userId, accountId);
+    if (!gateway) {
+      gateway = (await this.syncAccount(userId, accountId)) ?? undefined;
+    }
+    if (!gateway) {
+      throw new Error(`WeChat account "${accountId}" not active or gateway unavailable for user "${userId}"`);
+    }
+    if (typeof (gateway as any).sendProactiveMessage === 'function') {
+      return (gateway as any).sendProactiveMessage(params);
+    }
+    throw new Error('Active WeChat gateway does not support sendProactiveMessage');
   }
 
   /**
@@ -664,9 +896,61 @@ export class WeChatRuntimeManager {
 
         // 2. Redrive pending/failed outbox replies (max 3 attempts)
         await this.redrivePendingOutbox();
+
+        // 3. Scan and reconcile committed assistant turns missing outbox records (like Lark)
+        await this.scanAndReconcileCommittedTurns();
       }
     } finally {
       this.isTickRunning = false;
+    }
+  }
+
+  /**
+   * Scans SQLite database for completed assistant messages on WeChat sessions
+   * that do not have an outbox record yet (e.g. server restart immediately after turn completion).
+   */
+  async scanAndReconcileCommittedTurns(): Promise<void> {
+    if (!this.db || !this.isRunning || this.isDisposing) return;
+
+    try {
+      const unOutboxedRows = this.db.prepare(`
+        SELECT wm.id as message_id, wm.session_id, wm.user_id, wm.turn_id, wm.content as reply_text,
+               sr.account_id, sr.native_context_id, ir.idempotency_key
+        FROM web_messages wm
+        JOIN session_routes sr ON sr.id = wm.session_id AND sr.channel = 'wechat'
+        LEFT JOIN idempotency_records ir ON ir.turn_id = wm.turn_id AND ir.user_id = wm.user_id
+        LEFT JOIN channel_outbox co ON co.session_id = wm.session_id AND co.account_id = sr.account_id
+             AND json_extract(co.payload_json, '$.turnId') = wm.turn_id
+        WHERE wm.role = 'assistant' AND wm.status = 'delivered'
+          AND wm.created_at < datetime('now', '-15 seconds')
+          AND co.id IS NULL
+          AND (ir.idempotency_key LIKE 'idem_wechat_%' OR sr.channel = 'wechat')
+      `).all() as Array<{
+        message_id: string;
+        session_id: string;
+        user_id: string;
+        turn_id: string;
+        reply_text: string;
+        account_id: string;
+        native_context_id: string;
+        idempotency_key: string;
+      }>;
+
+      for (const row of unOutboxedRows) {
+        if (!this.isRunning || this.isDisposing) break;
+        await this.handleTurnCompleted({
+          userId: row.user_id,
+          sessionId: row.session_id,
+          spaceId: '',
+          turnId: row.turn_id,
+          deliveryId: '',
+          idempotencyKey: row.idempotency_key || `idem_wechat_${row.account_id}_${row.turn_id}`,
+          executionResult: { replyText: row.reply_text },
+          tokenUsage: { tokens: 0 },
+        });
+      }
+    } catch {
+      // Ignore scan query errors if tables not ready
     }
   }
 
