@@ -177,18 +177,29 @@ export class WeChatChannelGateway {
       return { handled: false, ignoredReason: 'duplicate_event' };
     }
 
+    const rawSenderId = msg.senderId;
+    const bareSenderId = rawSenderId.startsWith('wechat:') ? rawSenderId.slice(7) : rawSenderId;
+    const nativeContextId = `wechat:${bareSenderId}`;
+    const nativeEventId = msg.messageId || msg.dedupKey;
+
     // Cache context_token immediately
     if (msg.contextToken) {
       await this.contextTokenStore.set(msg.senderId, msg.contextToken);
+      if (bareSenderId !== msg.senderId) {
+        await this.contextTokenStore.set(bareSenderId, msg.contextToken);
+      }
     }
-
-    const nativeContextId = `wechat:${msg.senderId}`;
-    const nativeEventId = msg.messageId || msg.dedupKey;
 
     // 1. Resolve channel binding
     let binding = await this.channelRepo.findBindingByContext(this.accountId, nativeContextId);
-    if (!binding && msg.chatId && msg.chatId !== nativeContextId) {
+    if (!binding && bareSenderId !== nativeContextId) {
+      binding = await this.channelRepo.findBindingByContext(this.accountId, bareSenderId);
+    }
+    if (!binding && msg.chatId && msg.chatId !== nativeContextId && msg.chatId !== bareSenderId) {
       binding = await this.channelRepo.findBindingByContext(this.accountId, msg.chatId);
+      if (!binding && msg.chatId.startsWith('wechat:')) {
+        binding = await this.channelRepo.findBindingByContext(this.accountId, msg.chatId.slice(7));
+      }
     }
 
     // Auto-create binding to default space if missing
@@ -249,26 +260,45 @@ export class WeChatChannelGateway {
       inboxItem = claimed || item;
     }
 
-    // 3. Resolve Session Route per nativeContextId
+    // 3. Resolve Session Route (binding.spaceId -> Canonical/Imported SessionRoute)
     let route: WeChatSessionRoute;
-    const existingRoute = await this.sessionRouteRepo.findByRouteIdentity(
-      'wechat',
-      this.accountId,
-      nativeContextId
-    );
-    if (existingRoute) {
-      route = existingRoute;
-    } else {
-      const dshSessionId = `ses_${randomBytes(16).toString('hex')}`;
-      route = await this.sessionRouteRepo.create({
-        spaceId: binding.spaceId,
+    if (typeof this.sessionRouteRepo.getOrCreateCanonicalSession === 'function') {
+      route = await this.sessionRouteRepo.getOrCreateCanonicalSession(binding.spaceId, {
         channel: 'wechat',
         accountId: this.accountId,
         nativeContextId,
-        peerId: msg.senderId,
-        dshSessionId,
+        peerId: msg.senderId || nativeContextId,
         title: `WeChat ${msg.senderName || msg.senderId}`,
       });
+    } else {
+      let existingRoute = await this.sessionRouteRepo.findByRouteIdentity(
+        'wechat',
+        this.accountId,
+        nativeContextId
+      );
+      if (!existingRoute && bareSenderId !== nativeContextId) {
+        existingRoute = await this.sessionRouteRepo.findByRouteIdentity(
+          'wechat',
+          this.accountId,
+          bareSenderId
+        );
+      }
+      if (existingRoute) {
+        route = existingRoute;
+      } else {
+        const newSessionId = `ses_${randomBytes(16).toString('hex')}`;
+        const dshSessionId = `ses_${randomBytes(16).toString('hex')}`;
+        route = await this.sessionRouteRepo.create({
+          id: newSessionId,
+          spaceId: binding.spaceId,
+          channel: 'wechat',
+          accountId: this.accountId,
+          nativeContextId,
+          peerId: msg.senderId || nativeContextId,
+          dshSessionId,
+          title: `WeChat ${msg.senderName || msg.senderId}`,
+        });
+      }
     }
 
     // 4. Inbound Media Download + Decrypt & Attachment Ingestion (Mirror Lark & HappyClaw)
@@ -454,9 +484,17 @@ export class WeChatChannelGateway {
 
       // 1. Resolve route and recipient ID
       const route = await this.sessionRouteRepo.findById(params.sessionId);
-      const nativeContextId = route?.nativeContextId || params.nativeContextId || '';
+      const nativeContextId = params.nativeContextId || route?.nativeContextId || '';
 
-      let toUserId = route?.peerId || '';
+      let toUserId = '';
+      if (params.nativeContextId) {
+        toUserId = params.nativeContextId.startsWith('wechat:')
+          ? params.nativeContextId.slice(7)
+          : params.nativeContextId;
+      }
+      if (!toUserId) {
+        toUserId = route?.peerId || '';
+      }
       if (!toUserId && nativeContextId.startsWith('wechat:')) {
         toUserId = nativeContextId.slice(7);
       }

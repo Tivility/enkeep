@@ -605,11 +605,21 @@ export async function importWeChatCredentials(
         // 2. Query agent_channel_mounts
         if (tableExists(hcDb, 'agent_channel_mounts')) {
           try {
+            const hasChannelType = columnExists(hcDb, 'agent_channel_mounts', 'channel_type');
+            const hasChannel = columnExists(hcDb, 'agent_channel_mounts', 'channel');
+            const hasWsFolder = columnExists(hcDb, 'agent_channel_mounts', 'workspace_folder');
+            const filterClause = [
+              hasChannelType ? "channel_type = 'wechat'" : null,
+              hasChannel ? "channel = 'wechat'" : null,
+              "channel_jid LIKE 'wechat:%'",
+            ].filter(Boolean).join(' OR ');
+
+            const cols = ['workspace_jid', 'channel_jid', hasWsFolder ? 'workspace_folder' : "'' AS workspace_folder"].join(', ');
             const agentMounts = hcDb
               .prepare(
-                `SELECT workspace_jid, workspace_folder, channel_jid FROM agent_channel_mounts
+                `SELECT ${cols} FROM agent_channel_mounts
                  WHERE (channel_account_id = ? OR owner_user_id = ?)
-                   AND (channel_type = 'wechat' OR channel = 'wechat' OR channel_jid LIKE 'wechat:%')`
+                   AND (${filterClause})`
               )
               .all(acc.id, acc.owner_user_id) as unknown as Array<{ workspace_jid?: string; workspace_folder?: string; channel_jid?: string }>;
             for (const m of agentMounts) {
@@ -625,16 +635,43 @@ export async function importWeChatCredentials(
         // 3. Query channel_mounts
         if (tableExists(hcDb, 'channel_mounts')) {
           try {
-            const chanMounts = hcDb
-              .prepare(
-                `SELECT workspace_jid, workspace_id, group_jid, channel_jid, workspace_folder FROM channel_mounts
-                 WHERE (channel_account_id = ? OR account_id = ? OR owner_user_id = ?)
-                   AND (channel = 'wechat' OR channel_type = 'wechat' OR group_jid LIKE 'wechat:%' OR channel_jid LIKE 'wechat:%')`
-              )
-              .all(acc.id, acc.id, acc.owner_user_id) as unknown as Array<{ workspace_jid?: string; workspace_id?: string; group_jid?: string; channel_jid?: string; workspace_folder?: string }>;
+            const hasChannelType = columnExists(hcDb, 'channel_mounts', 'channel_type');
+            const hasChannel = columnExists(hcDb, 'channel_mounts', 'channel');
+            const hasAccId = columnExists(hcDb, 'channel_mounts', 'account_id');
+            const hasChanAccId = columnExists(hcDb, 'channel_mounts', 'channel_account_id');
+            const hasOwnerUserId = columnExists(hcDb, 'channel_mounts', 'owner_user_id');
+            const hasWsFolder = columnExists(hcDb, 'channel_mounts', 'workspace_folder');
+            const hasGroupJid = columnExists(hcDb, 'channel_mounts', 'group_jid');
+
+            const accClauses = [
+              hasChanAccId ? 'channel_account_id = ?' : null,
+              hasAccId ? 'account_id = ?' : null,
+              hasOwnerUserId ? 'owner_user_id = ?' : null,
+            ].filter(Boolean).join(' OR ');
+
+            const filterClause = [
+              hasChannelType ? "channel_type = 'wechat'" : null,
+              hasChannel ? "channel = 'wechat'" : null,
+              hasGroupJid ? "group_jid LIKE 'wechat:%'" : null,
+              "channel_jid LIKE 'wechat:%'",
+            ].filter(Boolean).join(' OR ');
+
+            const cols = [
+              'workspace_jid',
+              'channel_jid',
+              hasWsFolder ? 'workspace_folder' : "'' AS workspace_folder",
+              hasGroupJid ? 'group_jid' : "'' AS group_jid",
+            ].join(', ');
+
+            const params: any[] = [];
+            if (hasChanAccId) params.push(acc.id);
+            if (hasAccId) params.push(acc.id);
+            if (hasOwnerUserId) params.push(acc.owner_user_id);
+
+            const sql = `SELECT ${cols} FROM channel_mounts WHERE (${accClauses || '1=1'}) AND (${filterClause})`;
+            const chanMounts = hcDb.prepare(sql).all(...params) as unknown as Array<{ workspace_jid?: string; workspace_folder?: string; channel_jid?: string; group_jid?: string }>;
             for (const m of chanMounts) {
               if (m.workspace_jid && !workspaceJids.includes(m.workspace_jid)) workspaceJids.push(m.workspace_jid);
-              if (m.workspace_id && !workspaceJids.includes(m.workspace_id)) workspaceJids.push(m.workspace_id);
               if (m.workspace_folder && !workspaceFolders.includes(m.workspace_folder)) workspaceFolders.push(m.workspace_folder);
               const cJid = m.channel_jid || m.group_jid;
               if (cJid && cJid.startsWith('wechat:') && !chatJids.includes(cJid)) chatJids.push(cJid);
@@ -741,7 +778,25 @@ export async function importWeChatCredentials(
             const withoutPrefix = cleanJid.replace(/^wechat:/, '');
             const senderWithoutDomain = withoutPrefix.replace(/@im\.wechat$/, '').replace(/@[^@]+$/, '');
 
-            // Check fixed_import_provenance
+            // Check fixed_import_provenance (joined with session_routes for canonical space)
+            if (tableExists(targetDb, 'fixed_import_provenance') && tableExists(targetDb, 'session_routes')) {
+              try {
+                const provRow = targetDb
+                  .prepare(
+                    `SELECT sr.space_id FROM fixed_import_provenance fip
+                     JOIN session_routes sr ON fip.target_route_id = sr.id
+                     WHERE fip.user_id = ? AND (fip.source_chat_jid = ? OR fip.source_chat_jid = ? OR fip.source_chat_jid = ?)
+                     LIMIT 1`
+                  )
+                  .get(targetUserId, cleanJid, withoutPrefix, senderWithoutDomain) as { space_id: string } | undefined;
+                if (provRow?.space_id && userSpaceIds.has(provRow.space_id)) {
+                  return provRow.space_id;
+                }
+              } catch {
+                // ignore
+              }
+            }
+
             if (tableExists(targetDb, 'fixed_import_provenance')) {
               try {
                 const provRow = targetDb
@@ -1160,6 +1215,17 @@ export async function importWeChatCredentials(
               }
 
               if (existingRouteId) {
+                try {
+                  targetDb
+                    .prepare(
+                      `DELETE FROM session_routes
+                       WHERE user_id = ? AND channel = 'wechat' AND account_id = ? AND native_context_id = ? AND id != ?`
+                    )
+                    .run(targetUserId, targetAccountId, primaryNativeCtxId, existingRouteId);
+                } catch {
+                  // ignore
+                }
+
                 routeUpdateStmt.run(
                   targetAccountId,
                   primaryNativeCtxId,

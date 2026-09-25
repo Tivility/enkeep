@@ -230,7 +230,7 @@ describe('WeChatChannelGateway', () => {
       findByRouteIdentity: vi.fn(async (_ch, _acc, ctxId) => routeMap.get(ctxId) || null),
       create: vi.fn(async (input) => {
         const route: WeChatSessionRoute = {
-          id: `ses_route_${Math.random().toString(36).slice(2, 8)}`,
+          id: input.id || `ses_route_${Math.random().toString(36).slice(2, 8)}`,
           spaceId: input.spaceId,
           channel: input.channel,
           accountId: input.accountId,
@@ -748,6 +748,324 @@ describe('WeChatChannelGateway', () => {
       const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
       expect(envelope.content).toBe('[图片]');
       expect(envelope.attachments).toBeUndefined();
+    });
+  });
+
+  describe('Canonical Session & Bound Space Resolution (WX-FIX-6)', () => {
+    it('existing imported session for peer is reused via getOrCreateCanonicalSession', async () => {
+      const canonicalSession: WeChatSessionRoute = {
+        id: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+        spaceId: 'spc_28c452e0fd9aa266664d3650416da79a',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        peerId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        dshSessionId: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+        title: 'WeChat Canonical Session',
+      };
+
+      const getOrCreateCanonicalSession = vi.fn(async (_spaceId: string, _params: any) => canonicalSession);
+      const sessionRouteRepoWithCanonical: WeChatSessionRouteRepo = {
+        ...mockSessionRouteRepo,
+        getOrCreateCanonicalSession,
+      };
+
+      // Existing binding points to dedicated wechat space
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_hpc_wechat',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: 'spc_28c452e0fd9aa266664d3650416da79a',
+        nativeContextId: 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat') return existingBinding;
+        return null;
+      });
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: sessionRouteRepoWithCanonical,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_canonical_001',
+        senderId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        chatId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledTimes(1);
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledWith(
+        'spc_28c452e0fd9aa266664d3650416da79a',
+        expect.objectContaining({
+          channel: 'wechat',
+          accountId: testAccount.id,
+          nativeContextId: 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+          peerId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        })
+      );
+      // No new session created
+      expect(mockSessionRouteRepo.create).not.toHaveBeenCalled();
+      expect(result.sessionRouteId).toBe(canonicalSession.id);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.sessionId).toBe(canonicalSession.id);
+    });
+
+    it('existing imported session for peer is reused via findByRouteIdentity prefix fallback', async () => {
+      // Mock session stored with bare nativeContextId (no wechat: prefix, typical of HappyClaw migration)
+      const importedSession: WeChatSessionRoute = {
+        id: 'import-fa878f4a856c7cfa02668978de99c5b7',
+        spaceId: 'spc_imported_space_cxx',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        peerId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        dshSessionId: 'import-fa878f4a856c7cfa02668978de99c5b7',
+      };
+
+      // Mock sessionRouteRepo WITHOUT getOrCreateCanonicalSession to exercise fallback
+      const fallbackRepo: WeChatSessionRouteRepo = {
+        findById: vi.fn(async (id: string) => (id === importedSession.id ? importedSession : null)),
+        findByRouteIdentity: vi.fn(async (channel: string, accId: string, ctxId: string) => {
+          if (channel === 'wechat' && accId === testAccount.id && ctxId === 'owxe59f0c1c911f11e4b9fce97ba@im.wechat') {
+            return importedSession;
+          }
+          return null;
+        }),
+        create: vi.fn(),
+      };
+
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_cxx_wechat',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: 'spc_imported_space_cxx',
+        nativeContextId: 'wechat:owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:owxe59f0c1c911f11e4b9fce97ba@im.wechat') return existingBinding;
+        return null;
+      });
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: fallbackRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_bare_ctx_001',
+        senderId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        chatId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+      // findByRouteIdentity should have been called first with prefixed, then bare
+      expect(fallbackRepo.findByRouteIdentity).toHaveBeenCalledWith(
+        'wechat',
+        testAccount.id,
+        'wechat:owxe59f0c1c911f11e4b9fce97ba@im.wechat'
+      );
+      expect(fallbackRepo.findByRouteIdentity).toHaveBeenCalledWith(
+        'wechat',
+        testAccount.id,
+        'owxe59f0c1c911f11e4b9fce97ba@im.wechat'
+      );
+      expect(fallbackRepo.create).not.toHaveBeenCalled();
+      expect(result.sessionRouteId).toBe(importedSession.id);
+    });
+
+    it('new peer creates new session in bound space with runtime-valid ids', async () => {
+      const boundSpaceId = 'spc_custom_bound_project';
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_custom_project',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: boundSpaceId,
+        nativeContextId: 'wechat:wx_new_peer_001',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:wx_new_peer_001') return existingBinding;
+        return null;
+      });
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_new_peer_001',
+        senderId: 'wx_new_peer_001',
+        chatId: 'wx_new_peer_001',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+      expect(mockSessionRouteRepo.create).toHaveBeenCalledTimes(1);
+      const createInput = (mockSessionRouteRepo.create as any).mock.calls[0][0];
+
+      // Session must be in the bound space, NOT default
+      expect(createInput.spaceId).toBe(boundSpaceId);
+      // Valid runtime session IDs matching ses_[0-9a-f]{32}
+      expect(createInput.id).toMatch(/^ses_[0-9a-f]{32}$/);
+      expect(createInput.dshSessionId).toMatch(/^ses_[0-9a-f]{32}$/);
+      expect(createInput.channel).toBe('wechat');
+      expect(createInput.nativeContextId).toBe('wechat:wx_new_peer_001');
+    });
+
+    it('binding space is used, not user default space', async () => {
+      // User default space is testAccount.defaultSpaceId ('spc_default_space_123')
+      const boundSpaceId = 'spc_dedicated_wechat_container';
+      expect(testAccount.defaultSpaceId).not.toBe(boundSpaceId);
+
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_dedicated',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: boundSpaceId,
+        nativeContextId: 'wechat:wx_user_frank',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:wx_user_frank') return existingBinding;
+        return null;
+      });
+
+      const getOrCreateCanonicalSession = vi.fn(async (spaceId: string, _params: any) => ({
+        id: 'ses_bound_canonical_123',
+        spaceId,
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_frank',
+        peerId: 'wx_user_frank',
+        dshSessionId: 'ses_bound_canonical_123',
+      }));
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount, // has defaultSpaceId: 'spc_default_space_123'
+        defaultSpaceId: 'spc_default_space_123',
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: {
+          ...mockSessionRouteRepo,
+          getOrCreateCanonicalSession,
+        },
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_bound_space_001',
+        senderId: 'wx_user_frank',
+        chatId: 'wx_user_frank',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+
+      // Verify canonical session resolution received the bound space, NOT default
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledWith(
+        boundSpaceId,
+        expect.anything()
+      );
+      expect(getOrCreateCanonicalSession).not.toHaveBeenCalledWith(
+        testAccount.defaultSpaceId,
+        expect.anything()
+      );
+    });
+
+    it('resolves binding imported with bare contextId and routes to that space instead of user default', async () => {
+      const importedSpaceId = 'spc_28c452e0fd9aa266664d3650416da79a';
+      const barePeerId = 'owxba7a691c8b4cadd86ea7f2eea@im.wechat';
+
+      // Binding in DB has bare nativeContextId (no wechat: prefix)
+      const importedBinding: WeChatChannelBinding = {
+        id: 'bind_hpc_74ab_bare',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: importedSpaceId,
+        nativeContextId: barePeerId,
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === barePeerId) return importedBinding;
+        return null;
+      });
+
+      const getOrCreateCanonicalSession = vi.fn(async (spaceId: string, _params: any) => ({
+        id: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+        spaceId,
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: barePeerId,
+        peerId: barePeerId,
+        dshSessionId: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+      }));
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        defaultSpaceId: testAccount.defaultSpaceId,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: {
+          ...mockSessionRouteRepo,
+          getOrCreateCanonicalSession,
+        },
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_bare_binding_001',
+        senderId: barePeerId,
+        chatId: barePeerId,
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+
+      // Verify the bare binding was found and its space used
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledWith(
+        importedSpaceId,
+        expect.anything()
+      );
+      // Did NOT create a fallback binding to default space
+      expect(mockChannelRepo.createBinding).not.toHaveBeenCalled();
     });
   });
 });
