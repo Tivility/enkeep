@@ -8,6 +8,7 @@
 
 import type { WeChatParsedMessage, WeChatTransport } from './types.js';
 import { ContextTokenStore } from './context-token-store.js';
+import { downloadAndDecryptMedia } from './crypto.js';
 import type {
   WeChatChannelAccount,
   WeChatChannelBinding,
@@ -16,12 +17,63 @@ import type {
   WeChatChannelRepo,
   WeChatChannelGatewayOptions,
   WeChatInboundEnvelope,
+  WeChatInboundEnvelopeAttachmentItem,
   WeChatInboundHandlingResult,
   WeChatRuntimeGateway,
   WeChatSessionRoute,
   WeChatSessionRouteRepo,
   WeChatSpaceRepo,
 } from './gateway-types.js';
+
+export const MAX_WECHAT_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB per image
+export const MAX_WECHAT_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024; // 20 MiB per file
+
+/**
+ * Media attachment ingestor interface compatible with Lark's TenantScopedLarkImageIngestor.
+ */
+export interface WeChatMediaAttachmentIngestor {
+  ingestImage(params: {
+    userId: string;
+    spaceId: string;
+    messageId: string;
+    fileKey: string;
+    buffer: Buffer;
+    contentType?: string;
+  }): Promise<{
+    path: string;
+    etag: string;
+    mediaType: string;
+    displayName: string;
+  }>;
+  ingestFile?(params: {
+    userId: string;
+    spaceId: string;
+    messageId: string;
+    fileKey: string;
+    fileName?: string;
+    buffer: Buffer;
+    contentType?: string;
+  }): Promise<{
+    path: string;
+    etag: string;
+    mediaType: string;
+    displayName: string;
+  }>;
+}
+
+export interface WeChatIngestedAttachment extends WeChatInboundEnvelopeAttachmentItem {
+  readonly path: string;
+  readonly etag: string;
+  readonly displayName: string;
+  readonly mediaType?: string;
+}
+
+export interface WeChatChannelGatewayExtendedOptions extends WeChatChannelGatewayOptions {
+  readonly mediaAttachmentIngestor?: WeChatMediaAttachmentIngestor;
+  readonly imageAttachmentIngestor?: WeChatMediaAttachmentIngestor;
+  readonly cdnBaseUrl?: string;
+  readonly fetchFn?: typeof fetch;
+}
 
 export class WeChatChannelGateway {
   readonly account: WeChatChannelAccount;
@@ -32,13 +84,16 @@ export class WeChatChannelGateway {
   readonly runtimeGateway: WeChatRuntimeGateway;
   readonly contextTokenStore: ContextTokenStore;
   readonly defaultSpaceId?: string | null;
+  readonly mediaAttachmentIngestor?: WeChatMediaAttachmentIngestor;
+  readonly cdnBaseUrl?: string;
+  readonly fetchFn?: typeof fetch;
 
   private isDisposed = false;
   private readonly inFlightTurns = new Set<string>();
   private readonly messageHandler: (msg: WeChatParsedMessage) => Promise<void>;
   private readonly cursorCommitHandler?: (cursor: string) => Promise<void> | void;
 
-  constructor(options: WeChatChannelGatewayOptions) {
+  constructor(options: WeChatChannelGatewayExtendedOptions) {
     this.account = options.account;
     this.transport = options.transport;
     this.channelRepo = options.channelRepo;
@@ -47,6 +102,9 @@ export class WeChatChannelGateway {
     this.runtimeGateway = options.runtimeGateway;
     this.contextTokenStore = options.contextTokenStore ?? new ContextTokenStore();
     this.defaultSpaceId = options.defaultSpaceId ?? this.account.defaultSpaceId;
+    this.mediaAttachmentIngestor = options.mediaAttachmentIngestor ?? options.imageAttachmentIngestor;
+    this.cdnBaseUrl = options.cdnBaseUrl ?? (options.transport as any)?.cdnBaseUrl;
+    this.fetchFn = options.fetchFn;
 
     // 1. Attach message listener to transport
     this.messageHandler = async (msg: WeChatParsedMessage) => {
@@ -212,11 +270,104 @@ export class WeChatChannelGateway {
       });
     }
 
-    // 4. Clean Content & Build Inbound Envelope
+    // 4. Inbound Media Download + Decrypt & Attachment Ingestion (Mirror Lark & HappyClaw)
+    const envelopeAttachments: WeChatIngestedAttachment[] = [];
+    const mediaItems = msg.mediaItems ?? [];
+
+    if (this.mediaAttachmentIngestor && mediaItems.length > 0) {
+      for (let i = 0; i < mediaItems.length; i++) {
+        const item = mediaItems[i];
+        if (item.type === 'image') {
+          if (!item.encryptQueryParam || !item.aesKey) {
+            continue;
+          }
+          try {
+            const buffer = await downloadAndDecryptMedia({
+              encryptQueryParam: item.encryptQueryParam,
+              aesKeyBase64: item.aesKey,
+              cdnBaseUrl: this.cdnBaseUrl,
+              fetchFn: this.fetchFn,
+              maxFileSize: MAX_WECHAT_ATTACHMENT_IMAGE_BYTES,
+            });
+
+            if (buffer && buffer.length > 0 && buffer.length <= MAX_WECHAT_ATTACHMENT_IMAGE_BYTES) {
+              const safeMsgId = (nativeEventId || 'msg').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+              const fileKey = `wx_img_${safeMsgId}_${i}`.slice(0, 128);
+              const ingested = await this.mediaAttachmentIngestor.ingestImage({
+                userId: this.userId,
+                spaceId: binding.spaceId,
+                messageId: safeMsgId,
+                fileKey,
+                buffer,
+              });
+              envelopeAttachments.push({
+                type: 'image',
+                name: ingested.displayName,
+                displayName: ingested.displayName,
+                path: ingested.path,
+                etag: ingested.etag,
+                mediaType: ingested.mediaType,
+              });
+            }
+          } catch {
+            // Keep text fallback on failure (download/decrypt/size/ingest)
+          }
+        } else if (item.type === 'file') {
+          if (!item.encryptQueryParam || !item.aesKey) {
+            continue;
+          }
+          try {
+            const buffer = await downloadAndDecryptMedia({
+              encryptQueryParam: item.encryptQueryParam,
+              aesKeyBase64: item.aesKey,
+              cdnBaseUrl: this.cdnBaseUrl,
+              fetchFn: this.fetchFn,
+              maxFileSize: MAX_WECHAT_ATTACHMENT_FILE_BYTES,
+            });
+
+            if (buffer && buffer.length > 0 && buffer.length <= MAX_WECHAT_ATTACHMENT_FILE_BYTES) {
+              if (typeof this.mediaAttachmentIngestor.ingestFile === 'function') {
+                const safeMsgId = (nativeEventId || 'msg').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+                const fileKey = `wx_file_${safeMsgId}_${i}`.slice(0, 128);
+                const ingested = await this.mediaAttachmentIngestor.ingestFile({
+                  userId: this.userId,
+                  spaceId: binding.spaceId,
+                  messageId: safeMsgId,
+                  fileKey,
+                  fileName: item.name,
+                  buffer,
+                });
+                envelopeAttachments.push({
+                  type: 'file',
+                  name: ingested.displayName,
+                  displayName: ingested.displayName,
+                  path: ingested.path,
+                  etag: ingested.etag,
+                  mediaType: ingested.mediaType,
+                });
+              }
+            }
+          } catch {
+            // Keep text fallback on failure (download/decrypt/size/ingest)
+          }
+        }
+      }
+    }
+
+    // 5. Clean Content & Build Inbound Envelope
     const platformIdempotencyKey = `idem_wechat_${this.accountId}_${nativeEventId}`;
     let effectiveContent = msg.text?.trim() || '';
-    if (!effectiveContent && msg.mediaItems && msg.mediaItems.length > 0) {
-      effectiveContent = msg.mediaItems.some((m) => m.type === 'image') ? '[图片]' : '[多媒体消息]';
+    if (!effectiveContent && mediaItems.length > 0) {
+      const hasImage = mediaItems.some((m) => m.type === 'image');
+      const hasFile = mediaItems.some((m) => m.type === 'file');
+      if (hasImage && !hasFile) {
+        effectiveContent = '[图片]';
+      } else if (hasFile && !hasImage) {
+        const fileItem = mediaItems.find((m) => m.type === 'file');
+        effectiveContent = fileItem?.name ? `[文件: ${fileItem.name}]` : '[文件]';
+      } else {
+        effectiveContent = '[多媒体消息]';
+      }
     }
     if (!effectiveContent) {
       effectiveContent = '[消息]';
@@ -236,6 +387,7 @@ export class WeChatChannelGateway {
         nativeEventId,
         replyToMessageId: msg.messageId,
       },
+      ...(envelopeAttachments.length > 0 ? { attachments: envelopeAttachments } : {}),
     };
 
     // 5. Dispatch Inbound to Runtime

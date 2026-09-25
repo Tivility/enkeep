@@ -438,4 +438,290 @@ describe('WeChatChannelGateway', () => {
     expect(outboxItem?.status).toBe('failed');
     expect(fakeTransport.sentReplies.length).toBe(0);
   });
+
+  describe('Inbound Media Ingestion (WF3)', () => {
+    const rawKey = Buffer.alloc(16, 0x42);
+    const aesKeyBase64 = rawKey.toString('base64');
+    const imagePayload = Buffer.from('fake-image-png-binary-content-12345');
+    const filePayload = Buffer.from('fake-file-pdf-binary-content-67890');
+
+    it('downloads, decrypts, and ingests inbound image attachment via mediaAttachmentIngestor', async () => {
+      const { encryptAesEcb } = await import('../src/crypto.js');
+      const ciphertext = encryptAesEcb(imagePayload, rawKey);
+
+      const mockFetch = vi.fn(async () => {
+        return new Response(ciphertext, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(ciphertext.length),
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(async ({ fileKey }: any) => ({
+          path: `.attachments/incoming/${fileKey}.jpg`,
+          etag: `"${fileKey}_etag"`,
+          mediaType: 'image/jpeg',
+          displayName: `${fileKey}.jpg`,
+        })),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_100',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_100',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockIngestor.ingestImage).toHaveBeenCalledTimes(1);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeDefined();
+      expect(envelope.attachments.length).toBe(1);
+      expect(envelope.attachments[0]).toMatchObject({
+        type: 'image',
+        path: expect.stringContaining('.attachments/incoming/'),
+        etag: expect.any(String),
+        mediaType: 'image/jpeg',
+      });
+    });
+
+    it('downloads, decrypts, and ingests inbound file attachment via mediaAttachmentIngestor', async () => {
+      const { encryptAesEcb } = await import('../src/crypto.js');
+      const ciphertext = encryptAesEcb(filePayload, rawKey);
+
+      const mockFetch = vi.fn(async () => {
+        return new Response(ciphertext, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(ciphertext.length),
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(async () => {
+          throw new Error('Not an image');
+        }),
+        ingestFile: vi.fn(async ({ fileName, fileKey }: any) => ({
+          path: `.attachments/incoming/${fileKey}.pdf`,
+          etag: `"${fileKey}_etag"`,
+          mediaType: 'application/pdf',
+          displayName: fileName || 'doc.pdf',
+        })),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const fileMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_file_200',
+        text: '',
+        mediaItems: [
+          {
+            type: 'file',
+            name: 'quarterly_report.pdf',
+            encryptQueryParam: 'cdn_enc_param_file_200',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(fileMsg);
+      expect(result.handled).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockIngestor.ingestFile).toHaveBeenCalledTimes(1);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[文件: quarterly_report.pdf]');
+      expect(envelope.attachments).toBeDefined();
+      expect(envelope.attachments.length).toBe(1);
+      expect(envelope.attachments[0]).toMatchObject({
+        type: 'file',
+        displayName: 'quarterly_report.pdf',
+        mediaType: 'application/pdf',
+      });
+    });
+
+    it('falls back to text placeholder when image exceeds size limit (>20MB)', async () => {
+      const mockFetch = vi.fn(async () => {
+        return new Response('dummy', {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(25 * 1024 * 1024), // 25 MiB > 20 MiB limit
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_toolarge',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_huge',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockIngestor.ingestImage).not.toHaveBeenCalled();
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeUndefined();
+    });
+
+    it('falls back to text placeholder gracefully when download or decryption fails', async () => {
+      const mockFetch = vi.fn(async () => {
+        return new Response('Not Found on CDN', { status: 404 });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_error',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_err',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockIngestor.ingestImage).not.toHaveBeenCalled();
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeUndefined();
+    });
+
+    it('falls back to text placeholder gracefully when ingestImage throws', async () => {
+      const { encryptAesEcb } = await import('../src/crypto.js');
+      const ciphertext = encryptAesEcb(imagePayload, rawKey);
+
+      const mockFetch = vi.fn(async () => {
+        return new Response(ciphertext, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(ciphertext.length),
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(async () => {
+          throw new Error('Disk full or storage failure');
+        }),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_ingest_fail',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_fail',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockIngestor.ingestImage).toHaveBeenCalledTimes(1);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeUndefined();
+    });
+  });
 });
