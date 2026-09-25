@@ -2635,6 +2635,14 @@ fs.appendFileSync(p, corruptData);
       larkCredentialKeyFilePath: pathOptions.mode === 'test'
         ? join(paths.dataRoot, 'credentials', 'lark-vault.key')
         : join(homedir(), '.config', 'enkeep', 'keys', `${createHash('sha256').update(paths.dbPath).digest('hex').slice(0, 16)}-lark-vault.key`),
+      wechatRuntimeManager: options.wechatRuntimeManager,
+      wechatCredentialResolver: options.wechatCredentialResolver,
+      wechatTransportFactory: options.wechatTransportFactory,
+      wechatDefaultSpaceResolver: options.wechatDefaultSpaceResolver,
+      wechatMasterKey: options.wechatMasterKey,
+      wechatCredentialKeyFilePath: options.wechatCredentialKeyFilePath ?? (pathOptions.mode === 'test'
+        ? join(paths.dataRoot, 'credentials', 'lark-vault.key')
+        : join(homedir(), '.config', 'enkeep', 'keys', `${createHash('sha256').update(paths.dbPath).digest('hex').slice(0, 16)}-lark-vault.key`)),
       webhookSecurityOptions: options.webhookSecurityOptions ?? { allowTestLoopback: true, enforceHttps: false },
       spacesDir: options.spacesDir ?? paths.spacesDir,
       dshHome: options.dshHome ?? paths.dataRoot,

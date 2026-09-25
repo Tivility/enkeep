@@ -158,6 +158,12 @@ export interface DemoUpOptions extends DemoPathOptions {
   larkCredentialResolver?: import('@enkeep/channel-lark').LarkCredentialResolver;
   larkTransportFactory?: import('@enkeep/platform-server').LarkTransportFactory;
   larkDefaultSpaceResolver?: import('@enkeep/platform-server').LarkDefaultSpaceResolver;
+  wechatRuntimeManager?: import('@enkeep/platform-server').PlatformServerOptions['wechatRuntimeManager'];
+  wechatCredentialResolver?: import('@enkeep/platform-server').PlatformServerOptions['wechatCredentialResolver'];
+  wechatTransportFactory?: import('@enkeep/platform-server').PlatformServerOptions['wechatTransportFactory'];
+  wechatDefaultSpaceResolver?: import('@enkeep/platform-server').PlatformServerOptions['wechatDefaultSpaceResolver'];
+  wechatMasterKey?: Buffer | string;
+  wechatCredentialKeyFilePath?: string;
 }
 
 export interface DemoServiceEndpoint {

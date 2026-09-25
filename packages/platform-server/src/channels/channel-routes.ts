@@ -32,6 +32,7 @@ import { assertStrictBodyShape, validateExactString } from '../extensions/extens
 
 import type { ChannelRuntimeManager } from './channel-runtime-manager.js';
 import type { LarkOnboardingService } from './lark-onboarding-service.js';
+import type { WeChatRuntimeManager } from './wechat-runtime.js';
 
 export const ALLOWED_CHANNEL_ACCOUNT_CREATE_KEYS = Object.freeze([
   'type',
@@ -72,11 +73,17 @@ export const ALLOWED_ONBOARDING_JOB_CREATE_KEYS = Object.freeze([
 
 export class ChannelManagementService {
   private readonly storage: PlatformStorage;
-  private readonly runtimeManager?: ChannelRuntimeManager;
+  private runtimeManager?: ChannelRuntimeManager;
+  private wechatRuntimeManager?: WeChatRuntimeManager;
 
-  constructor(storage: PlatformStorage, runtimeManager?: ChannelRuntimeManager) {
+  constructor(
+    storage: PlatformStorage,
+    runtimeManager?: ChannelRuntimeManager,
+    wechatRuntimeManager?: WeChatRuntimeManager
+  ) {
     this.storage = storage;
     this.runtimeManager = runtimeManager;
+    this.wechatRuntimeManager = wechatRuntimeManager;
   }
 
   // ──────── Account Management ────────
@@ -124,9 +131,15 @@ export class ChannelManagementService {
       defaultSpaceId,
       groupActivationMode: input.groupActivationMode,
     });
-    if (this.runtimeManager && created.status === 'active') {
+    if (created.status === 'active') {
       try {
-        await this.runtimeManager.onAccountUpdated(userId, created.id);
+        if (created.type === 'wechat') {
+          if (this.wechatRuntimeManager) {
+            await this.wechatRuntimeManager.syncAccount(userId, created.id);
+          }
+        } else if (this.runtimeManager) {
+          await this.runtimeManager.onAccountUpdated(userId, created.id);
+        }
       } catch {}
     }
     return created;
@@ -164,22 +177,46 @@ export class ChannelManagementService {
     if (input.groupActivationMode !== undefined) {
       await this.storage.forTenant(userId).channels.setGroupActivationModeForAccountBindings(accountId, input.groupActivationMode);
     }
-    if (this.runtimeManager) {
-      try {
+    try {
+      if (updated.type === 'wechat') {
+        if (this.wechatRuntimeManager) {
+          await this.wechatRuntimeManager.syncAccount(userId, accountId);
+        }
+      } else if (this.runtimeManager) {
         await this.runtimeManager.onAccountUpdated(userId, accountId);
-      } catch {}
-    }
+      }
+    } catch {}
     return updated;
   }
 
   async deleteAccount(userId: string, accountId: string): Promise<boolean> {
+    const existing = await this.storage.forTenant(userId).channels.findAccountById(accountId);
+    const channelType = existing?.type;
     const deleted = await this.storage.forTenant(userId).channels.deleteAccount(accountId);
-    if (deleted && this.runtimeManager) {
+    if (deleted) {
       try {
-        await this.runtimeManager.onAccountDeleted(userId, accountId);
+        if (channelType === 'wechat') {
+          if (this.wechatRuntimeManager) {
+            await this.wechatRuntimeManager.syncAccount(userId, accountId);
+          }
+        } else if (this.runtimeManager) {
+          await this.runtimeManager.onAccountDeleted(userId, accountId);
+        }
       } catch {}
     }
     return deleted;
+  }
+
+  async syncAccount(userId: string, accountId: string): Promise<ChannelAccount> {
+    const account = await this.getAccount(userId, accountId);
+    if (account.type === 'wechat') {
+      if (this.wechatRuntimeManager) {
+        await this.wechatRuntimeManager.syncAccount(userId, accountId);
+      }
+    } else if (this.runtimeManager) {
+      await this.runtimeManager.syncAccount(userId, accountId);
+    }
+    return account;
   }
 
   // ──────── Binding Management ────────
@@ -369,6 +406,20 @@ export class ChannelRoutes {
         });
 
         sendJsonResponse(res, 201, createSuccessEnvelope(created));
+        return true;
+      }
+    }
+
+    // ──────────────── /api/manage/channels/accounts/:id/sync ────────────────
+    const accountSyncMatch = pathname.match(/^\/api\/manage\/channels\/accounts\/([^/]+)\/sync$/);
+    if (accountSyncMatch) {
+      const accountId = decodeURIComponent(accountSyncMatch[1]);
+      if (method === 'POST') {
+        if (this.expectedCsrfToken) {
+          validateCsrf(req, { csrfToken: this.expectedCsrfToken });
+        }
+        const account = await this.service.syncAccount(user.id, accountId);
+        sendJsonResponse(res, 200, createSuccessEnvelope({ synced: true, account }));
         return true;
       }
     }

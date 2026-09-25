@@ -1,4 +1,6 @@
 import { createServer, type Server } from 'node:http';
+import { createHash, createDecipheriv } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -121,6 +123,12 @@ import {
   type LarkTransportFactory,
   type LarkDefaultSpaceResolver,
 } from '../channels/channel-runtime-manager.js';
+import {
+  WeChatRuntimeManager,
+  type WeChatCredentialResolver,
+  type WeChatTransportFactory,
+  type WeChatDefaultSpaceResolver,
+} from '../channels/wechat-runtime.js';
 import { SqliteStreamEventSource } from '../channels/sqlite-stream-event-source.js';
 import { LarkEncryptedCredentialStore } from '../channels/lark-encrypted-credentials.js';
 import { LarkOnboardingService } from '../channels/lark-onboarding-service.js';
@@ -241,6 +249,12 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'channelService',
   'channelRoutes',
   'channelRuntimeManager',
+  'wechatRuntimeManager',
+  'wechatCredentialResolver',
+  'wechatTransportFactory',
+  'wechatDefaultSpaceResolver',
+  'wechatMasterKey',
+  'wechatCredentialKeyFilePath',
   'larkCredentialResolver',
   'larkTransportFactory',
   'larkDefaultSpaceResolver',
@@ -402,6 +416,18 @@ export interface PlatformServerOptions {
   channelRoutes?: ChannelRoutes;
   /** Optional channel runtime manager */
   channelRuntimeManager?: ChannelRuntimeManager;
+  /** Optional WeChat channel runtime manager */
+  wechatRuntimeManager?: WeChatRuntimeManager;
+  /** Optional WeChat credential resolver */
+  wechatCredentialResolver?: WeChatCredentialResolver;
+  /** Optional WeChat transport factory */
+  wechatTransportFactory?: WeChatTransportFactory;
+  /** Optional WeChat default space resolver */
+  wechatDefaultSpaceResolver?: WeChatDefaultSpaceResolver;
+  /** Optional WeChat master encryption key */
+  wechatMasterKey?: Buffer | string;
+  /** Optional explicit 0600 key file path for WeChat encrypted credentials */
+  wechatCredentialKeyFilePath?: string;
   /** Optional Lark credential resolver */
   larkCredentialResolver?: LarkCredentialResolver;
   /** Optional Lark transport factory */
@@ -472,6 +498,7 @@ export class PlatformServer {
   public readonly channelService: ChannelManagementService;
   public readonly channelRoutes: ChannelRoutes;
   public readonly channelRuntimeManager?: ChannelRuntimeManager;
+  public readonly wechatRuntimeManager?: WeChatRuntimeManager;
   public readonly larkEncryptedCredentialStore?: LarkEncryptedCredentialStore;
   public readonly larkOnboardingService?: LarkOnboardingService;
   public readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
@@ -863,6 +890,111 @@ export class PlatformServer {
           })
         : undefined);
 
+    // Resolve master encryption key for WeChat credentials consistent with importer
+    let effectiveWeChatMasterKey = options.wechatMasterKey;
+    if (!effectiveWeChatMasterKey) {
+      const keyFile = options.wechatCredentialKeyFilePath ?? options.larkCredentialKeyFilePath;
+      if (keyFile && existsSync(keyFile)) {
+        try {
+          const content = readFileSync(keyFile, 'utf8').trim();
+          if (/^[0-9a-fA-F]{64}$/.test(content)) {
+            effectiveWeChatMasterKey = Buffer.from(content, 'hex');
+          } else if (content.length > 0) {
+            effectiveWeChatMasterKey = createHash('sha256').update(content, 'utf8').digest();
+          }
+        } catch {}
+      }
+    }
+    if (!effectiveWeChatMasterKey) {
+      const envKey = process.env.ENKEEP_VAULT_KEY || process.env.ENKEEP_MASTER_KEY;
+      if (envKey && envKey.trim().length > 0) {
+        if (/^[0-9a-fA-F]{64}$/.test(envKey.trim())) {
+          effectiveWeChatMasterKey = Buffer.from(envKey.trim(), 'hex');
+        } else {
+          effectiveWeChatMasterKey = createHash('sha256').update(envKey.trim(), 'utf8').digest();
+        }
+      }
+    }
+    if (!effectiveWeChatMasterKey && options.cookieSecret) {
+      effectiveWeChatMasterKey = createHash('sha256').update(options.cookieSecret, 'utf8').digest();
+    }
+    if (!effectiveWeChatMasterKey) {
+      effectiveWeChatMasterKey = createHash('sha256').update('enkeep-channel-master-encryption-key-v1', 'utf8').digest();
+    }
+
+    const effectiveWeChatCredentialResolver: WeChatCredentialResolver = async (userId: string, credentialRef: string) => {
+      if (options.wechatCredentialResolver) {
+        const customRes = await options.wechatCredentialResolver(userId, credentialRef);
+        if (customRes) return customRes;
+      }
+      if (!db) return null;
+      try {
+        const row = db.prepare('SELECT encrypted_payload FROM channel_encrypted_credentials WHERE credential_ref = ?').get(credentialRef) as { encrypted_payload?: string } | undefined;
+        if (!row?.encrypted_payload) return null;
+        const raw = row.encrypted_payload;
+        if (raw.startsWith('{')) {
+          return JSON.parse(raw);
+        }
+        if (raw.startsWith('v1:')) {
+          const parts = raw.split(':');
+          if (parts.length === 4) {
+            const [, ivHex, tagHex, dataHex] = parts;
+            const iv = Buffer.from(ivHex, 'hex');
+            const tag = Buffer.from(tagHex, 'hex');
+            const ciphertext = Buffer.from(dataHex, 'hex');
+            const aad = Buffer.from(`${userId}:${credentialRef}`, 'utf8');
+
+            const candidateKeys: Buffer[] = [];
+            if (effectiveWeChatMasterKey) {
+              const k = Buffer.isBuffer(effectiveWeChatMasterKey) && effectiveWeChatMasterKey.length === 32
+                ? effectiveWeChatMasterKey
+                : createHash('sha256').update(effectiveWeChatMasterKey).digest();
+              candidateKeys.push(k);
+            }
+            if (options.cookieSecret) {
+              candidateKeys.push(createHash('sha256').update(options.cookieSecret, 'utf8').digest());
+            }
+            candidateKeys.push(createHash('sha256').update('enkeep-channel-master-encryption-key-v1', 'utf8').digest());
+
+            for (const key of candidateKeys) {
+              try {
+                const decipher = createDecipheriv('aes-256-gcm', key, iv);
+                decipher.setAAD(aad);
+                decipher.setAuthTag(tag);
+                const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+                return JSON.parse(decrypted.toString('utf8'));
+              } catch {}
+            }
+          }
+        }
+      } catch {}
+      return null;
+    };
+
+    let wechatDefaultSpaceResolver = options.wechatDefaultSpaceResolver;
+    if (!wechatDefaultSpaceResolver) {
+      wechatDefaultSpaceResolver = async (userId: string, account: ChannelAccount) => {
+        if (account.defaultSpaceId !== undefined && account.defaultSpaceId !== null) {
+          return account.defaultSpaceId;
+        }
+        return undefined;
+      };
+    }
+
+    this.wechatRuntimeManager =
+      options.wechatRuntimeManager ??
+      (this.runtimeGateway instanceof DeliveryRuntimeGateway
+        ? new WeChatRuntimeManager({
+            storage: this.storage,
+            db,
+            deliveryGateway: this.runtimeGateway,
+            credentialResolver: effectiveWeChatCredentialResolver,
+            transportFactory: options.wechatTransportFactory,
+            defaultSpaceResolver: wechatDefaultSpaceResolver,
+            masterKey: effectiveWeChatMasterKey,
+          })
+        : undefined);
+
     // 7. Initialize Task Worker if requested or injected (placed after providers, dshHome, dataRoot, and channelRuntimeManager)
     if (options.taskWorker) {
       this.taskWorker = options.taskWorker;
@@ -903,6 +1035,7 @@ export class PlatformServer {
 
     // Re-bind runtimeManager to channelService, larkOnboardingService, and taskWorker
     (this.channelService as any).runtimeManager = this.channelRuntimeManager;
+    (this.channelService as any).wechatRuntimeManager = this.wechatRuntimeManager;
     (this.larkOnboardingService as any).runtimeManager = this.channelRuntimeManager;
     if (this.taskWorker) {
       this.taskWorker.channelRuntimeManager = this.channelRuntimeManager;
@@ -1195,6 +1328,11 @@ export class PlatformServer {
         await this.channelRuntimeManager.start();
       }
 
+      // 5.6 Start WeChat runtime manager
+      if (this.wechatRuntimeManager) {
+        await this.wechatRuntimeManager.start();
+      }
+
       // 6. Bind listener
       await new Promise<void>((resolve, reject) => {
         server.once('error', reject);
@@ -1233,6 +1371,30 @@ export class PlatformServer {
             workerStopErr instanceof Error
               ? workerStopErr
               : new Error('Task worker stop failed during rollback', { cause: workerStopErr })
+          );
+        }
+      }
+
+      // Roll back channel runtime managers if started
+      if (this.wechatRuntimeManager) {
+        try {
+          await this.wechatRuntimeManager.stop();
+        } catch (wechatErr: unknown) {
+          rollbackErrors.push(
+            wechatErr instanceof Error
+              ? wechatErr
+              : new Error('WeChat runtime manager stop failed during rollback', { cause: wechatErr })
+          );
+        }
+      }
+      if (this.channelRuntimeManager) {
+        try {
+          await this.channelRuntimeManager.stop();
+        } catch (crmErr: unknown) {
+          rollbackErrors.push(
+            crmErr instanceof Error
+              ? crmErr
+              : new Error('Channel runtime manager stop failed during rollback', { cause: crmErr })
           );
         }
       }
@@ -1369,6 +1531,19 @@ export class PlatformServer {
             crmErr instanceof Error
               ? crmErr
               : new Error('Channel runtime manager stop failed during shutdown', { cause: crmErr })
+          );
+        }
+      }
+
+      // 2.6 Stop WeChat runtime manager
+      if (this.wechatRuntimeManager) {
+        try {
+          await this.wechatRuntimeManager.stop();
+        } catch (wechatErr: unknown) {
+          errors.push(
+            wechatErr instanceof Error
+              ? wechatErr
+              : new Error('WeChat runtime manager stop failed during shutdown', { cause: wechatErr })
           );
         }
       }
