@@ -112,6 +112,7 @@ describe('Module I: HappyClaw WeChat Credential Importer & Cutover', () => {
         folder TEXT NOT NULL,
         execution_mode TEXT NOT NULL DEFAULT 'container',
         status TEXT NOT NULL DEFAULT 'active',
+        canonical_session_id TEXT,
         created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
         updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
       );
@@ -144,6 +145,44 @@ describe('Module I: HappyClaw WeChat Credential Importer & Cutover', () => {
         created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
         updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
         UNIQUE(account_id, native_context_id)
+      );
+      CREATE TABLE IF NOT EXISTS session_routes (
+        id TEXT PRIMARY KEY,
+        space_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        channel TEXT NOT NULL DEFAULT 'web',
+        account_id TEXT NOT NULL DEFAULT 'default',
+        native_context_id TEXT NOT NULL,
+        peer_id TEXT,
+        dsh_session_id TEXT,
+        execution_mode TEXT NOT NULL DEFAULT 'container',
+        status TEXT NOT NULL DEFAULT 'active',
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+        UNIQUE(user_id, channel, account_id, native_context_id)
+      );
+      CREATE TABLE IF NOT EXISTS fixed_import_provenance (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        source_fingerprint TEXT,
+        source_chat_jid TEXT NOT NULL,
+        source_message_id TEXT,
+        target_space_id TEXT NOT NULL,
+        target_route_id TEXT NOT NULL,
+        target_dsh_session_id TEXT,
+        target_message_id TEXT,
+        target_event_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+      );
+      CREATE TABLE IF NOT EXISTS session_sources (
+        id TEXT PRIMARY KEY,
+        route_id TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        metadata TEXT,
+        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
       );
     `);
     return db;
@@ -580,6 +619,393 @@ describe('Module I: HappyClaw WeChat Credential Importer & Cutover', () => {
       const serialized = JSON.stringify(item);
       expect(serialized).not.toContain('bot_whz_secret_id_123');
       expect(serialized).toContain('***123');
+    });
+  });
+
+  describe('6. WeChat Workspace Binding & Gateway Compatibility (MIG-3)', () => {
+    it('resolves correct Enkeep space from HC WeChat mount when multiple spaces are present, regardless of DB insertion order', async () => {
+      const keyHex = crypto.randomBytes(32).toString('hex');
+      const keyBuf = Buffer.from(keyHex, 'hex');
+      const { hcDir, accDir, dbFile } = setupMockHappyClaw(keyHex);
+      const targetDb = setupMockEnkeepDb();
+
+      const hcUserId = '5df32a3a-15d3-4591-a7c3-8a0233c7a5ca';
+      const hcAccId = '267efc74-e8cc-45d8-aa55-3fb26a952453';
+      const peerJid = 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat';
+
+      // 1. Seed HappyClaw source DB
+      const hcDb = new DatabaseSync(dbFile);
+      hcDb.exec(`
+        CREATE TABLE IF NOT EXISTS agent_channel_mounts (
+          id TEXT PRIMARY KEY,
+          owner_user_id TEXT NOT NULL,
+          channel_account_id TEXT NOT NULL,
+          channel_type TEXT NOT NULL,
+          channel_jid TEXT NOT NULL,
+          workspace_jid TEXT NOT NULL,
+          workspace_folder TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS channel_mounts (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          workspace_id TEXT,
+          workspace_jid TEXT,
+          group_jid TEXT,
+          channel_jid TEXT,
+          channel TEXT,
+          workspace_folder TEXT
+        );
+      `);
+
+      hcDb.prepare('INSERT INTO users (id, username, display_name, role) VALUES (?, ?, ?, ?)').run(
+        hcUserId,
+        'owner-user',
+        'owner-user Admin',
+        'admin'
+      );
+      hcDb.prepare(
+        'INSERT INTO channel_accounts (id, owner_user_id, provider, name, secret_ref, enabled, status) VALUES (?, ?, ?, ?, ?, 1, ?)'
+      ).run(hcAccId, hcUserId, 'wechat', '微信', `channel-account:${hcAccId}`, 'connected');
+
+      // Mount pointing to web:wechat (folder: wechat)
+      hcDb.prepare(`
+        INSERT INTO agent_channel_mounts (id, owner_user_id, channel_account_id, channel_type, channel_jid, workspace_jid, workspace_folder)
+        VALUES ('mount_1', ?, ?, 'wechat', ?, 'web:wechat', 'wechat')
+      `).run(hcUserId, hcAccId, peerJid);
+
+      hcDb.prepare(`
+        INSERT INTO registered_groups (jid, name, folder, created_by, channel_account_id)
+        VALUES (?, '微信', 'wechat', ?, ?)
+      `).run(peerJid, hcUserId, hcAccId);
+
+      hcDb.close();
+
+      // Seed HappyClaw encrypted secret file
+      fs.writeFileSync(
+        path.join(accDir, `${hcAccId}.json`),
+        JSON.stringify(
+          encryptHappyClawSecretPayload(
+            {
+              botToken: 'token_tiv_wx',
+              ilinkBotId: 'bot_tiv_ilink_1',
+              getUpdatesBuf: 'cursor_tiv',
+            },
+            keyBuf
+          )
+        )
+      );
+
+      // 2. Seed Target Enkeep DB with MULTIPLE SPACES in arbitrary order
+      // Home workspace is inserted FIRST, random project SECOND, WeChat space THIRD
+      targetDb.prepare('INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)').run(
+        hcUserId,
+        'owner-user',
+        'pwd_hash'
+      );
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, ?, ?, ?)').run(
+        'spc_df56c7ef91f973b5ccb3c06e2253a72f',
+        hcUserId,
+        'Home Workspace [Host]',
+        'main',
+        'host'
+      );
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, ?, ?, ?)').run(
+        'spc_random_project_alpha',
+        hcUserId,
+        'Alpha Project',
+        'alpha',
+        'container'
+      );
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, ?, ?, ?)').run(
+        'spc_28c452e0fd9aa266664d3650416da79a',
+        hcUserId,
+        '微信 [Container]',
+        'wechat--container',
+        'container'
+      );
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, ?, ?, ?)').run(
+        'spc_sandbox_scratchpad',
+        hcUserId,
+        'Scratchpad',
+        'sandbox',
+        'container'
+      );
+
+      // Historical session route for the WeChat conversation (imported as channel 'web' originally)
+      targetDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id, peer_id, title)
+        VALUES ('ses_aaa935905a793ffcff025fb3839c9cb8', 'spc_28c452e0fd9aa266664d3650416da79a', ?, 'web', 'default', ?, ?, 'WeChat Historical')
+      `).run(hcUserId, peerJid, peerJid);
+
+      // 3. Run migration
+      const report = await importWeChatCredentials({
+        hcDir,
+        targetDb,
+        masterKey: 'enkeep-test-master-key',
+        status: 'disabled',
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.items.length).toBe(1);
+
+      const item = report.items[0];
+      // Deterministically chose the WeChat space, NOT the Home workspace or Alpha project!
+      expect(item.defaultSpaceId).toBe('spc_28c452e0fd9aa266664d3650416da79a');
+
+      // Verify channel_accounts default_space_id
+      const accRow = targetDb.prepare('SELECT * FROM channel_accounts WHERE id = ?').get(item.targetAccountId) as any;
+      expect(accRow.default_space_id).toBe('spc_28c452e0fd9aa266664d3650416da79a');
+
+      // Verify channel_bindings all point to the WeChat container space
+      const bindings = targetDb
+        .prepare('SELECT * FROM channel_bindings WHERE account_id = ?')
+        .all(item.targetAccountId) as any[];
+      expect(bindings.length).toBeGreaterThanOrEqual(2);
+      for (const b of bindings) {
+        expect(b.space_id).toBe('spc_28c452e0fd9aa266664d3650416da79a');
+      }
+
+      const boundCtxIds = bindings.map((b) => b.native_context_id);
+      // Native context IDs compatible with gateway (both full domain and bare senderId)
+      expect(boundCtxIds).toContain('wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat');
+      expect(boundCtxIds).toContain('wechat:owxba7a691c8b4cadd86ea7f2eea');
+
+      // Verify session_routes was updated to channel 'wechat' with gateway-compatible identity
+      const routeRow = targetDb
+        .prepare('SELECT * FROM session_routes WHERE id = ?')
+        .get('ses_aaa935905a793ffcff025fb3839c9cb8') as any;
+      expect(routeRow.channel).toBe('wechat');
+      expect(routeRow.account_id).toBe(item.targetAccountId);
+      expect(routeRow.native_context_id).toBe('wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat');
+      expect(routeRow.peer_id).toBe('owxba7a691c8b4cadd86ea7f2eea@im.wechat');
+      expect(routeRow.space_id).toBe('spc_28c452e0fd9aa266664d3650416da79a');
+
+      // Verify canonical_session_id was populated on the target space
+      const spaceRow = targetDb
+        .prepare('SELECT canonical_session_id FROM spaces WHERE id = ?')
+        .get('spc_28c452e0fd9aa266664d3650416da79a') as any;
+      expect(spaceRow.canonical_session_id).toBe('ses_aaa935905a793ffcff025fb3839c9cb8');
+    });
+
+    it('proves unordered DB order does not affect target space resolution (reversed insertion order)', async () => {
+      const keyHex = crypto.randomBytes(32).toString('hex');
+      const keyBuf = Buffer.from(keyHex, 'hex');
+      const { hcDir, accDir, dbFile } = setupMockHappyClaw(keyHex);
+      const targetDb = setupMockEnkeepDb();
+
+      const hcUserId = 'u_tiv_rev';
+      const hcAccId = 'acc_wx_rev';
+      const peerJid = 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat';
+
+      // Seed HappyClaw
+      const hcDb = new DatabaseSync(dbFile);
+      hcDb.exec(`
+        CREATE TABLE IF NOT EXISTS agent_channel_mounts (
+          id TEXT PRIMARY KEY,
+          owner_user_id TEXT NOT NULL,
+          channel_account_id TEXT NOT NULL,
+          channel_type TEXT NOT NULL,
+          channel_jid TEXT NOT NULL,
+          workspace_jid TEXT NOT NULL,
+          workspace_folder TEXT NOT NULL
+        );
+      `);
+      hcDb.prepare('INSERT INTO users (id, username, display_name) VALUES (?, ?, ?)').run(hcUserId, 'tiv_rev', 'Tiv');
+      hcDb.prepare('INSERT INTO channel_accounts (id, owner_user_id, provider, name, secret_ref, enabled, status) VALUES (?, ?, ?, ?, ?, 1, ?)')
+        .run(hcAccId, hcUserId, 'wechat', '微信', `channel-account:${hcAccId}`, 'connected');
+      hcDb.prepare(`
+        INSERT INTO agent_channel_mounts (id, owner_user_id, channel_account_id, channel_type, channel_jid, workspace_jid, workspace_folder)
+        VALUES ('mount_rev', ?, ?, 'wechat', ?, 'web:wechat', 'wechat')
+      `).run(hcUserId, hcAccId, peerJid);
+      hcDb.close();
+
+      fs.writeFileSync(
+        path.join(accDir, `${hcAccId}.json`),
+        JSON.stringify(encryptHappyClawSecretPayload({ botToken: 'tok', ilinkBotId: 'bot_rev' }, keyBuf))
+      );
+
+      // Seed Target Enkeep DB with spaces in REVERSED order (Scratchpad first, WeChat middle, Home last)
+      targetDb.prepare('INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)').run(hcUserId, 'tiv_rev', 'pwd');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_scratch', hcUserId, 'Scratchpad', 'sandbox');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_alpha', hcUserId, 'Alpha', 'alpha');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_wechat_target', hcUserId, '微信 [Container]', 'wechat--container');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_home_first', hcUserId, 'Home', 'main');
+
+      const report = await importWeChatCredentials({
+        hcDir,
+        targetDb,
+        masterKey: 'enkeep-test-master-key',
+        status: 'disabled',
+      });
+
+      expect(report.success).toBe(true);
+      // Despite reversed DB row insertion order, deterministic space mapping resolves spc_wechat_target!
+      expect(report.items[0].defaultSpaceId).toBe('spc_wechat_target');
+
+      const accRow = targetDb.prepare('SELECT default_space_id FROM channel_accounts WHERE id = ?').get(report.items[0].targetAccountId) as any;
+      expect(accRow.default_space_id).toBe('spc_wechat_target');
+    });
+
+    it('resolves correct Enkeep space via fixed_import_provenance when multiple spaces are present', async () => {
+      const keyHex = crypto.randomBytes(32).toString('hex');
+      const keyBuf = Buffer.from(keyHex, 'hex');
+      const { hcDir, accDir, dbFile } = setupMockHappyClaw(keyHex);
+      const targetDb = setupMockEnkeepDb();
+
+      const hcUserId = 'u_prov_test';
+      const hcAccId = 'acc_wx_prov';
+      const peerJid = 'wechat:owx_provenance_user@im.wechat';
+
+      // HappyClaw has chats with peerJid
+      const hcDb = new DatabaseSync(dbFile);
+      hcDb.prepare('INSERT INTO users (id, username, display_name) VALUES (?, ?, ?)').run(hcUserId, 'prov_user', 'Prov');
+      hcDb.prepare('INSERT INTO channel_accounts (id, owner_user_id, provider, name, secret_ref, enabled, status) VALUES (?, ?, ?, ?, ?, 1, ?)')
+        .run(hcAccId, hcUserId, 'wechat', '微信', `channel-account:${hcAccId}`, 'connected');
+      hcDb.prepare('INSERT INTO registered_groups (jid, name, folder, created_by, channel_account_id) VALUES (?, ?, ?, ?, ?)')
+        .run(peerJid, '微信私聊', 'home-prov', hcUserId, hcAccId);
+      hcDb.close();
+
+      fs.writeFileSync(
+        path.join(accDir, `${hcAccId}.json`),
+        JSON.stringify(encryptHappyClawSecretPayload({ botToken: 'tok', ilinkBotId: 'bot_prov' }, keyBuf))
+      );
+
+      // Target DB has 3 spaces: Home, Other, and Disambiguated Provenance space
+      targetDb.prepare('INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)').run(hcUserId, 'prov_user', 'pwd');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_home_prov', hcUserId, 'Home', 'home-prov');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_other_prov', hcUserId, 'Other', 'other');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_prov_isolated', hcUserId, '微信专属', 'home-prov--wechat-o9cq--abc12345');
+
+      // fixed_import_provenance explicitly points peerJid to spc_prov_isolated
+      targetDb.prepare(`
+        INSERT INTO fixed_import_provenance (id, user_id, source_chat_jid, target_space_id, target_route_id, target_dsh_session_id)
+        VALUES ('prov_1', ?, ?, 'spc_prov_isolated', 'ses_prov_canon_1', 'dsh_ses_1')
+      `).run(hcUserId, peerJid);
+
+      targetDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id, peer_id)
+        VALUES ('ses_prov_canon_1', 'spc_prov_isolated', ?, 'web', 'default', ?, ?)
+      `).run(hcUserId, peerJid, peerJid);
+
+      const report = await importWeChatCredentials({
+        hcDir,
+        targetDb,
+        masterKey: 'enkeep-test-master-key',
+        status: 'disabled',
+      });
+
+      expect(report.success).toBe(true);
+      // Resolved via fixed_import_provenance to the isolated space!
+      expect(report.items[0].defaultSpaceId).toBe('spc_prov_isolated');
+
+      // Verify route was aligned to channel 'wechat'
+      const routeRow = targetDb.prepare('SELECT * FROM session_routes WHERE id = ?').get('ses_prov_canon_1') as any;
+      expect(routeRow.channel).toBe('wechat');
+      expect(routeRow.space_id).toBe('spc_prov_isolated');
+      expect(routeRow.native_context_id).toBe('wechat:owx_provenance_user@im.wechat');
+    });
+
+    it('fails loudly when HappyClaw mapping is missing and multiple spaces exist instead of picking arbitrary space', async () => {
+      const keyHex = crypto.randomBytes(32).toString('hex');
+      const keyBuf = Buffer.from(keyHex, 'hex');
+      const { hcDir, accDir, dbFile } = setupMockHappyClaw(keyHex);
+      const targetDb = setupMockEnkeepDb();
+
+      const hcUserId = 'u_missing_map';
+      const hcAccId = 'acc_missing';
+
+      // HappyClaw has account but NO mounts, NO registered groups, NO conversations
+      const hcDb = new DatabaseSync(dbFile);
+      hcDb.prepare('INSERT INTO users (id, username, display_name) VALUES (?, ?, ?)').run(hcUserId, 'missing_user', 'Missing');
+      hcDb.prepare('INSERT INTO channel_accounts (id, owner_user_id, provider, name, secret_ref, enabled, status) VALUES (?, ?, ?, ?, ?, 1, ?)')
+        .run(hcAccId, hcUserId, 'wechat', '微信', `channel-account:${hcAccId}`, 'connected');
+      hcDb.close();
+
+      fs.writeFileSync(
+        path.join(accDir, `${hcAccId}.json`),
+        JSON.stringify(encryptHappyClawSecretPayload({ botToken: 'tok', ilinkBotId: 'bot_missing' }, keyBuf))
+      );
+
+      // Target DB has spaces for user, but NONE match any WeChat mapping
+      targetDb.prepare('INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)').run(hcUserId, 'missing_user', 'pwd');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_unrelated_1', hcUserId, 'Unrelated 1', 'unrelated-1');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_unrelated_2', hcUserId, 'Unrelated 2', 'unrelated-2');
+
+      // Must FAIL LOUDLY instead of arbitrarily doing SELECT id FROM spaces LIMIT 1
+      await expect(
+        importWeChatCredentials({
+          hcDir,
+          targetDb,
+          masterKey: 'enkeep-test-master-key',
+          status: 'disabled',
+        })
+      ).rejects.toThrow(/FAIL-CLOSED: Cannot resolve target Enkeep space for WeChat account/);
+    });
+
+    it('ensures gateway findByRouteIdentity compatibility for inbound WeChat messages', async () => {
+      const keyHex = crypto.randomBytes(32).toString('hex');
+      const keyBuf = Buffer.from(keyHex, 'hex');
+      const { hcDir, accDir, dbFile } = setupMockHappyClaw(keyHex);
+      const targetDb = setupMockEnkeepDb();
+
+      const hcUserId = 'u_gw_compat';
+      const hcAccId = 'acc_gw_compat';
+      const senderId = 'o9cq_gw_sender_123@im.wechat';
+      const peerJid = `wechat:${senderId}`;
+
+      const hcDb = new DatabaseSync(dbFile);
+      hcDb.prepare('INSERT INTO users (id, username, display_name) VALUES (?, ?, ?)').run(hcUserId, 'gw_user', 'GW');
+      hcDb.prepare('INSERT INTO channel_accounts (id, owner_user_id, provider, name, secret_ref, enabled, status) VALUES (?, ?, ?, ?, ?, 1, ?)')
+        .run(hcAccId, hcUserId, 'wechat', '微信', `channel-account:${hcAccId}`, 'connected');
+      hcDb.prepare('INSERT INTO registered_groups (jid, name, folder, created_by, channel_account_id) VALUES (?, ?, ?, ?, ?)')
+        .run(peerJid, '微信私聊', 'wechat', hcUserId, hcAccId);
+      hcDb.close();
+
+      fs.writeFileSync(
+        path.join(accDir, `${hcAccId}.json`),
+        JSON.stringify(encryptHappyClawSecretPayload({ botToken: 'tok', ilinkBotId: 'bot_gw' }, keyBuf))
+      );
+
+      targetDb.prepare('INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)').run(hcUserId, 'gw_user', 'pwd');
+      targetDb.prepare('INSERT INTO spaces (id, user_id, name, folder) VALUES (?, ?, ?, ?)').run('spc_gw_wx', hcUserId, '微信空间', 'wechat');
+
+      // Pre-seed route
+      targetDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id, peer_id)
+        VALUES ('ses_gw_existing', 'spc_gw_wx', ?, 'web', 'default', ?, ?)
+      `).run(hcUserId, peerJid, peerJid);
+
+      const report = await importWeChatCredentials({
+        hcDir,
+        targetDb,
+        masterKey: 'enkeep-test-master-key',
+        status: 'disabled',
+      });
+
+      expect(report.success).toBe(true);
+      const targetAccId = report.items[0].targetAccountId;
+
+      // Simulate Gateway:
+      // 1. In gateway.ts: const nativeContextId = `wechat:${msg.senderId}`;
+      const gatewayNativeContextId = `wechat:${senderId}`;
+
+      // 2. Gateway lookup binding:
+      const binding = targetDb
+        .prepare('SELECT * FROM channel_bindings WHERE account_id = ? AND native_context_id = ?')
+        .get(targetAccId, gatewayNativeContextId) as any;
+      expect(binding).toBeDefined();
+      expect(binding.space_id).toBe('spc_gw_wx');
+
+      // 3. Gateway lookup session route:
+      // In gateway.ts: findByRouteIdentity('wechat', this.accountId, nativeContextId)
+      // translates to: SELECT * FROM session_routes WHERE user_id = ? AND channel = ? AND account_id = ? AND native_context_id = ?
+      const route = targetDb
+        .prepare('SELECT * FROM session_routes WHERE user_id = ? AND channel = ? AND account_id = ? AND native_context_id = ?')
+        .get(hcUserId, 'wechat', targetAccId, gatewayNativeContextId) as any;
+      expect(route).toBeDefined();
+      expect(route.id).toBe('ses_gw_existing');
+      expect(route.space_id).toBe('spc_gw_wx');
+      expect(route.channel).toBe('wechat');
     });
   });
 });

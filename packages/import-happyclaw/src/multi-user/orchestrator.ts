@@ -3,7 +3,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { assertNotProductionData, validateSourceFile } from '../guard.js'
-import { deterministicMessageId, deterministicSessionId, deterministicSpaceId } from '../ids.js'
+import { channelFromJid, deterministicMessageId, deterministicSessionId, deterministicSpaceId } from '../ids.js'
 import { computeSourceFingerprint } from '../manifest.js'
 import { introspectSource } from '../introspection.js'
 import { compileChats } from '../seed.js'
@@ -511,7 +511,7 @@ export async function executeMultiUserMigration(
           ? targetDb.prepare(
               `INSERT INTO session_routes (
                 id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, created_at, updated_at, status, title
-              ) VALUES (?, ?, ?, 'web', 'default', ?, ?, ?, 'container', ?, ?, 'active', ?)`
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'container', ?, ?, 'active', ?)`
             )
           : null
 
@@ -558,17 +558,51 @@ export async function executeMultiUserMigration(
           : null
 
         for (const ses of uPlan.sessions) {
+          const isWeChat = ses.chatJid.startsWith('wechat:') || channelFromJid(ses.chatJid) === 'wechat'
+          let channel = 'web'
+          let accountId = 'default'
+          let nativeCtxId = ses.chatJid
+          let peerId = ses.targetSessionId
+
+          if (isWeChat) {
+            channel = 'wechat'
+            const wxAcc = uPlan.channelAccounts.find((ca) => ca.channelType === 'wechat')
+            if (wxAcc) {
+              accountId = `acc_${sha256Hex(`${targetUserId}:wechat:${wxAcc.sourceAccountId}`).slice(0, 24)}`
+            } else {
+              accountId = `acc_hpc_wechat_${targetUserId}`
+            }
+            const cleanJid = ses.chatJid.trim()
+            const withoutPrefix = cleanJid.replace(/^wechat:/, '')
+            nativeCtxId = `wechat:${withoutPrefix}`
+            peerId = withoutPrefix
+          }
+
           routeStmt?.run(
             ses.targetSessionId,
             ses.spaceId,
             targetUserId,
-            ses.chatJid,
-            ses.targetSessionId,
+            channel,
+            accountId,
+            nativeCtxId,
+            peerId,
             ses.targetSessionId,
             createdAt,
             createdAt,
             ses.title
           )
+
+          if (targetTables.has('spaces')) {
+            try {
+              targetDb
+                .prepare(
+                  `UPDATE spaces SET canonical_session_id = ? WHERE id = ? AND (canonical_session_id IS NULL OR canonical_session_id = '')`
+                )
+                .run(ses.targetSessionId, ses.spaceId)
+            } catch {
+              // ignore
+            }
+          }
 
           const genId = `gen_${sha256Hex(`${targetUserId}:${ses.targetSessionId}:1`).slice(0, 24)}`
           genStmt?.run(genId, targetUserId, ses.targetSessionId, ses.targetSessionId, createdAt)
@@ -699,17 +733,65 @@ export async function executeMultiUserMigration(
 
           // Create disabled bindings to user spaces
           if (bindStmt) {
-            for (const sp of uPlan.spaces) {
-              const bindId = `bind_${sha256Hex(`${targetAccId}:${sp.workspaceJid}`).slice(0, 24)}`
-              bindStmt.run(
-                bindId,
-                targetUserId,
-                targetAccId,
-                sp.spaceId,
-                sp.workspaceJid,
-                createdAt,
-                createdAt
+            if (credInfo.channelType === 'wechat') {
+              const wxSessions = uPlan.sessions.filter(
+                (s) => s.chatJid.startsWith('wechat:') || channelFromJid(s.chatJid) === 'wechat'
               )
+              if (wxSessions.length > 0) {
+                for (const ws of wxSessions) {
+                  const cleanJid = ws.chatJid.trim()
+                  const withoutPrefix = cleanJid.replace(/^wechat:/, '')
+                  const senderWithDomain = withoutPrefix
+                  const senderWithoutDomain = withoutPrefix.replace(/@im\.wechat$/, '').replace(/@[^@]+$/, '')
+
+                  const ctxIds = new Set<string>()
+                  ctxIds.add(`wechat:${senderWithDomain}`)
+                  if (senderWithoutDomain && senderWithoutDomain !== senderWithDomain) {
+                    ctxIds.add(`wechat:${senderWithoutDomain}`)
+                  }
+                  if (senderWithDomain) ctxIds.add(senderWithDomain)
+                  if (cleanJid) ctxIds.add(cleanJid)
+
+                  for (const ctxId of ctxIds) {
+                    const bindId = `bind_${sha256Hex(`${targetAccId}:${ctxId}`).slice(0, 24)}`
+                    bindStmt.run(
+                      bindId,
+                      targetUserId,
+                      targetAccId,
+                      ws.spaceId,
+                      ctxId,
+                      createdAt,
+                      createdAt
+                    )
+                  }
+                }
+              } else {
+                for (const sp of uPlan.spaces) {
+                  const bindId = `bind_${sha256Hex(`${targetAccId}:${sp.workspaceJid}`).slice(0, 24)}`
+                  bindStmt.run(
+                    bindId,
+                    targetUserId,
+                    targetAccId,
+                    sp.spaceId,
+                    sp.workspaceJid,
+                    createdAt,
+                    createdAt
+                  )
+                }
+              }
+            } else {
+              for (const sp of uPlan.spaces) {
+                const bindId = `bind_${sha256Hex(`${targetAccId}:${sp.workspaceJid}`).slice(0, 24)}`
+                bindStmt.run(
+                  bindId,
+                  targetUserId,
+                  targetAccId,
+                  sp.spaceId,
+                  sp.workspaceJid,
+                  createdAt,
+                  createdAt
+                )
+              }
             }
           }
         }
