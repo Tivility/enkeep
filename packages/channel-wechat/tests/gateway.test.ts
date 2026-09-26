@@ -465,6 +465,155 @@ describe('WeChatChannelGateway', () => {
     expect(fakeTransport.sentReplies.length).toBe(0);
   });
 
+  describe('Outbound Final Text & Plain Text Delivery (K2)', () => {
+    it('sends only final answer text when finalText is provided from runtime (K1 contract)', async () => {
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const route = await mockSessionRouteRepo.create({
+        spaceId: 'spc_default_001',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_carol',
+        peerId: 'wx_user_carol',
+      });
+      await contextTokenStore.set('wx_user_carol', 'ctx_carol_token_k2');
+
+      const outboxItem = await gateway.handleTurnCompleted({
+        sessionId: route.id,
+        turnId: 'turn_k2_final_text',
+        replyText: '<think>internal draft thoughts</think>raw reply',
+        finalText: 'Clean final answer from runtime K1',
+      });
+
+      expect(outboxItem?.status).toBe('delivered');
+      expect(fakeTransport.sentReplies.length).toBe(1);
+      expect(fakeTransport.sentReplies[0].text).toBe('Clean final answer from runtime K1');
+
+      const payload = JSON.parse(outboxItem!.payloadJson);
+      expect(payload.text).toBe('Clean final answer from runtime K1');
+      expect(payload.text).not.toContain('think');
+    });
+
+    it('strips thinking/reasoning blocks when K1 is not yet merged and converts Markdown to plain text', async () => {
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const route = await mockSessionRouteRepo.create({
+        spaceId: 'spc_default_001',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_carol',
+        peerId: 'wx_user_carol',
+      });
+      await contextTokenStore.set('wx_user_carol', 'ctx_carol_token_k2');
+
+      const replyWithMarkdownAndThinking = `
+<think>
+Let's see: user asks for service status.
+I should prepare a table with Gateway and Database.
+</think>
+
+系统运行概况如下：
+
+| 服务 | 状态 |
+| :--- | :---: |
+| 网关 | 正常 |
+| 存储 | 正常 |
+
+详情参考 [监控面板](https://monitor.example.com)。
+`;
+
+      const outboxItem = await gateway.handleTurnCompleted({
+        sessionId: route.id,
+        turnId: 'turn_k2_cot_strip',
+        replyText: replyWithMarkdownAndThinking,
+      });
+
+      expect(outboxItem?.status).toBe('delivered');
+      expect(fakeTransport.sentReplies.length).toBe(1);
+      const deliveredText = fakeTransport.sentReplies[0].text;
+
+      // Ensure thinking monologue is stripped
+      expect(deliveredText).not.toContain('<think>');
+      expect(deliveredText).not.toContain('Let\'s see');
+
+      // Ensure table is converted to plain text without separator row
+      expect(deliveredText).not.toContain('| :---');
+      expect(deliveredText).toContain('服务');
+      expect(deliveredText).toContain('状态');
+      expect(deliveredText).toContain('网关');
+      expect(deliveredText).toContain('存储');
+
+      // Ensure link is sensibly formatted as text (url)
+      expect(deliveredText).toContain('监控面板 (https://monitor.example.com)');
+
+      // Outbox payload also contains clean plain text
+      const payload = JSON.parse(outboxItem!.payloadJson);
+      expect(payload.text).toBe(deliveredText);
+    });
+
+    it('splits message exceeding MSG_SPLIT_LIMIT (2000 chars) into multiple chunks per HappyClaw', async () => {
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const route = await mockSessionRouteRepo.create({
+        spaceId: 'spc_default_001',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_carol',
+        peerId: 'wx_user_carol',
+      });
+      await contextTokenStore.set('wx_user_carol', 'ctx_carol_token_k2');
+
+      // Generate text with 3 paragraphs of 800 chars each = ~2400 chars > 2000
+      const p1 = '第1段：' + 'A'.repeat(800);
+      const p2 = '第2段：' + 'B'.repeat(800);
+      const p3 = '第3段：' + 'C'.repeat(800);
+      const longMessage = `${p1}\n\n${p2}\n\n${p3}`;
+
+      const outboxItem = await gateway.handleTurnCompleted({
+        sessionId: route.id,
+        turnId: 'turn_k2_long_message',
+        replyText: longMessage,
+      });
+
+      expect(outboxItem?.status).toBe('delivered');
+      // Sent in multiple chunks via transport
+      expect(fakeTransport.sentReplies.length).toBeGreaterThan(1);
+      for (const sent of fakeTransport.sentReplies) {
+        expect(sent.text.length).toBeLessThanOrEqual(2000);
+      }
+
+      // Reassembled content matches original paragraphs
+      const combinedSentText = fakeTransport.sentReplies.map((r) => r.text).join('\n\n');
+      expect(combinedSentText).toContain('第1段');
+      expect(combinedSentText).toContain('第2段');
+      expect(combinedSentText).toContain('第3段');
+    });
+  });
+
   describe('Inbound Media Ingestion (WF3)', () => {
     const rawKey = Buffer.alloc(16, 0x42);
     const aesKeyBase64 = rawKey.toString('base64');

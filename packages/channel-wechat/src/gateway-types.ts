@@ -182,6 +182,24 @@ export interface WeChatChannelGatewayOptions {
   readonly onCursorCommit?: (cursor: string) => Promise<void> | void;
 }
 
+export interface WeChatTurnCompletedParams {
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly replyText?: string;
+  readonly finalText?: string;
+  readonly final_text?: string;
+  readonly finalAnswerText?: string;
+  readonly executionResult?: {
+    readonly replyText?: string;
+    readonly finalText?: string;
+    readonly final_text?: string;
+  };
+  readonly idempotencyKey?: string;
+  readonly nativeContextId?: string;
+  readonly replyToMessageId?: string;
+  readonly nativeEventId?: string;
+}
+
 export interface WeChatInboundHandlingResult {
   readonly handled: boolean;
   readonly ignoredReason?:
@@ -196,6 +214,7 @@ export interface WeChatInboundHandlingResult {
   readonly turnId?: string;
   readonly outboxItem?: WeChatChannelOutboxItem;
   readonly replyText?: string;
+  readonly finalText?: string;
 }
 
 export interface WeChatTurnCompletedEvent {
@@ -205,7 +224,11 @@ export interface WeChatTurnCompletedEvent {
   readonly turnId: string;
   readonly deliveryId?: string;
   readonly idempotencyKey?: string;
-  readonly executionResult: { readonly replyText: string };
+  readonly executionResult: {
+    readonly replyText?: string;
+    readonly finalText?: string;
+    readonly final_text?: string;
+  };
   readonly tokenUsage?: { readonly tokens: number };
   readonly executionMode?: 'runtime' | 'command';
 }

@@ -10,6 +10,12 @@ import { randomBytes } from 'node:crypto';
 import type { WeChatParsedMessage, WeChatTransport } from './types.js';
 import { ContextTokenStore } from './context-token-store.js';
 import { downloadAndDecryptMedia } from './crypto.js';
+import {
+  extractFinalAnswerText,
+  markdownToPlainText,
+  splitTextChunks,
+  MSG_SPLIT_LIMIT,
+} from './markdown.js';
 import type {
   WeChatChannelAccount,
   WeChatChannelBinding,
@@ -24,6 +30,7 @@ import type {
   WeChatSessionRoute,
   WeChatSessionRouteRepo,
   WeChatSpaceRepo,
+  WeChatTurnCompletedParams,
 } from './gateway-types.js';
 
 export const MAX_WECHAT_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB per image
@@ -446,20 +453,15 @@ export class WeChatChannelGateway {
   /**
    * Handles agent turn completion event:
    * 1. Verifies turn origin and active account
-   * 2. Resolves recipient user ID
-   * 3. Retrieves cached context_token
-   * 4. Creates outbox record
-   * 5. Sends outbound reply via transport
+   * 2. Extracts final answer text and strips thinking/reasoning blocks
+   * 3. Converts Markdown to plain text with sensible table/code block/link formatting
+   * 4. Resolves recipient user ID and cached context_token
+   * 5. Creates outbox record
+   * 6. Sends outbound reply via transport (with length splitting per HappyClaw)
    */
-  async handleTurnCompleted(params: {
-    sessionId: string;
-    turnId: string;
-    replyText: string;
-    idempotencyKey?: string;
-    nativeContextId?: string;
-    replyToMessageId?: string;
-    nativeEventId?: string;
-  }): Promise<WeChatChannelOutboxItem | null> {
+  async handleTurnCompleted(
+    params: WeChatTurnCompletedParams
+  ): Promise<WeChatChannelOutboxItem | null> {
     if (this.isDisposed) return null;
 
     const outboxId = `out_wechat_${params.turnId}`;
@@ -481,6 +483,11 @@ export class WeChatChannelGateway {
     try {
       const isActive = await this.checkAccountActive();
       if (!isActive) return null;
+
+      // Extract only final answer text (filtering thinking/reasoning or using runtime finalText)
+      const rawFinalText = extractFinalAnswerText(params);
+      // Convert Markdown to clean plain text for WeChat IM
+      const plainText = markdownToPlainText(rawFinalText);
 
       // 1. Resolve route and recipient ID
       const route = await this.sessionRouteRepo.findById(params.sessionId);
@@ -529,7 +536,7 @@ export class WeChatChannelGateway {
           replyToNativeId: params.replyToMessageId,
           payloadJson: JSON.stringify({
             toUserId,
-            text: params.replyText,
+            text: plainText,
             turnId: params.turnId,
             error: `Missing cached context_token for recipient ${toUserId}`,
           }),
@@ -537,7 +544,7 @@ export class WeChatChannelGateway {
         });
       }
 
-      // 3. Create pending outbox item
+      // 3. Create pending outbox item with clean plain text payload
       let outboxItem = await this.channelRepo.createOutboxItem({
         id: outboxId,
         accountId: this.accountId,
@@ -547,16 +554,26 @@ export class WeChatChannelGateway {
         payloadJson: JSON.stringify({
           toUserId,
           contextToken,
-          text: params.replyText,
+          text: plainText,
           turnId: params.turnId,
         }),
         status: 'pending',
       });
 
-      // 4. Send reply via transport
+      // 4. Send reply via transport with length splitting per HappyClaw
       try {
-        const replyResult = await this.transport.sendReply(toUserId, contextToken, params.replyText);
-        if (replyResult.success) {
+        const chunks = splitTextChunks(plainText, MSG_SPLIT_LIMIT);
+        let allSuccess = true;
+
+        for (const chunk of chunks) {
+          const replyResult = await this.transport.sendReply(toUserId, contextToken, chunk);
+          if (!replyResult.success) {
+            allSuccess = false;
+            break;
+          }
+        }
+
+        if (allSuccess) {
           outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'delivered');
         } else {
           outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
