@@ -231,11 +231,12 @@ export interface FakeRemovedReactionRecord {
 }
 
 export interface FakeStreamingCallRecord {
-  readonly type: 'card_create' | 'push' | 'push_status' | 'finalize';
+  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'finalize';
   readonly cardId?: string;
   readonly messageId?: string;
   readonly content?: string;
   readonly toolStatus?: string | readonly CardToolStatusEntry[];
+  readonly thinkingText?: string;
   readonly status?: 'completed' | 'failed' | 'stopped';
   readonly metadata?: CardFinalMetadata;
   readonly card?: any;
@@ -312,6 +313,113 @@ export function buildCollapsibleStatusPanel(opts: {
   }
 
   return panel;
+}
+
+/**
+ * Build Schema 2.0 collapsible_panel element for model thinking / reasoning.
+ * Header uses "blue-50" (matching HappyClaw PANEL_TINT.thinking) or custom background_color.
+ * Title defaults to "**💭 思考过程**".
+ */
+export function buildCollapsibleThinkingPanel(opts: {
+  content: string;
+  expanded?: boolean;
+  elementId?: string;
+  contentElementId?: string;
+  title?: string;
+  backgroundColor?: string;
+}): Record<string, unknown> {
+  const panel: Record<string, unknown> = {
+    tag: 'collapsible_panel',
+    expanded: opts.expanded ?? false,
+    header: {
+      title: {
+        tag: 'markdown',
+        content: opts.title ?? '**💭 思考过程**',
+      },
+      background_color: opts.backgroundColor ?? 'blue-50',
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: opts.content,
+        ...(opts.contentElementId ? { element_id: opts.contentElementId } : {}),
+      },
+    ],
+  };
+
+  if (opts.elementId) {
+    panel.element_id = opts.elementId;
+  }
+
+  return panel;
+}
+
+export const THINKING_MAX_CONTENT_LENGTH = 3800;
+export const THINKING_TRUNCATION_NOTICE = '... (思考过程超长，已截断展示)\n\n';
+
+/**
+ * Guard thinking text to safe maximum length (default 3800 characters) for Feishu CardKit.
+ * When text exceeds maxLength, truncates and prepends a notice.
+ */
+export function applyThinkingLengthGuard(
+  text: string,
+  maxLength: number = THINKING_MAX_CONTENT_LENGTH,
+  notice: string = THINKING_TRUNCATION_NOTICE
+): string {
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+  if (notice.length >= maxLength) {
+    return text.slice(text.length - maxLength);
+  }
+  const allowed = maxLength - notice.length;
+  return notice + text.slice(text.length - allowed);
+}
+
+/**
+ * Format reasoning content during streaming (HappyClaw style).
+ * Wraps text into blockquote or summarized form with safe length cap.
+ */
+export function formatThinkingContent(text: string, maxLength: number = 2000): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "<font color='grey'>正在思考…</font>";
+  const sliced = trimmed.length > maxLength ? '…' + trimmed.slice(-(maxLength - 1)) : trimmed;
+  return sliced
+    .split('\n')
+    .map((l) => (l.trim() ? `> ${l}` : '>'))
+    .join('\n');
+}
+
+/**
+ * Strip <think>...</think> tags from text so that card body contains only the final answer.
+ */
+export function stripThinkingTags(text: string): string {
+  if (!text || !text.includes('<think>')) return text;
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/gi, '')
+    .trim();
+}
+
+/**
+ * Extract reasoning from inline <think> tags if present in text.
+ */
+export function extractThinkingFromText(text: string): { text: string; thinking?: string } {
+  if (!text || !text.includes('<think>')) return { text };
+  const thinkMatches: string[] = [];
+  let cleaned = text.replace(/<think>([\s\S]*?)<\/think>/gi, (_, p1) => {
+    if (p1.trim()) thinkMatches.push(p1.trim());
+    return '';
+  });
+  cleaned = cleaned.replace(/<think>([\s\S]*)$/gi, (_, p1) => {
+    if (p1.trim()) thinkMatches.push(p1.trim());
+    return '';
+  });
+  const thinking = thinkMatches.length > 0 ? thinkMatches.join('\n\n') : undefined;
+  return {
+    text: cleaned.trim(),
+    thinking,
+  };
 }
 
 /**
@@ -604,6 +712,8 @@ export class FakeLarkTransport implements LarkTransport {
     title?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
+    withThinkingPanel?: boolean;
+    collapsibleThinking?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
@@ -619,10 +729,23 @@ export class FakeLarkTransport implements LarkTransport {
 
     const cardId = `crd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const messageId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
     const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
     const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
 
     const initialElements: Array<Record<string, unknown>> = [];
+    if (withThinking) {
+      initialElements.push(
+        buildCollapsibleThinkingPanel({
+          content: '正在思考…',
+          expanded: true,
+          elementId: 'thinking_panel',
+          contentElementId: 'thinking_content',
+          title: '**💭 思考过程**',
+          backgroundColor: 'blue-50',
+        })
+      );
+    }
     if (withStatus) {
       initialElements.push(
         buildCollapsibleStatusPanel({
@@ -675,13 +798,14 @@ export class FakeLarkTransport implements LarkTransport {
     const session: LarkStreamingCardSession = {
       cardId,
       messageId,
-      pushText: async (accumulatedText: string, toolStatus?: string): Promise<void> => {
+      pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void> => {
         this._streamingCalls.push({
           type: 'push',
           cardId,
           messageId,
           content: accumulatedText,
           toolStatus,
+          thinkingText,
           timestamp: new Date().toISOString(),
         });
       },
@@ -694,19 +818,55 @@ export class FakeLarkTransport implements LarkTransport {
           timestamp: new Date().toISOString(),
         });
       },
+      pushThinking: async (thinkingText: string): Promise<void> => {
+        this._streamingCalls.push({
+          type: 'push_thinking',
+          cardId,
+          messageId,
+          content: thinkingText,
+          timestamp: new Date().toISOString(),
+        });
+      },
       finalize: async (
         finalText: string,
         status: 'completed' | 'failed' | 'stopped',
         metadata?: CardFinalMetadata,
-        toolStatus?: string | readonly CardToolStatusEntry[]
+        toolStatus?: string | readonly CardToolStatusEntry[],
+        thinkingText?: string
       ): Promise<void> => {
         if (this.finalizeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, this.finalizeDelayMs));
         }
-        const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
 
+        let cleanFinalText = finalText;
+        let cleanThinking = thinkingText?.trim();
+        if (cleanFinalText && cleanFinalText.includes('<think>')) {
+          const extracted = extractThinkingFromText(cleanFinalText);
+          cleanFinalText = extracted.text;
+          if (!cleanThinking && extracted.thinking) {
+            cleanThinking = extracted.thinking;
+          }
+        }
+
+        const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
+        let hasProcessArea = false;
+
+        // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
+        if (cleanThinking) {
+          const guardedThinking = applyThinkingLengthGuard(cleanThinking);
+          bodyElements.push(
+            buildCollapsibleThinkingPanel({
+              content: guardedThinking,
+              expanded: false, // collapsed on completion
+              title: '**💭 思考过程**',
+              backgroundColor: 'blue-50',
+            })
+          );
+          hasProcessArea = true;
+        }
+
+        // 2. Process panel (tool status panel)
         const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
-        let hasProcessPanel = false;
         if (formattedToolStatus) {
           bodyElements.push(
             buildCollapsibleStatusPanel({
@@ -716,7 +876,7 @@ export class FakeLarkTransport implements LarkTransport {
               backgroundColor: 'wathet-50',
             })
           );
-          hasProcessPanel = true;
+          hasProcessArea = true;
         } else if (withStatus) {
           bodyElements.push(
             buildCollapsibleStatusPanel({
@@ -726,15 +886,15 @@ export class FakeLarkTransport implements LarkTransport {
               backgroundColor: 'wathet-50',
             })
           );
-          hasProcessPanel = true;
+          hasProcessArea = true;
         }
 
-        if (hasProcessPanel) {
+        if (hasProcessArea) {
           bodyElements.push({ tag: 'hr' });
         }
 
         const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
-        const contentElements = markdownToCardElements(finalText, {
+        const contentElements = markdownToCardElements(cleanFinalText, {
           maxChunkLen: 4000,
           emptyFallback,
         });
@@ -1455,6 +1615,8 @@ export class CredentialedLarkTransport implements LarkTransport {
     title?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
+    withThinkingPanel?: boolean;
+    collapsibleThinking?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
@@ -1471,9 +1633,22 @@ export class CredentialedLarkTransport implements LarkTransport {
         return null;
       }
 
+      const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
       const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
       const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
       const initialElements: Array<Record<string, unknown>> = [];
+      if (withThinking) {
+        initialElements.push(
+          buildCollapsibleThinkingPanel({
+            content: '正在思考…',
+            expanded: true,
+            elementId: 'thinking_panel',
+            contentElementId: 'thinking_content',
+            title: '**💭 思考过程**',
+            backgroundColor: 'blue-50',
+          })
+        );
+      }
       if (withStatus) {
         initialElements.push(
           buildCollapsibleStatusPanel({
@@ -1647,7 +1822,7 @@ export class CredentialedLarkTransport implements LarkTransport {
       const session: LarkStreamingCardSession = {
         cardId,
         messageId: boundMessageId,
-        pushText: async (accumulatedText: string, toolStatus?: string): Promise<void> => {
+        pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void> => {
           try {
             const contentFn = client.cardkit?.v1?.cardElement?.content;
             if (typeof contentFn !== 'function') return;
@@ -1753,6 +1928,20 @@ export class CredentialedLarkTransport implements LarkTransport {
                 },
               });
             }
+
+            if (thinkingText) {
+              seq += 1;
+              await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: 'thinking_content',
+                },
+                data: {
+                  content: thinkingText,
+                  sequence: seq,
+                },
+              });
+            }
           } catch (err) {
             logger.warn('[lark-stream] pushText error', {
               code: (err as any)?.code,
@@ -1783,11 +1972,35 @@ export class CredentialedLarkTransport implements LarkTransport {
             });
           }
         },
+        pushThinking: async (thinkingText: string): Promise<void> => {
+          try {
+            const contentFn = client.cardkit?.v1?.cardElement?.content;
+            if (typeof contentFn !== 'function') return;
+
+            seq += 1;
+            await contentFn({
+              path: {
+                card_id: cardId,
+                element_id: 'thinking_content',
+              },
+              data: {
+                content: thinkingText,
+                sequence: seq,
+              },
+            });
+          } catch (err) {
+            logger.warn('[lark-stream] pushThinking error', {
+              code: (err as any)?.code,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        },
         finalize: async (
           finalText: string,
           status: 'completed' | 'failed' | 'stopped',
           metadata?: CardFinalMetadata,
-          toolStatus?: string | readonly CardToolStatusEntry[]
+          toolStatus?: string | readonly CardToolStatusEntry[],
+          thinkingText?: string
         ): Promise<void> => {
           // Close streaming mode via card.settings (swallow errors)
           try {
@@ -1809,11 +2022,36 @@ export class CredentialedLarkTransport implements LarkTransport {
             });
           }
 
+          let cleanFinalText = finalText;
+          let cleanThinking = thinkingText?.trim();
+          if (cleanFinalText && cleanFinalText.includes('<think>')) {
+            const extracted = extractThinkingFromText(cleanFinalText);
+            cleanFinalText = extracted.text;
+            if (!cleanThinking && extracted.thinking) {
+              cleanThinking = extracted.thinking;
+            }
+          }
+
           // Build final card JSON
           const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
+          let hasProcessArea = false;
 
+          // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
+          if (cleanThinking) {
+            const guardedThinking = applyThinkingLengthGuard(cleanThinking);
+            bodyElements.push(
+              buildCollapsibleThinkingPanel({
+                content: guardedThinking,
+                expanded: false, // collapsed on completion
+                title: '**💭 思考过程**',
+                backgroundColor: 'blue-50',
+              })
+            );
+            hasProcessArea = true;
+          }
+
+          // 2. Process panel (tool status panel)
           const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
-          let hasProcessPanel = false;
           if (formattedToolStatus) {
             bodyElements.push(
               buildCollapsibleStatusPanel({
@@ -1823,7 +2061,7 @@ export class CredentialedLarkTransport implements LarkTransport {
                 backgroundColor: 'wathet-50',
               })
             );
-            hasProcessPanel = true;
+            hasProcessArea = true;
           } else if (withStatus) {
             bodyElements.push(
               buildCollapsibleStatusPanel({
@@ -1833,15 +2071,15 @@ export class CredentialedLarkTransport implements LarkTransport {
                 backgroundColor: 'wathet-50',
               })
             );
-            hasProcessPanel = true;
+            hasProcessArea = true;
           }
 
-          if (hasProcessPanel) {
+          if (hasProcessArea) {
             bodyElements.push({ tag: 'hr' });
           }
 
           const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
-          const contentElements = markdownToCardElements(finalText, {
+          const contentElements = markdownToCardElements(cleanFinalText, {
             maxChunkLen: 4000,
             emptyFallback,
           });

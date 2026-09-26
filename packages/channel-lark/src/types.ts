@@ -165,7 +165,7 @@ export interface OutboundReplyPayload {
 
 export interface StreamAssistantEvent {
   rowId: number;
-  type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status';
+  type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status' | 'reasoning_delta' | 'thinking';
   delta?: string;
   streamId?: string;
   status?: string;
@@ -219,13 +219,15 @@ export interface OutboundReplyResult {
 export interface LarkStreamingCardSession {
   readonly cardId: string;
   readonly messageId: string;
-  pushText(accumulatedText: string, toolStatus?: string): Promise<void>;
+  pushText(accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void>;
   pushToolStatus?(statusText: string): Promise<void>;
+  pushThinking?(thinkingText: string): Promise<void>;
   finalize(
     finalText: string,
     status: 'completed' | 'failed' | 'stopped',
     metadata?: CardFinalMetadata,
-    toolStatus?: string | readonly CardToolStatusEntry[]
+    toolStatus?: string | readonly CardToolStatusEntry[],
+    thinkingText?: string
   ): Promise<void>;
 }
 
@@ -254,9 +256,13 @@ export interface LarkTransport {
     title?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
+    withThinkingPanel?: boolean;
+    collapsibleThinking?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
+    enableCot?: boolean;
+    cotEnabled?: boolean;
   }): Promise<LarkStreamingCardSession | null>;
   addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;

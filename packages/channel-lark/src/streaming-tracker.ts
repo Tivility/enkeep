@@ -13,7 +13,12 @@ import type {
   LarkTransport,
   StreamEventSource,
 } from './types.js';
-import { formatToolStatusMarkdown } from './transport.js';
+import {
+  formatToolStatusMarkdown,
+  formatThinkingContent,
+  stripThinkingTags,
+  extractThinkingFromText,
+} from './transport.js';
 
 export const STREAMING_MAX_CONTENT_LENGTH = 3800;
 export const STREAMING_MAX_LENGTH = STREAMING_MAX_CONTENT_LENGTH;
@@ -47,9 +52,13 @@ export interface StreamingReplyTrackerCardParams {
   title?: string;
   withStatusPanel?: boolean;
   collapsibleToolStatus?: boolean;
+  withThinkingPanel?: boolean;
+  collapsibleThinking?: boolean;
   withStopButton?: boolean;
   turnId?: string;
   sessionId?: string;
+  enableCot?: boolean;
+  cotEnabled?: boolean;
 }
 
 export interface StreamingReplyTrackerOptions {
@@ -67,8 +76,13 @@ export interface StreamingReplyTrackerOptions {
   metadata?: CardFinalMetadata;
   withStatusPanel?: boolean;
   collapsibleToolStatus?: boolean;
+  withThinkingPanel?: boolean;
+  collapsibleThinking?: boolean;
   withStopButton?: boolean;
   senderId?: string;
+  enableCot?: boolean;
+  cotEnabled?: boolean;
+  isCotEnabled?: (chatId?: string) => boolean;
 }
 
 /**
@@ -295,8 +309,12 @@ export class StreamingReplyTracker {
   private cursor = 0;
   private accumulatedText = '';
   private lastPushedText = '';
+  private accumulatedThinking = '';
+  private lastPushedThinking = '';
   private readonly runningTools = new Map<string, number>();
   private readonly withStatusPanel: boolean;
+  private readonly withThinkingPanel: boolean;
+  private readonly isCotActive: boolean;
   private readonly toolStatusEntries: CardToolStatusEntry[] = [];
   private lastPushedToolStatus = '';
   private currentStreamId: string | null = null;
@@ -320,6 +338,33 @@ export class StreamingReplyTracker {
     this.initialMetadata = options.metadata;
     this.withStopButton = options.withStopButton ?? options.cardParams?.withStopButton;
     this.senderId = options.senderId;
+
+    const chatId = options.cardParams?.chatId;
+    const cotOption =
+      options.enableCot ??
+      options.cotEnabled ??
+      options.cardParams?.enableCot ??
+      options.cardParams?.cotEnabled;
+    const cotChatCheck =
+      typeof options.isCotEnabled === 'function'
+        ? options.isCotEnabled(chatId)
+        : typeof (options.transport as any)?.isCotEnabledForChat === 'function'
+          ? (options.transport as any).isCotEnabledForChat(chatId)
+          : typeof (options.transport as any)?.cotManager?.isCotEnabledForChat === 'function'
+            ? (options.transport as any).cotManager.isCotEnabledForChat(chatId)
+            : undefined;
+
+    this.isCotActive = Boolean(cotOption ?? cotChatCheck ?? false);
+
+    this.withThinkingPanel = Boolean(
+      !this.isCotActive &&
+      (options.withThinkingPanel ??
+        options.collapsibleThinking ??
+        options.cardParams?.withThinkingPanel ??
+        options.cardParams?.collapsibleThinking ??
+        true)
+    );
+
     this.withStatusPanel = Boolean(
       options.withStatusPanel ??
       options.collapsibleToolStatus ??
@@ -342,6 +387,14 @@ export class StreamingReplyTracker {
 
   getAccumulatedText(): string {
     return this.accumulatedText;
+  }
+
+  getAccumulatedThinking(): string {
+    return this.accumulatedThinking;
+  }
+
+  isCotActiveForTurn(): boolean {
+    return this.isCotActive;
   }
 
   getToolStatusEntries(): readonly CardToolStatusEntry[] {
@@ -382,6 +435,7 @@ export class StreamingReplyTracker {
       const cardParams = {
         ...this.cardParams,
         ...(this.withStatusPanel ? { withStatusPanel: true } : {}),
+        ...(this.withThinkingPanel ? { withThinkingPanel: true } : {}),
         withStopButton: this.withStopButton ?? this.cardParams?.withStopButton,
         turnId: this.turnId ?? this.cardParams?.turnId,
         sessionId: this.sessionRouteId ?? this.cardParams?.sessionId,
@@ -427,7 +481,7 @@ export class StreamingReplyTracker {
   private processEvents(
     events: Array<{
       rowId: number;
-      type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status';
+      type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status' | 'reasoning_delta' | 'thinking';
       delta?: string;
       streamId?: string;
       status?: string;
@@ -449,7 +503,9 @@ export class StreamingReplyTracker {
         this.cursor = evt.rowId;
       }
 
-      if (evt.type === 'assistant_delta' && typeof evt.delta === 'string') {
+      if ((evt.type === 'reasoning_delta' || (evt as any).type === 'thinking') && typeof evt.delta === 'string') {
+        this.accumulatedThinking += evt.delta;
+      } else if (evt.type === 'assistant_delta' && typeof evt.delta === 'string') {
         const streamId = evt.streamId;
         // When a new streamId starts after a stream_end, append paragraph break (\n\n) between segments
         if (
@@ -588,6 +644,18 @@ export class StreamingReplyTracker {
         // Wait for card session to be available if still pending
         const session = this.cardSession ?? (await this.cardSessionPromise);
         if (session && !this.isStopped) {
+          let thinkingToPush: string | undefined;
+          if (!this.isCotActive && this.accumulatedThinking.trim().length > 0) {
+            const formattedThinking = formatThinkingContent(this.accumulatedThinking);
+            if (formattedThinking !== this.lastPushedThinking) {
+              this.lastPushedThinking = formattedThinking;
+              thinkingToPush = formattedThinking;
+              if (this.withThinkingPanel && typeof session.pushThinking === 'function') {
+                await session.pushThinking(formattedThinking);
+              }
+            }
+          }
+
           if (this.withStatusPanel) {
             const statusMarkdown = formatToolStatusMarkdown(this.toolStatusEntries);
             if (statusMarkdown && statusMarkdown !== this.lastPushedToolStatus) {
@@ -597,21 +665,23 @@ export class StreamingReplyTracker {
               }
             }
 
-            const textToPush = applyStreamingLengthGuard(this.accumulatedText, this.maxStreamingLength);
+            const cleanText = stripThinkingTags(this.accumulatedText);
+            const textToPush = applyStreamingLengthGuard(cleanText, this.maxStreamingLength);
             if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
               this.lastPushedText = textToPush;
-              await session.pushText(textToPush, statusMarkdown ?? undefined);
+              await session.pushText(textToPush, statusMarkdown ?? undefined, thinkingToPush);
             }
           } else {
             const subagentCount = this.runningTools.get('subagent') ?? 0;
+            const cleanText = stripThinkingTags(this.accumulatedText);
             const rawTextToPush =
               subagentCount > 0
-                ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
-                : this.accumulatedText;
+                ? `${cleanText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
+                : cleanText;
             const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
             if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
               this.lastPushedText = textToPush;
-              await session.pushText(textToPush);
+              await session.pushText(textToPush, undefined, thinkingToPush);
             }
           }
         }
@@ -689,7 +759,8 @@ export class StreamingReplyTracker {
     finalText: string,
     status: 'completed' | 'failed' | 'stopped',
     metadata?: CardFinalMetadata,
-    toolStatus?: string | readonly CardToolStatusEntry[]
+    toolStatus?: string | readonly CardToolStatusEntry[],
+    thinkingText?: string
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
     if (this.finalizedResult) {
       return this.finalizedResult;
@@ -736,6 +807,19 @@ export class StreamingReplyTracker {
         if (terminalStatus) {
           this.terminalReached = true;
         }
+
+        let thinkingToPush: string | undefined;
+        if (!this.isCotActive && this.accumulatedThinking.trim().length > 0) {
+          const formattedThinking = formatThinkingContent(this.accumulatedThinking);
+          if (formattedThinking !== this.lastPushedThinking) {
+            this.lastPushedThinking = formattedThinking;
+            thinkingToPush = formattedThinking;
+            if (this.withThinkingPanel && typeof session.pushThinking === 'function') {
+              await session.pushThinking(formattedThinking);
+            }
+          }
+        }
+
         if (this.withStatusPanel) {
           const statusMarkdown = formatToolStatusMarkdown(this.toolStatusEntries);
           if (statusMarkdown && statusMarkdown !== this.lastPushedToolStatus) {
@@ -744,31 +828,49 @@ export class StreamingReplyTracker {
               await session.pushToolStatus(statusMarkdown);
             }
           }
-          const textToPush = applyStreamingLengthGuard(this.accumulatedText, this.maxStreamingLength);
+          const cleanText = stripThinkingTags(this.accumulatedText);
+          const textToPush = applyStreamingLengthGuard(cleanText, this.maxStreamingLength);
           if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
             this.lastPushedText = textToPush;
-            await session.pushText(textToPush, statusMarkdown ?? undefined);
+            await session.pushText(textToPush, statusMarkdown ?? undefined, thinkingToPush);
           }
         } else {
           const subagentCount = this.runningTools.get('subagent') ?? 0;
+          const cleanText = stripThinkingTags(this.accumulatedText);
           const rawTextToPush =
             subagentCount > 0
-              ? `${this.accumulatedText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
-              : this.accumulatedText;
+              ? `${cleanText}\n\n---\n⏳ 后台任务运行中：subagent ×${subagentCount}`
+              : cleanText;
           const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
           if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
             this.lastPushedText = textToPush;
-            await session.pushText(textToPush);
+            await session.pushText(textToPush, undefined, thinkingToPush);
           }
         }
       } catch {}
     }
 
-    const textToFinalize =
+    let textToFinalize =
       finalText ||
       this.accumulatedText ||
       (status === 'failed' ? 'Execution failed' : status === 'stopped' ? '(已停止回复)' : '');
     const finalMetadata = await this.resolveMetadata(metadata);
+
+    let finalThinking: string | undefined;
+    if (!this.isCotActive) {
+      finalThinking =
+        thinkingText !== undefined
+          ? thinkingText
+          : this.accumulatedThinking.trim().length > 0
+            ? this.accumulatedThinking
+            : undefined;
+    }
+
+    const extracted = extractThinkingFromText(textToFinalize);
+    textToFinalize = extracted.text;
+    if (!this.isCotActive && !finalThinking && extracted.thinking) {
+      finalThinking = extracted.thinking;
+    }
 
     // If turn completed or stopped, settle any remaining running tool entries
     if (status === 'completed' || status === 'stopped') {
@@ -790,7 +892,7 @@ export class StreamingReplyTracker {
           : undefined;
 
     try {
-      await session.finalize(textToFinalize, status, finalMetadata, finalToolStatus);
+      await session.finalize(textToFinalize, status, finalMetadata, finalToolStatus, finalThinking);
       const res = { handled: true, messageId: session.messageId };
       this.finalizedResult = res;
       if (this.detached) {
@@ -846,7 +948,8 @@ export class StreamingReplyTracker {
     finalText: string,
     status: 'completed' | 'failed' | 'stopped',
     metadata?: CardFinalMetadata,
-    toolStatus?: string | readonly CardToolStatusEntry[]
+    toolStatus?: string | readonly CardToolStatusEntry[],
+    thinkingText?: string
   ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
     if (this.finalizedResult) {
       return this.finalizedResult;
@@ -859,6 +962,6 @@ export class StreamingReplyTracker {
       } catch {}
     }
 
-    return this.doFinalize(finalText, status, metadata, toolStatus);
+    return this.doFinalize(finalText, status, metadata, toolStatus, thinkingText);
   }
 }
