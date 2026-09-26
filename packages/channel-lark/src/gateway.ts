@@ -1191,6 +1191,7 @@ export class LarkChannelGateway {
           initialCursor,
           turnId: dispatchResult.turnId,
           senderId: parsed.senderId,
+          withStatusPanel: true,
           cardParams: {
             chatId: parsed.chatId,
             replyToMessageId: parsed.messageId,
@@ -1198,6 +1199,7 @@ export class LarkChannelGateway {
             threadId: parsed.threadId,
             turnId: dispatchResult.turnId,
             sessionId: route.id,
+            withStatusPanel: true,
           },
         });
         tracker.start();
@@ -1448,7 +1450,13 @@ export class LarkChannelGateway {
         currentText && currentText.trim().length > 0
           ? `${currentText}\n\n*(已停止回复)*`
           : '(已停止回复)';
-      await tracker.finalize(stoppedText, 'stopped');
+      const toolStatus = tracker.getToolStatusEntries();
+      await tracker.finalize(
+        stoppedText,
+        'stopped',
+        undefined,
+        toolStatus.length > 0 ? toolStatus : undefined
+      );
       tracker.stop();
     }
 
@@ -1580,7 +1588,13 @@ export class LarkChannelGateway {
     let streamingHandled = false;
     let streamingMessageId: string | undefined;
     if (tracker) {
-      const r = await tracker.finalize(params.replyText, 'completed');
+      const toolStatus = tracker.getToolStatusEntries();
+      const r = await tracker.finalize(
+        params.replyText,
+        'completed',
+        undefined,
+        toolStatus.length > 0 ? toolStatus : undefined
+      );
       if (r.handled) {
         streamingHandled = true;
         streamingMessageId = r.messageId;
@@ -1962,7 +1976,13 @@ export class LarkChannelGateway {
     let streamingHandled = false;
     let streamingMessageId: string | undefined;
     if (tracker) {
-      const r = await tracker.finalize(errorReplyText, 'failed');
+      const toolStatus = tracker.getToolStatusEntries();
+      const r = await tracker.finalize(
+        errorReplyText,
+        'failed',
+        undefined,
+        toolStatus.length > 0 ? toolStatus : undefined
+      );
       if (r.handled) {
         streamingHandled = true;
         streamingMessageId = r.messageId;

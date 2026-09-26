@@ -363,9 +363,9 @@ export function formatCardUsageFooter(metadata?: CardFinalMetadata): string | nu
   }
 
   // 3. Tokens (prompt + completion or total)
-  const hasPrompt = typeof metadata.promptTokens === 'number' && Number.isFinite(metadata.promptTokens) && metadata.promptTokens >= 0;
-  const hasCompletion = typeof metadata.completionTokens === 'number' && Number.isFinite(metadata.completionTokens) && metadata.completionTokens >= 0;
-  const hasTotal = typeof metadata.totalTokens === 'number' && Number.isFinite(metadata.totalTokens) && metadata.totalTokens >= 0;
+  const hasPrompt = typeof metadata.promptTokens === 'number' && Number.isFinite(metadata.promptTokens) && metadata.promptTokens > 0;
+  const hasCompletion = typeof metadata.completionTokens === 'number' && Number.isFinite(metadata.completionTokens) && metadata.completionTokens > 0;
+  const hasTotal = typeof metadata.totalTokens === 'number' && Number.isFinite(metadata.totalTokens) && metadata.totalTokens > 0;
 
   if (hasPrompt && hasCompletion) {
     parts.push(`💡 ${metadata.promptTokens}+${metadata.completionTokens} tokens`);
@@ -378,7 +378,7 @@ export function formatCardUsageFooter(metadata?: CardFinalMetadata): string | nu
   }
 
   // 4. Cost (only if available from existing turn metadata; no fabricated numbers)
-  if (typeof metadata.cost === 'number' && Number.isFinite(metadata.cost) && metadata.cost >= 0) {
+  if (typeof metadata.cost === 'number' && Number.isFinite(metadata.cost) && metadata.cost > 0) {
     const formattedCost = Number.isInteger(metadata.cost)
       ? String(metadata.cost)
       : String(Number(metadata.cost.toFixed(4)));
@@ -706,6 +706,7 @@ export class FakeLarkTransport implements LarkTransport {
         const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
 
         const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
+        let hasProcessPanel = false;
         if (formattedToolStatus) {
           bodyElements.push(
             buildCollapsibleStatusPanel({
@@ -715,6 +716,7 @@ export class FakeLarkTransport implements LarkTransport {
               backgroundColor: 'wathet-50',
             })
           );
+          hasProcessPanel = true;
         } else if (withStatus) {
           bodyElements.push(
             buildCollapsibleStatusPanel({
@@ -724,6 +726,11 @@ export class FakeLarkTransport implements LarkTransport {
               backgroundColor: 'wathet-50',
             })
           );
+          hasProcessPanel = true;
+        }
+
+        if (hasProcessPanel) {
+          bodyElements.push({ tag: 'hr' });
         }
 
         const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
@@ -746,6 +753,7 @@ export class FakeLarkTransport implements LarkTransport {
         if (footer) {
           bodyElements.push({
             tag: 'markdown',
+            text_size: 'notation',
             content: footer,
           });
         }
@@ -755,8 +763,8 @@ export class FakeLarkTransport implements LarkTransport {
           header:
             status === 'completed'
               ? {
-                  title: { tag: 'plain_text', content: params.title ?? 'Enkeep' },
-                  template: 'green',
+                  title: { tag: 'plain_text', content: params.title ?? '已完成' },
+                  template: 'violet',
                 }
               : status === 'stopped'
                 ? {
@@ -764,10 +772,13 @@ export class FakeLarkTransport implements LarkTransport {
                       tag: 'plain_text',
                       content: params.title ? `${params.title} (已中止)` : '已中止',
                     },
-                    template: 'grey',
+                    template: 'orange',
                   }
                 : {
-                    title: { tag: 'plain_text', content: '处理失败' },
+                    title: {
+                      tag: 'plain_text',
+                      content: params.title ? `${params.title} (处理失败)` : '处理失败',
+                    },
                     template: 'red',
                   },
           body: {
@@ -1802,6 +1813,7 @@ export class CredentialedLarkTransport implements LarkTransport {
           const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
 
           const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
+          let hasProcessPanel = false;
           if (formattedToolStatus) {
             bodyElements.push(
               buildCollapsibleStatusPanel({
@@ -1811,6 +1823,7 @@ export class CredentialedLarkTransport implements LarkTransport {
                 backgroundColor: 'wathet-50',
               })
             );
+            hasProcessPanel = true;
           } else if (withStatus) {
             bodyElements.push(
               buildCollapsibleStatusPanel({
@@ -1820,6 +1833,11 @@ export class CredentialedLarkTransport implements LarkTransport {
                 backgroundColor: 'wathet-50',
               })
             );
+            hasProcessPanel = true;
+          }
+
+          if (hasProcessPanel) {
+            bodyElements.push({ tag: 'hr' });
           }
 
           const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
@@ -1842,6 +1860,7 @@ export class CredentialedLarkTransport implements LarkTransport {
           if (footer) {
             bodyElements.push({
               tag: 'markdown',
+              text_size: 'notation',
               content: footer,
             });
           }
@@ -1851,8 +1870,8 @@ export class CredentialedLarkTransport implements LarkTransport {
             header:
               status === 'completed'
                 ? {
-                    title: { tag: 'plain_text', content: params.title ?? 'Enkeep' },
-                    template: 'green',
+                    title: { tag: 'plain_text', content: params.title ?? '已完成' },
+                    template: 'violet',
                   }
                 : status === 'stopped'
                   ? {
@@ -1860,10 +1879,13 @@ export class CredentialedLarkTransport implements LarkTransport {
                         tag: 'plain_text',
                         content: params.title ? `${params.title} (已中止)` : '已中止',
                       },
-                      template: 'grey',
+                      template: 'orange',
                     }
                   : {
-                      title: { tag: 'plain_text', content: '处理失败' },
+                      title: {
+                        tag: 'plain_text',
+                        content: params.title ? `${params.title} (处理失败)` : '处理失败',
+                      },
                       template: 'red',
                     },
             body: {

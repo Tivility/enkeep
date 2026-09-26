@@ -239,7 +239,7 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       expect(calls.cardUpdate[0].data.sequence).toBe(5);
       const finalCardData = JSON.parse(calls.cardUpdate[0].data.card.data);
       expect(finalCardData.schema).toBe('2.0');
-      expect(finalCardData.header.template).toBe('green');
+      expect(finalCardData.header.template).toBe('violet');
       expect(finalCardData.header.title.content).toBe('Custom Title');
       // Body headings should be demoted
       expect(finalCardData.body.elements[0].content).toContain('#### Final Answer Header');
@@ -317,7 +317,7 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       expect(calls.imPatch.length).toBe(1);
       expect(calls.imPatch[0].path.message_id).toBe('om_reply_mock_67890');
       const patchedCard = JSON.parse(calls.imPatch[0].data.content);
-      expect(patchedCard.header.template).toBe('green');
+      expect(patchedCard.header.template).toBe('violet');
       expect(patchedCard.body.elements[0].content).toBe('Fallback answer');
     });
 
@@ -678,7 +678,7 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       expect(calls.cardUpdate.length).toBe(1);
       const finalCard = JSON.parse(calls.cardUpdate[0].data.card.data);
       expect(finalCard.schema).toBe('2.0');
-      expect(finalCard.header.template).toBe('green');
+      expect(finalCard.header.template).toBe('violet');
       const finalElements = finalCard.body.elements;
 
       // Element 0: Collapsed tool status panel ABOVE answer
@@ -687,13 +687,17 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       expect(finalElements[0].header.background_color).toBe('wathet-50');
       expect(finalElements[0].elements[0].content).toContain('✅ **web_search**: 已完成');
 
-      // Element 1: Final answer content
-      expect(finalElements[1].tag).toBe('markdown');
-      expect(finalElements[1].content).toBe('Here is the completed final answer');
+      // Element 1: Divider hr
+      expect(finalElements[1].tag).toBe('hr');
 
-      // Element 2: Usage footer
+      // Element 2: Final answer content
       expect(finalElements[2].tag).toBe('markdown');
-      expect(finalElements[2].content).toContain("🤖 deepseek-chat · ⏱ 2.5s · 💡 120 tokens");
+      expect(finalElements[2].content).toBe('Here is the completed final answer');
+
+      // Element 3: Usage footer with notation text_size
+      expect(finalElements[3].tag).toBe('markdown');
+      expect(finalElements[3].text_size).toBe('notation');
+      expect(finalElements[3].content).toContain("🤖 deepseek-chat · ⏱ 2.5s · 💡 120 tokens");
     });
 
     it('FakeLarkTransport: withStatusPanel produces Schema 2.0 collapsible_panel above answer collapsed on completion', async () => {
@@ -719,15 +723,17 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       expect(finalizeCall?.card).toBeDefined();
 
       const elements = finalizeCall?.card.body.elements;
-      expect(elements.length).toBe(2);
+      expect(elements.length).toBe(3);
       // Panel is above answer
       expect(elements[0].tag).toBe('collapsible_panel');
       expect(elements[0].expanded).toBe(false);
       expect(elements[0].header.background_color).toBe('wathet-50');
       expect(elements[0].elements[0].content).toContain('🤖 **subagent**: 已完成');
+      // Divider hr
+      expect(elements[1].tag).toBe('hr');
       // Answer
-      expect(elements[1].tag).toBe('markdown');
-      expect(elements[1].content).toBe('Final report');
+      expect(elements[2].tag).toBe('markdown');
+      expect(elements[2].content).toBe('Final report');
     });
 
     it('StreamingReplyTracker: live tool calls update status panel and card finalizes collapsed above answer', async () => {
@@ -818,13 +824,17 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
         expect(finalElements[0].elements[0].content).toContain('✅ **web_search**: 已完成');
         expect(finalElements[0].elements[0].content).toContain('🤖 **subagent**: 已完成');
 
-        // 1: Main answer
-        expect(finalElements[1].tag).toBe('markdown');
-        expect(finalElements[1].content).toBe('Final polished answer');
+        // 1: Divider hr
+        expect(finalElements[1].tag).toBe('hr');
 
-        // 2: Footer
+        // 2: Main answer
         expect(finalElements[2].tag).toBe('markdown');
-        expect(finalElements[2].content).toContain('🤖 gpt-4o · ⏱ 3.1s');
+        expect(finalElements[2].content).toBe('Final polished answer');
+
+        // 3: Footer
+        expect(finalElements[3].tag).toBe('markdown');
+        expect(finalElements[3].text_size).toBe('notation');
+        expect(finalElements[3].content).toContain('🤖 gpt-4o · ⏱ 3.1s');
       } finally {
         vi.useRealTimers();
       }
@@ -870,7 +880,7 @@ All criteria met.
       expect(calls.cardUpdate.length).toBe(1);
       const finalCard = JSON.parse(calls.cardUpdate[0].data.card.data);
       expect(finalCard.schema).toBe('2.0');
-      expect(finalCard.header.template).toBe('green');
+      expect(finalCard.header.template).toBe('violet');
 
       const elements = finalCard.body.elements;
       // Should have: [markdown (summary), table, markdown (closing)]
@@ -960,14 +970,18 @@ All criteria met.
       expect(elements[0].tag).toBe('collapsible_panel');
       expect(elements[0].expanded).toBe(false);
 
-      // 1: C5 Native table
-      expect(elements[1].tag).toBe('table');
-      expect(elements[1].columns).toHaveLength(2);
-      expect(elements[1].rows).toHaveLength(2);
+      // 1: Divider hr
+      expect(elements[1].tag).toBe('hr');
 
-      // 2: C2 Usage footer
-      expect(elements[2].tag).toBe('markdown');
-      expect(elements[2].content).toContain('🤖 deepseek-chat · ⏱ 1.5s · 💡 50 tokens');
+      // 2: C5 Native table
+      expect(elements[2].tag).toBe('table');
+      expect(elements[2].columns).toHaveLength(2);
+      expect(elements[2].rows).toHaveLength(2);
+
+      // 3: C2 Usage footer
+      expect(elements[3].tag).toBe('markdown');
+      expect(elements[3].text_size).toBe('notation');
+      expect(elements[3].content).toContain('🤖 deepseek-chat · ⏱ 1.5s · 💡 50 tokens');
     });
 
     it('FakeLarkTransport: finalize generates native table element in recorded card', async () => {

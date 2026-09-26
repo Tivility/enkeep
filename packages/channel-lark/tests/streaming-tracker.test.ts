@@ -782,7 +782,7 @@ describe('StreamingReplyTracker', () => {
 
       expect(updatedCardData).toBeDefined();
       expect(updatedCardData.schema).toBe('2.0');
-      expect(updatedCardData.header.template).toBe('green');
+      expect(updatedCardData.header.template).toBe('violet');
 
       const elements = updatedCardData.body.elements;
       expect(elements.length).toBe(2);

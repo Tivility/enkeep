@@ -1388,11 +1388,11 @@ describe('Lark Channel Closed-Loop Communication', () => {
       // Assert runtime cancellation API was invoked
       expect(cancelTurnCalledWith).not.toBeNull();
 
-      // Assert card is updated to stopped state with grey header and '已中止'
+      // Assert card is updated to stopped state with orange header and '已中止'
       const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
       expect(finalizeCall).toBeDefined();
       expect(finalizeCall?.status).toBe('stopped');
-      expect(finalizeCall?.card.header.template).toBe('grey');
+      expect(finalizeCall?.card.header.template).toBe('orange');
       expect(finalizeCall?.card.header.title.content).toContain('已中止');
       // Assert stop button is stripped from final stopped card
       const finalElements = finalizeCall?.card.body.elements;

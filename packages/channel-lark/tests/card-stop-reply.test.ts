@@ -113,7 +113,7 @@ describe('C3: Feishu Streaming Card Stop-Reply Button & Authorization (card-stop
       const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
       expect(finalizeCall).toBeDefined();
       expect(finalizeCall?.status).toBe('stopped');
-      expect(finalizeCall?.card.header.template).toBe('grey');
+      expect(finalizeCall?.card.header.template).toBe('orange');
       expect(finalizeCall?.card.header.title.content).toBe('Assistant (已中止)');
       // Statically stripped stop button
       const finalElements = finalizeCall?.card.body.elements;

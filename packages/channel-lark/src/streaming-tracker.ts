@@ -785,7 +785,7 @@ export class StreamingReplyTracker {
     const finalToolStatus =
       toolStatus !== undefined
         ? toolStatus
-        : this.withStatusPanel && this.toolStatusEntries.length > 0
+        : this.toolStatusEntries.length > 0
           ? this.toolStatusEntries
           : undefined;
 
