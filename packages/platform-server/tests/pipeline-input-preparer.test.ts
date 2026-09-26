@@ -10,6 +10,7 @@ import {
 } from '@enkeep/platform-storage-sqlite';
 import {
   PipelineTaskInputPreparerService,
+  computeLosAngelesCompletedSevenDays,
   type PipelinePreparationRegistration,
 } from '../src/tasks/pipeline-input-preparer.js';
 import {
@@ -597,5 +598,199 @@ describe('Pipeline Task Input Preparer Service & Staging Contract', () => {
         signal: new AbortController().signal,
       })
     ).rejects.toThrow(/path traversal/i);
+  });
+
+  it('11. Prepared message records include source space folder and spaceId attribution', async () => {
+    // Setup a secondary space for Alice
+    const secondarySpaceId = 'spc_11111111111111111111111111111112';
+    const secondarySessionId = 'ses_11111111111111111111111111111112';
+    await storage.forTenant(tenantAlice).spaces.create({
+      id: secondarySpaceId,
+      name: 'Secondary Alice Space',
+      folder: 'space-alice-secondary',
+      executionMode: 'host',
+    });
+    await storage.forTenant(tenantAlice).sessionRoutes.create({
+      id: secondarySessionId,
+      spaceId: secondarySpaceId,
+      channel: 'web',
+      accountId: 'web-user',
+      nativeContextId: secondarySessionId,
+      peerId: 'peer_alice_2',
+      dshSessionId: 'ses_1234567890abcdef1234567890abcdef2',
+      executionMode: 'host',
+    });
+
+    const nowIso = '2026-09-10T12:30:00.000Z';
+    db.prepare(`
+      INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, created_at)
+      VALUES ('msg_sec_0001', ?, ?, 'user', 'Secondary space message', 'delivered', 'rt_sec', 'turn_sec', ?)
+    `).run(secondarySessionId, tenantAlice, nowIso);
+
+    const preparer = new PipelineTaskInputPreparerService({
+      database: db,
+      fileService: fakeFileService as any,
+    });
+
+    const pipelineTaskId = 'task_00000000000000000000000000000011';
+    preparer.registerCapability(pipelineTaskId, {
+      capability: 'pipeline_observation',
+      targetSpaceId: aliceSpaceId,
+      sourceSpaceIds: [aliceSpaceId, secondarySpaceId],
+    });
+
+    const runId = 'run_attr_test_0000000000000000001';
+    const res = await preparer.prepare({
+      task: { id: pipelineTaskId } as any,
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Attribution test',
+        sessionId: aliceSessionId,
+        sessionPolicy: 'existing_session',
+        spaceId: aliceSpaceId,
+      },
+      tenantId: tenantAlice,
+      runId,
+      signal: new AbortController().signal,
+    });
+
+    const fileKey = `${tenantAlice}:${aliceSpaceId}:${res?.stagedPath}`;
+    expect(writtenFiles.has(fileKey)).toBe(true);
+
+    const envelope = JSON.parse(writtenFiles.get(fileKey)!);
+    expect(envelope.capability).toBe('pipeline_observation');
+    expect(envelope.recordsCount).toBe(4); // 3 from aliceSpaceId + 1 from secondarySpaceId
+
+    // Verify messages from primary space
+    const primaryRecs = envelope.records.filter((r: any) => r.spaceId === aliceSpaceId);
+    expect(primaryRecs).toHaveLength(3);
+    for (const r of primaryRecs) {
+      expect(r.spaceId).toBe(aliceSpaceId);
+      expect(r.folder).toBe('space-alice-pipe');
+      expect(r.sessionId).toBe(aliceSessionId);
+    }
+
+    // Verify message from secondary space
+    const secRec = envelope.records.find((r: any) => r.id === 'msg_sec_0001');
+    expect(secRec).toBeDefined();
+    expect(secRec.spaceId).toBe(secondarySpaceId);
+    expect(secRec.folder).toBe('space-alice-secondary');
+    expect(secRec.sessionId).toBe(secondarySessionId);
+  });
+
+  it('12. Weekly aggregation splits observations by markdown date headings (## YYYY-MM-DD), preserves date headers and bounded window', async () => {
+    const { sinceDate } = computeLosAngelesCompletedSevenDays();
+
+    // Calculate dates inside and outside window
+    const [y, m, d] = sinceDate.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + 2); // 2 days after sinceDate: inside window
+    const inWindowDate1 = dt.toISOString().slice(0, 10);
+    dt.setUTCDate(dt.getUTCDate() + 2); // 4 days after sinceDate: inside window
+    const inWindowDate2 = dt.toISOString().slice(0, 10);
+    dt.setUTCDate(dt.getUTCDate() - 10); // before sinceDate: outside window
+    const outsideWindowOldDate = dt.toISOString().slice(0, 10);
+
+    const rawObsContent = `# 认知模式观察
+
+Preamble reflection that should not be considered an observation section
+
+## ${outsideWindowOldDate}
+
+### 观察 0 (Old)
+- **类别**：决策模式
+- **观察**：Old observation from 2 weeks ago outside lookback window.
+
+## ${inWindowDate1}
+
+### 观察 1 (Valid)
+- **类别**：思考路径
+- **观察**：In-window valid pattern observation.
+- **原话**："Let us test the bounded window."
+- **置信度**：高
+
+### 观察 2 (Valid)
+- **类别**：反应模式
+- **观察**：Another valid observation under same heading.
+
+## ${inWindowDate2}
+
+### 观察 3 (Valid)
+- **类别**：语言与沟通
+- **观察**：Recent in-window observation.
+`;
+
+    // Write observations.md and buffers in Alice space
+    writtenFiles.set(`${tenantAlice}:${aliceSpaceId}:observations.md`, rawObsContent);
+    writtenFiles.set(`${tenantAlice}:${aliceSpaceId}:pipeline/knowledge-buffer.md`, '# Knowledge\n- Item 1\n');
+    writtenFiles.set(`${tenantAlice}:${aliceSpaceId}:pipeline/interaction-buffer.md`, '# Interaction\n- Rule 1\n');
+
+    const fakeMemoryReader = async (_tenantId: string, filePath: string) => {
+      return `# Memory ${filePath}\n`;
+    };
+
+    const preparer = new PipelineTaskInputPreparerService({
+      database: db,
+      fileService: fakeFileService as any,
+      readTenantMemory: fakeMemoryReader as any,
+    });
+
+    const pipelineTaskId = 'task_00000000000000000000000000000012';
+    preparer.registerCapability(pipelineTaskId, {
+      capability: 'pipeline_aggregation',
+      targetSpaceId: aliceSpaceId,
+      sourceSpaceIds: [aliceSpaceId],
+      checkpointPath: 'pipeline/.weekly-checkpoint',
+      stagedInputPrefix: 'pipeline/inputs',
+    });
+
+    const runId = 'run_weekly_split_test_0000000001';
+    const res = await preparer.prepare({
+      task: { id: pipelineTaskId } as any,
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Weekly aggregation test',
+        sessionId: aliceSessionId,
+        sessionPolicy: 'existing_session',
+        spaceId: aliceSpaceId,
+      },
+      tenantId: tenantAlice,
+      runId,
+      signal: new AbortController().signal,
+    });
+
+    const fileKey = `${tenantAlice}:${aliceSpaceId}:${res?.stagedPath}`;
+    expect(writtenFiles.has(fileKey)).toBe(true);
+    const envelope = JSON.parse(writtenFiles.get(fileKey)!);
+    expect(envelope.capability).toBe('pipeline_aggregation');
+
+    // Exactly 2 sections in window (inWindowDate1 and inWindowDate2)
+    expect(envelope.sections.observations.totalObservationsCount).toBe(2);
+
+    const obsKey = `${tenantAlice}:${aliceSpaceId}:pipeline/inputs/${runId}/observations.json`;
+    expect(writtenFiles.has(obsKey)).toBe(true);
+    const stagedObs = JSON.parse(writtenFiles.get(obsKey)!);
+    expect(stagedObs).toHaveLength(1); // 1 space
+    expect(stagedObs[0].spaceId).toBe(aliceSpaceId);
+    expect(stagedObs[0].folder).toBe('space-alice-pipe');
+    expect(stagedObs[0].observations).toHaveLength(2);
+
+    // Section 1 preserves ## date heading and its observations
+    const sec1 = stagedObs[0].observations[0];
+    expect(sec1).toContain(`## ${inWindowDate1}`);
+    expect(sec1).toContain('### 观察 1 (Valid)');
+    expect(sec1).toContain('### 观察 2 (Valid)');
+    expect(sec1).toContain('Let us test the bounded window.');
+
+    // Section 2 preserves ## date heading and its observation
+    const sec2 = stagedObs[0].observations[1];
+    expect(sec2).toContain(`## ${inWindowDate2}`);
+    expect(sec2).toContain('### 观察 3 (Valid)');
+
+    // Outside window date and preamble are NOT included
+    const allStagedObsStr = JSON.stringify(stagedObs);
+    expect(allStagedObsStr).not.toContain(outsideWindowOldDate);
+    expect(allStagedObsStr).not.toContain('Old observation from 2 weeks ago');
+    expect(allStagedObsStr).not.toContain('Preamble reflection');
   });
 });
