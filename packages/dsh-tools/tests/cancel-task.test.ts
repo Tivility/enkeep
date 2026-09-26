@@ -15,6 +15,7 @@ import {
 } from '../src/index.js';
 import type { PlatformClientService, ToolDefinition } from '../src/types.js';
 import { PlatformToolError } from '../src/errors.js';
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools';
 
 class MockToolsService extends Service {
   public registeredTools: ToolDefinition[] = [];
@@ -205,6 +206,102 @@ describe('dsh-tools: task management tools (cancel_task, list_tasks, get_task, c
       await expect(tool.execute({ limit: 101 })).rejects.toThrow(/integer between 1 and 100/);
       await expect(tool.execute({ offset: -1 })).rejects.toThrow(/non-negative integer/);
       await expect(tool.execute({ unknownField: true })).rejects.toThrow(/Unrecognized field/);
+    });
+
+    it('accepts null values returned by platform (dueDate, nextRunAt, lastRun) and reproduces F-41 schema defect', async () => {
+      // 1. Unpatched legacy schema reproducing F-41 failure
+      const unpatchedSchema = {
+        type: 'object',
+        properties: {
+          success: { type: 'boolean' },
+          tasks: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                taskId: { type: 'string' },
+                title: { type: 'string' },
+                status: { type: 'string' },
+                priority: { type: 'string' },
+                nextRunAt: { type: 'string' },
+                dueDate: { type: 'string' },
+                createdAt: { type: 'string' },
+              },
+              required: ['taskId', 'title', 'status'],
+            },
+          },
+          count: { type: 'number' },
+        },
+        required: ['success', 'tasks', 'count'],
+        additionalProperties: false,
+      };
+
+      // Exact F-41 scenario: platform returns tasks with null dueDate / nextRunAt / lastRun
+      const f41PlatformTasks = [
+        {
+          id: 'task_86124d169cea44e0862ee5e671775aae',
+          title: 'Daily 23:00 Notification Reminder',
+          status: 'cancelled',
+          priority: null,
+          nextRunAt: null,
+          dueDate: null,
+          lastRun: null,
+          createdAt: '2026-09-24T15:00:00.000Z',
+        },
+        {
+          id: 'task_e8392104928104820194820194820194',
+          title: 'One-off Analysis Task',
+          status: 'completed',
+          priority: 'medium',
+          nextRunAt: null,
+          dueDate: null,
+          lastRun: '2026-09-24T16:00:00.000Z',
+        },
+      ];
+
+      const mockClient: PlatformClientService = {
+        async request() {
+          return {
+            status: 200,
+            data: {
+              success: true,
+              data: f41PlatformTasks,
+            },
+          };
+        },
+      };
+
+      const tool = createListTasksTool(() => mockClient);
+      const res = await tool.execute({});
+
+      // Reproduce F-41 failure: unpatched schema rejects null nextRunAt and dueDate with INVALID_TOOL_OUTPUT
+      const f41Violations = validateJsonSchemaValue(unpatchedSchema as any, res, 'value');
+      expect(f41Violations.length).toBeGreaterThan(0);
+      expect(f41Violations).toContain('"value.tasks[0].nextRunAt" must be a string');
+      expect(f41Violations).toContain('"value.tasks[0].dueDate" must be a string');
+      expect(f41Violations).toContain('"value.tasks[1].nextRunAt" must be a string');
+      expect(f41Violations).toContain('"value.tasks[1].dueDate" must be a string');
+
+      // Verify fix: patched schema in tool.output.schema accepts null values with 0 violations
+      expect(tool.output?.schema).toBeDefined();
+      const patchedViolations = validateJsonSchemaValue(tool.output!.schema as any, res, 'value');
+      expect(patchedViolations).toEqual([]);
+
+      // Verify task fields preserved accurately
+      expect(res.tasks[0].taskId).toBe('task_86124d169cea44e0862ee5e671775aae');
+      expect(res.tasks[0].nextRunAt).toBeNull();
+      expect(res.tasks[0].dueDate).toBeNull();
+      expect(res.tasks[0].lastRun).toBeNull();
+      expect(res.tasks[0].priority).toBeNull();
+      expect(res.tasks[1].lastRun).toBe('2026-09-24T16:00:00.000Z');
+
+      // Verify render handles null nextRunAt gracefully without "next: null"
+      const renderFn = tool.output?.render;
+      const blocks = renderFn!({}, res as any);
+      expect(blocks).toHaveLength(1);
+      const text = (blocks[0] as any).text;
+      expect(text).toContain('[task_86124d169cea44e0862ee5e671775aae] "Daily 23:00 Notification Reminder" (cancelled)');
+      expect(text).not.toContain('next: null');
     });
   });
 

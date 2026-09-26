@@ -160,10 +160,12 @@ export interface TaskSummary {
   readonly taskId: string;
   readonly title: string;
   readonly status: TaskStatus;
-  readonly priority?: TaskPriority;
+  readonly priority?: TaskPriority | null;
   readonly nextRunAt?: string | null;
   readonly dueDate?: string | null;
-  readonly createdAt?: string;
+  readonly createdAt?: string | null;
+  readonly lastRun?: string | null;
+  readonly lastRunAt?: string | null;
 }
 
 export interface ListTasksArgs {

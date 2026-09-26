@@ -67,10 +67,12 @@ export function createListTasksTool(
                 taskId: { type: 'string' },
                 title: { type: 'string' },
                 status: { type: 'string' },
-                priority: { type: 'string' },
-                nextRunAt: { type: 'string' },
-                dueDate: { type: 'string' },
-                createdAt: { type: 'string' },
+                priority: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                nextRunAt: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                dueDate: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                createdAt: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                lastRun: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                lastRunAt: { oneOf: [{ type: 'string' }, { type: 'null' }] },
               },
               required: ['taskId', 'title', 'status'],
             },
@@ -202,19 +204,21 @@ export function createListTasksTool(
           (typeof t.taskId === 'string' ? t.taskId : '');
         const title = typeof t.title === 'string' ? t.title : '';
         const taskStatus = typeof t.status === 'string' ? (t.status as TaskStatus) : 'pending';
-        const priority = typeof t.priority === 'string' ? (t.priority as TaskPriority) : undefined;
+        const priority = typeof t.priority === 'string' ? (t.priority as TaskPriority) : (t.priority === null ? null : undefined);
         const nextRunAt = typeof t.nextRunAt === 'string' ? t.nextRunAt : (t.schedule?.nextRunAt ?? null);
         const dueDate = typeof t.dueDate === 'string' ? t.dueDate : (typeof t.due_date === 'string' ? t.due_date : null);
-        const createdAt = typeof t.createdAt === 'string' ? t.createdAt : (typeof t.created_at === 'string' ? t.created_at : undefined);
+        const createdAt = typeof t.createdAt === 'string' ? t.createdAt : (typeof t.created_at === 'string' ? t.created_at : (t.createdAt === null || t.created_at === null ? null : undefined));
+        const lastRun = typeof t.lastRun === 'string' ? t.lastRun : (t.lastRun === null ? null : (typeof t.lastRunAt === 'string' ? t.lastRunAt : (t.lastRunAt === null ? null : (typeof t.last_run_at === 'string' ? t.last_run_at : (t.last_run_at === null ? null : (t.schedule?.lastRunAt ?? undefined))))));
 
         return {
           taskId,
           title,
           status: taskStatus,
-          priority,
+          ...(priority !== undefined ? { priority } : {}),
           nextRunAt: nextRunAt ?? null,
           dueDate: dueDate ?? null,
-          createdAt,
+          ...(createdAt !== undefined ? { createdAt } : {}),
+          ...(lastRun !== undefined ? { lastRun } : {}),
         };
       });
 
