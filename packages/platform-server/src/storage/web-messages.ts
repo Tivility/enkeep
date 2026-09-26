@@ -78,6 +78,16 @@ export interface WebThinkingEventPayload {
 }
 
 /**
+ * Safe reasoning delta event payload.
+ */
+export interface WebReasoningDeltaEventPayload {
+  streamId?: string;
+  delta?: string;
+  accumulatedLength?: number;
+  status: 'thinking';
+}
+
+/**
  * Safe tool status event payload.
  * Public payload contains ONLY safe toolName allowlist + status (no args, no result).
  */
@@ -131,6 +141,13 @@ export interface WebThinkingEventRecord {
   createdAt: string;
 }
 
+export interface WebReasoningDeltaEventRecord {
+  id: string;
+  type: 'reasoning_delta';
+  payload: WebReasoningDeltaEventPayload;
+  createdAt: string;
+}
+
 export interface WebToolStatusEventRecord {
   id: string;
   type: 'tool_status';
@@ -161,6 +178,7 @@ export type WebEventRecord =
   | WebAssistantDeltaEventRecord
   | WebAssistantStreamEndEventRecord
   | WebThinkingEventRecord
+  | WebReasoningDeltaEventRecord
   | WebToolStatusEventRecord
   | WebStatusEventRecord
   | WebErrorEventRecord;
@@ -1974,6 +1992,31 @@ export class SqliteWebMessageStore {
           };
           break;
         }
+        case 'reasoning_delta': {
+          const streamId = typeof event.payload['streamId'] === 'string' ? event.payload['streamId'] : generate32HexId('msgstream');
+          const delta = typeof event.payload['delta'] === 'string' ? event.payload['delta'] : (typeof event.payload['text'] === 'string' ? event.payload['text'] : '');
+          const accumulatedLength = typeof event.payload['accumulatedLength'] === 'number' && Number.isFinite(event.payload['accumulatedLength'])
+            ? Math.max(0, Math.floor(event.payload['accumulatedLength']))
+            : delta.length;
+          sanitizedPayload = {
+            streamId,
+            delta,
+            accumulatedLength,
+            status: 'thinking',
+          };
+          record = {
+            id,
+            type: 'reasoning_delta',
+            payload: {
+              streamId,
+              delta,
+              accumulatedLength,
+              status: 'thinking',
+            },
+            createdAt,
+          };
+          break;
+        }
         case 'tool_status': {
           const rawToolName = event.payload['toolName'] ?? event.payload['name'];
           const toolName = sanitizeToolName(rawToolName);
@@ -2210,6 +2253,23 @@ export class SqliteWebMessageStore {
             payload: {
               status: 'thinking',
               ...(streamId ? { streamId } : {}),
+            },
+            createdAt: r.created_at,
+          };
+          break;
+        }
+        case 'reasoning_delta': {
+          const streamId = typeof parsedPayload['streamId'] === 'string' ? parsedPayload['streamId'] : undefined;
+          const delta = typeof parsedPayload['delta'] === 'string' ? parsedPayload['delta'] : (typeof parsedPayload['text'] === 'string' ? parsedPayload['text'] : '');
+          const accumulatedLength = typeof parsedPayload['accumulatedLength'] === 'number' ? parsedPayload['accumulatedLength'] : undefined;
+          record = {
+            id: r.id,
+            type: 'reasoning_delta',
+            payload: {
+              status: 'thinking',
+              delta,
+              ...(streamId ? { streamId } : {}),
+              ...(accumulatedLength !== undefined ? { accumulatedLength } : {}),
             },
             createdAt: r.created_at,
           };

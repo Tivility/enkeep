@@ -152,12 +152,19 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
 
     const types = batchedEvents.map((e: any) => e.type);
     expect(types).toContain('turn_started');
-    expect(types).toContain('thinking_delta');
+    expect(types).toContain('reasoning_delta');
     expect(types).toContain('assistant_delta');
     expect(types).toContain('tool_started');
     expect(types).toContain('tool_completed');
     expect(types).toContain('assistant_stream_end');
     expect(types).toContain('turn_completed');
+
+    // Verify reasoning_delta carries delta text and status without polluting assistant_delta
+    const reasoningDelta = batchedEvents.find((e: any) => e.type === 'reasoning_delta');
+    expect(reasoningDelta).toBeDefined();
+    expect(reasoningDelta.payload.delta).toBe('Thinking about the problem...');
+    expect(reasoningDelta.payload.status).toBe('thinking');
+    expect(reasoningDelta.payload.accumulatedLength).toBe('Thinking about the problem...'.length);
 
     // Verify streamId format and accumulatedLength
     const deltas = batchedEvents.filter((e: any) => e.type === 'assistant_delta');

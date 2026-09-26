@@ -35,7 +35,7 @@ export class SqliteStreamEventSource implements StreamEventSource {
     limit = 100
   ): Promise<StreamAssistantEvent[]> {
     const stmt = this.db.prepare(
-      `SELECT rowid, type, payload FROM web_events WHERE session_id = ? AND rowid > ? AND type IN ('assistant_delta', 'assistant_stream_end', 'turn_status', 'tool_status') ORDER BY rowid ASC LIMIT ?`
+      `SELECT rowid, type, payload FROM web_events WHERE session_id = ? AND rowid > ? AND type IN ('assistant_delta', 'assistant_stream_end', 'turn_status', 'tool_status', 'reasoning_delta', 'thinking') ORDER BY rowid ASC LIMIT ?`
     );
 
     const rows = stmt.all(sessionRouteId, afterRowId, limit) as unknown as WebEventRow[];
@@ -60,6 +60,16 @@ export class SqliteStreamEventSource implements StreamEventSource {
         if (row.type === 'assistant_delta') {
           if (typeof parsed.delta === 'string') delta = parsed.delta;
           if (typeof parsed.streamId === 'string') streamId = parsed.streamId;
+        } else if (row.type === 'reasoning_delta') {
+          if (typeof parsed.delta === 'string') delta = parsed.delta;
+          else if (typeof parsed.text === 'string') delta = parsed.text;
+          if (typeof parsed.streamId === 'string') streamId = parsed.streamId;
+          status = typeof parsed.status === 'string' ? parsed.status : 'thinking';
+        } else if (row.type === 'thinking') {
+          if (typeof parsed.status === 'string') status = parsed.status;
+          if (typeof parsed.streamId === 'string') streamId = parsed.streamId;
+          if (typeof parsed.delta === 'string') delta = parsed.delta;
+          else if (typeof parsed.text === 'string') delta = parsed.text;
         } else if (row.type === 'assistant_stream_end') {
           if (typeof parsed.streamId === 'string') streamId = parsed.streamId;
         } else if (row.type === 'turn_status') {
@@ -70,9 +80,11 @@ export class SqliteStreamEventSource implements StreamEventSource {
         }
       } catch {}
 
+      const eventType = row.type === 'thinking' ? 'reasoning_delta' : row.type;
+
       return {
         rowId: Number(row.rowid),
-        type: row.type as 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status',
+        type: eventType as any,
         delta,
         streamId,
         status,
@@ -80,7 +92,7 @@ export class SqliteStreamEventSource implements StreamEventSource {
         turnId,
         originTurnId,
       };
-    });
+    }) as unknown as StreamAssistantEvent[];
   }
 
   async resolveTurnOrigin(turnId: string): Promise<ChannelTurnOrigin | null> {

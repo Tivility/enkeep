@@ -2141,6 +2141,16 @@ export class PlatformProxyHandler implements StreamHandler {
               sanitizedPayload = { streamId };
               break;
             }
+            case 'reasoning_delta': {
+              eventType = 'reasoning_delta';
+              const streamId = typeof p['streamId'] === 'string' ? p['streamId'] : `msgstream_${randomUUID().replace(/-/g, '')}`;
+              const delta = typeof p['delta'] === 'string' ? p['delta'] : (typeof p['text'] === 'string' ? p['text'] : '');
+              const accumulatedLength = typeof p['accumulatedLength'] === 'number' && Number.isFinite(p['accumulatedLength'])
+                ? p['accumulatedLength']
+                : delta.length;
+              sanitizedPayload = { streamId, delta, accumulatedLength, status: 'thinking' };
+              break;
+            }
             case 'thinking_delta':
             case 'thinking': {
               eventType = 'thinking';

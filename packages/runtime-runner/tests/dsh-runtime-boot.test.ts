@@ -17,6 +17,8 @@ import {
   computeSessionEventsChecksum,
   canonicalJsonStringify,
   TOOLS_UNAVAILABLE_REASONS,
+  extractTextFromAssistantMessage,
+  extractTurnResultFromEvents,
   type SessionSeedReceipt,
   type DshRuntimeBootConfig,
 } from '../src/index.js';
@@ -1034,5 +1036,86 @@ describe('Official DSH Runtime Boot & Followup Integration', () => {
     } finally {
       await runtime.dispose();
     }
+  });
+
+  it('extractTextFromAssistantMessage and extractTurnResultFromEvents strictly separate answer text from reasoning and thinking blocks', () => {
+    // 1. Message with mixed reasoning and final text blocks
+    const mixedMessage = {
+      role: 'assistant',
+      content: [
+        { type: 'reasoning', text: 'Analyzing database tables and indexes...' },
+        { type: 'text', text: 'The database has 12 tables.' },
+      ],
+    };
+    expect(extractTextFromAssistantMessage(mixedMessage)).toBe('The database has 12 tables.');
+
+    // 2. Message with thinking block and thought block
+    const thinkingMessage = {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', text: 'Step 1: Check user permissions\nStep 2: Check balance' },
+          { type: 'thought', text: 'Let me double check the currency.' },
+          { type: 'text', text: 'Your balance is 100 USD.' },
+        ],
+      },
+    };
+    expect(extractTextFromAssistantMessage(thinkingMessage)).toBe('Your balance is 100 USD.');
+
+    // 3. Message with inline <think> tags (e.g. DeepSeek-R1 style)
+    const inlineThinkMessage = {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: '<think>Let me formulate the answer step by step.</think>Hello, how can I help you today?' },
+        ],
+      },
+    };
+    expect(extractTextFromAssistantMessage(inlineThinkMessage)).toBe('Hello, how can I help you today?');
+
+    // 4. Message with only reasoning or tool-call blocks (no final answer)
+    const reasoningOnlyMessage = {
+      role: 'assistant',
+      content: [
+        { type: 'reasoning', text: 'I am thinking about calling a tool...' },
+        { type: 'tool-call', id: 'call_1', name: 'check_balance' },
+      ],
+    };
+    expect(extractTextFromAssistantMessage(reasoningOnlyMessage)).toBe('');
+
+    // 5. Unclosed <think> tag (aborted/interrupted thinking stream)
+    const unclosedThinkMessage = {
+      text: '<think>Unfinished thinking process without closing tag',
+    };
+    expect(extractTextFromAssistantMessage(unclosedThinkMessage)).toBe('');
+
+    // 6. extractTurnResultFromEvents derives clean replyText ignoring reasoning steps
+    const sampleEvents = [
+      { type: 'turn/start', data: { turn: 1 } },
+      {
+        type: 'assistant/message',
+        data: {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'Step 1: Internal model reasoning that must NOT leak to WeChat/Lark.' },
+            { type: 'tool-call', id: 'call_1', name: 'bash' },
+          ],
+        },
+      },
+      {
+        type: 'assistant/message',
+        data: {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'Step 2: Processing tool output...' },
+            { type: 'text', text: 'Final conclusion: All tests passed successfully.' },
+          ],
+        },
+      },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    const turnResult = extractTurnResultFromEvents(sampleEvents as any);
+    expect(turnResult.replyText).toBe('Final conclusion: All tests passed successfully.');
+    expect(turnResult.isCancelled).toBe(false);
   });
 });

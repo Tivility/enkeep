@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { SqliteWebMessageStore } from '../src/storage/web-messages.js';
 import { SqlitePlatformWebApiAdapter } from '../src/storage/sqlite-platform-api.js';
+import { SqliteStreamEventSource } from '../src/channels/sqlite-stream-event-source.js';
 import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
 import { PlatformServerMigrationRunner, ALL_PLATFORM_MIGRATIONS } from '../src/storage/migrations.js';
 
@@ -150,5 +151,75 @@ describe('Streaming Events Storage, Keyset Cursor & Tenant Isolation', () => {
 
     // Alice attempting to poll Bob session throws 403 / TenantAccessDenied
     await expect(api.pollEvents('alice', 'ses_bob_1')).rejects.toThrow();
+  });
+
+  it('SqliteStreamEventSource listAssistantEvents queries and preserves reasoning_delta as distinct event type', async () => {
+    const streamSource = new SqliteStreamEventSource(db);
+
+    // Insert reasoning_delta, assistant_delta, and assistant_stream_end
+    await messageStore.insertEventsBatch([
+      {
+        id: 'evt_stream_test_0001',
+        sessionId: 'ses_alice_1',
+        userId: 'alice',
+        type: 'reasoning_delta' as any,
+        payload: {
+          streamId: 'msgstream_test_reasoning',
+          delta: 'Reasoning part 1: checking requirements...',
+          status: 'thinking',
+        },
+        createdAt: '2026-08-28T10:00:00.000Z',
+      },
+      {
+        id: 'evt_stream_test_0002',
+        sessionId: 'ses_alice_1',
+        userId: 'alice',
+        type: 'reasoning_delta' as any,
+        payload: {
+          streamId: 'msgstream_test_reasoning',
+          delta: 'Reasoning part 2: concluding solution.',
+          status: 'thinking',
+        },
+        createdAt: '2026-08-28T10:00:00.020Z',
+      },
+      {
+        id: 'evt_stream_test_0003',
+        sessionId: 'ses_alice_1',
+        userId: 'alice',
+        type: 'assistant_delta',
+        payload: {
+          streamId: 'msgstream_test_reasoning',
+          delta: 'Here is the final answer.',
+          accumulatedLength: 26,
+        },
+        createdAt: '2026-08-28T10:00:00.040Z',
+      },
+      {
+        id: 'evt_stream_test_0004',
+        sessionId: 'ses_alice_1',
+        userId: 'alice',
+        type: 'assistant_stream_end',
+        payload: {
+          streamId: 'msgstream_test_reasoning',
+        },
+        createdAt: '2026-08-28T10:00:00.060Z',
+      },
+    ]);
+
+    const events = await streamSource.listAssistantEvents('ses_alice_1', 0);
+    expect(events.length).toBe(4);
+
+    const reasoningEvents = events.filter((e) => e.type === 'reasoning_delta');
+    expect(reasoningEvents.length).toBe(2);
+    expect(reasoningEvents[0].delta).toBe('Reasoning part 1: checking requirements...');
+    expect(reasoningEvents[1].delta).toBe('Reasoning part 2: concluding solution.');
+
+    const assistantDeltas = events.filter((e) => e.type === 'assistant_delta');
+    expect(assistantDeltas.length).toBe(1);
+    expect(assistantDeltas[0].delta).toBe('Here is the final answer.');
+
+    // Verify web polling also succeeds and maps reasoning_delta to thinking for web UI compatibility
+    const polled = await api.pollEvents('alice', 'ses_alice_1');
+    expect(polled.events.some((e: any) => e.type === 'thinking')).toBe(true);
   });
 });

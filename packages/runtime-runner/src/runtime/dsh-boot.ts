@@ -370,7 +370,17 @@ export interface DshBootedRuntime {
 }
 
 /**
+ * Strips model internal thinking/reasoning tags like <think>...</think> from text.
+ */
+function stripThinkingTags(text: string): string {
+  if (!text) return '';
+  return text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '');
+}
+
+/**
  * Extracts pure text content from an official assistant message data payload.
+ * Strictly includes only final answer text blocks, excluding reasoning, thinking,
+ * thought, and tool call blocks. Also strips inline thinking tags.
  */
 export function extractTextFromAssistantMessage(data: unknown): string {
   if (!data || typeof data !== 'object') return '';
@@ -381,23 +391,37 @@ export function extractTextFromAssistantMessage(data: unknown): string {
     const parts: string[] = [];
     for (const b of (message as any).content) {
       if (typeof b === 'string') {
-        parts.push(b);
+        const cleaned = stripThinkingTags(b);
+        if (cleaned.length > 0) parts.push(cleaned);
       } else if (b && typeof b === 'object') {
         const block = b as Record<string, unknown>;
+        const blockType = typeof block.type === 'string' ? block.type.toLowerCase() : undefined;
+        // Strictly exclude reasoning, thinking, thought, and tool call blocks
+        if (blockType && blockType !== 'text') {
+          continue;
+        }
+        if (block.reasoning === true || block.isReasoning === true || block.thinking === true) {
+          continue;
+        }
+        let blockText = '';
         if (typeof block.text === 'string') {
-          parts.push(block.text);
-        } else if (block.type === 'text' && typeof block.content === 'string') {
-          parts.push(block.content);
+          blockText = block.text;
+        } else if (typeof block.content === 'string') {
+          blockText = block.content;
+        }
+        const cleaned = stripThinkingTags(blockText);
+        if (cleaned.length > 0) {
+          parts.push(cleaned);
         }
       }
     }
-    return parts.join('');
+    return parts.join('').trim();
   }
   if (typeof (message as any).text === 'string') {
-    return (message as any).text;
+    return stripThinkingTags((message as any).text).trim();
   }
   if (typeof d.text === 'string') {
-    return d.text;
+    return stripThinkingTags(d.text).trim();
   }
   return '';
 }

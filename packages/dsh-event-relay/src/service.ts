@@ -28,6 +28,7 @@ import { EventRelayValidationError } from './errors.js';
 interface SessionStreamState {
   streamId: string;
   accumulatedLength: number;
+  accumulatedReasoningLength?: number;
   activeToolName?: string;
 }
 
@@ -380,11 +381,17 @@ export class EventRelayService implements IEventRelayService {
             createdAt: this.getMonotonicIsoTimestamp(),
           });
         } else if (chunk.type === 'reasoning-delta') {
+          const deltaText = typeof chunk.text === 'string'
+            ? chunk.text
+            : (typeof (chunk as any).delta === 'string' ? (chunk as any).delta : '');
+          streamState.accumulatedReasoningLength = (streamState.accumulatedReasoningLength || 0) + deltaText.length;
           frames.push({
             sessionId,
-            type: 'thinking_delta',
+            type: 'reasoning_delta',
             payload: {
               streamId: streamState.streamId,
+              delta: deltaText,
+              accumulatedLength: streamState.accumulatedReasoningLength,
               status: 'thinking',
             },
             createdAt: this.getMonotonicIsoTimestamp(),
@@ -507,16 +514,16 @@ export class EventRelayService implements IEventRelayService {
       // Backpressure check: if pending bytes exceed maxPendingBytes (256KB),
       // drop intermediate assistant_delta frames to avoid memory exhaustion
       if (this.pendingOutboundBytes + estimatedBytes > this.maxPendingBytes) {
-        if (frame.type === 'assistant_delta') {
+        if (frame.type === 'assistant_delta' || frame.type === 'reasoning_delta') {
           this.droppedDeltaCount++;
           continue;
         } else {
-          // For non-delta control frames, drop oldest assistant_delta from buffer if needed
+          // For non-delta control frames, drop oldest assistant_delta or reasoning_delta from buffer if needed
           while (
             this.pendingOutboundBytes + estimatedBytes > this.maxPendingBytes &&
             this.pendingOutboundFrames.length > 0
           ) {
-            const deltaIdx = this.pendingOutboundFrames.findIndex((f) => f.type === 'assistant_delta');
+            const deltaIdx = this.pendingOutboundFrames.findIndex((f) => f.type === 'assistant_delta' || f.type === 'reasoning_delta');
             if (deltaIdx >= 0) {
               const dropped = this.pendingOutboundFrames.splice(deltaIdx, 1)[0];
               this.pendingOutboundBytes -= JSON.stringify(dropped).length;

@@ -1855,6 +1855,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
           };
         }
 
+        case 'reasoning_delta':
         case 'thinking': {
           const streamId = typeof payload['streamId'] === 'string' ? payload['streamId'] : undefined;
           return {
