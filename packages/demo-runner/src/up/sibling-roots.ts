@@ -9,6 +9,8 @@
  * - Normalizes and maps paths according to execution mode (Host vs Container)
  * - NEVER uses client-supplied paths
  * - Produces a deterministic, stable, and bounded array (or undefined for ordinary 1-space)
+ * - Orders candidate sibling spaces by recent activity (updated_at/created_at DESC) with stable tie-breaking (folder ASC)
+ * - Sensible default cap of 64 covers multi-space owner accounts (e.g. ~39 spaces)
  *
  * @module @enkeep/demo-runner/up/sibling-roots
  */
@@ -16,7 +18,7 @@
 import { resolve, normalize, sep } from 'node:path';
 import { posix } from 'node:path';
 
-export const MAX_SIBLING_EXTRA_READABLE_ROOTS = 20;
+export const MAX_SIBLING_EXTRA_READABLE_ROOTS = 64;
 
 export interface SiblingRootsQueryDb {
   prepare(sql: string): {
@@ -109,18 +111,33 @@ export function resolveSiblingExtraReadableRoots(
 
   // 2. Query spaces table for candidate spaces belonging to THIS user only
   let hasStatusColumn = true;
+  let hasUpdatedAtColumn = false;
+  let hasCreatedAtColumn = false;
   try {
     const tableInfo = db.prepare("PRAGMA table_info('spaces')").all() as Array<{ name?: string }>;
     hasStatusColumn = tableInfo.some((col) => col.name === 'status');
+    hasUpdatedAtColumn = tableInfo.some((col) => col.name === 'updated_at');
+    hasCreatedAtColumn = tableInfo.some((col) => col.name === 'created_at');
   } catch {
     hasStatusColumn = false;
+    hasUpdatedAtColumn = false;
+    hasCreatedAtColumn = false;
+  }
+
+  let orderBySql = 'ORDER BY folder ASC';
+  if (hasUpdatedAtColumn && hasCreatedAtColumn) {
+    orderBySql = 'ORDER BY COALESCE(updated_at, created_at, \'\') DESC, folder ASC';
+  } else if (hasUpdatedAtColumn) {
+    orderBySql = 'ORDER BY COALESCE(updated_at, \'\') DESC, folder ASC';
+  } else if (hasCreatedAtColumn) {
+    orderBySql = 'ORDER BY COALESCE(created_at, \'\') DESC, folder ASC';
   }
 
   let rows: Array<{ id?: string; folder?: string; status?: string }> = [];
   try {
     const querySql = hasStatusColumn
-      ? 'SELECT id, folder, status FROM spaces WHERE user_id = ? ORDER BY folder ASC'
-      : 'SELECT id, folder FROM spaces WHERE user_id = ? ORDER BY folder ASC';
+      ? `SELECT id, folder, status FROM spaces WHERE user_id = ? ${orderBySql}`
+      : `SELECT id, folder FROM spaces WHERE user_id = ? ${orderBySql}`;
     rows = db.prepare(querySql).all(canonicalUserId) as Array<{ id?: string; folder?: string; status?: string }>;
   } catch {
     return undefined;
@@ -226,13 +243,13 @@ export function resolveSiblingExtraReadableRoots(
     return undefined;
   }
 
-  // 5. Stable deduplication and sorting, bounded by limit
-  const uniqueSorted = Array.from(new Set(mappedRoots)).sort((a, b) => a.localeCompare(b));
+  // 5. Stable deduplication and limiting by cap
+  const deduplicated = Array.from(new Set(mappedRoots));
   const boundedLimit = typeof maxRoots === 'number' && Number.isSafeInteger(maxRoots) && maxRoots > 0
     ? maxRoots
     : MAX_SIBLING_EXTRA_READABLE_ROOTS;
 
-  const bounded = uniqueSorted.slice(0, boundedLimit);
+  const bounded = deduplicated.slice(0, boundedLimit);
 
   if (bounded.length === 0) {
     return undefined;

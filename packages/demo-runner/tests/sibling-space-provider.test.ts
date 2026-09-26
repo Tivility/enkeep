@@ -284,8 +284,8 @@ describe('G12-P3: Control-Plane Sibling Space Provider', () => {
         'sp_main', ALICE_ID, 'Main', 'main', 'active'
       );
 
-      // Insert 25 sibling spaces
-      for (let i = 0; i < 25; i++) {
+      // Insert 70 sibling spaces to exceed the 64 bound
+      for (let i = 0; i < 70; i++) {
         const num = String(i).padStart(2, '0');
         db.prepare('INSERT INTO spaces (id, user_id, name, folder, status) VALUES (?, ?, ?, ?, ?)').run(
           `sp_${num}`, ALICE_ID, `Space ${num}`, `space-${num}`, 'active'
@@ -302,10 +302,94 @@ describe('G12-P3: Control-Plane Sibling Space Provider', () => {
       });
 
       expect(boundedRoots).toBeDefined();
-      expect(boundedRoots?.length).toBe(MAX_SIBLING_EXTRA_READABLE_ROOTS); // 20
-      // Check alphabetical ordering
+      expect(boundedRoots?.length).toBe(MAX_SIBLING_EXTRA_READABLE_ROOTS); // 64
+      // Check deterministic tie-break ordering by folder
       expect(boundedRoots?.[0]).toBe('/home/dsh/spaces/space-00');
-      expect(boundedRoots?.[19]).toBe('/home/dsh/spaces/space-19');
+      expect(boundedRoots?.[63]).toBe('/home/dsh/spaces/space-63');
+      expect(Object.isFrozen(boundedRoots)).toBe(true);
+
+      // Caller can explicitly specify a smaller maxRoots
+      const customBoundedRoots = resolveSiblingExtraReadableRoots({
+        db,
+        userId: ALICE_ID,
+        currentSpaceId: 'sp_main',
+        currentSpaceFolder: 'main',
+        isHost: false,
+        dataRoot: DATA_ROOT,
+        maxRoots: 20,
+      });
+      expect(customBoundedRoots?.length).toBe(20);
+    });
+
+    it('covers owner accounts with ~39 spaces without truncation', () => {
+      db.prepare('INSERT INTO spaces (id, user_id, name, folder, status) VALUES (?, ?, ?, ?, ?)').run(
+        'sp_main_owner', ALICE_ID, 'Main', 'main-owner', 'active'
+      );
+
+      // Insert 39 sibling spaces (owner multi-space profile)
+      for (let i = 0; i < 39; i++) {
+        const num = String(i).padStart(2, '0');
+        db.prepare('INSERT INTO spaces (id, user_id, name, folder, status) VALUES (?, ?, ?, ?, ?)').run(
+          `sp_owner_${num}`, ALICE_ID, `Owner Space ${num}`, `owner-space-${num}`, 'active'
+        );
+      }
+
+      const roots = resolveSiblingExtraReadableRoots({
+        db,
+        userId: ALICE_ID,
+        currentSpaceId: 'sp_main_owner',
+        currentSpaceFolder: 'main-owner',
+        isHost: false,
+        dataRoot: DATA_ROOT,
+      });
+
+      expect(roots).toBeDefined();
+      // All 39 sibling spaces are retained (cap raised from 20 to 64)
+      expect(roots?.length).toBe(39);
+      expect(roots?.[0]).toBe('/home/dsh/spaces/owner-space-00');
+      expect(roots?.[38]).toBe('/home/dsh/spaces/owner-space-38');
+      expect(Object.isFrozen(roots)).toBe(true);
+    });
+
+    it('orders candidate sibling spaces by recent activity (updated_at DESC) with stable tie-breaking', () => {
+      db.prepare('INSERT INTO spaces (id, user_id, name, folder, status) VALUES (?, ?, ?, ?, ?)').run(
+        'sp_current', ALICE_ID, 'Current', 'current', 'active'
+      );
+
+      // Insert sibling spaces with distinct and tied updated_at timestamps
+      db.prepare(
+        'INSERT INTO spaces (id, user_id, name, folder, status, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run('sp_recent', ALICE_ID, 'Recent', 'z-recent', 'active', '2026-09-26 12:00:00');
+
+      db.prepare(
+        'INSERT INTO spaces (id, user_id, name, folder, status, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run('sp_tied_b', ALICE_ID, 'Tied B', 'b-tied', 'active', '2026-09-20 12:00:00');
+
+      db.prepare(
+        'INSERT INTO spaces (id, user_id, name, folder, status, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run('sp_tied_a', ALICE_ID, 'Tied A', 'a-tied', 'active', '2026-09-20 12:00:00');
+
+      db.prepare(
+        'INSERT INTO spaces (id, user_id, name, folder, status, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run('sp_oldest', ALICE_ID, 'Oldest', 'a-oldest', 'active', '2026-09-10 12:00:00');
+
+      const roots = resolveSiblingExtraReadableRoots({
+        db,
+        userId: ALICE_ID,
+        currentSpaceId: 'sp_current',
+        currentSpaceFolder: 'current',
+        isHost: false,
+        dataRoot: DATA_ROOT,
+      });
+
+      expect(roots).toBeDefined();
+      expect(roots).toEqual([
+        '/home/dsh/spaces/z-recent',
+        '/home/dsh/spaces/a-tied',
+        '/home/dsh/spaces/b-tied',
+        '/home/dsh/spaces/a-oldest',
+      ]);
+      expect(Object.isFrozen(roots)).toBe(true);
     });
   });
 
