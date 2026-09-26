@@ -34,6 +34,8 @@ import {
 
 export type TaskWorkerStatus = 'idle' | 'running' | 'stopping' | 'stopped';
 
+export const DEFAULT_TASK_EXECUTION_BUDGET_MS = 1_800_000; // 30 minutes default
+
 export interface TaskExecutionBudget {
   readonly maxWaitMs?: number;
 }
@@ -126,6 +128,7 @@ export interface TaskWorkerOptions {
   pollIntervalMs?: number;
   leaseDurationMs?: number;
   heartbeatIntervalMs?: number;
+  defaultExecutionBudgetMs?: number;
   recoverOnStart?: boolean;
   systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   onError?: TaskWorkerErrorHandler;
@@ -202,6 +205,7 @@ export class AgentPromptTaskWorker {
   private readonly pollIntervalMs: number;
   private readonly leaseDurationMs: number;
   private readonly heartbeatIntervalMs: number;
+  private readonly defaultExecutionBudgetMs: number;
   private readonly recoverOnStart: boolean;
   private readonly systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   private readonly onErrorCallback?: TaskWorkerErrorHandler;
@@ -232,6 +236,7 @@ export class AgentPromptTaskWorker {
     this.pollIntervalMs = options.pollIntervalMs ?? 1000;
     this.leaseDurationMs = options.leaseDurationMs ?? 30_000;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? Math.max(500, Math.floor(this.leaseDurationMs / 3));
+    this.defaultExecutionBudgetMs = options.defaultExecutionBudgetMs ?? DEFAULT_TASK_EXECUTION_BUDGET_MS;
     this.recoverOnStart = options.recoverOnStart ?? true;
     this.systemRecovery = options.systemRecovery;
     this.onErrorCallback = options.onError;
@@ -770,6 +775,108 @@ export class AgentPromptTaskWorker {
       let heartbeatActive = true;
       let isRenewing = false;
       let leaseLost = false;
+      const taskExecutionStartTime = Date.now();
+      let executionBudget: TaskExecutionBudget | undefined = undefined;
+
+      const getEffectiveBudgetMs = (): number => {
+        if (
+          executionBudget &&
+          typeof executionBudget.maxWaitMs === 'number' &&
+          Number.isSafeInteger(executionBudget.maxWaitMs) &&
+          executionBudget.maxWaitMs > 0
+        ) {
+          return executionBudget.maxWaitMs;
+        }
+        return this.defaultExecutionBudgetMs;
+      };
+
+      const stopHeartbeat = () => {
+        heartbeatActive = false;
+        if (heartbeatTimeoutHandle) {
+          clearTimeout(heartbeatTimeoutHandle);
+          heartbeatTimeoutHandle = null;
+        }
+      };
+
+      // 2. Non-overlapping recursive heartbeat loop renewing lease every heartbeatIntervalMs,
+      // bounded by the task execution budget (default 30min) so no immortal leases are created.
+      const scheduleHeartbeat = () => {
+        if (!heartbeatActive || abortController.signal.aborted || leaseLost) {
+          return;
+        }
+
+        const effectiveBudgetMs = getEffectiveBudgetMs();
+        const elapsedMs = Date.now() - taskExecutionStartTime;
+        if (elapsedMs >= effectiveBudgetMs) {
+          // Task execution budget exhausted: do not renew, stop heartbeat and abort
+          leaseLost = true;
+          stopHeartbeat();
+          abortController.abort(new TaskLeaseExpiredError(task.id));
+          return;
+        }
+
+        const remainingBudgetMs = effectiveBudgetMs - elapsedMs;
+        const nextIntervalMs = Math.min(this.heartbeatIntervalMs, Math.max(10, remainingBudgetMs));
+
+        heartbeatTimeoutHandle = setTimeout(async () => {
+          if (!heartbeatActive || abortController.signal.aborted || leaseLost || isRenewing) {
+            return;
+          }
+
+          const currentElapsedMs = Date.now() - taskExecutionStartTime;
+          const currentBudgetMs = getEffectiveBudgetMs();
+          if (currentElapsedMs >= currentBudgetMs) {
+            leaseLost = true;
+            stopHeartbeat();
+            abortController.abort(new TaskLeaseExpiredError(task.id));
+            return;
+          }
+
+          const currentRemainingBudgetMs = currentBudgetMs - currentElapsedMs;
+          const renewDurationMs = Math.min(
+            this.leaseDurationMs,
+            currentRemainingBudgetMs
+          );
+
+          isRenewing = true;
+          try {
+            let renewedTask: Task;
+            if (ops.tasks instanceof TaskOperationService) {
+              renewedTask = await ops.tasks.renewLease(task.id, {
+                claimantId: this.workerId,
+                leaseDurationMs: renewDurationMs,
+                runId: task.currentRun?.id,
+              });
+            } else {
+              renewedTask = await (ops.tasks as TenantScopedTaskRepository).renewLease(
+                task.id,
+                this.workerId,
+                renewDurationMs,
+                task.currentRun?.id
+              );
+            }
+            if (renewedTask) {
+              task.leaseExpiresAt = renewedTask.leaseExpiresAt;
+              task.leaseDurationMs = renewedTask.leaseDurationMs;
+              if (renewedTask.currentRun) {
+                task.currentRun = renewedTask.currentRun;
+              }
+            }
+          } catch (heartbeatErr: unknown) {
+            leaseLost = true;
+            stopHeartbeat();
+            // Immediately abort the in-flight dispatch signal
+            abortController.abort(
+              heartbeatErr instanceof Error ? heartbeatErr : new TaskLeaseExpiredError(task.id)
+            );
+            return;
+          } finally {
+            isRenewing = false;
+          }
+
+          scheduleHeartbeat();
+        }, nextIntervalMs);
+      };
 
       // 1. Strict payload validation
       let payload: TaskPayload;
@@ -835,60 +942,7 @@ export class AgentPromptTaskWorker {
         };
       }
 
-      // 2. Non-overlapping recursive heartbeat loop
-      const scheduleHeartbeat = () => {
-        if (!heartbeatActive || abortController.signal.aborted || leaseLost) {
-          return;
-        }
-        heartbeatTimeoutHandle = setTimeout(async () => {
-          if (!heartbeatActive || abortController.signal.aborted || leaseLost || isRenewing) {
-            return;
-          }
-          isRenewing = true;
-          try {
-            if (ops.tasks instanceof TaskOperationService) {
-              await ops.tasks.renewLease(task.id, {
-                claimantId: this.workerId,
-                leaseDurationMs: this.leaseDurationMs,
-                runId: task.currentRun?.id,
-              });
-            } else {
-              await (ops.tasks as TenantScopedTaskRepository).renewLease(
-                task.id,
-                this.workerId,
-                this.leaseDurationMs,
-                task.currentRun?.id
-              );
-            }
-          } catch (heartbeatErr: unknown) {
-            leaseLost = true;
-            heartbeatActive = false;
-            if (heartbeatTimeoutHandle) {
-              clearTimeout(heartbeatTimeoutHandle);
-              heartbeatTimeoutHandle = null;
-            }
-            // Immediately abort the in-flight dispatch signal
-            abortController.abort(
-              heartbeatErr instanceof Error ? heartbeatErr : new TaskLeaseExpiredError(task.id)
-            );
-            return;
-          } finally {
-            isRenewing = false;
-          }
-
-          scheduleHeartbeat();
-        }, this.heartbeatIntervalMs);
-      };
-
       scheduleHeartbeat();
-
-      const stopHeartbeat = () => {
-        heartbeatActive = false;
-        if (heartbeatTimeoutHandle) {
-          clearTimeout(heartbeatTimeoutHandle);
-          heartbeatTimeoutHandle = null;
-        }
-      };
 
       if (payload.type === 'script') {
         return await this.executeScriptTask({
@@ -904,7 +958,6 @@ export class AgentPromptTaskWorker {
 
       // 2b. Optional trusted pre-dispatch input preparation
       let effectivePayload = payload;
-      let executionBudget: TaskExecutionBudget | undefined = undefined;
       if (this.prepareTaskInput) {
         const runId = task.currentRun?.id || task.id;
         try {
@@ -923,6 +976,11 @@ export class AgentPromptTaskWorker {
           }
           if (prepResult && prepResult.executionBudget !== undefined) {
             executionBudget = prepResult.executionBudget;
+            if (Date.now() - taskExecutionStartTime >= getEffectiveBudgetMs()) {
+              leaseLost = true;
+              stopHeartbeat();
+              abortController.abort(new TaskLeaseExpiredError(task.id));
+            }
           }
         } catch (prepErr) {
           stopHeartbeat();

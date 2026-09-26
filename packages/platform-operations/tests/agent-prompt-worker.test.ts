@@ -35,6 +35,7 @@ describe('AgentPromptTaskWorker (Single-Process Worker, Concurrency=1, Heartbeat
     options?: {
       leaseDurationMs?: number;
       heartbeatIntervalMs?: number;
+      defaultExecutionBudgetMs?: number;
       pollIntervalMs?: number;
       workerId?: string;
       onError?: (err: Error, ctx: any) => void;
@@ -48,6 +49,7 @@ describe('AgentPromptTaskWorker (Single-Process Worker, Concurrency=1, Heartbeat
       dispatcher,
       leaseDurationMs: options?.leaseDurationMs ?? 2000,
       heartbeatIntervalMs: options?.heartbeatIntervalMs ?? 200,
+      defaultExecutionBudgetMs: options?.defaultExecutionBudgetMs,
       pollIntervalMs: options?.pollIntervalMs ?? 100,
       recoverOnStart: true,
       systemRecovery: () => storage.recoverAfterRestart(),
@@ -622,5 +624,157 @@ describe('AgentPromptTaskWorker (Single-Process Worker, Concurrency=1, Heartbeat
 
     const completedTask2 = await ops.tasks.getTask(task2.id);
     expect(completedTask2?.status).toBe('completed');
+  });
+
+  it('multi-subagent long agent task progressing within execution budget continuously renews lease and completes successfully without TASK_LEASE_EXPIRED', async () => {
+    const ops = service.forTenant('user_test');
+    const { task } = await ops.tasks.createTask({
+      title: 'Multi-Subagent Pipeline Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Coordinate subagent 1 (cognitive), subagent 2 (knowledge), and subagent 3 (interaction)',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+      },
+    });
+
+    let renewalCount = 0;
+    const origRenew = ops.tasks.renewLease.bind(ops.tasks);
+    ops.tasks.renewLease = async (taskId, input) => {
+      renewalCount++;
+      return origRenew(taskId, input);
+    };
+
+    // Task takes 400ms, while lease duration is only 150ms.
+    // Without heartbeat renewal, lease would expire at 150ms and task would fail with TASK_LEASE_EXPIRED.
+    const worker = createWorker(async (ctx) => {
+      // Simulate multiple sequential/parallel subagent turn execution
+      for (let i = 0; i < 4; i++) {
+        if (ctx.signal.aborted) {
+          throw new Error('Aborted');
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return {
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+      };
+    }, {
+      leaseDurationMs: 150,
+      heartbeatIntervalMs: 40,
+      defaultExecutionBudgetMs: 5000,
+    });
+
+    const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+
+    expect(result).not.toBeNull();
+    expect(result?.status).toBe('completed');
+    expect(result?.error).toBeUndefined();
+    // Heartbeat must have renewed the lease multiple times while task was progressing
+    expect(renewalCount).toBeGreaterThanOrEqual(3);
+
+    const finished = await ops.tasks.getTask(task.id);
+    expect(finished?.status).toBe('completed');
+    expect(finished?.error).toBeNull();
+  });
+
+  it('task execution lease renewal is strictly bounded by execution budget (no immortal leases)', async () => {
+    const ops = service.forTenant('user_test');
+    const { task } = await ops.tasks.createTask({
+      title: 'Runaway Task Exceeding Execution Budget',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Runaway agent task that hangs or runs forever',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+      },
+    });
+
+    let renewalCount = 0;
+    const origRenew = ops.tasks.renewLease.bind(ops.tasks);
+    ops.tasks.renewLease = async (taskId, input) => {
+      renewalCount++;
+      return origRenew(taskId, input);
+    };
+
+    let signalAborted = false;
+    const worker = createWorker(async (ctx) => {
+      ctx.signal.addEventListener('abort', () => {
+        signalAborted = true;
+      });
+      // Simulate hung / runaway task waiting 600ms
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 600);
+        ctx.signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          resolve(undefined);
+        });
+      });
+      return {
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+      };
+    }, {
+      leaseDurationMs: 500,
+      heartbeatIntervalMs: 40,
+      defaultExecutionBudgetMs: 200, // Budget is strictly 200ms
+    });
+
+    const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+
+    // Must be aborted / lease_lost due to budget exhaustion, NOT immortal
+    expect(result?.status === 'lease_lost' || result?.status === 'aborted').toBe(true);
+    expect(signalAborted).toBe(true);
+    // Renewals should have stopped once the budget was reached
+    expect(renewalCount).toBeLessThan(6);
+  });
+
+  it('dynamic execution budget from prepareTaskInput overrides default and strictly bounds lease renewal', async () => {
+    const ops = service.forTenant('user_test');
+    const { task } = await ops.tasks.createTask({
+      title: 'Dynamic Budget Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Task with custom execution budget from prepareTaskInput',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+      },
+    });
+
+    let signalAborted = false;
+    const worker = new AgentPromptTaskWorker({
+      workerId: 'worker_dyn_budget',
+      tenantEnumerator: () => ['user_test'],
+      getTenantOperations: (tenantId) => service.forTenant(tenantId),
+      prepareTaskInput: async () => ({
+        preparedPrompt: 'Prepared prompt with budget',
+        executionBudget: { maxWaitMs: 180 }, // Dynamic budget of 180ms
+      }),
+      dispatcher: async (ctx) => {
+        ctx.signal.addEventListener('abort', () => {
+          signalAborted = true;
+        });
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 600);
+          ctx.signal.addEventListener('abort', () => {
+            clearTimeout(timer);
+            resolve(undefined);
+          });
+        });
+        return {
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+        };
+      },
+      leaseDurationMs: 400,
+      heartbeatIntervalMs: 40,
+      defaultExecutionBudgetMs: 30_000, // Default is large, but overridden by prepareTaskInput
+    });
+    activeWorkers.push(worker);
+
+    const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+
+    expect(result?.status === 'lease_lost' || result?.status === 'aborted').toBe(true);
+    expect(signalAborted).toBe(true);
   });
 });
