@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
 import {
   createSyntheticV2Fixture,
   inspectSourceV2,
@@ -11,6 +12,7 @@ import {
   validateCredentialCapability,
   FakeSourceCredentialReader,
   stageMigrationPackageV2,
+  executePilotMigrationV2,
   EphemeralCredentialVaultEncryptor,
   type SourceCredentialCapability,
 } from '../src/index.js'
@@ -225,5 +227,93 @@ describe('Migration V2 Plan Engine & Credential Authorized Transfer', () => {
     expect(manifestContent.planId).toBe(plan.planId)
     expect(manifestContent.packageChecksum).toBe(stageResult.packageChecksum)
     expect(manifestContent.summary.totalWorkspaces).toBe(2)
+  })
+
+  it('6. executePilotMigrationV2 sets schedule_type and cron_expression in platform_tasks from HC schedule', async () => {
+    const plan = createMigrationPlanV2({
+      sourcePath: dbPath,
+      sourceGroupsDir: groupsDir,
+      targetUserId: 'alice',
+      selectedWorkspaceIds: ['web:alice-space'],
+    })
+
+    const stagingDir = join(testRoot, 'staged-pilot')
+    stageMigrationPackageV2(
+      {
+        sourcePath: dbPath,
+        selectedWorkspaceIds: ['web:alice-space'],
+      },
+      plan,
+      stagingDir
+    )
+
+    const targetDb = new DatabaseSync(':memory:')
+    // Setup target tables needed by pilot-v2
+    targetDb.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT, role TEXT, password_hash TEXT, must_change_password INTEGER, created_at TEXT, updated_at TEXT);
+      CREATE TABLE spaces (id TEXT PRIMARY KEY, user_id TEXT, folder TEXT, name TEXT, execution_mode TEXT, status TEXT, created_at TEXT, updated_at TEXT, UNIQUE(user_id, folder));
+      CREATE TABLE session_routes (id TEXT PRIMARY KEY, space_id TEXT, user_id TEXT, channel TEXT, account_id TEXT, native_context_id TEXT, peer_id TEXT, dsh_session_id TEXT, execution_mode TEXT, status TEXT, title TEXT, created_at TEXT, updated_at TEXT, UNIQUE(user_id, channel, native_context_id));
+      CREATE TABLE session_generations (id TEXT PRIMARY KEY, user_id TEXT, route_id TEXT, generation_number INTEGER, dsh_session_id TEXT, agent_profile_snapshot_id TEXT, reset_reason TEXT, created_at TEXT, UNIQUE(route_id, generation_number));
+      CREATE TABLE session_sources (id TEXT PRIMARY KEY, route_id TEXT, source_type TEXT, source_id TEXT, user_id TEXT, metadata TEXT, created_at TEXT);
+      CREATE TABLE web_messages (id TEXT PRIMARY KEY, session_id TEXT, user_id TEXT, role TEXT, content TEXT, status TEXT, route_key TEXT, metadata TEXT, created_at TEXT);
+      CREATE TABLE web_events (id TEXT PRIMARY KEY, session_id TEXT, user_id TEXT, type TEXT, payload TEXT, created_at TEXT);
+      CREATE TABLE import_jobs (id TEXT PRIMARY KEY, actor_user_id TEXT, target_user_id TEXT, staged_id TEXT, source_fingerprint TEXT, request_hash TEXT, idempotency_key TEXT, status TEXT, dry_run INTEGER, total_conversations INTEGER, completed_conversations INTEGER, progress_json TEXT, result_json TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE fixed_import_receipts (user_id TEXT, source_fingerprint TEXT, importer_version TEXT, id_algorithm TEXT, target_dsh TEXT, session_format INTEGER, source_chats_count INTEGER, source_messages_count INTEGER, imported_messages_count INTEGER, dropped_messages_count INTEGER, attachments_count INTEGER, canonical_hash TEXT, created_at TEXT, PRIMARY KEY (user_id, source_fingerprint));
+      CREATE TABLE fixed_import_provenance (id TEXT PRIMARY KEY, user_id TEXT, source_fingerprint TEXT, source_chat_jid TEXT, source_message_id TEXT, target_space_id TEXT, target_route_id TEXT, target_dsh_session_id TEXT, target_message_id TEXT, target_event_id TEXT, created_at TEXT);
+      CREATE TABLE agent_profiles (id TEXT PRIMARY KEY, user_id TEXT, name TEXT, description TEXT, status TEXT, active_version TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE agent_profile_snapshots (id TEXT PRIMARY KEY, user_id TEXT, profile_id TEXT, version TEXT, prompt_mode TEXT, prompt_hash TEXT, identity TEXT, soul TEXT, agents TEXT, tools TEXT, created_at TEXT);
+      CREATE TABLE extension_packages (id TEXT PRIMARY KEY, user_id TEXT, slug TEXT, name TEXT, description TEXT, source_kind TEXT, source_ref TEXT, installed_version INTEGER, active_version INTEGER, status TEXT, integrity_sha256 TEXT, provenance_json TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE extension_contributions (id TEXT PRIMARY KEY, package_id TEXT, kind TEXT, contribution_key TEXT, manifest_json TEXT, status TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE extension_bindings (id TEXT PRIMARY KEY, user_id TEXT, space_id TEXT, contribution_id TEXT, enabled INTEGER, created_at TEXT, updated_at TEXT, UNIQUE(space_id, contribution_id));
+      CREATE TABLE platform_tasks (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        idempotency_key TEXT,
+        title TEXT,
+        description TEXT,
+        priority TEXT,
+        status TEXT,
+        payload TEXT,
+        schedule_type TEXT NOT NULL DEFAULT 'once',
+        cron_expression TEXT,
+        created_at TEXT,
+        updated_at TEXT
+      );
+      CREATE TABLE task_schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT UNIQUE,
+        user_id TEXT,
+        schedule_type TEXT,
+        cron_expression TEXT,
+        enabled INTEGER,
+        paused_at TEXT,
+        created_at TEXT,
+        updated_at TEXT
+      );
+      CREATE TABLE channel_accounts (id TEXT PRIMARY KEY, user_id TEXT, type TEXT, status TEXT, credential_ref TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE channel_bindings (id TEXT PRIMARY KEY, user_id TEXT, account_id TEXT, space_id TEXT, native_context_id TEXT, activation_mode TEXT, created_at TEXT, updated_at TEXT, UNIQUE(account_id, native_context_id));
+      INSERT INTO users (id, username, role) VALUES ('usr_alice', 'alice', 'admin');
+    `)
+
+    const pilotResult = await executePilotMigrationV2({
+      stagingDir,
+      planId: plan.planId,
+      db: targetDb,
+      targetUserId: 'usr_alice',
+    })
+
+    expect(pilotResult.success).toBe(true)
+
+    const taskRow = targetDb.prepare('SELECT * FROM platform_tasks WHERE title = ?').get('Daily Workspace Sync') as any
+    expect(taskRow).toBeDefined()
+    expect(taskRow.schedule_type).toBe('cron')
+    expect(taskRow.cron_expression).toBe('0 9 * * *')
+
+    const schedRow = targetDb.prepare('SELECT * FROM task_schedules WHERE task_id = ?').get(taskRow.id) as any
+    expect(schedRow).toBeDefined()
+    expect(schedRow.schedule_type).toBe('cron')
+    expect(schedRow.cron_expression).toBe('0 9 * * *')
+
+    targetDb.close()
   })
 })

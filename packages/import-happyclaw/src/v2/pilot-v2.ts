@@ -268,9 +268,9 @@ export async function executePilotMigrationV2(options: ExecutePilotOptions): Pro
     // Tasks Statements
     const taskStmt = db.prepare(`
       INSERT INTO platform_tasks (
-        id, user_id, idempotency_key, title, description, priority, status, payload, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
+        id, user_id, idempotency_key, title, description, priority, status, payload, schedule_type, cron_expression, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = 'pending', schedule_type = excluded.schedule_type, cron_expression = excluded.cron_expression, updated_at = excluded.updated_at
     `)
 
     const taskScheduleStmt = db.prepare(`
@@ -513,6 +513,8 @@ export async function executePilotMigrationV2(options: ExecutePilotOptions): Pro
       // Tasks (Paused)
       for (const task of item.taskPlans) {
         const taskId = `task_pilot_${createHash('sha256').update(`${targetUserId}:${item.targetSpaceFolder}:${task.sourceTaskId}`).digest('hex').slice(0, 16)}`
+        const schedType = task.cronExpression ? 'cron' : 'once'
+        const cronExpr = task.cronExpression || null
         taskStmt.run(
           taskId,
           targetUserId,
@@ -521,6 +523,8 @@ export async function executePilotMigrationV2(options: ExecutePilotOptions): Pro
           task.prompt,
           task.priority === 'urgent' ? 'urgent' : task.priority === 'high' ? 'high' : task.priority === 'low' ? 'low' : 'medium',
           JSON.stringify({ prompt: task.prompt, planId: plan.planId }),
+          schedType,
+          cronExpr,
           createdAt,
           createdAt
         )
@@ -530,8 +534,8 @@ export async function executePilotMigrationV2(options: ExecutePilotOptions): Pro
           schedId,
           taskId,
           targetUserId,
-          task.cronExpression ? 'cron' : 'once',
-          task.cronExpression || null,
+          schedType,
+          cronExpr,
           createdAt,
           createdAt,
           createdAt
