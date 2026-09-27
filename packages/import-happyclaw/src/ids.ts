@@ -102,3 +102,28 @@ export function channelFromJid(jid: string): string {
   if (jid.includes('@s.whatsapp.net')) return 'whatsapp'
   return 'dm'
 }
+
+/**
+ * Normalizes source channel names to Enkeep canonical platform channel names.
+ * e.g. 'feishu' -> 'lark', 'wx' -> 'wechat'
+ */
+export function normalizeChannelType(type: string): string {
+  if (!type || typeof type !== 'string') return 'generic'
+  const lower = type.trim().toLowerCase()
+  if (lower === 'feishu' || lower === 'lark') return 'lark'
+  if (lower === 'wechat' || lower === 'wx') return 'wechat'
+  if (lower === 'web') return 'web'
+  return lower || 'generic'
+}
+
+/**
+ * Extracts clean native context id from a channel JID or context identifier.
+ * Strips transport prefixes (feishu:, lark:, wechat:, etc.) and trailing #account/thread tags.
+ */
+export function extractNativeContextId(jidOrContext: string): string {
+  if (!jidOrContext || typeof jidOrContext !== 'string') return ''
+  let clean = jidOrContext.trim()
+  clean = clean.replace(/^(?:feishu|lark|wechat|web|im|qq):/i, '')
+  clean = clean.replace(/#[^#]+$/i, '').replace(/#[^#]+$/i, '')
+  return clean
+}

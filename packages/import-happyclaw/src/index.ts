@@ -45,6 +45,8 @@ export {
   deterministicSourceProvenanceId,
   folderSlug,
   channelFromJid,
+  normalizeChannelType,
+  extractNativeContextId,
 } from './ids.js'
 
 export {
@@ -106,6 +108,7 @@ export type {
   UserInstructionPlan,
   ExtensionMigrationPlan,
   TaskMigrationPlan,
+  TaskDeliveryTargetPlan,
   ChannelBindingMigrationPlan,
   ChannelAccountMigrationPlan,
   QuotaMigrationPlan,

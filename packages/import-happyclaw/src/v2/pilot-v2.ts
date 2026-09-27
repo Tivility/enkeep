@@ -515,6 +515,71 @@ export async function executePilotMigrationV2(options: ExecutePilotOptions): Pro
         const taskId = `task_pilot_${createHash('sha256').update(`${targetUserId}:${item.targetSpaceFolder}:${task.sourceTaskId}`).digest('hex').slice(0, 16)}`
         const schedType = task.cronExpression ? 'cron' : 'once'
         const cronExpr = task.cronExpression || null
+
+        // Resolve delivery for task payload
+        let taskDelivery: { channel: string; accountId: string; nativeContextId: string } | undefined
+        if (task.delivery) {
+          const mappedAccId =
+            channelAccountIdMap.get(task.delivery.accountId) ||
+            channelAccountIdMap.get(task.delivery.channel) ||
+            task.delivery.accountId
+          taskDelivery = {
+            channel: task.delivery.channel,
+            accountId: mappedAccId,
+            nativeContextId: task.delivery.nativeContextId,
+          }
+        } else if (item.channelBindingsPlans.length > 0) {
+          const nonWeb = item.channelBindingsPlans.find((cb) => cb.channelType !== 'web' && cb.channelType !== 'generic')
+          if (nonWeb) {
+            const mappedAccId =
+              channelAccountIdMap.get(nonWeb.channelType) ||
+              channelAccountIdMap.get('generic') ||
+              `acc_pilot_fallback_${nonWeb.channelType}`
+            taskDelivery = {
+              channel: nonWeb.channelType,
+              accountId: mappedAccId,
+              nativeContextId: nonWeb.nativeContextId,
+            }
+          }
+        }
+
+        // Fallback: check existing channel_bindings in db for this space
+        if (!taskDelivery) {
+          try {
+            const bindRow = db
+              .prepare('SELECT account_id, native_context_id FROM channel_bindings WHERE space_id = ? LIMIT 1')
+              .get(spaceId) as { account_id: string; native_context_id: string } | undefined
+            if (bindRow) {
+              const accRow = db.prepare('SELECT type FROM channel_accounts WHERE id = ?').get(bindRow.account_id) as
+                | { type: string }
+                | undefined
+              if (accRow && accRow.type !== 'web' && accRow.type !== 'generic') {
+                taskDelivery = {
+                  channel: accRow.type,
+                  accountId: bindRow.account_id,
+                  nativeContextId: bindRow.native_context_id,
+                }
+              }
+            }
+          } catch {}
+        }
+
+        const targetSessionId =
+          item.sessionPlans[0]?.targetSessionId ||
+          `ses_${createHash('sha256').update(`${targetUserId}:${item.targetSpaceFolder}:canonical`).digest('hex').slice(0, 16)}`
+        const taskPayload: Record<string, unknown> = {
+          type: 'agent_prompt',
+          prompt: task.prompt,
+          sessionId: targetSessionId,
+          sessionPolicy: task.contextMode === 'isolated' ? 'isolated' : 'existing_session',
+          spaceId,
+          spaceFolder: item.targetSpaceFolder,
+          silent: false,
+        }
+        if (taskDelivery) {
+          taskPayload.delivery = taskDelivery
+        }
+
         taskStmt.run(
           taskId,
           targetUserId,
@@ -522,7 +587,7 @@ export async function executePilotMigrationV2(options: ExecutePilotOptions): Pro
           task.title,
           task.prompt,
           task.priority === 'urgent' ? 'urgent' : task.priority === 'high' ? 'high' : task.priority === 'low' ? 'low' : 'medium',
-          JSON.stringify({ prompt: task.prompt, planId: plan.planId }),
+          JSON.stringify(taskPayload),
           schedType,
           cronExpr,
           createdAt,

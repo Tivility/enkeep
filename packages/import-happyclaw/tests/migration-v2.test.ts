@@ -97,6 +97,12 @@ describe('Migration V2 Plan Engine & Credential Authorized Transfer', () => {
     expect(aliceItem?.instructionPlan?.instructionType).toBe('claude_md')
     expect(aliceItem?.extensionPlans.some((e) => e.kind === 'skill' && e.name === 'git-workflow-skill')).toBe(true)
     expect(aliceItem?.taskPlans.some((t) => t.title === 'Daily Workspace Sync')).toBe(true)
+    const syncTask = aliceItem?.taskPlans.find((t) => t.title === 'Daily Workspace Sync')
+    expect(syncTask?.delivery).toEqual({
+      channel: 'lark',
+      accountId: 'acc_alice_lark',
+      nativeContextId: 'oc_alice_chat_123',
+    })
     expect(aliceItem?.channelBindingsPlans.some((b) => b.channelType === 'lark' && b.cutoverDeferred === true)).toBe(true)
 
     // Check Bob Space mapping and Untrusted Plugin Quarantine
@@ -308,6 +314,14 @@ describe('Migration V2 Plan Engine & Credential Authorized Transfer', () => {
     expect(taskRow).toBeDefined()
     expect(taskRow.schedule_type).toBe('cron')
     expect(taskRow.cron_expression).toBe('0 9 * * *')
+
+    const taskPayload = JSON.parse(taskRow.payload)
+    expect(taskPayload.type).toBe('agent_prompt')
+    expect(taskPayload.delivery).toEqual({
+      channel: 'lark',
+      accountId: expect.stringMatching(/^acc_pilot_/),
+      nativeContextId: 'oc_alice_chat_123',
+    })
 
     const schedRow = targetDb.prepare('SELECT * FROM task_schedules WHERE task_id = ?').get(taskRow.id) as any
     expect(schedRow).toBeDefined()

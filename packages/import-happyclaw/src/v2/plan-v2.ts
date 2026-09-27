@@ -8,6 +8,8 @@ import {
   deterministicSessionId,
   deterministicSpaceId,
   folderSlug,
+  normalizeChannelType,
+  extractNativeContextId,
 } from '../ids.js'
 import { computeSourceFingerprint } from '../manifest.js'
 import { introspectSource } from '../introspection.js'
@@ -30,6 +32,7 @@ import {
   type SourceInspectResultV2,
   type SpaceInstructionPlan,
   type TaskMigrationPlan,
+  type TaskDeliveryTargetPlan,
   type UserInstructionPlan,
   type UserSnapshotPlan,
   type WorkspaceInspectSummaryV2,
@@ -155,14 +158,32 @@ export function inspectSourceV2(
     }
 
     // Tasks
-    let allTasks: Array<{ id: string; title?: string; workspace_id?: string; group_jid?: string }> = []
+    let allTasks: Array<{ id: string; title?: string; workspace_id?: string; group_jid?: string; group_folder?: string; chat_jid?: string }> = []
     if (tableSet.has('scheduled_tasks')) {
       const cols = new Set(diagnostic.columnMap['scheduled_tasks'] ?? [])
       const idCol = cols.has('id') ? 'id' : 'rowid AS id'
       const titleCol = cols.has('title') ? 'title' : cols.has('prompt') ? 'prompt AS title' : "'Scheduled Task' AS title"
-      const wsCol = cols.has('workspace_id') ? 'workspace_id' : cols.has('workspace_jid') ? 'workspace_jid AS workspace_id' : cols.has('group_folder') ? 'group_folder AS workspace_id' : 'NULL AS workspace_id'
-      const groupCol = cols.has('group_jid') ? 'group_jid' : cols.has('chat_jid') ? 'chat_jid AS group_jid' : cols.has('workspace_jid') ? 'workspace_jid AS group_jid' : 'NULL AS group_jid'
-      allTasks = (db.prepare(`SELECT ${idCol}, ${titleCol}, ${wsCol}, ${groupCol} FROM scheduled_tasks`).all() as unknown[]) as typeof allTasks
+      const wsCol = cols.has('workspace_id') && cols.has('group_folder')
+        ? "COALESCE(NULLIF(workspace_id, ''), NULLIF(group_folder, ''), NULLIF(workspace_jid, '')) AS workspace_id"
+        : cols.has('workspace_id')
+        ? 'workspace_id'
+        : cols.has('group_folder')
+        ? 'group_folder AS workspace_id'
+        : cols.has('workspace_jid')
+        ? 'workspace_jid AS workspace_id'
+        : 'NULL AS workspace_id'
+      const groupCol = cols.has('group_jid') && cols.has('chat_jid')
+        ? "COALESCE(NULLIF(group_jid, ''), NULLIF(chat_jid, ''), NULLIF(workspace_jid, '')) AS group_jid"
+        : cols.has('group_jid')
+        ? 'group_jid'
+        : cols.has('chat_jid')
+        ? 'chat_jid AS group_jid'
+        : cols.has('workspace_jid')
+        ? 'workspace_jid AS group_jid'
+        : 'NULL AS group_jid'
+      const folderCol = cols.has('group_folder') ? 'group_folder' : 'NULL AS group_folder'
+      const chatCol = cols.has('chat_jid') ? 'chat_jid' : 'NULL AS chat_jid'
+      allTasks = (db.prepare(`SELECT ${idCol}, ${titleCol}, ${wsCol}, ${groupCol}, ${folderCol}, ${chatCol} FROM scheduled_tasks`).all() as unknown[]) as typeof allTasks
     } else if (tableSet.has('tasks')) {
       const cols = new Set(diagnostic.columnMap['tasks'] ?? [])
       const idCol = cols.has('id') ? 'id' : 'rowid AS id'
@@ -215,7 +236,14 @@ export function inspectSourceV2(
       const wsSkills = allSkills.filter((s) => s.space_id === ws.jid || s.space_id === folder)
       const wsMcp = allMcp.filter((m) => m.workspace_id === ws.jid || m.workspace_id === folder)
       const wsPlugins = allPlugins.filter((p) => p.workspace_id === ws.jid || p.workspace_id === folder)
-      const wsTasks = allTasks.filter((t) => t.workspace_id === ws.jid || t.group_jid === ws.jid || t.workspace_id === folder)
+      const wsTasks = allTasks.filter(
+        (t) =>
+          t.workspace_id === ws.jid ||
+          t.group_jid === ws.jid ||
+          t.workspace_id === folder ||
+          t.group_folder === folder ||
+          t.chat_jid === ws.jid
+      )
       const wsMounts = allMounts.filter((m) => m.workspace_id === ws.jid || m.group_jid === ws.jid || m.workspace_id === folder)
       const channels = Array.from(new Set(wsMounts.map((m) => m.channel || 'generic').concat(channelFromJid(ws.jid))))
 
@@ -483,6 +511,10 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
       priority?: string | null
       workspace_id?: string | null
       group_jid?: string | null
+      chat_jid?: string | null
+      delivery_route_jid?: string | null
+      group_folder?: string | null
+      context_mode?: string | null
     }
     let rawTasks: RawTask[] = []
     if (tableSet.has('scheduled_tasks')) {
@@ -492,9 +524,29 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
       const promptCol = cols.has('prompt') ? 'prompt' : "'' AS prompt"
       const cronCol = cols.has('cron_expression') ? 'cron_expression' : cols.has('schedule_value') ? 'schedule_value AS cron_expression' : 'NULL AS cron_expression'
       const priCol = cols.has('priority') ? 'priority' : 'NULL AS priority'
-      const wsCol = cols.has('workspace_id') ? 'workspace_id' : cols.has('workspace_jid') ? 'workspace_jid AS workspace_id' : cols.has('group_folder') ? 'group_folder AS workspace_id' : 'NULL AS workspace_id'
-      const grpCol = cols.has('group_jid') ? 'group_jid' : cols.has('chat_jid') ? 'chat_jid AS group_jid' : cols.has('workspace_jid') ? 'workspace_jid AS group_jid' : 'NULL AS group_jid'
-      rawTasks = (db.prepare(`SELECT ${idCol}, ${titleCol}, ${promptCol}, ${cronCol}, ${priCol}, ${wsCol}, ${grpCol} FROM scheduled_tasks`).all() as unknown[]) as RawTask[]
+      const wsCol = cols.has('workspace_id') && cols.has('group_folder')
+        ? "COALESCE(NULLIF(workspace_id, ''), NULLIF(group_folder, ''), NULLIF(workspace_jid, '')) AS workspace_id"
+        : cols.has('workspace_id')
+        ? 'workspace_id'
+        : cols.has('group_folder')
+        ? 'group_folder AS workspace_id'
+        : cols.has('workspace_jid')
+        ? 'workspace_jid AS workspace_id'
+        : 'NULL AS workspace_id'
+      const grpCol = cols.has('group_jid') && cols.has('chat_jid')
+        ? "COALESCE(NULLIF(group_jid, ''), NULLIF(chat_jid, ''), NULLIF(workspace_jid, '')) AS group_jid"
+        : cols.has('group_jid')
+        ? 'group_jid'
+        : cols.has('chat_jid')
+        ? 'chat_jid AS group_jid'
+        : cols.has('workspace_jid')
+        ? 'workspace_jid AS group_jid'
+        : 'NULL AS group_jid'
+      const chatCol = cols.has('chat_jid') ? 'chat_jid' : 'NULL AS chat_jid'
+      const routeCol = cols.has('delivery_route_jid') ? 'delivery_route_jid' : 'NULL AS delivery_route_jid'
+      const folderCol = cols.has('group_folder') ? 'group_folder' : 'NULL AS group_folder'
+      const ctxModeCol = cols.has('context_mode') ? 'context_mode' : 'NULL AS context_mode'
+      rawTasks = (db.prepare(`SELECT ${idCol}, ${titleCol}, ${promptCol}, ${cronCol}, ${priCol}, ${wsCol}, ${grpCol}, ${chatCol}, ${routeCol}, ${folderCol}, ${ctxModeCol} FROM scheduled_tasks`).all() as unknown[]) as RawTask[]
     } else if (tableSet.has('tasks')) {
       const cols = new Set(diagnostic.columnMap['tasks'] ?? [])
       const idCol = cols.has('id') ? 'id' : 'rowid AS id'
@@ -503,7 +555,11 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
       const cronCol = cols.has('cron_expression') ? 'cron_expression' : cols.has('schedule') ? 'schedule AS cron_expression' : 'NULL AS cron_expression'
       const priCol = cols.has('priority') ? 'priority' : 'NULL AS priority'
       const wsCol = cols.has('workspace_id') ? 'workspace_id' : 'NULL AS workspace_id'
-      rawTasks = (db.prepare(`SELECT ${idCol}, ${titleCol}, ${promptCol}, ${cronCol}, ${priCol}, ${wsCol} FROM tasks`).all() as unknown[]) as RawTask[]
+      const chatCol = cols.has('chat_jid') ? 'chat_jid' : 'NULL AS chat_jid'
+      const routeCol = cols.has('delivery_route_jid') ? 'delivery_route_jid' : 'NULL AS delivery_route_jid'
+      const folderCol = cols.has('group_folder') ? 'group_folder' : 'NULL AS group_folder'
+      const ctxModeCol = cols.has('context_mode') ? 'context_mode' : 'NULL AS context_mode'
+      rawTasks = (db.prepare(`SELECT ${idCol}, ${titleCol}, ${promptCol}, ${cronCol}, ${priCol}, ${wsCol}, ${wsCol} AS group_jid, ${chatCol}, ${routeCol}, ${folderCol}, ${ctxModeCol} FROM tasks`).all() as unknown[]) as RawTask[]
     }
 
     // 7. Read Channel Accounts & Bindings
@@ -534,6 +590,7 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
       native_context_id: string
       activation_mode?: string | null
       channel?: string | null
+      channel_jid?: string | null
     }
     let rawChannelBindings: RawChannelBinding[] = []
     if (tableSet.has('channel_mounts')) {
@@ -542,10 +599,19 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
       const accCol = cols.has('account_id') ? 'account_id' : cols.has('channel_account_id') ? 'channel_account_id AS account_id' : "'' AS account_id"
       const wsCol = cols.has('workspace_id') ? 'workspace_id' : cols.has('workspace_jid') ? 'workspace_jid AS workspace_id' : 'NULL AS workspace_id'
       const grpCol = cols.has('group_jid') ? 'group_jid' : cols.has('workspace_jid') ? 'workspace_jid AS group_jid' : 'NULL AS group_jid'
-      const natCol = cols.has('native_context_id') ? 'native_context_id' : cols.has('session_id') ? 'session_id AS native_context_id' : cols.has('channel_jid') ? 'channel_jid AS native_context_id' : "'' AS native_context_id"
+      const natCol = cols.has('native_context_id')
+        ? 'native_context_id'
+        : cols.has('session_id') && cols.has('channel_jid')
+        ? "COALESCE(NULLIF(session_id, ''), channel_jid) AS native_context_id"
+        : cols.has('session_id')
+        ? 'session_id AS native_context_id'
+        : cols.has('channel_jid')
+        ? 'channel_jid AS native_context_id'
+        : "'' AS native_context_id"
       const actCol = cols.has('activation_mode') ? 'activation_mode' : "'auto' AS activation_mode"
       const chanCol = cols.has('channel') ? 'channel' : cols.has('channel_type') ? 'channel_type AS channel' : "'generic' AS channel"
-      rawChannelBindings = (db.prepare(`SELECT ${idCol}, ${accCol}, ${wsCol}, ${grpCol}, ${natCol}, ${actCol}, ${chanCol} FROM channel_mounts`).all() as unknown[]) as RawChannelBinding[]
+      const chanJidCol = cols.has('channel_jid') ? 'channel_jid' : 'NULL AS channel_jid'
+      rawChannelBindings = (db.prepare(`SELECT ${idCol}, ${accCol}, ${wsCol}, ${grpCol}, ${natCol}, ${actCol}, ${chanCol}, ${chanJidCol} FROM channel_mounts`).all() as unknown[]) as RawChannelBinding[]
     } else if (tableSet.has('im_context_bindings')) {
       const cols = new Set(diagnostic.columnMap['im_context_bindings'] ?? [])
       const idCol = cols.has('id') ? 'id' : cols.has('source_jid') ? 'source_jid AS id' : 'rowid AS id'
@@ -554,7 +620,7 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
       const natCol = cols.has('native_context_id') ? 'native_context_id' : cols.has('context_id') ? 'context_id AS native_context_id' : cols.has('source_jid') ? 'source_jid AS native_context_id' : "'' AS native_context_id"
       const actCol = cols.has('activation_mode') ? 'activation_mode' : "'auto' AS activation_mode"
       const chanCol = cols.has('channel') ? 'channel' : cols.has('context_type') ? 'context_type AS channel' : "'generic' AS channel"
-      rawChannelBindings = (db.prepare(`SELECT ${idCol}, ${accCol}, ${wsCol}, ${natCol}, ${actCol}, ${chanCol} FROM im_context_bindings`).all() as unknown[]) as RawChannelBinding[]
+      rawChannelBindings = (db.prepare(`SELECT ${idCol}, ${accCol}, ${wsCol}, ${natCol}, ${actCol}, ${chanCol}, NULL AS channel_jid FROM im_context_bindings`).all() as unknown[]) as RawChannelBinding[]
     }
 
     // 8. Read Quotas & Model Preferences
@@ -826,12 +892,144 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
         }
       }
 
-      // 6. Tasks
+      // 6. Channel Bindings (Lark, WeChat to M31)
+      const channelBindingsPlans: ChannelBindingMigrationPlan[] = []
+      if (scopes.channelsMetadata) {
+        const wsBindings = rawChannelBindings.filter(
+          (b) =>
+            b.workspace_id === ws.jid ||
+            b.group_jid === ws.jid ||
+            b.workspace_id === folder ||
+            (b.channel_jid && (b.channel_jid === ws.jid || b.channel_jid.includes(folder)))
+        )
+        for (const b of wsBindings) {
+          const rawChan =
+            b.channel ||
+            (channelFromJid(b.channel_jid || ws.jid) !== 'unknown' ? channelFromJid(b.channel_jid || ws.jid) : 'generic')
+          const chType = normalizeChannelType(rawChan)
+          const rawNat = b.native_context_id || b.channel_jid || ws.jid
+          const natId = extractNativeContextId(rawNat) || ws.jid
+          channelBindingsPlans.push({
+            sourceBindingId: b.id,
+            channelType: chType,
+            nativeContextId: natId,
+            targetSpaceFolder: targetFolder,
+            activationMode: b.activation_mode === 'always' ? 'always' : 'mention',
+            cutoverDeferred: true,
+          })
+          totalChannels++
+        }
+      }
+
+      // 7. Tasks
       const taskPlans: TaskMigrationPlan[] = []
       if (scopes.tasks) {
-        const wsTasks = rawTasks.filter((t) => t.workspace_id === ws.jid || t.group_jid === ws.jid || t.workspace_id === folder)
+        const wsTasks = rawTasks.filter(
+          (t) =>
+            t.workspace_id === ws.jid ||
+            t.group_jid === ws.jid ||
+            t.workspace_id === folder ||
+            t.group_folder === folder ||
+            t.chat_jid === ws.jid ||
+            (t.delivery_route_jid && (t.delivery_route_jid === ws.jid || t.delivery_route_jid.includes(folder)))
+        )
         for (const t of wsTasks) {
-          const prio = (t.priority === 'urgent' || t.priority === 'high' || t.priority === 'low') ? t.priority : 'normal'
+          const prio = t.priority === 'urgent' || t.priority === 'high' || t.priority === 'low' ? t.priority : 'normal'
+
+          // Resolve task delivery target { channel, accountId, nativeContextId }
+          let delivery: TaskDeliveryTargetPlan | null = null
+          const candidateJid = t.delivery_route_jid || t.chat_jid || t.group_jid || t.workspace_id || ws.jid
+
+          // 1. Direct match against rawChannelBindings for specific candidateJid
+          let matchedMount = rawChannelBindings.find(
+            (b) =>
+              candidateJid &&
+              (b.id === candidateJid ||
+                b.channel_jid === candidateJid ||
+                b.workspace_id === candidateJid ||
+                b.group_jid === candidateJid ||
+                b.native_context_id === candidateJid ||
+                (b.channel_jid && extractNativeContextId(b.channel_jid) === extractNativeContextId(candidateJid)) ||
+                (b.native_context_id && extractNativeContextId(b.native_context_id) === extractNativeContextId(candidateJid)))
+          )
+
+          // 2. If candidateJid is an external channel JID (e.g. feishu:oc_... or wechat:...)
+          if (!matchedMount && candidateJid) {
+            const rawChan = channelFromJid(candidateJid)
+            const parsedChan = normalizeChannelType(rawChan)
+            if (parsedChan !== 'web' && parsedChan !== 'generic' && parsedChan !== 'unknown') {
+              const nativeId = extractNativeContextId(candidateJid)
+              let accId = ''
+              const accMatch = candidateJid.match(/#account:([^#]+)/)
+              if (accMatch) {
+                accId = accMatch[1]
+              } else {
+                const bMatch = rawChannelBindings.find(
+                  (b) =>
+                    extractNativeContextId(b.native_context_id) === nativeId ||
+                    extractNativeContextId(b.channel_jid || '') === nativeId
+                )
+                if (bMatch?.account_id) {
+                  accId = bMatch.account_id
+                } else {
+                  const aMatch = rawChannelAccounts.find((a) => normalizeChannelType(a.type) === parsedChan)
+                  if (aMatch) accId = aMatch.id
+                }
+              }
+              if (nativeId) {
+                delivery = {
+                  channel: parsedChan,
+                  accountId: accId || 'default',
+                  nativeContextId: nativeId,
+                }
+              }
+            }
+          }
+
+          // 3. Fall back to workspace-level channel mount if candidateJid is workspace/web
+          if (!delivery && !matchedMount) {
+            matchedMount = rawChannelBindings.find(
+              (b) =>
+                (b.workspace_id === ws.jid || b.group_jid === ws.jid || b.workspace_id === folder) &&
+                normalizeChannelType(b.channel || '') !== 'web' &&
+                normalizeChannelType(b.channel || '') !== 'generic'
+            )
+          }
+
+          // If a mount was matched, construct delivery
+          if (!delivery && matchedMount) {
+            const rawChan = matchedMount.channel || channelFromJid(matchedMount.channel_jid || '')
+            const chan = normalizeChannelType(rawChan)
+            if (chan !== 'web' && chan !== 'generic' && chan !== 'unknown') {
+              const nativeContextId = extractNativeContextId(matchedMount.native_context_id || matchedMount.channel_jid || '')
+              let accId = matchedMount.account_id
+              if (!accId) {
+                const aMatch = rawChannelAccounts.find((a) => normalizeChannelType(a.type) === chan)
+                if (aMatch) accId = aMatch.id
+              }
+              if (nativeContextId) {
+                delivery = {
+                  channel: chan,
+                  accountId: accId || 'default',
+                  nativeContextId,
+                }
+              }
+            }
+          }
+
+          // 4. Fall back to channelBindingsPlans for this workspace
+          if (!delivery && channelBindingsPlans.length > 0) {
+            const nonWeb = channelBindingsPlans.find((cb) => cb.channelType !== 'web' && cb.channelType !== 'generic')
+            if (nonWeb) {
+              const accMatch = rawChannelAccounts.find((a) => normalizeChannelType(a.type) === nonWeb.channelType)
+              delivery = {
+                channel: nonWeb.channelType,
+                accountId: accMatch?.id || 'default',
+                nativeContextId: nonWeb.nativeContextId,
+              }
+            }
+          }
+
           taskPlans.push({
             sourceTaskId: t.id,
             title: t.title,
@@ -839,26 +1037,10 @@ export function createMigrationPlanV2(request: MigrationV2DryRunRequest): Migrat
             cronExpression: t.cron_expression || null,
             priority: prio,
             targetSpaceFolder: targetFolder,
+            delivery: delivery || null,
+            contextMode: t.context_mode || null,
           })
           totalTasks++
-        }
-      }
-
-      // 7. Channel Bindings (Lark, WeChat to M31)
-      const channelBindingsPlans: ChannelBindingMigrationPlan[] = []
-      if (scopes.channelsMetadata) {
-        const wsBindings = rawChannelBindings.filter((b) => b.workspace_id === ws.jid || b.group_jid === ws.jid || b.workspace_id === folder)
-        for (const b of wsBindings) {
-          const chType = b.channel || (channelFromJid(ws.jid) !== 'unknown' ? channelFromJid(ws.jid) : 'generic')
-          channelBindingsPlans.push({
-            sourceBindingId: b.id,
-            channelType: chType,
-            nativeContextId: b.native_context_id || ws.jid,
-            targetSpaceFolder: targetFolder,
-            activationMode: b.activation_mode === 'always' ? 'always' : 'mention',
-            cutoverDeferred: true,
-          })
-          totalChannels++
         }
       }
 
