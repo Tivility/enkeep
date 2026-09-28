@@ -8,7 +8,7 @@ import {
   type Space,
   type SessionRoute,
 } from '@enkeep/platform-core';
-import { type InboundEnvelope, buildRouteKey } from '@enkeep/web-channel';
+import { type InboundEnvelope, buildRouteKey, DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS } from '@enkeep/web-channel';
 import {
   validateAgentPromptPayload,
   type AgentPromptDispatchContext,
@@ -19,6 +19,7 @@ import {
 import {
   DeliveryRuntimeGateway,
 } from '../runtime/delivery-gateway.js';
+import { SPACE_ID_REGEX } from '../files/runtime-file-api.js';
 
 export interface AgentPromptCompletedResult {
   readonly status: 'completed';
@@ -59,7 +60,7 @@ interface AuthoritativeAssistantMessageRow {
 
 const CANONICAL_TASK_ID_PATTERN = /^(?:task_[0-9a-f]{32}|task_hpc_[0-9a-f]{24})$/;
 const VALID_SESSION_ID_PATTERN = /^(?:ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
-const VALID_SPACE_ID_PATTERN = /^(?:spc_[0-9a-f]{32}|impsp_[0-9a-f]{64})$/;
+const VALID_SPACE_ID_PATTERN = SPACE_ID_REGEX;
 
 /**
  * Exact parser for SQLite turn_runs row (no unsafe casts or fabricated defaults).
@@ -151,8 +152,8 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     this.gateway = options.gateway;
     this.storage = options.storage;
     this.db = options.database;
-    const maxWait = options.maxWaitMs ?? 300_000;
-    this.maxWaitMs = Number.isSafeInteger(maxWait) && maxWait > 0 ? maxWait : 300_000;
+    const maxWait = options.maxWaitMs ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
+    this.maxWaitMs = Number.isSafeInteger(maxWait) && maxWait > 0 ? maxWait : DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
     const pollInterval = options.pollIntervalMs ?? 50;
     this.pollIntervalMs = Number.isSafeInteger(pollInterval) && pollInterval > 0 ? pollInterval : 50;
   }
@@ -195,9 +196,9 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       }
       if (context.executionBudget.maxWaitMs !== undefined) {
         const wait = context.executionBudget.maxWaitMs;
-        if (typeof wait !== 'number' || !Number.isSafeInteger(wait) || wait <= 0 || wait > 900_000) {
+        if (typeof wait !== 'number' || !Number.isSafeInteger(wait) || wait <= 0 || wait > DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS) {
           throw new ValidationError(
-            '[INVALID_EXECUTION_BUDGET] Execution budget maxWaitMs must be a finite integer between 1 and 900000'
+            `[INVALID_EXECUTION_BUDGET] Execution budget maxWaitMs must be a finite integer between 1 and ${DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS}`
           );
         }
         effectiveMaxWaitMs = wait;
@@ -216,8 +217,8 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new ValidationError('[INVALID_PAYLOAD] Task payload sessionId format is invalid');
     }
 
-    if (payload.sessionPolicy !== 'existing_session') {
-      throw new ValidationError('[INVALID_PAYLOAD] Task payload sessionPolicy must be existing_session');
+    if (payload.sessionPolicy !== 'existing_session' && payload.sessionPolicy !== 'isolated') {
+      throw new ValidationError('[INVALID_PAYLOAD] Task payload sessionPolicy must be existing_session or isolated');
     }
 
     // Validate optional payload.spaceId format when provided
@@ -305,43 +306,69 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
       throw new ValidationError('[SPACE_FOLDER_MISMATCH] Task payload spaceFolder does not match target space folder');
     }
 
-    // Authoritative canonical session validation
-    const spaceRow = this.db
-      .prepare('SELECT canonical_session_id FROM spaces WHERE id = ? AND user_id = ? LIMIT 1')
-      .get(targetSpace.id, tenantId) as { canonical_session_id: string | null } | undefined;
+    let ephemeralRoute: SessionRoute | null = null;
 
-    const currentCanonicalId = spaceRow?.canonical_session_id ?? null;
-    if (currentCanonicalId && currentCanonicalId !== targetRoute.id) {
-      const canonRoute = this.db
-        .prepare('SELECT id, status FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? LIMIT 1')
-        .get(currentCanonicalId, targetSpace.id, tenantId) as { id: string; status: string } | undefined;
+    if (payload.sessionPolicy === 'existing_session') {
+      // Authoritative canonical session validation
+      const spaceRow = this.db
+        .prepare('SELECT canonical_session_id FROM spaces WHERE id = ? AND user_id = ? LIMIT 1')
+        .get(targetSpace.id, tenantId) as { canonical_session_id: string | null } | undefined;
 
-      if (canonRoute && canonRoute.status === 'active') {
-        throw new ValidationError('[NON_CANONICAL_SESSION] Specified session is not the canonical session for space');
+      const currentCanonicalId = spaceRow?.canonical_session_id ?? null;
+      if (currentCanonicalId && currentCanonicalId !== targetRoute.id) {
+        const canonRoute = this.db
+          .prepare('SELECT id, status FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? LIMIT 1')
+          .get(currentCanonicalId, targetSpace.id, tenantId) as { id: string; status: string } | undefined;
+
+        if (canonRoute && canonRoute.status === 'active') {
+          throw new ValidationError('[NON_CANONICAL_SESSION] Specified session is not the canonical session for space');
+        }
+        // Stale or archived canonical session: rebind space canonical_session_id to active targetRoute
+        this.db
+          .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(targetRoute.id, targetSpace.id, tenantId);
+      } else if (!currentCanonicalId) {
+        // First active session: set as canonical_session_id to preserve onecanonical invariant
+        this.db
+          .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(targetRoute.id, targetSpace.id, tenantId);
       }
-      // Stale or archived canonical session: rebind space canonical_session_id to active targetRoute
-      this.db
-        .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(targetRoute.id, targetSpace.id, tenantId);
-    } else if (!currentCanonicalId) {
-      // First active session: set as canonical_session_id to preserve onecanonical invariant
-      this.db
-        .prepare('UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(targetRoute.id, targetSpace.id, tenantId);
+
+      // Sync session_routes executionMode with authoritative space executionMode if divergent
+      if (targetRoute.executionMode !== targetSpace.executionMode) {
+        this.db
+          .prepare('UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(targetSpace.executionMode, targetRoute.id, tenantId);
+      }
+    } else {
+      // payload.sessionPolicy === 'isolated'
+      // Create fresh ephemeral session in the same space without mutating canonical_session_id
+      const ephemeralSessionId = `ses_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+      const ephemeralDshSessionId = `ses_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+      const title = `[Task] ${task.title}`;
+
+      ephemeralRoute = await tenantStorage.sessionRoutes.create({
+        id: ephemeralSessionId,
+        spaceId: targetSpace.id,
+        channel: 'web',
+        accountId: 'default',
+        nativeContextId: ephemeralSessionId,
+        peerId: `web:${ephemeralSessionId}`,
+        dshSessionId: ephemeralDshSessionId,
+        executionMode: targetSpace.executionMode,
+        title,
+        agentProfileId: targetRoute.agentProfileId ?? null,
+        agentProfileSnapshotId: targetRoute.agentProfileSnapshotId ?? null,
+      });
     }
 
-    // Sync session_routes executionMode with authoritative space executionMode if divergent
-    if (targetRoute.executionMode !== targetSpace.executionMode) {
-      this.db
-        .prepare('UPDATE session_routes SET execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(targetSpace.executionMode, targetRoute.id, tenantId);
-    }
+    const dispatchRoute = ephemeralRoute ?? targetRoute;
 
     // 3. Construct InboundEnvelope strictly authoritative from route
     // Canonical delivery ID format: deliv_ + 32 lowercase hex UUID
     const deliveryId = `deliv_${randomUUID().replace(/-/g, '')}`;
     const nowIso = new Date().toISOString();
-    const platformSessionId = targetRoute.id;
+    const platformSessionId = dispatchRoute.id;
 
     // Simplified InboundEnvelope: id, userId, sessionId, content, timestamp
     const envelope: InboundEnvelope = {
@@ -354,6 +381,9 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
 
     // Check abort again immediately before dispatch
     if (signal.aborted) {
+      if (ephemeralRoute) {
+        await tenantStorage.sessionRoutes.archive(ephemeralRoute.id).catch(() => {});
+      }
       throw new Error('[TASK_ABORTED] Task execution was aborted');
     }
 
@@ -361,8 +391,21 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     const dispatchOptions = context.executionBudget?.maxWaitMs !== undefined
       ? { timeoutMs: effectiveMaxWaitMs }
       : undefined;
-    const dispatchRes = await this.gateway.dispatchInbound(envelope, dispatchOptions);
+
+    let dispatchRes;
+    try {
+      dispatchRes = await this.gateway.dispatchInbound(envelope, dispatchOptions);
+    } catch (dispatchErr) {
+      if (ephemeralRoute) {
+        await tenantStorage.sessionRoutes.archive(ephemeralRoute.id).catch(() => {});
+      }
+      throw dispatchErr;
+    }
+
     if (!dispatchRes.accepted || !dispatchRes.turnId) {
+      if (ephemeralRoute) {
+        await tenantStorage.sessionRoutes.archive(ephemeralRoute.id).catch(() => {});
+      }
       if (dispatchRes.isDuplicate) {
         throw new PlatformError(
           '[GATEWAY_DISPATCH_DUPLICATE] Inbound delivery rejected as duplicate',
@@ -378,15 +421,59 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     }
     const turnId = dispatchRes.turnId;
 
+    // Record session_id and turn_id in task_runs if task run record exists
+    try {
+      if (task.currentRun?.id) {
+        this.db
+          .prepare('UPDATE task_runs SET session_id = ?, turn_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+          .run(dispatchRoute.id, turnId, task.currentRun.id, tenantId);
+      } else if (task.id) {
+        this.db
+          .prepare("UPDATE task_runs SET session_id = ?, turn_id = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ? AND user_id = ? AND status IN ('claimed', 'running')")
+          .run(dispatchRoute.id, turnId, task.id, tenantId);
+      }
+    } catch {
+      // Best-effort update if task_runs table exists
+    }
+
     // 5. Execution / Polling Promise race with one awaited cancellation routine
-    return await this.pollTurnExecution({
-      tenantId,
-      turnId,
-      routeId: targetRoute.id,
-      sessionId: platformSessionId,
-      signal,
-      maxWaitMs: effectiveMaxWaitMs,
-    });
+    let dispatchResult: AgentPromptDispatchResult | undefined;
+    let dispatchError: unknown;
+    try {
+      dispatchResult = await this.pollTurnExecution({
+        tenantId,
+        turnId,
+        routeId: dispatchRoute.id,
+        sessionId: platformSessionId,
+        signal,
+        maxWaitMs: effectiveMaxWaitMs,
+      });
+      return dispatchResult;
+    } catch (err: unknown) {
+      dispatchError = err;
+      throw err;
+    } finally {
+      if (ephemeralRoute) {
+        try {
+          await this.notifySourceSessionOnIsolatedCompletion({
+            tenantId,
+            sourceSessionId: payload.sessionId,
+            ephemeralRouteId: ephemeralRoute.id,
+            turnId,
+            task,
+            dispatchError,
+          });
+        } catch {
+          // Failure to notify should not mask original outcome
+        }
+
+        try {
+          await tenantStorage.sessionRoutes.archive(ephemeralRoute.id);
+        } catch {
+          // Preserve debuggable outcome without masking original error
+        }
+      }
+    }
   }
 
   /**
@@ -610,6 +697,94 @@ export class AgentPromptDeliveryDispatcher implements AgentPromptDispatcher {
     };
 
     return result;
+  }
+
+  /**
+   * Notifies the source session when an isolated session (/sw background task) completes or fails.
+   * Inserts into web_messages and web_events for the source session if active.
+   * Strictly truncates notification card to <= 2000 characters.
+   */
+  private async notifySourceSessionOnIsolatedCompletion(params: {
+    tenantId: string;
+    sourceSessionId: string;
+    ephemeralRouteId: string;
+    turnId: string;
+    task: { id: string; title: string };
+    dispatchError?: unknown;
+  }): Promise<void> {
+    const { tenantId, sourceSessionId, ephemeralRouteId, turnId, task, dispatchError } = params;
+
+    const tenantStorage = this.storage.forTenant(tenantId);
+    const targetRoute = await tenantStorage.sessionRoutes.findById(sourceSessionId);
+    if (!targetRoute || targetRoute.status !== 'active') {
+      return;
+    }
+
+    const shortId = task.id.startsWith('task_') ? task.id.slice(5, 9) : task.id.slice(0, 4);
+    const displayTitle = task.title ? task.title.replace(/^⚡\s*/, '') : '';
+
+    let notifyContent: string;
+    if (!dispatchError) {
+      const assistantMsg = this.queryAuthoritativeAssistantMessage(tenantId, ephemeralRouteId, turnId);
+      const rawContent = assistantMsg?.content ?? '';
+      const header = `⚡ 并行任务已完成 [${shortId}] ${displayTitle}\n\n`;
+      const maxSummaryLen = Math.max(0, 2000 - header.length);
+      const summary = rawContent.length > maxSummaryLen ? rawContent.slice(0, maxSummaryLen) : rawContent;
+      notifyContent = `${header}${summary}`;
+    } else {
+      const errMsg = dispatchError instanceof Error ? dispatchError.message : String(dispatchError);
+      const header = `⚡ 并行任务失败 [${shortId}] ${displayTitle}\n\n`;
+      const maxErrLen = Math.max(0, 2000 - header.length);
+      const errSummary = errMsg.length > maxErrLen ? errMsg.slice(0, maxErrLen) : errMsg;
+      notifyContent = `${header}${errSummary}`;
+    }
+
+    if (notifyContent.length > 2000) {
+      notifyContent = notifyContent.slice(0, 2000);
+    }
+
+    const nowIso = new Date().toISOString();
+    const messageId = `msg_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+    const eventId = `evt_${randomUUID().replace(/-/g, '').toLowerCase()}`;
+    const routeKey = `${tenantId}:web:${targetRoute.spaceId}:${sourceSessionId}`;
+
+    const messageRecord = {
+      id: messageId,
+      sessionId: sourceSessionId,
+      userId: tenantId,
+      role: 'assistant',
+      content: notifyContent,
+      status: 'delivered',
+      createdAt: nowIso,
+    };
+
+    try {
+      this.db.prepare(`
+        INSERT INTO web_messages (
+          id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+        ) VALUES (?, ?, ?, 'assistant', ?, 'delivered', ?, NULL, ?)
+      `).run(
+        messageId,
+        sourceSessionId,
+        tenantId,
+        notifyContent,
+        routeKey,
+        nowIso
+      );
+
+      this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'message', ?, ?)
+      `).run(
+        eventId,
+        sourceSessionId,
+        tenantId,
+        JSON.stringify({ message: messageRecord }),
+        nowIso
+      );
+    } catch {
+      // Notification insertion error should not break dispatcher
+    }
   }
 }
 

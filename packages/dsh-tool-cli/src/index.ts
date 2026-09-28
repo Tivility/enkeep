@@ -10,6 +10,7 @@ export * from './types.js';
 export * from './errors.js';
 export * from './approvals.js';
 export * from './scope.js';
+export * from './feishu-bridge.js';
 export * from './executor.js';
 export * from './service.js';
 

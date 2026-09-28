@@ -1,7 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { FakeLarkTransport } from '../src/transport.js';
-import { StreamingReplyTracker } from '../src/streaming-tracker.js';
-import type { StreamEventSource } from '../src/types.js';
+import {
+  FakeLarkTransport,
+  formatCardUsageFooter,
+  CredentialedLarkTransport,
+} from '../src/transport.js';
+import {
+  StreamingReplyTracker,
+  extractTurnMetricsFromDb,
+} from '../src/streaming-tracker.js';
+import type {
+  StreamEventSource,
+  CardFinalMetadata,
+  ILarkApiClient,
+  LarkSdkClientFactory,
+} from '../src/types.js';
 
 describe('StreamingReplyTracker', () => {
   beforeEach(() => {
@@ -498,5 +510,288 @@ describe('StreamingReplyTracker', () => {
 
     const res = await tracker.finalize('Turn 2 running reply', 'completed');
     expect(res.handled).toBe(true);
+  });
+
+  describe('C2: Final card compact usage footer (card-final-usage-footer)', () => {
+    it('formatCardUsageFooter formats all metadata components accurately', () => {
+      const full: CardFinalMetadata = {
+        model: 'gpt-4o',
+        durationSeconds: 8.4,
+        promptTokens: 120,
+        completionTokens: 45,
+        cost: 0.0152,
+      };
+      expect(formatCardUsageFooter(full)).toBe(
+        "<font color='grey'>🤖 gpt-4o · ⏱ 8.4s · 💡 120+45 tokens · 💰 $0.0152</font>"
+      );
+    });
+
+    it('formatCardUsageFooter gracefully degrades and omits missing fields without fabricating numbers', () => {
+      // Missing cost: cost is omitted
+      const noCost: CardFinalMetadata = {
+        model: 'claude-3-7-sonnet',
+        durationSeconds: 3.2,
+        totalTokens: 150,
+      };
+      expect(formatCardUsageFooter(noCost)).toBe(
+        "<font color='grey'>🤖 claude-3-7-sonnet · ⏱ 3.2s · 💡 150 tokens</font>"
+      );
+
+      // Only model and duration
+      const modelAndDuration: CardFinalMetadata = {
+        model: 'deepseek-chat',
+        durationMs: 4500,
+      };
+      expect(formatCardUsageFooter(modelAndDuration)).toBe(
+        "<font color='grey'>🤖 deepseek-chat · ⏱ 4.5s</font>"
+      );
+
+      // Integer duration format
+      const intDuration: CardFinalMetadata = {
+        durationSeconds: 5,
+        promptTokens: 80,
+      };
+      expect(formatCardUsageFooter(intDuration)).toBe(
+        "<font color='grey'>⏱ 5s · 💡 80 tokens</font>"
+      );
+
+      // Only completion tokens
+      expect(formatCardUsageFooter({ completionTokens: 40 })).toBe(
+        "<font color='grey'>💡 40 tokens</font>"
+      );
+
+      // Integer cost format
+      expect(formatCardUsageFooter({ model: 'custom', cost: 1 })).toBe(
+        "<font color='grey'>🤖 custom · 💰 $1</font>"
+      );
+
+      // Empty or invalid returns null (no empty footer element)
+      expect(formatCardUsageFooter(undefined)).toBeNull();
+      expect(formatCardUsageFooter({})).toBeNull();
+      expect(formatCardUsageFooter({ model: '   ' })).toBeNull();
+    });
+
+    it('tracker.finalize passes explicit metadata to final card session and renders footer markdown', async () => {
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const fakeSource: StreamEventSource = {
+        listAssistantEvents: vi.fn().mockResolvedValue([]),
+      };
+
+      const tracker = new StreamingReplyTracker({
+        transport,
+        streamEventSource: fakeSource,
+        sessionRouteId: 'session_c2_1',
+        cardParams: { chatId: 'oc_c2_chat' },
+      });
+
+      tracker.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const metadata: CardFinalMetadata = {
+        model: 'claude-3-5-sonnet',
+        durationSeconds: 2.4,
+        promptTokens: 200,
+        completionTokens: 80,
+      };
+
+      const res = await tracker.finalize('Task completed successfully', 'completed', metadata);
+      expect(res.handled).toBe(true);
+
+      const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+      expect(finalizeCall).toBeDefined();
+      expect(finalizeCall?.metadata).toEqual(metadata);
+      expect(finalizeCall?.card).toBeDefined();
+
+      const elements = finalizeCall?.card.body.elements;
+      expect(elements.length).toBe(2);
+      expect(elements[0].content).toBe('Task completed successfully');
+      expect(elements[1].tag).toBe('markdown');
+      expect(elements[1].content).toBe(
+        "<font color='grey'>🤖 claude-3-5-sonnet · ⏱ 2.4s · 💡 200+80 tokens</font>"
+      );
+    });
+
+    it('tracker.finalize automatically queries streamEventSource.getTurnMetrics when available', async () => {
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const queriedMetrics: CardFinalMetadata = {
+        model: 'gemini-1.5-pro',
+        durationSeconds: 1.8,
+        totalTokens: 350,
+      };
+
+      const fakeSource: StreamEventSource = {
+        listAssistantEvents: vi.fn().mockResolvedValue([]),
+        getTurnMetrics: vi.fn().mockResolvedValue(queriedMetrics),
+      };
+
+      const tracker = new StreamingReplyTracker({
+        transport,
+        streamEventSource: fakeSource,
+        sessionRouteId: 'session_c2_source',
+        turnId: 'turn_source_001',
+        cardParams: { chatId: 'oc_c2_chat' },
+      });
+
+      tracker.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const res = await tracker.finalize('Result via getTurnMetrics', 'completed');
+      expect(res.handled).toBe(true);
+      expect(fakeSource.getTurnMetrics).toHaveBeenCalledWith('session_c2_source', 'turn_source_001');
+
+      const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+      expect(finalizeCall?.metadata?.model).toBe('gemini-1.5-pro');
+      expect(finalizeCall?.metadata?.totalTokens).toBe(350);
+
+      const elements = finalizeCall?.card.body.elements;
+      expect(elements[elements.length - 1].content).toBe(
+        "<font color='grey'>🤖 gemini-1.5-pro · ⏱ 1.8s · 💡 350 tokens</font>"
+      );
+    });
+
+    it('tracker.finalize extracts metadata from SQLite turn_runs and related tables', async () => {
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const fakeDb = {
+        prepare: vi.fn().mockImplementation((sql: string) => {
+          if (sql.includes('FROM turn_runs')) {
+            return {
+              get: () => ({
+                id: 'tr_1',
+                turn_id: 'turn_db_001',
+                started_at: '2026-03-30T10:00:00.000Z',
+                finished_at: '2026-03-30T10:00:03.500Z',
+                model: 'qwen-2.5-max',
+                user_id: 'usr_c2',
+                space_id: 'sp_c2',
+              }),
+            };
+          }
+          if (sql.includes('FROM task_runs')) {
+            return {
+              get: () => ({
+                prompt_tokens: 150,
+                completion_tokens: 60,
+                total_tokens: 210,
+              }),
+            };
+          }
+          return { get: () => undefined };
+        }),
+      };
+
+      const fakeSource: StreamEventSource = {
+        listAssistantEvents: vi.fn().mockResolvedValue([]),
+      };
+      (fakeSource as any).db = fakeDb;
+
+      const tracker = new StreamingReplyTracker({
+        transport,
+        streamEventSource: fakeSource,
+        sessionRouteId: 'session_c2_db',
+        turnId: 'turn_db_001',
+        cardParams: { chatId: 'oc_c2_chat' },
+      });
+
+      tracker.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const res = await tracker.finalize('Result via SQLite turn_runs', 'completed');
+      expect(res.handled).toBe(true);
+
+      const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+      expect(finalizeCall?.metadata?.model).toBe('qwen-2.5-max');
+      expect(finalizeCall?.metadata?.durationSeconds).toBe(3.5);
+      expect(finalizeCall?.metadata?.promptTokens).toBe(150);
+      expect(finalizeCall?.metadata?.completionTokens).toBe(60);
+
+      const elements = finalizeCall?.card.body.elements;
+      expect(elements[elements.length - 1].content).toBe(
+        "<font color='grey'>🤖 qwen-2.5-max · ⏱ 3.5s · 💡 150+60 tokens</font>"
+      );
+    });
+
+    it('CredentialedLarkTransport final card JSON renders footer markdown element at elements bottom', async () => {
+      let updatedCardData: any;
+      const mockClient = {
+        im: {
+          v1: {
+            message: {
+              create: vi.fn().mockResolvedValue({
+                code: 0,
+                data: { message_id: 'om_cred_card_1' },
+              }),
+              patch: vi.fn().mockResolvedValue({ code: 0 }),
+            },
+          },
+        },
+        cardkit: {
+          v1: {
+            card: {
+              create: vi.fn().mockResolvedValue({
+                code: 0,
+                data: { card_id: 'card_cred_1' },
+              }),
+              settings: vi.fn().mockResolvedValue({ code: 0 }),
+              update: vi.fn().mockImplementation((req: any) => {
+                updatedCardData = JSON.parse(req.data.card.data);
+                return { code: 0 };
+              }),
+              element: {
+                content: vi.fn().mockResolvedValue({ code: 0 }),
+              },
+            },
+          },
+        },
+      } as unknown as ILarkApiClient;
+
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_c2_test',
+          userId: 'usr_c2',
+          appId: 'cli_mock_c2',
+          appSecret: 'sec_mock_c2',
+        },
+        clientFactory: {
+          createClient: () => mockClient,
+        } as LarkSdkClientFactory,
+      });
+
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_test_cred',
+        title: 'C2 Test Bot',
+      });
+      expect(session).not.toBeNull();
+
+      const metadata: CardFinalMetadata = {
+        model: 'claude-3-7-sonnet',
+        durationSeconds: 4.2,
+        promptTokens: 300,
+        completionTokens: 110,
+        cost: 0.0084,
+      };
+
+      await session!.finalize('# Final Header\nActual answer text', 'completed', metadata);
+
+      expect(updatedCardData).toBeDefined();
+      expect(updatedCardData.schema).toBe('2.0');
+      expect(updatedCardData.header.template).toBe('violet');
+
+      const elements = updatedCardData.body.elements;
+      expect(elements.length).toBe(2);
+      expect(elements[0].tag).toBe('markdown');
+      expect(elements[0].content).toContain('#### Final Header');
+      expect(elements[1].tag).toBe('markdown');
+      expect(elements[1].content).toBe(
+        "<font color='grey'>🤖 claude-3-7-sonnet · ⏱ 4.2s · 💡 300+110 tokens · 💰 $0.0084</font>"
+      );
+    });
   });
 });

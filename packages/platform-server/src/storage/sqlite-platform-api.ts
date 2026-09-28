@@ -1550,6 +1550,58 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
     }
   }
 
+  async compactSession(
+    userId: string,
+    sessionId: string
+  ): Promise<{
+    beforeTokens?: number;
+    afterTokens?: number;
+    eventsBefore: number;
+    eventsAfter: number;
+    summaryChars: number;
+    status?: string;
+    error?: string;
+  }> {
+    if (!userId || typeof userId !== 'string') {
+      throw new ValidationError('userId must be a non-empty string');
+    }
+    if (!sessionId || typeof sessionId !== 'string') {
+      throw new ValidationError('sessionId must be a non-empty string');
+    }
+
+    const routeRow = this.db
+      .prepare(
+        `SELECT r.dsh_session_id, r.space_id, COALESCE(r.execution_mode, s.execution_mode) AS execution_mode, s.folder AS space_folder
+         FROM session_routes r
+         LEFT JOIN spaces s ON s.id = r.space_id
+         WHERE (r.id = ? OR r.dsh_session_id = ?) AND r.user_id = ?
+         LIMIT 1`
+      )
+      .get(sessionId, sessionId, userId) as { dsh_session_id?: string; space_id?: string; execution_mode?: string; space_folder?: string } | undefined;
+
+    const dshSessionId = routeRow?.dsh_session_id || sessionId;
+    const mode = (routeRow?.execution_mode as any) || 'container';
+    const workspaceFolder = routeRow?.space_folder || undefined;
+
+    const provider =
+      this.runtimeProviderRegistry?.getProvider(mode) ??
+      this.runtimeProviderRegistry?.getProvider('container') ??
+      this.runtimeProviderRegistry?.getProvider('host');
+    const artifactPort =
+      provider?.runtimeArtifactPort ??
+      (this.sessionLifecycleService as any)?.runtimeArtifactPort;
+
+    if (!artifactPort || typeof artifactPort.compactSession !== 'function') {
+      throw new Error('Compaction is not available on runtime artifact port');
+    }
+
+    return artifactPort.compactSession({
+      userId,
+      dshSessionId,
+      workspaceFolder,
+    });
+  }
+
   async listSessionGenerations(userId: string, sessionId: string): Promise<PublicGeneration[]> {
     const tenant = this.storage.forTenant(userId);
     const existing = await tenant.sessionRoutes.findById(sessionId);
@@ -1803,6 +1855,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
           };
         }
 
+        case 'reasoning_delta':
         case 'thinking': {
           const streamId = typeof payload['streamId'] === 'string' ? payload['streamId'] : undefined;
           return {

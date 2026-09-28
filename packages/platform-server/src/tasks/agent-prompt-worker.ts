@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import {
@@ -12,6 +14,10 @@ import {
   type TaskWorkerExecutionResult,
   type TenantDiagnostic,
   type AgentPromptTaskPayload,
+  type ScriptTaskPayload,
+  type ScriptTaskDispatchResult,
+  type TaskPayload,
+  type TaskDispatchResult,
   type TaskExecutionBudget,
 } from '@enkeep/platform-operations';
 import {
@@ -35,6 +41,10 @@ export {
   type TaskWorkerExecutionResult,
   type TenantDiagnostic,
   type AgentPromptTaskPayload,
+  type ScriptTaskPayload,
+  type ScriptTaskDispatchResult,
+  type TaskPayload,
+  type TaskDispatchResult,
   type TaskExecutionBudget,
 };
 
@@ -49,6 +59,7 @@ export interface PlatformServerTaskWorkerOptions {
   operationsStorage?: SqlitePlatformOperationsStorage;
   taskNotificationService?: TaskNotificationService;
   channelRuntimeManager?: any;
+  wechatRuntimeManager?: any;
   prepareTaskInput?: TaskWorkerOptions['prepareTaskInput'];
   pipelineTaskPreparer?: PipelineTaskInputPreparerService;
   pipelineManifestPath?: string;
@@ -170,6 +181,64 @@ export function createPlatformServerTaskWorker(
     taskPreparerHook = preparer.asPreparerHook();
   }
 
+  const resolveSpaceCwd = async (params: {
+    tenantId: string;
+    spaceId: string;
+    spaceFolder?: string;
+  }): Promise<string> => {
+    let folder = params.spaceFolder;
+    const spaceRow = options.db
+      .prepare('SELECT folder, execution_mode FROM spaces WHERE id = ? AND user_id = ?')
+      .get(params.spaceId, params.tenantId) as { folder: string; execution_mode: string } | undefined;
+
+    if (!spaceRow) {
+      throw new Error(`Target space "${params.spaceId}" not found for tenant`);
+    }
+    if (spaceRow.execution_mode !== 'host') {
+      throw new Error(`Script tasks can only execute in host mode spaces (current mode: ${spaceRow.execution_mode})`);
+    }
+    if (!folder) {
+      folder = spaceRow.folder;
+    }
+
+    const userRow = options.db
+      .prepare('SELECT username FROM users WHERE id = ?')
+      .get(params.tenantId) as { username: string } | undefined;
+    const username = userRow?.username || params.tenantId;
+
+    const dataRoots = [
+      options.dataRoot,
+      options.dshHome,
+      process.env.ENKEEP_DATA_DIR,
+      process.env.DSH_HOME,
+      path.join(process.cwd(), '.demo-data'),
+      path.join(process.cwd(), 'data'),
+    ].filter((r): r is string => typeof r === 'string' && r.trim().length > 0);
+
+    const candidates: string[] = [];
+    for (const root of dataRoots) {
+      candidates.push(path.join(root, 'host-runtimes', username, 'spaces', folder));
+      candidates.push(path.join(root, 'host-runtimes', params.tenantId, 'spaces', folder));
+      candidates.push(path.join(root, 'host-runtimes', username, '.dsh', 'spaces', folder));
+      candidates.push(path.join(root, 'spaces', folder));
+    }
+
+    for (const cand of candidates) {
+      if (fs.existsSync(cand)) {
+        return cand;
+      }
+    }
+
+    const primaryRoot = dataRoots[0] || path.join(process.cwd(), '.demo-data');
+    const defaultHostPath = path.join(primaryRoot, 'host-runtimes', username, 'spaces', folder);
+    if (!fs.existsSync(defaultHostPath)) {
+      try {
+        fs.mkdirSync(defaultHostPath, { recursive: true });
+      } catch {}
+    }
+    return defaultHostPath;
+  };
+
   return new AgentPromptTaskWorker({
     workerId: resolvedWorkerId,
     tenantEnumerator,
@@ -180,7 +249,9 @@ export function createPlatformServerTaskWorker(
     heartbeatIntervalMs: options.heartbeatIntervalMs,
     systemRecovery: () => operationsStorage.recoverAfterRestart(),
     channelRuntimeManager: options.channelRuntimeManager,
+    wechatRuntimeManager: options.wechatRuntimeManager,
     prepareTaskInput: taskPreparerHook,
+    resolveSpaceCwd,
     db: options.db,
   });
 }

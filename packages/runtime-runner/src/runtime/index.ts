@@ -6,6 +6,8 @@
 
 export * from './demo-model-plugin.js';
 export * from './agent-profile.js';
+export * from './child-scope.js';
+export { isContextDerivedFrom } from './child-scope.js';
 export * from './official-plugins.js';
 export * from './dsh-boot.js';
 export * from './exec-cli.js';

@@ -207,13 +207,18 @@ export function computeCanonicalMessagesHash(messages: ReadonlyArray<{ role: str
   return computeSha256(payload);
 }
 
+function stripThinkingTags(text: string): string {
+  if (!text) return '';
+  return text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '');
+}
+
 /**
  * Extracts visible plain text from DSH content blocks.
  * Reasonings and tool-calls are strictly filtered out of visible user-facing message text.
  */
 export function extractVisibleTextFromContentBlocks(content: unknown): string {
   if (typeof content === 'string') {
-    return content;
+    return stripThinkingTags(content).trim();
   }
   if (!Array.isArray(content)) {
     return '';
@@ -223,13 +228,23 @@ export function extractVisibleTextFromContentBlocks(content: unknown): string {
   for (const block of content) {
     if (!block || typeof block !== 'object') continue;
     const typedBlock = block as Record<string, unknown>;
-    if (typedBlock.type === 'text' && typeof typedBlock.text === 'string') {
-      textPieces.push(typedBlock.text);
+    const blockType = typeof typedBlock.type === 'string' ? typedBlock.type.toLowerCase() : undefined;
+    if (blockType && blockType !== 'text') {
+      continue;
     }
-    // Note: reasoning, tool-call, tool-result, image blocks without text are skipped for text projection
+    if (typedBlock.reasoning === true || typedBlock.isReasoning === true || typedBlock.thinking === true) {
+      continue;
+    }
+    if (typeof typedBlock.text === 'string') {
+      const cleaned = stripThinkingTags(typedBlock.text);
+      if (cleaned.length > 0) textPieces.push(cleaned);
+    } else if (typeof typedBlock.content === 'string') {
+      const cleaned = stripThinkingTags(typedBlock.content);
+      if (cleaned.length > 0) textPieces.push(cleaned);
+    }
   }
 
-  return textPieces.join('');
+  return textPieces.join('').trim();
 }
 
 // ============================================================================

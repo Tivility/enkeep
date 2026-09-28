@@ -1,6 +1,7 @@
 import type {
   Task,
   CreateTaskInput,
+  UpdateTaskInput,
   TaskQueryOptions,
   TaskRecoveryResult,
   AgentPromptDispatchResult,
@@ -16,6 +17,12 @@ export interface TenantScopedTaskRepository {
   findById(id: string): Promise<Task | null>;
   findByIdempotencyKey(key: string): Promise<Task | null>;
   create(input: CreateTaskInput): Promise<Task>;
+
+  /**
+   * Update an existing task and its schedule.
+   * Atomically merges editable fields, recomputes next_run_at, and preserves immutable fields.
+   */
+  update(id: string, input: UpdateTaskInput): Promise<Task>;
 
   /**
    * Atomically claim a pending or lease-expired task/schedule.

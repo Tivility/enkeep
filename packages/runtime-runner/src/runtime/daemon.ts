@@ -119,6 +119,8 @@ import {
   type ListApprovalsResponse,
   type ShutdownRequest,
   type ShutdownResponse,
+  type CompactSessionRequest,
+  type CompactSessionResponse,
   type DaemonErrorResponse,
   type DaemonEvictionReason,
 } from './daemon-protocol.js';
@@ -130,12 +132,38 @@ import type {
   FallbackTarget,
 } from '../transport/types.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
-import { computeMountHash } from '../spec/mount-security.js';
+import { computeMountHash, computeExtraRootsHash, validateExtraReadableRoots } from '../spec/mount-security.js';
 import { computeExtensionPlanHash } from '../spec/extension-plan-security.js';
 import {
   type ExtensionActivationPlan,
   validateExtensionActivationPlan,
 } from '@enkeep/protocol';
+
+function haveSkillsChanged(
+  oldPlan: ExtensionActivationPlan | null | undefined,
+  newPlan: ExtensionActivationPlan | null | undefined
+): boolean {
+  if (!oldPlan && !newPlan) return false;
+  const oldSkills = oldPlan?.skills ?? [];
+  const newSkills = newPlan?.skills ?? [];
+  if (oldSkills.length !== newSkills.length) return true;
+  for (let i = 0; i < newSkills.length; i++) {
+    const o = oldSkills[i];
+    const n = newSkills[i];
+    if (
+      o.contributionKey !== n.contributionKey ||
+      o.name !== n.name ||
+      o.version !== n.version ||
+      o.contentHash !== n.contentHash ||
+      o.enabled !== n.enabled ||
+      o.modelInvocable !== n.modelInvocable ||
+      o.userInvocable !== n.userInvocable
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export interface DaemonOptions extends DshRuntimeBootConfig {
   /** Maximum number of active agents held in memory (default: 16, or env DSH_MAX_AGENTS) */
@@ -176,6 +204,8 @@ export interface ManagedAgentEntry {
   mounts?: readonly RuntimeMountSpec[];
   extensionPlanHash?: string;
   extensionPlan?: ExtensionActivationPlan | null;
+  extraReadableRootsHash?: string;
+  extraReadableRoots?: readonly string[];
   lastUsed: number;
   status: AgentSessionStatus;
   pendingQueue: QueuedTurnItem[];
@@ -476,6 +506,9 @@ export class RuntimeDaemon extends EventEmitter {
         case DAEMON_OPS.SHUTDOWN:
           return await this.handleShutdown(request as ShutdownRequest);
 
+        case DAEMON_OPS.COMPACT_SESSION:
+          return await this.handleCompactSession(request as CompactSessionRequest);
+
         default: {
           const raw = request as any;
           return {
@@ -614,6 +647,24 @@ export class RuntimeDaemon extends EventEmitter {
       }
     }
 
+    // 2b. Validate extraReadableRoots if provided (fail-closed)
+    let validatedExtraRoots: readonly string[] | undefined;
+    if (request.extraReadableRoots !== undefined && request.extraReadableRoots !== null) {
+      try {
+        validatedExtraRoots = validateExtraReadableRoots(request.extraReadableRoots);
+      } catch (valErr: unknown) {
+        return {
+          id: request.id,
+          op: request.op,
+          ok: false,
+          error: {
+            code: DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+            message: valErr instanceof Error ? valErr.message : String(valErr),
+          },
+        };
+      }
+    }
+
     // 3. Record accepted in journal atomically
     this.journal.recordAccepted({
       turnId,
@@ -676,7 +727,8 @@ export class RuntimeDaemon extends EventEmitter {
         request.profileSnapshot ?? request.profile,
         targetFolder,
         request.mounts ?? undefined,
-        validatedExtensionPlan
+        validatedExtensionPlan,
+        validatedExtraRoots
       );
       entry.lastUsed = Date.now();
     } catch (err: unknown) {
@@ -1263,6 +1315,126 @@ export class RuntimeDaemon extends EventEmitter {
     };
   }
 
+  public async handleCompactSession(
+    request: CompactSessionRequest
+  ): Promise<CompactSessionResponse | DaemonErrorResponse> {
+    const { sessionId } = request;
+
+    if (!sessionId || typeof sessionId !== 'string') {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          message: 'Invalid or missing sessionId',
+        },
+      };
+    }
+
+    if (this.currentTurns.has(sessionId)) {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: 'TURN_ACTIVE',
+          message: `Cannot compact session "${sessionId}" while a turn is active`,
+        },
+      };
+    }
+
+    let entry = this.agents.get(sessionId);
+    if (entry && (entry.currentTurn || entry.status === 'running')) {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: 'TURN_ACTIVE',
+          message: `Cannot compact session "${sessionId}" while a turn is active`,
+        },
+      };
+    }
+
+    if (!entry) {
+      const artifactCheck = await this.bootedRuntime.checkSessionArtifact(sessionId);
+      if (!artifactCheck.exists) {
+        return {
+          id: request.id,
+          op: 'compactSession',
+          ok: false,
+          error: {
+            code: DAEMON_ERROR_CODES.SESSION_NOT_FOUND,
+            message: `Session "${sessionId}" not found`,
+          },
+        };
+      }
+      entry = await this.getOrCreateManagedAgent(sessionId);
+    }
+
+    const compaction = this.bootedRuntime.context.get('compaction');
+    if (!compaction || typeof compaction.compactNow !== 'function') {
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: 'COMPACTION_UNSUPPORTED',
+          message: 'Explicit compaction is unsupported: ctx.compaction service unavailable in current runtime',
+        },
+      };
+    }
+
+    const tokenMeter = this.bootedRuntime.context.get('tokenMeter');
+    const beforeMeasurement = tokenMeter ? tokenMeter.measure(entry.agent.session) : undefined;
+    const beforeTokens = beforeMeasurement?.totalTokens;
+    const eventsBefore = entry.agent.session.snapshotEvents().length;
+
+    try {
+      const abortController = new AbortController();
+      const result = await compaction.compactNow(entry.agent, abortController.signal);
+
+      const afterMeasurement = tokenMeter ? tokenMeter.measure(entry.agent.session) : undefined;
+      const afterTokens = afterMeasurement?.totalTokens;
+      const eventsAfter = entry.agent.session.snapshotEvents().length;
+
+      let summaryChars = 0;
+      if (result && Array.isArray(result.summary)) {
+        for (const block of result.summary) {
+          if (typeof (block as any).text === 'string') {
+            summaryChars += (block as any).text.length;
+          }
+        }
+      }
+
+      entry.lastUsed = Date.now();
+
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: true,
+        beforeTokens,
+        afterTokens,
+        eventsBefore,
+        eventsAfter,
+        summaryChars,
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isBusy = (err as any)?.code === 'busy' || message.includes('idle');
+      return {
+        id: request.id,
+        op: 'compactSession',
+        ok: false,
+        error: {
+          code: isBusy ? 'TURN_ACTIVE' : DAEMON_ERROR_CODES.INTERNAL_ERROR,
+          message: `Compaction failed: ${message}`,
+        },
+      };
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Agent Lifecycle, Concurrency & FIFO Queue Scheduler
   // ---------------------------------------------------------------------------
@@ -1276,11 +1448,12 @@ export class RuntimeDaemon extends EventEmitter {
     profileSnapshot?: AgentProfileSnapshot | null,
     workspaceFolder?: string,
     mounts?: readonly RuntimeMountSpec[],
-    extensionPlan?: ExtensionActivationPlan | null
+    extensionPlan?: ExtensionActivationPlan | null,
+    extraReadableRoots?: readonly string[]
   ): Promise<ManagedAgentEntry> {
     const existing = this.agents.get(sessionId);
     if (existing) {
-      return this.verifyAndReturnExistingAgent(existing, profileSnapshot, workspaceFolder, mounts, extensionPlan);
+      return this.verifyAndReturnExistingAgent(existing, profileSnapshot, workspaceFolder, mounts, extensionPlan, extraReadableRoots);
     }
 
     const inFlight = this.loadingAgents.get(sessionId);
@@ -1288,7 +1461,7 @@ export class RuntimeDaemon extends EventEmitter {
       return await inFlight;
     }
 
-    const loadPromise = this.doCreateManagedAgent(sessionId, profileSnapshot, workspaceFolder, mounts, extensionPlan);
+    const loadPromise = this.doCreateManagedAgent(sessionId, profileSnapshot, workspaceFolder, mounts, extensionPlan, extraReadableRoots);
     this.loadingAgents.set(sessionId, loadPromise);
 
     try {
@@ -1304,7 +1477,8 @@ export class RuntimeDaemon extends EventEmitter {
     profileSnapshot?: AgentProfileSnapshot | null,
     workspaceFolder?: string,
     mounts?: readonly RuntimeMountSpec[],
-    extensionPlan?: ExtensionActivationPlan | null
+    extensionPlan?: ExtensionActivationPlan | null,
+    extraReadableRoots?: readonly string[]
   ): Promise<ManagedAgentEntry> {
     let validatedProfile: ValidatedAgentProfile | undefined;
     if (profileSnapshot) {
@@ -1329,6 +1503,15 @@ export class RuntimeDaemon extends EventEmitter {
       }
     }
 
+    let rootsMismatch = false;
+    if (extraReadableRoots !== undefined) {
+      const newRootsHash = computeExtraRootsHash(extraReadableRoots);
+      const oldRootsHash = existing.extraReadableRootsHash ?? computeExtraRootsHash([]);
+      if (oldRootsHash !== newRootsHash) {
+        rootsMismatch = true;
+      }
+    }
+
     let extensionPlanMismatch = false;
     let validatedExtensionPlan: ExtensionActivationPlan | null = null;
     if (extensionPlan !== undefined) {
@@ -1342,22 +1525,25 @@ export class RuntimeDaemon extends EventEmitter {
       }
     }
 
-    if (profileMismatch || workspaceMismatch || mountMismatch) {
+    const planSkillsChanged = extensionPlanMismatch && haveSkillsChanged(existing.extensionPlan, validatedExtensionPlan);
+    if (profileMismatch || workspaceMismatch || mountMismatch || planSkillsChanged || rootsMismatch) {
       // If agent is active / has pending turns: drain after current turn
       const queue = this.sessionQueues.get(existing.sessionId);
       const queueLen = queue ? queue.length : 0;
       if (existing.status === 'running' || queueLen > 0 || this.currentTurns.has(existing.sessionId)) {
         existing.status = 'draining';
       } else {
-        const reason = mountMismatch
-          ? 'mount_mismatch'
-          : (profileMismatch ? 'profile_mismatch' : 'space_mismatch');
+        const reason = rootsMismatch
+          ? 'roots_mismatch'
+          : (mountMismatch
+            ? 'mount_mismatch'
+            : (profileMismatch || planSkillsChanged ? 'profile_mismatch' : 'space_mismatch'));
         await this.evictAgent(existing.sessionId, reason);
-        return this.getOrCreateManagedAgent(existing.sessionId, profileSnapshot, workspaceFolder, mounts, extensionPlan);
+        return this.getOrCreateManagedAgent(existing.sessionId, profileSnapshot, workspaceFolder, mounts, extensionPlan, extraReadableRoots);
       }
     } else if (extensionPlanMismatch) {
       if (this.bootedRuntime?.getOrCreateAgent) {
-        await this.bootedRuntime.getOrCreateAgent(existing.sessionId, profileSnapshot, workspaceFolder, mounts, validatedExtensionPlan);
+        await this.bootedRuntime.getOrCreateAgent(existing.sessionId, profileSnapshot, workspaceFolder, mounts, validatedExtensionPlan, extraReadableRoots);
       }
       existing.extensionPlan = validatedExtensionPlan;
       existing.extensionPlanHash = computeExtensionPlanHash(validatedExtensionPlan);
@@ -1373,7 +1559,8 @@ export class RuntimeDaemon extends EventEmitter {
     profileSnapshot?: AgentProfileSnapshot | null,
     workspaceFolder?: string,
     mounts?: readonly RuntimeMountSpec[],
-    extensionPlan?: ExtensionActivationPlan | null
+    extensionPlan?: ExtensionActivationPlan | null,
+    extraReadableRoots?: readonly string[]
   ): Promise<ManagedAgentEntry> {
     let validatedProfile: ValidatedAgentProfile | undefined;
     if (profileSnapshot) {
@@ -1403,7 +1590,8 @@ export class RuntimeDaemon extends EventEmitter {
         profileSnapshot,
         workspaceFolder,
         mounts,
-        validatedExtensionPlan
+        validatedExtensionPlan,
+        extraReadableRoots
       );
       const agentHandle = this.bootedRuntime.agentHandles?.get(sessionId);
 
@@ -1414,6 +1602,7 @@ export class RuntimeDaemon extends EventEmitter {
       const spacePath = ((agent.session.header as any)?.meta as any)?.cwd || path.join(this.spacesDir, workspaceFolder || '');
       const mountHash = computeMountHash(mounts);
       const extensionPlanHash = computeExtensionPlanHash(validatedExtensionPlan);
+      const extraReadableRootsHash = computeExtraRootsHash(extraReadableRoots);
 
       const queue = this.getOrCreateSessionQueue(sessionId);
       const curTurn = this.currentTurns.get(sessionId);
@@ -1430,6 +1619,8 @@ export class RuntimeDaemon extends EventEmitter {
         mounts,
         extensionPlanHash,
         extensionPlan: validatedExtensionPlan,
+        extraReadableRootsHash,
+        extraReadableRoots,
         lastUsed: Date.now(),
         status: 'idle',
         pendingQueue: queue,
@@ -1494,6 +1685,11 @@ export class RuntimeDaemon extends EventEmitter {
       }
       const reqMounts = request.mounts ?? undefined;
 
+      let validatedReqExtraRoots: readonly string[] | undefined;
+      if (request.extraReadableRoots !== undefined && request.extraReadableRoots !== null) {
+        validatedReqExtraRoots = validateExtraReadableRoots(request.extraReadableRoots);
+      }
+
       let entry: ManagedAgentEntry;
       try {
         let existing = this.agents.get(sessionId);
@@ -1510,12 +1706,17 @@ export class RuntimeDaemon extends EventEmitter {
           const planDiffers = Boolean(
             request.extensionPlan !== undefined && (existing.extensionPlanHash ?? computeExtensionPlanHash(null)) !== computeExtensionPlanHash(validatedReqPlan)
           );
+          const rootsDiffers = Boolean(
+            request.extraReadableRoots !== undefined &&
+            (existing.extraReadableRootsHash ?? computeExtraRootsHash([])) !== computeExtraRootsHash(validatedReqExtraRoots)
+          );
 
-          if (profileDiffers || workspaceDiffers || mountDiffers) {
-            await this.evictAgent(sessionId, mountDiffers ? 'mount_mismatch' : (profileDiffers ? 'profile_mismatch' : 'space_mismatch'));
-            entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan);
+          const planSkillsChanged = planDiffers && haveSkillsChanged(existing.extensionPlan, validatedReqPlan);
+          if (profileDiffers || workspaceDiffers || mountDiffers || planSkillsChanged || rootsDiffers) {
+            await this.evictAgent(sessionId, rootsDiffers ? 'roots_mismatch' : (mountDiffers ? 'mount_mismatch' : (profileDiffers || planSkillsChanged ? 'profile_mismatch' : 'space_mismatch')));
+            entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan, validatedReqExtraRoots);
           } else if (planDiffers) {
-            entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan);
+            entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan, validatedReqExtraRoots);
             entry.extensionPlan = validatedReqPlan;
             entry.extensionPlanHash = computeExtensionPlanHash(validatedReqPlan);
           } else {
@@ -1523,7 +1724,7 @@ export class RuntimeDaemon extends EventEmitter {
             entry.lastUsed = Date.now();
           }
         } else {
-          entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan);
+          entry = await this.getOrCreateManagedAgent(sessionId, reqProfile, targetFolder, reqMounts, validatedReqPlan, validatedReqExtraRoots);
         }
       } catch (prepErr: unknown) {
         const idx = queue.indexOf(item);
@@ -1590,6 +1791,7 @@ export class RuntimeDaemon extends EventEmitter {
           timeoutMs: request.timeoutMs,
           mounts: request.mounts ?? undefined,
           extensionPlan: validatedReqPlan,
+          extraReadableRoots: validatedReqExtraRoots,
         });
 
         // Independently derive authoritative turn result from events occurring after beforeEventsCount

@@ -9,6 +9,8 @@ import type {
   CreateTaskResult,
   ToolExecutionContext,
   ToolResult,
+  AgentPromptSessionPolicy,
+  AgentPromptContextMode,
 } from '../types.js';
 import {
   createPlatformToolUnavailableError,
@@ -21,7 +23,8 @@ export const CANONICAL_UUID_V4_REGEX =
 export const CANONICAL_SESSION_ID_REGEX =
   /^(?:ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
 
-export const CANONICAL_TASK_ID_REGEX = /^task_[0-9a-f]{32}$/;
+export const CANONICAL_TASK_ID_REGEX =
+  /^(?:task_[0-9a-f]{32}|task_hpc_[0-9a-f]{24})$/;
 
 export const VALID_TASK_STATUSES = new Set<TaskStatus>([
   'pending',
@@ -39,6 +42,8 @@ export interface CreateTaskArgs {
   idempotencyKey: string;
   priority?: TaskPriority;
   dueDate?: string;
+  sessionPolicy?: AgentPromptSessionPolicy;
+  contextMode?: AgentPromptContextMode;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -99,6 +104,16 @@ export function createCreateTaskTool(
           type: 'string',
           description: 'Optional exact ISO 8601 UTC due date string (e.g. 2026-09-01T00:00:00.000Z).',
         },
+        sessionPolicy: {
+          type: 'string',
+          enum: ['existing_session', 'isolated'],
+          description: 'Optional session execution policy (existing_session or isolated). Defaults to existing_session.',
+        },
+        contextMode: {
+          type: 'string',
+          enum: ['group', 'isolated'],
+          description: 'Optional execution context mode (group or isolated). Alias compatible with sessionPolicy.',
+        },
       },
       required: ['title', 'prompt', 'sessionId', 'idempotencyKey'],
       additionalProperties: false,
@@ -124,7 +139,7 @@ export function createCreateTaskTool(
           return [
             {
               type: 'text',
-              text: `Task created: "${value.title}" (Status: ${value.status}, IdempotentHit: ${value.isIdempotentHit})`,
+              text: `Task created: ${value.taskId} ("${value.title}", Status: ${value.status}, IdempotentHit: ${value.isIdempotentHit})`,
             },
           ];
         }
@@ -213,6 +228,44 @@ export function createCreateTaskTool(
         dueDate = rawArgs.dueDate;
       }
 
+      // Session policy validation
+      let sessionPolicy: AgentPromptSessionPolicy | undefined;
+      if (rawArgs.sessionPolicy !== undefined && rawArgs.sessionPolicy !== null) {
+        if (
+          typeof rawArgs.sessionPolicy !== 'string' ||
+          !['existing_session', 'isolated'].includes(rawArgs.sessionPolicy)
+        ) {
+          throw new TypeError(
+            'Invalid task sessionPolicy. Allowed: existing_session, isolated'
+          );
+        }
+        sessionPolicy = rawArgs.sessionPolicy as AgentPromptSessionPolicy;
+      }
+
+      // Context mode validation
+      let contextMode: AgentPromptContextMode | undefined;
+      if (rawArgs.contextMode !== undefined && rawArgs.contextMode !== null) {
+        if (
+          typeof rawArgs.contextMode !== 'string' ||
+          !['group', 'isolated'].includes(rawArgs.contextMode)
+        ) {
+          throw new TypeError(
+            'Invalid task contextMode. Allowed: group, isolated'
+          );
+        }
+        contextMode = rawArgs.contextMode as AgentPromptContextMode;
+      }
+
+      if (sessionPolicy !== undefined && contextMode !== undefined) {
+        const mapped = contextMode === 'isolated' ? 'isolated' : 'existing_session';
+        if (sessionPolicy !== mapped) {
+          throw new TypeError('Conflicting sessionPolicy and contextMode provided');
+        }
+      }
+
+      const effectiveSessionPolicy: AgentPromptSessionPolicy | undefined =
+        sessionPolicy ?? (contextMode !== undefined ? (contextMode === 'isolated' ? 'isolated' : 'existing_session') : undefined);
+
       // Zero-network / missing platform client check
       const client = getClient();
       if (!client || !client.request) {
@@ -226,6 +279,7 @@ export function createCreateTaskTool(
         title,
         prompt,
         sessionId,
+        ...(effectiveSessionPolicy !== undefined ? { sessionPolicy: effectiveSessionPolicy } : {}),
         ...(priority !== undefined ? { priority } : {}),
         ...(dueDate !== undefined ? { dueDate } : {}),
       };

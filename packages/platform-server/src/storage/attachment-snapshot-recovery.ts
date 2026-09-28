@@ -76,6 +76,7 @@ export interface AttachmentSnapshotRecoveryReport {
   readonly abortedStaging: number;
   readonly linkedCopied: number;
   readonly cleanedOrphans: number;
+  readonly skippedArchived: number;
   readonly errors: ReadonlyArray<AttachmentSnapshotRecoveryError>;
 }
 
@@ -366,7 +367,7 @@ export class AttachmentSnapshotRecoveryService {
     `).get() as { count: number } | undefined;
 
     if (!hasTable || hasTable.count === 0) {
-      return { totalScanned: 0, abortedStaging: 0, linkedCopied: 0, cleanedOrphans: 0, errors: [] };
+      return { totalScanned: 0, abortedStaging: 0, linkedCopied: 0, cleanedOrphans: 0, skippedArchived: 0, errors: [] };
     }
 
     const rawRows = this.db.prepare(`
@@ -379,7 +380,15 @@ export class AttachmentSnapshotRecoveryService {
     let abortedStaging = 0;
     let linkedCopied = 0;
     let cleanedOrphans = 0;
+    let skippedArchived = 0;
     const errors: Array<AttachmentSnapshotRecoveryError> = [];
+
+    const hasSpacesTable = this.db.prepare(`
+      SELECT count(*) as count FROM sqlite_master WHERE type='table' AND name='spaces'
+    `).get() as { count: number } | undefined;
+    const spaceStmt = (hasSpacesTable && hasSpacesTable.count > 0)
+      ? this.db.prepare('SELECT status, execution_mode FROM spaces WHERE id = ?')
+      : null;
 
     for (const rawRow of rawRows) {
       let entry: AttachmentSnapshotJournalEntry;
@@ -397,6 +406,36 @@ export class AttachmentSnapshotRecoveryService {
       }
 
       try {
+        const spaceRow = spaceStmt
+          ? (spaceStmt.get(entry.spaceId) as { status?: string; execution_mode?: string } | undefined)
+          : undefined;
+
+        if (!spaceRow || spaceRow.status === 'archived') {
+          const nextStatus = (entry.status === 'staging' || entry.status === 'copied') ? 'aborted' : 'cleaned';
+          let startedTx = false;
+          try {
+            this.db.exec('BEGIN IMMEDIATE');
+            startedTx = true;
+            this.db.prepare(`
+              UPDATE attachment_snapshot_journal
+              SET status = ?, updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?
+            `).run(nextStatus, entry.id);
+            this.db.exec('COMMIT');
+            startedTx = false;
+            skippedArchived++;
+          } catch {
+            if (startedTx) {
+              try { this.db.exec('ROLLBACK'); } catch {}
+            }
+            errors.push({
+              journalId: entry.id,
+              code: 'DB_UPDATE_FAILED',
+              stage: 'archived_space_update',
+            });
+          }
+          continue;
+        }
         if (entry.status === 'staging') {
           let inspection: SnapshotInspection;
           try {
@@ -811,6 +850,7 @@ export class AttachmentSnapshotRecoveryService {
       abortedStaging,
       linkedCopied,
       cleanedOrphans,
+      skippedArchived,
       errors,
     };
   }

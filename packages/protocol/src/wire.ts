@@ -669,6 +669,8 @@ export interface RuntimeTurnRequest {
   readonly mounts?: readonly RuntimeMountSpec[];
   /** Optional generic extension activation plan */
   readonly extensionPlan?: ExtensionActivationPlan | null;
+  /** Optional extra readable roots for sandbox boundary allowlist (e.g. authorized sibling spaces) */
+  readonly extraReadableRoots?: readonly string[];
 }
 
 

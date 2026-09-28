@@ -32,6 +32,16 @@ export function messageIdFor(chatJid: string, messageId: string): string {
 }
 
 /**
+ * Deterministic message ID for an imported HappyClaw message based on chatJid and messageId composite key.
+ * Derives deterministically from both chatJid and messageId using sha256 with canonical prefix msg_hpc_.
+ * Always returns `msg_hpc_${digestHex.slice(0, 24)}`.
+ */
+export function deterministicMessageId(chatJid: string, messageId: string): string {
+  const digest = createHash('sha256').update(`${chatJid}:${messageId}`).digest('hex').slice(0, 24)
+  return `msg_hpc_${digest}`
+}
+
+/**
  * Deterministic space ID for an imported/forked folder.
  * Returns `impsp_${digestHex}`.
  */
@@ -91,4 +101,29 @@ export function channelFromJid(jid: string): string {
   if (jid.includes('@g.us') || jid.includes('@group')) return 'group'
   if (jid.includes('@s.whatsapp.net')) return 'whatsapp'
   return 'dm'
+}
+
+/**
+ * Normalizes source channel names to Enkeep canonical platform channel names.
+ * e.g. 'feishu' -> 'lark', 'wx' -> 'wechat'
+ */
+export function normalizeChannelType(type: string): string {
+  if (!type || typeof type !== 'string') return 'generic'
+  const lower = type.trim().toLowerCase()
+  if (lower === 'feishu' || lower === 'lark') return 'lark'
+  if (lower === 'wechat' || lower === 'wx') return 'wechat'
+  if (lower === 'web') return 'web'
+  return lower || 'generic'
+}
+
+/**
+ * Extracts clean native context id from a channel JID or context identifier.
+ * Strips transport prefixes (feishu:, lark:, wechat:, etc.) and trailing #account/thread tags.
+ */
+export function extractNativeContextId(jidOrContext: string): string {
+  if (!jidOrContext || typeof jidOrContext !== 'string') return ''
+  let clean = jidOrContext.trim()
+  clean = clean.replace(/^(?:feishu|lark|wechat|web|im|qq):/i, '')
+  clean = clean.replace(/#[^#]+$/i, '').replace(/#[^#]+$/i, '')
+  return clean
 }

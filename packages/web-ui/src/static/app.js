@@ -2326,7 +2326,14 @@ function parseManagementRoute(rawRoute, isAdmin) {
 
 function getRouteBreadcrumb(parsedRoute, isAdmin) {
   if (!parsedRoute || parsedRoute.type === 'workspace') {
-    return t('chat.navLabel', null, 'Chat');
+    const curSpace = state.spaces.find((s) => s.id === state.currentSpaceId);
+    const spaceName = curSpace ? (curSpace.name || t('chat.untitledSpace', null, 'Untitled Space')) : '';
+    const curSession = state.sessions.find((s) => s.id === state.currentSessionId);
+    const sessionTitle = curSession ? (curSession.title || t('chat.untitledSession', null, 'Untitled')) : '';
+    const parts = [t('chat.navLabel', null, 'Chat')];
+    if (spaceName) parts.push(spaceName);
+    if (sessionTitle) parts.push(sessionTitle);
+    return parts.join(' / ');
   }
   if (parsedRoute.type === 'management-overview') {
     return t('management.breadcrumbOverview', null, 'Management / Overview');
@@ -2336,13 +2343,7 @@ function getRouteBreadcrumb(parsedRoute, isAdmin) {
   }
   const tabCapitalized = parsedRoute.tab.charAt(0).toUpperCase() + parsedRoute.tab.slice(1);
   const tabName = t(`management.tab${tabCapitalized}`, null, tabCapitalized);
-  const sections = (isAdmin ? TAB_SECTIONS_ADMIN : TAB_SECTIONS_MEMBER)[parsedRoute.tab] || [];
-  const sec = sections.find((s) => s.id === parsedRoute.section);
-  let secName = parsedRoute.section || 'Section';
-  if (sec) {
-    secName = t(`section.${parsedRoute.tab}.${sec.id}.label`, null, sec.label);
-  }
-  return `${t('management.breadcrumb', null, 'Management')} / ${tabName} / ${secName}`;
+  return `${t('management.breadcrumb', null, 'Management')} / ${tabName}`;
 }
 
 function handleRouteHash() {
@@ -2419,10 +2420,12 @@ function handleRouteHash() {
   // Switch View Panels
   const workspaceView = document.getElementById('view-workspace');
   const managementView = document.getElementById('view-management');
+  const spaceRail = document.getElementById('space-rail');
 
   if (parsed.type === 'workspace') {
     if (workspaceView) workspaceView.classList.remove('hidden');
     if (managementView) managementView.classList.add('hidden');
+    if (spaceRail) spaceRail.classList.remove('hidden');
 
     // Resume chat polling if session is active
     if (state.currentSessionId && !state.isPollingActive) {
@@ -2434,6 +2437,7 @@ function handleRouteHash() {
 
     if (workspaceView) workspaceView.classList.add('hidden');
     if (managementView) managementView.classList.remove('hidden');
+    if (spaceRail) spaceRail.classList.add('hidden');
 
     renderManagementView(route);
   }
@@ -3081,6 +3085,62 @@ async function renderStorageReconcileView(container) {
   }
 }
 
+// Helper for Reasoning Effort form control (reused by user preference and admin platform forms)
+function createReasoningEffortField(providersMap, selectId) {
+  const grpEffort = document.createElement('div');
+  grpEffort.className = 'form-group';
+  const lblEffort = document.createElement('label');
+  if (selectId) {
+    lblEffort.htmlFor = selectId;
+  }
+  lblEffort.textContent = t('models.labelReasoningEffort', null, 'Reasoning effort');
+  const selEffort = document.createElement('select');
+  if (selectId) {
+    selEffort.id = selectId;
+  }
+  selEffort.className = 'form-select';
+
+  function populateEfforts(pkey, mid) {
+    selEffort.replaceChildren();
+    const p = providersMap ? providersMap[pkey] : null;
+    const models = (p && Array.isArray(p.models)) ? p.models : [];
+    const foundModel = models.find((m) => m.id === mid);
+    const effortKeys = (foundModel && foundModel.reasoningEfforts && typeof foundModel.reasoningEfforts === 'object')
+      ? Object.keys(foundModel.reasoningEfforts)
+      : [];
+
+    if (effortKeys.length > 0) {
+      selEffort.disabled = false;
+      const optDefault = document.createElement('option');
+      optDefault.value = '';
+      optDefault.textContent = '(default)';
+      selEffort.appendChild(optDefault);
+      effortKeys.forEach((key) => {
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = key;
+        selEffort.appendChild(opt);
+      });
+    } else {
+      selEffort.disabled = true;
+      const optNone = document.createElement('option');
+      optNone.value = '';
+      optNone.textContent = 'no effort options';
+      selEffort.appendChild(optNone);
+    }
+  }
+
+  grpEffort.appendChild(lblEffort);
+  grpEffort.appendChild(selEffort);
+
+  return {
+    group: grpEffort,
+    select: selEffort,
+    label: lblEffort,
+    populateEfforts,
+  };
+}
+
 // User Model Config View (for Member / Bob)
 async function renderUserModelConfigView(container) {
   let modelData = null;
@@ -3120,8 +3180,8 @@ async function renderUserModelConfigView(container) {
 
   const providersMap = modelData.providers || {};
   const activeDefSuffix = (userOverrideData && userOverrideData.reasoningEffort)
-    ? ` · effort: ${userOverrideData.reasoningEffort}`
-    : (modelData.defaultModel && modelData.defaultModel.reasoningEffort ? ` · effort: ${modelData.defaultModel.reasoningEffort}` : '');
+    ? ` · ${t('models.labelReasoningEffort', null, 'Reasoning effort')}: ${userOverrideData.reasoningEffort}`
+    : (modelData.defaultModel && modelData.defaultModel.reasoningEffort ? ` · ${t('models.labelReasoningEffort', null, 'Reasoning effort')}: ${modelData.defaultModel.reasoningEffort}` : '');
   const activeDef = userOverrideData && userOverrideData.provider
     ? `${userOverrideData.provider} / ${userOverrideData.model}${activeDefSuffix}`
     : (modelData.defaultModel ? `${modelData.defaultModel.provider} / ${modelData.defaultModel.model}${activeDefSuffix}` : (getLocale() === 'zh-CN' ? '未配置' : 'Unconfigured'));
@@ -3172,42 +3232,11 @@ async function renderUserModelConfigView(container) {
   const selPrefModel = document.createElement('select');
   selPrefModel.className = 'form-select';
 
-  const grpPrefEffort = document.createElement('div');
-  grpPrefEffort.className = 'form-group';
-  const lblPrefEffort = document.createElement('label');
-  lblPrefEffort.textContent = t('models.labelReasoningEffort', null, 'Reasoning effort');
-  const selPrefEffort = document.createElement('select');
-  selPrefEffort.className = 'form-select';
-
-  function populateUserEfforts(pkey, mid) {
-    selPrefEffort.replaceChildren();
-    const p = providersMap[pkey];
-    const models = (p && Array.isArray(p.models)) ? p.models : [];
-    const foundModel = models.find((m) => m.id === mid);
-    const effortKeys = (foundModel && foundModel.reasoningEfforts && typeof foundModel.reasoningEfforts === 'object')
-      ? Object.keys(foundModel.reasoningEfforts)
-      : [];
-
-    if (effortKeys.length > 0) {
-      selPrefEffort.disabled = false;
-      const optDefault = document.createElement('option');
-      optDefault.value = '';
-      optDefault.textContent = '(default)';
-      selPrefEffort.appendChild(optDefault);
-      effortKeys.forEach((key) => {
-        const opt = document.createElement('option');
-        opt.value = key;
-        opt.textContent = key;
-        selPrefEffort.appendChild(opt);
-      });
-    } else {
-      selPrefEffort.disabled = true;
-      const optNone = document.createElement('option');
-      optNone.value = '';
-      optNone.textContent = 'no effort options';
-      selPrefEffort.appendChild(optNone);
-    }
-  }
+  const {
+    group: grpPrefEffort,
+    select: selPrefEffort,
+    populateEfforts: populateUserEfforts,
+  } = createReasoningEffortField(providersMap, 'select-user-preference-effort');
 
   function populateUserModels(pkey) {
     selPrefModel.replaceChildren();
@@ -3255,8 +3284,6 @@ async function renderUserModelConfigView(container) {
   grpPrefProvider.appendChild(selPrefProvider);
   grpPrefModel.appendChild(lblPrefModel);
   grpPrefModel.appendChild(selPrefModel);
-  grpPrefEffort.appendChild(lblPrefEffort);
-  grpPrefEffort.appendChild(selPrefEffort);
   formPref.appendChild(grpPrefProvider);
   formPref.appendChild(grpPrefModel);
   formPref.appendChild(grpPrefEffort);
@@ -8567,9 +8594,10 @@ async function renderEffectiveModelPreview(container, spaceId, sessionId) {
     const sourceBadge = createBadgeElement(t(`models.scope${eff.source ? eff.source.charAt(0).toUpperCase() + eff.source.slice(1) : 'Platform'}`, null, `Layer: ${eff.source || 'platform'}`), 'info');
     flowDiv.appendChild(sourceBadge);
 
+    const effortLabel = t('models.labelReasoningEffort', null, 'Reasoning effort');
     const primaryNode = document.createElement('span');
     primaryNode.className = 'fallback-node';
-    primaryNode.textContent = `${eff.provider} / ${eff.model}${eff.reasoningEffort ? ` · effort: ${eff.reasoningEffort}` : ''}`;
+    primaryNode.textContent = `${eff.provider} / ${eff.model}${eff.reasoningEffort ? ` · ${effortLabel}: ${eff.reasoningEffort}` : ''}`;
     flowDiv.appendChild(primaryNode);
 
     if (Array.isArray(eff.fallbackChain) && eff.fallbackChain.length > 0) {
@@ -8581,7 +8609,7 @@ async function renderEffectiveModelPreview(container, spaceId, sessionId) {
 
         const fbNode = document.createElement('span');
         fbNode.className = 'fallback-node';
-        fbNode.textContent = `${fb.provider} / ${fb.model}${fb.reasoningEffort ? ` · effort: ${fb.reasoningEffort}` : ''}`;
+        fbNode.textContent = `${fb.provider} / ${fb.model}${fb.reasoningEffort ? ` · ${effortLabel}: ${fb.reasoningEffort}` : ''}`;
         flowDiv.appendChild(fbNode);
       });
     }
@@ -13524,7 +13552,13 @@ async function renderAdminModelsView(container) {
   const kpiGrid = document.createElement('div');
   kpiGrid.className = 'kpi-grid';
 
-  const defModel = modelData.defaultModel ? `${modelData.defaultModel.provider} / ${modelData.defaultModel.model}` : (getLocale() === 'zh-CN' ? '未配置' : 'Unconfigured');
+  const currentPlatformEffort = (modelData.override && modelData.override.reasoningEffort !== undefined)
+    ? modelData.override.reasoningEffort
+    : ((modelData.defaultModel && modelData.defaultModel.reasoningEffort !== undefined)
+      ? modelData.defaultModel.reasoningEffort
+      : (modelData.reasoningEffort ?? null));
+  const defEffortSuffix = currentPlatformEffort ? ` · ${t('models.labelReasoningEffort', null, 'Reasoning effort')}: ${currentPlatformEffort}` : '';
+  const defModel = modelData.defaultModel ? `${modelData.defaultModel.provider} / ${modelData.defaultModel.model}${defEffortSuffix}` : (getLocale() === 'zh-CN' ? '未配置' : 'Unconfigured');
   const dshDef = modelData.dshDefaultModel ? `${modelData.dshDefaultModel.provider} / ${modelData.dshDefaultModel.model}` : (getLocale() === 'zh-CN' ? '无' : 'None');
   const hasOverride = Boolean(modelData.override && modelData.override.provider);
   const overrideBadge = hasOverride
@@ -13600,6 +13634,12 @@ async function renderAdminModelsView(container) {
   selModel.className = 'form-select';
   selModel.required = true;
 
+  const {
+    group: grpEffort,
+    select: selEffort,
+    populateEfforts,
+  } = createReasoningEffortField(providersMap, 'select-override-effort');
+
   function populateModels(providerKey) {
     selModel.replaceChildren();
     const p = providersMap[providerKey];
@@ -13622,14 +13662,24 @@ async function renderAdminModelsView(container) {
   if (modelData.defaultModel && modelData.defaultModel.model) {
     selModel.value = modelData.defaultModel.model;
   }
+  populateEfforts(selProvider.value, selModel.value);
+  if (currentPlatformEffort) {
+    selEffort.value = currentPlatformEffort;
+  }
 
   selProvider.addEventListener('change', () => {
     populateModels(selProvider.value);
+    populateEfforts(selProvider.value, selModel.value);
+  });
+
+  selModel.addEventListener('change', () => {
+    populateEfforts(selProvider.value, selModel.value);
   });
 
   grpModel.appendChild(lblModel);
   grpModel.appendChild(selModel);
   form.appendChild(grpModel);
+  form.appendChild(grpEffort);
 
   // Apply Mode selection (default: restart_all, advanced option: save_only)
   const grpApplyMode = document.createElement('div');
@@ -13710,12 +13760,15 @@ async function renderAdminModelsView(container) {
         patchHeaders['If-Match'] = modelData.revision;
       }
 
+      const reasoningEffort = selEffort.value ? selEffort.value : null;
+
       const patchRes = await apiRequest('/api/admin/model-config', {
         method: 'PATCH',
         headers: patchHeaders,
         body: {
           provider,
           model,
+          reasoningEffort,
           applyMode,
           ifMatch: modelData.revision,
         },
@@ -14056,6 +14109,7 @@ const CHAT_I18N_EN = {
   'chat.replyTitle': 'Quote and reply to this message',
   'chat.replyingTo': 'Replying to {name}',
   'chat.cancelReply': 'Cancel reply',
+  'chat.canonicalSessionReused': 'This space uses a single canonical session; switched to it. Use Fork for a branch.',
   'chat.channelConversation': 'Conversation',
   'chat.channelConversationAria': 'Source: Conversation',
   'chat.channelDiscord': 'Discord',
@@ -14285,6 +14339,7 @@ const CHAT_I18N_ZH = {
   'chat.replyTitle': '引用此条消息进行回复',
   'chat.replyingTo': '正在回复 {name}',
   'chat.cancelReply': '取消引用',
+  'chat.canonicalSessionReused': '该空间使用单一主会话，已切换到主会话；如需分支请使用「派生」',
   'chat.channelConversation': '主会话',
   'chat.channelConversationAria': '来源：主会话',
   'chat.channelDiscord': 'Discord',
@@ -14878,6 +14933,7 @@ function renderSpaceSelect() {
     emptyOpt.value = "";
     emptyOpt.textContent = tr("chat.noSpacesAvailable", null, "No spaces available");
     select.appendChild(emptyOpt);
+    renderSpaceRail(state.spaces);
     return;
   }
 
@@ -14910,6 +14966,103 @@ function renderSpaceSelect() {
   if (state.currentSpaceId) {
     select.value = state.currentSpaceId;
   }
+  renderSpaceRail(state.spaces);
+}
+
+function renderSpaceRail(spaces) {
+  const railList = document.getElementById("space-rail-list");
+  const searchWrapper = document.getElementById("space-rail-search-wrapper");
+  if (!railList) return;
+
+  railList.replaceChildren();
+
+  let spaceItems = [];
+  if (Array.isArray(spaces) && spaces.length > 0) {
+    spaceItems = spaces.map((s) => ({
+      id: s.id,
+      name: s.name || tr("chat.untitledSpace", null, "Untitled Space"),
+      executionMode: (s && s.executionMode === "host") ? "host" : "docker",
+      status: (s && s.status) ? s.status : "active",
+    }));
+  } else {
+    const select = document.getElementById("space-select");
+    if (select && select.options && select.options.length > 0) {
+      for (let i = 0; i < select.options.length; i++) {
+        const opt = select.options[i];
+        if (opt.value) {
+          spaceItems.push({
+            id: opt.value,
+            name: opt.textContent.replace(/\s*\[(Host|Docker)\]$/, "").replace(/\s*\([^)]*\)$/, "").trim(),
+            executionMode: opt.textContent.includes("[Host]") ? "host" : "docker",
+            status: opt.textContent.includes("Archived") ? "archived" : "active",
+          });
+        }
+      }
+    }
+  }
+
+  if (searchWrapper) {
+    if (spaceItems.length > 8) {
+      searchWrapper.classList.remove("hidden");
+    } else {
+      searchWrapper.classList.add("hidden");
+    }
+  }
+
+  spaceItems.forEach((space) => {
+    const row = document.createElement("div");
+    row.className = "space-rail-item";
+    row.setAttribute("role", "button");
+    row.setAttribute("tabindex", "0");
+    row.dataset.spaceId = space.id;
+
+    if (space.id === state.currentSpaceId) {
+      row.classList.add("active");
+    }
+
+    const isArchived = space.status === "archived";
+    if (isArchived) {
+      row.classList.add("is-archived");
+    }
+
+    const icon = document.createElement("span");
+    icon.className = "space-rail-icon";
+    const spaceName = space.name || tr("chat.untitledSpace", null, "Untitled Space");
+    icon.textContent = (spaceName.charAt(0) || "S").toUpperCase();
+    row.appendChild(icon);
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "space-rail-name";
+    nameEl.textContent = isArchived ? `${spaceName} (${tr("chat.archivedBadge", null, "Archived")})` : spaceName;
+    nameEl.title = spaceName;
+    row.appendChild(nameEl);
+
+    const isHostSpace = space.executionMode === "host";
+    const chip = document.createElement("span");
+    chip.className = isHostSpace ? "badge badge-risk-high space-rail-chip" : "badge badge-info space-rail-chip";
+    chip.textContent = isHostSpace ? tr("spaces.modeHost", null, "Host") : tr("spaces.modeDocker", null, "Docker");
+    row.appendChild(chip);
+
+    row.addEventListener("click", () => {
+      const select = document.getElementById("space-select");
+      if (select) {
+        select.value = space.id;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    });
+
+    railList.appendChild(row);
+  });
+}
+
+function updateTopbarBreadcrumb() {
+  if (!state.currentUser) return;
+  const isAdmin = Boolean(state.currentUser && state.currentUser.role === 'admin');
+  const parsed = parseManagementRoute(state.currentRoute, isAdmin);
+  const breadcrumbEl = document.getElementById('active-view-label');
+  if (breadcrumbEl) {
+    breadcrumbEl.textContent = getRouteBreadcrumb(parsed, isAdmin);
+  }
 }
 
 function selectSpace(spaceId) {
@@ -14939,6 +15092,21 @@ function selectSpace(spaceId) {
       modeBadge.classList.add("hidden");
     }
   }
+
+  // Update space-rail active highlight
+  const railItems = document.querySelectorAll(".space-rail-item");
+  railItems.forEach((item) => {
+    item.classList.toggle("active", item.dataset.spaceId === spaceId);
+  });
+
+  // Update current-space-name in sidebar header
+  const currentSpaceNameEl = document.getElementById("current-space-name");
+  if (currentSpaceNameEl) {
+    const curSpace = state.spaces.find((s) => s.id === spaceId);
+    currentSpaceNameEl.textContent = curSpace && curSpace.name ? curSpace.name : tr("chat.spacesHeader", null, "Spaces");
+  }
+
+  updateTopbarBreadcrumb();
 
   updateSpaceLifecycleControls();
   loadSessions(spaceId);
@@ -15777,6 +15945,10 @@ async function selectSession(sessionId) {
         : tr("chat.routeActiveSession", null, "Session Workspace");
     }
 
+    if (typeof updateTopbarBreadcrumb === 'function') {
+      updateTopbarBreadcrumb();
+    }
+
     const metaEl = document.getElementById("current-session-meta");
     if (metaEl) {
       metaEl.textContent = res.data && res.data.title
@@ -16022,9 +16194,14 @@ function openForkSessionModal(fromMessageId, fromTurnId) {
   openModal("modal-fork-session");
 }
 
+let forkSubmitInFlight = false;
+
 async function handleForkSession(e) {
   e.preventDefault();
+  if (forkSubmitInFlight) return;
   if (!state.currentSessionId) return;
+
+  const submitBtn = (e && e.target && e.target.querySelector) ? e.target.querySelector('button[type="submit"]') : document.getElementById("btn-submit-fork-session");
 
   const titleInput = document.getElementById("fork-session-title-input");
   const title = titleInput ? titleInput.value.trim() : undefined;
@@ -16039,6 +16216,9 @@ async function handleForkSession(e) {
   const fromTurnId = (turnIdInput && turnIdInput.value) ? turnIdInput.value : undefined;
 
   const sessionId = state.currentSessionId;
+
+  forkSubmitInFlight = true;
+  if (submitBtn) submitBtn.disabled = true;
 
   try {
     const res = await apiRequest(`/api/sessions/${sessionId}/fork`, {
@@ -16065,6 +16245,9 @@ async function handleForkSession(e) {
     }
   } catch (err) {
     showToast(getSafeErrorMessage(err, tr("toast.failedForkSession", null, "Failed to fork session.")), "error");
+  } finally {
+    forkSubmitInFlight = false;
+    if (submitBtn) submitBtn.disabled = false;
   }
 }
 
@@ -16527,8 +16710,14 @@ async function handleSaveQuotaEdit(e) {
   }
 }
 
+let createSessionSubmitInFlight = false;
+
 async function handleCreateSession(e) {
   e.preventDefault();
+  if (createSessionSubmitInFlight) return;
+
+  const submitBtn = (e && e.target && e.target.querySelector) ? e.target.querySelector('button[type="submit"]') : (document.getElementById("create-session-form") ? document.getElementById("create-session-form").querySelector('button[type="submit"]') : null);
+
   const spaceSelect = document.getElementById("session-space-select");
   const titleInput = document.getElementById("session-title-input");
 
@@ -16540,8 +16729,16 @@ async function handleCreateSession(e) {
     return;
   }
 
+  createSessionSubmitInFlight = true;
+  if (submitBtn) submitBtn.disabled = true;
+
   try {
-    const body = { spaceId, executionMode: "container", ...(title ? { title } : {}) };
+    const space = state.spaces.find((s) => s.id === spaceId);
+    const body = {
+      spaceId,
+      ...(space && space.executionMode ? { executionMode: space.executionMode } : {}),
+      ...(title ? { title } : {}),
+    };
 
     const res = await apiRequest("/api/sessions", {
       method: "POST",
@@ -16559,6 +16756,9 @@ async function handleCreateSession(e) {
     await selectSession(res.data.id);
   } catch {
     showSafeError("create_session");
+  } finally {
+    createSessionSubmitInFlight = false;
+    if (submitBtn) submitBtn.disabled = false;
   }
 }
 
@@ -18086,9 +18286,19 @@ function updateCharCount() {
 
 function toggleWorkspaceSidebar() {
   const sidebar = document.getElementById('workspace-sidebar');
+  const rail = document.getElementById('space-rail');
+  const appBody = document.querySelector('.app-body');
+
   if (sidebar) {
     sidebar.classList.toggle('sidebar-collapsed');
+    sidebar.classList.toggle('drawer-open');
     state.isSidebarCollapsed = sidebar.classList.contains('sidebar-collapsed');
+  }
+  if (rail) {
+    rail.classList.toggle('drawer-open');
+  }
+  if (appBody) {
+    appBody.classList.toggle('drawer-active');
   }
 }
 
@@ -20001,11 +20211,17 @@ document.addEventListener('DOMContentLoaded', () => {
           state.sessions[0];
         if (canonical) {
           selectSession(canonical.id);
+          showToast(tr('chat.canonicalSessionReused', null, '该空间使用单一主会话，已切换到主会话；如需分支请使用「派生」'), 'info');
         } else {
           try {
+            const space = state.spaces.find((s) => s.id === state.currentSpaceId);
+            const body = {
+              spaceId: state.currentSpaceId,
+              ...(space && space.executionMode ? { executionMode: space.executionMode } : {}),
+            };
             const res = await apiRequest('/api/sessions', {
               method: 'POST',
-              body: { spaceId: state.currentSpaceId, executionMode: 'container' },
+              body,
             });
             if (res && res.data && res.data.id) {
               await loadSessions(state.currentSpaceId);
@@ -20540,6 +20756,110 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // Space Rail, Kebab Menu, and User Dropdown Initializations
+  initSpaceRail();
+  initSpaceKebab();
+  initUserMenuDropdown();
+
   // Initial Auth Check and CSRF token bootstrap
   fetchCsrfToken().then(() => checkAuth());
 });
+
+function initSpaceRail() {
+  const rail = document.getElementById('space-rail');
+  const toggleBtn = document.getElementById('btn-toggle-space-rail');
+  const searchInput = document.getElementById('space-rail-search-input');
+  const archivedToggleBtn = document.getElementById('btn-toggle-archived-spaces');
+
+  try {
+    const isCollapsed = localStorage.getItem('enkeep.spaceRail.collapsed') === 'true';
+    if (rail && isCollapsed) {
+      rail.classList.add('collapsed');
+    }
+  } catch (e) {
+    // Ignore localStorage access errors
+  }
+
+  if (toggleBtn && rail) {
+    toggleBtn.addEventListener('click', () => {
+      rail.classList.toggle('collapsed');
+      const collapsed = rail.classList.contains('collapsed');
+      try {
+        localStorage.setItem('enkeep.spaceRail.collapsed', String(collapsed));
+      } catch (e) {
+        // Ignore localStorage access errors
+      }
+    });
+  }
+
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      const q = (e.target.value || '').trim().toLowerCase();
+      const items = document.querySelectorAll('.space-rail-item');
+      items.forEach((item) => {
+        const nameEl = item.querySelector('.space-rail-name');
+        const text = nameEl ? nameEl.textContent.toLowerCase() : '';
+        const match = !q || text.includes(q);
+        item.classList.toggle('hidden', !match);
+      });
+    });
+  }
+
+  if (archivedToggleBtn) {
+    archivedToggleBtn.addEventListener('click', () => {
+      state.showArchivedSpaces = !state.showArchivedSpaces;
+      archivedToggleBtn.classList.toggle('active', state.showArchivedSpaces);
+      const archivedItems = document.querySelectorAll('.space-rail-item.is-archived');
+      archivedItems.forEach((item) => {
+        item.classList.toggle('hidden', !state.showArchivedSpaces);
+      });
+    });
+  }
+}
+
+function initSpaceKebab() {
+  const kebabBtn = document.getElementById('btn-space-kebab');
+  const kebabMenu = document.getElementById('space-kebab-menu');
+  if (!kebabBtn || !kebabMenu) return;
+
+  kebabBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isHidden = kebabMenu.classList.contains('hidden');
+    kebabMenu.classList.toggle('hidden', !isHidden);
+    kebabBtn.setAttribute('aria-expanded', isHidden ? 'true' : 'false');
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!kebabMenu.contains(e.target) && e.target !== kebabBtn) {
+      kebabMenu.classList.add('hidden');
+      kebabBtn.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  kebabMenu.querySelectorAll('.kebab-item').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      kebabMenu.classList.add('hidden');
+      kebabBtn.setAttribute('aria-expanded', 'false');
+    });
+  });
+}
+
+function initUserMenuDropdown() {
+  const trigger = document.getElementById('user-menu-trigger');
+  const dropdown = document.getElementById('user-menu-dropdown');
+  if (!trigger || !dropdown) return;
+
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isHidden = dropdown.classList.contains('hidden');
+    dropdown.classList.toggle('hidden', !isHidden);
+    trigger.setAttribute('aria-expanded', isHidden ? 'true' : 'false');
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!dropdown.contains(e.target) && e.target !== trigger) {
+      dropdown.classList.add('hidden');
+      trigger.setAttribute('aria-expanded', 'false');
+    }
+  });
+}

@@ -40,10 +40,13 @@ export {
   sessionIdFor,
   deterministicSessionId,
   messageIdFor,
+  deterministicMessageId,
   deterministicSpaceId,
   deterministicSourceProvenanceId,
   folderSlug,
   channelFromJid,
+  normalizeChannelType,
+  extractNativeContextId,
 } from './ids.js'
 
 export {
@@ -105,6 +108,7 @@ export type {
   UserInstructionPlan,
   ExtensionMigrationPlan,
   TaskMigrationPlan,
+  TaskDeliveryTargetPlan,
   ChannelBindingMigrationPlan,
   ChannelAccountMigrationPlan,
   QuotaMigrationPlan,
@@ -157,5 +161,63 @@ export {
   createSyntheticV2Fixture,
   type SyntheticFixtureResult,
 } from './v2/fixtures-v2.js'
+
+// Multi-User Migration Engine (Universal Multi-Tenant Support)
+export {
+  planMultiUserMigration,
+  executeMultiUserMigration,
+  discoverAndSelectUsers,
+} from './multi-user/orchestrator.js'
+
+export {
+  detectIdCollisions,
+  type DetectIdCollisionsOptions,
+} from './multi-user/collision.js'
+
+export {
+  mapUserSpaces,
+  type RawWorkspaceRow,
+} from './multi-user/space-mapper.js'
+
+export {
+  generateSecureTempPassword,
+  hashPasswordScrypt,
+  savePrivatePasswordsFile,
+  assertSafeCredentialsPath,
+  getDefaultPasswordFilePath,
+  type ProvisionedUserPassword,
+} from './multi-user/passwords.js'
+
+export {
+  scanSpaceFiles,
+  isSecretOrExcluded,
+  copySpaceFilesSafely,
+  discoverMemoryFiles,
+  copyMemoryFilesSafely,
+  EXCLUDED_NAMES,
+  type ScannedFileInfo,
+} from './multi-user/file-transfer.js'
+
+export {
+  prepareChannelAccountCredential,
+  encryptCredentialWithAad,
+  resolveMasterEncryptionKey,
+  type ChannelCredentialInfo,
+} from './multi-user/credentials.js'
+
+export type {
+  MultiUserSelectOptions,
+  MultiUserMigrateOptions,
+  MultiUserMigrationPlan,
+  MultiUserMigrationResult,
+  UserMigrationPlan,
+  SpaceMigrationPlanItem,
+  SessionMigrationPlanItem,
+  MemoryFilePlanItem,
+  ChannelAccountPlanItem,
+  DisambiguatedSpaceMapping,
+  IdCollisionReason,
+  IdCollisionDetail,
+} from './multi-user/types.js'
 
 

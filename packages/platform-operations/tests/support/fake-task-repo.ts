@@ -1,6 +1,7 @@
 import type {
   Task,
   CreateTaskInput,
+  UpdateTaskInput,
   TaskQueryOptions,
   TaskRecoveryResult,
   AgentPromptTaskPayload,
@@ -14,6 +15,7 @@ import type {
 import {
   validateAgentPromptPayload,
   validateAgentPromptResult,
+  validateUpdateTaskInput,
   generateTaskId,
   generateScheduleId,
   generateRunId,
@@ -171,6 +173,155 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     return { ...task };
   }
 
+  async update(id: string, input: UpdateTaskInput): Promise<Task> {
+    const validId = validateTaskId(id);
+    const validatedInput = validateUpdateTaskInput(input);
+
+    const existing = this.tasks.get(validId);
+    if (!existing || existing.userId !== this.userId) {
+      throw new TaskNotFoundError(validId);
+    }
+
+    // 1. If currently claimed or running, reject with TaskAlreadyClaimedError
+    if (existing.status === 'claimed' || existing.status === 'running') {
+      throw new TaskAlreadyClaimedError(validId, existing.claimantId || 'unknown');
+    }
+
+    const existingSchedule = this.schedules.get(validId) ?? existing.schedule;
+    const isRecurring =
+      existing.scheduleType === 'cron' ||
+      existing.scheduleType === 'interval' ||
+      existingSchedule?.scheduleType === 'cron' ||
+      existingSchedule?.scheduleType === 'interval';
+
+    // 2. Reject terminal single tasks or cancelled/failed tasks
+    if (!isRecurring) {
+      if (existing.status === 'completed' || existing.status === 'cancelled' || existing.status === 'failed') {
+        throw new TaskAlreadyCompletedError(validId);
+      }
+    } else {
+      if (existing.status === 'cancelled' || existing.status === 'failed') {
+        throw new TaskConflictError(validId, `Recurring task with status "${existing.status}" cannot be modified`);
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const now = new Date();
+
+    const title = validatedInput.title !== undefined ? validatedInput.title : existing.title;
+    const description = validatedInput.description !== undefined ? validatedInput.description : existing.description;
+    const assignee = validatedInput.assignee !== undefined ? validatedInput.assignee : existing.assignee;
+    const priority = validatedInput.priority !== undefined ? validatedInput.priority : existing.priority;
+
+    // Prompt updates payload.prompt while preserving immutable session and space fields
+    const prompt = validatedInput.prompt ?? validatedInput.payload?.prompt;
+    const payload: AgentPromptTaskPayload = prompt !== undefined
+      ? { ...existing.payload, prompt }
+      : { ...existing.payload };
+
+    // Schedule configuration
+    const scheduleType = validatedInput.scheduleType ?? existingSchedule?.scheduleType ?? existing.scheduleType ?? 'once';
+    const cronExpression = validatedInput.cronExpression !== undefined ? validatedInput.cronExpression : (existingSchedule?.cronExpression ?? existing.cronExpression ?? null);
+    const intervalSeconds = validatedInput.intervalSeconds !== undefined ? validatedInput.intervalSeconds : (existingSchedule?.intervalSeconds ?? existing.intervalSeconds ?? null);
+    const timezone = validatedInput.timezone !== undefined ? validatedInput.timezone : (existingSchedule?.timezone ?? existing.timezone ?? 'UTC');
+    const dueDate = validatedInput.dueDate !== undefined ? validatedInput.dueDate : (existing.dueDate ?? null);
+    const misfirePolicy = validatedInput.misfirePolicy ?? existingSchedule?.misfirePolicy ?? 'coalesce';
+    const overlapPolicy = validatedInput.overlapPolicy ?? existingSchedule?.overlapPolicy ?? 'skip';
+
+    // Validate type-specific schedule constraints
+    if (scheduleType === 'cron' && !cronExpression) {
+      throw new ValidationError('Cron expression is required for cron schedule type');
+    }
+    if (scheduleType === 'interval' && !intervalSeconds) {
+      throw new ValidationError('Interval seconds is required for interval schedule type');
+    }
+
+    // Recompute next_run_at if schedule fields changed
+    let nextRunAt = existing.nextRunAt;
+    const isScheduleChanged =
+      validatedInput.scheduleType !== undefined ||
+      validatedInput.cronExpression !== undefined ||
+      validatedInput.intervalSeconds !== undefined ||
+      validatedInput.dueDate !== undefined ||
+      validatedInput.timezone !== undefined;
+
+    if (isScheduleChanged) {
+      nextRunAt = computeNextRun(
+        {
+          scheduleType,
+          cronExpression,
+          intervalSeconds,
+          dueDate,
+          lastRunAt: existingSchedule?.lastRunAt ?? null,
+          pausedAt: existingSchedule?.pausedAt ?? null,
+          enabled: existingSchedule ? existingSchedule.enabled : true,
+          timezone,
+        },
+        now
+      );
+    }
+
+    let updatedSchedule: TaskSchedule | null = existingSchedule ? { ...existingSchedule } : null;
+    if (scheduleType === 'cron' || scheduleType === 'interval') {
+      if (!updatedSchedule) {
+        updatedSchedule = {
+          id: generateScheduleId(),
+          taskId: validId,
+          userId: this.userId,
+          scheduleType,
+          cronExpression,
+          intervalSeconds,
+          nextRunAt,
+          lastRunAt: null,
+          timezone,
+          enabled: true,
+          pausedAt: null,
+          misfirePolicy,
+          overlapPolicy,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+      } else {
+        updatedSchedule.scheduleType = scheduleType;
+        updatedSchedule.cronExpression = cronExpression;
+        updatedSchedule.intervalSeconds = intervalSeconds;
+        updatedSchedule.timezone = timezone;
+        updatedSchedule.nextRunAt = nextRunAt;
+        updatedSchedule.misfirePolicy = misfirePolicy;
+        updatedSchedule.overlapPolicy = overlapPolicy;
+        updatedSchedule.updatedAt = nowIso;
+      }
+      this.schedules.set(validId, updatedSchedule);
+    } else if (scheduleType === 'once' && updatedSchedule) {
+      updatedSchedule.scheduleType = 'once';
+      updatedSchedule.cronExpression = null;
+      updatedSchedule.intervalSeconds = null;
+      updatedSchedule.nextRunAt = nextRunAt;
+      updatedSchedule.updatedAt = nowIso;
+      this.schedules.set(validId, updatedSchedule);
+    }
+
+    const updatedTask: Task = {
+      ...existing,
+      title,
+      description,
+      assignee,
+      priority,
+      payload,
+      dueDate: scheduleType === 'once' ? dueDate : null,
+      scheduleType,
+      cronExpression: scheduleType === 'cron' ? cronExpression : null,
+      intervalSeconds: scheduleType === 'interval' ? intervalSeconds : null,
+      timezone,
+      nextRunAt,
+      schedule: updatedSchedule,
+      updatedAt: nowIso,
+    };
+
+    this.tasks.set(validId, updatedTask);
+    return { ...updatedTask };
+  }
+
   async findById(id: string): Promise<Task | null> {
     const validId = validateTaskId(id);
     const t = this.tasks.get(validId);
@@ -235,11 +386,14 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
 
       if (preferred.status === 'claimed' || preferred.status === 'running') {
         if (preferred.leaseExpiresAt && new Date(preferred.leaseExpiresAt).getTime() > clock.getTime()) {
+          if (schedule && isRecurring && (schedule.overlapPolicy === 'skip' || !schedule.overlapPolicy)) {
+            return null;
+          }
           throw new TaskAlreadyClaimedError(preferredTaskId, preferred.claimantId || 'unknown');
         }
       }
 
-      const due = preferred.nextRunAt ?? preferred.dueDate;
+      const due = schedule?.nextRunAt ?? preferred.nextRunAt ?? preferred.dueDate;
       if (due && new Date(due).getTime() > clock.getTime()) {
         return null;
       }
@@ -267,22 +421,33 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       this.runs.set(runId, run);
 
       let subsequentNextRunAt: string | null = null;
-      if (preferred.scheduleType === 'cron' || preferred.scheduleType === 'interval') {
-        const timezone = schedule?.timezone ?? preferred.timezone ?? 'UTC';
+      const schedType = schedule?.scheduleType ?? preferred.scheduleType;
+      const cronExpr = schedule?.cronExpression ?? preferred.cronExpression;
+      const intervalSec = schedule?.intervalSeconds ?? preferred.intervalSeconds;
+      const timezone = schedule?.timezone ?? preferred.timezone ?? 'UTC';
+
+      if (schedType === 'cron' || schedType === 'interval') {
+        const scheduledFor = schedule?.nextRunAt ?? preferred.nextRunAt ?? preferred.dueDate ?? nowIso;
+        const scheduledForTime = new Date(scheduledFor).getTime();
+        const baseClock = Number.isNaN(scheduledForTime)
+          ? clock
+          : new Date(Math.max(clock.getTime(), scheduledForTime));
+
         subsequentNextRunAt = computeNextRun(
           {
-            scheduleType: preferred.scheduleType,
-            cronExpression: preferred.cronExpression,
-            intervalSeconds: preferred.intervalSeconds,
+            scheduleType: schedType,
+            cronExpression: cronExpr,
+            intervalSeconds: intervalSec,
             enabled: true,
             timezone,
           },
-          clock
+          baseClock
         );
       }
 
+      const nextRunValue = subsequentNextRunAt ?? schedule?.nextRunAt ?? preferred.nextRunAt;
       if (schedule) {
-        schedule.nextRunAt = subsequentNextRunAt ?? schedule.nextRunAt;
+        schedule.nextRunAt = nextRunValue;
         schedule.lastRunAt = nowIso;
         schedule.updatedAt = nowIso;
       }
@@ -294,7 +459,7 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
         leaseExpiresAt,
         leaseDurationMs: input.leaseDurationMs,
         claimCount: preferred.claimCount + 1,
-        nextRunAt: subsequentNextRunAt ?? preferred.nextRunAt,
+        nextRunAt: nextRunValue,
         currentRun: run,
         schedule,
         updatedAt: nowIso,
@@ -398,7 +563,8 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     claimantId: string,
     result: AgentPromptDispatchResult,
     runId?: string,
-    tokenUsage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number }
+    tokenUsage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number },
+    nowParam?: Date | string
   ): Promise<Task> {
     const validId = validateTaskId(id);
     const validClaimantId = validateClaimantId(claimantId);
@@ -415,14 +581,21 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       throw new TaskAlreadyClaimedError(validId, existing.claimantId || 'unknown');
     }
 
-    const now = new Date();
+    const completedAtTime = validatedResult.completedAt ? new Date(validatedResult.completedAt) : null;
+    const now = nowParam
+      ? (typeof nowParam === 'string' ? new Date(nowParam) : nowParam)
+      : (completedAtTime && !Number.isNaN(completedAtTime.getTime()) ? completedAtTime : new Date());
     const nowIso = now.toISOString();
 
-    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= now.getTime()) {
+    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() < now.getTime()) {
       throw new TaskLeaseExpiredError(validId);
     }
 
-    const isRecurring = existing.scheduleType === 'cron' || existing.scheduleType === 'interval';
+    const isRecurring =
+      existing.scheduleType === 'cron' ||
+      existing.scheduleType === 'interval' ||
+      existing.schedule?.scheduleType === 'cron' ||
+      existing.schedule?.scheduleType === 'interval';
 
     if (runId && this.runs.has(runId)) {
       const r = this.runs.get(runId)!;
@@ -458,7 +631,8 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     error: string,
     retryable?: boolean,
     runId?: string,
-    errorCode?: string
+    errorCode?: string,
+    nowParam?: Date | string
   ): Promise<Task> {
     const validId = validateTaskId(id);
     const validClaimantId = validateClaimantId(claimantId);
@@ -474,14 +648,18 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       throw new TaskAlreadyClaimedError(validId, existing.claimantId || 'unknown');
     }
 
-    const now = new Date();
-    const nowIso = now.toISOString();
+    const clock = nowParam ? (typeof nowParam === 'string' ? new Date(nowParam) : nowParam) : new Date();
+    const nowIso = clock.toISOString();
 
-    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= now.getTime()) {
+    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() < clock.getTime()) {
       throw new TaskLeaseExpiredError(validId);
     }
 
-    const isRecurring = existing.scheduleType === 'cron' || existing.scheduleType === 'interval';
+    const isRecurring =
+      existing.scheduleType === 'cron' ||
+      existing.scheduleType === 'interval' ||
+      existing.schedule?.scheduleType === 'cron' ||
+      existing.schedule?.scheduleType === 'interval';
     const shouldFailPermanently = !isRecurring && (retryable === false || existing.claimCount >= existing.maxRetries);
 
     if (runId && this.runs.has(runId)) {

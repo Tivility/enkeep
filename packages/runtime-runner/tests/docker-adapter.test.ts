@@ -146,6 +146,84 @@ describe('Docker Runtime Adapter & Zero-Network Subsystem', () => {
         })
       ).toThrow(/Invalid caller-supplied volumeId/);
     });
+
+    it('supports configurable container networkMode ("none" | "bridge") defaulting to "none"', () => {
+      const defaultSpec = adapter.createDefaultUserSpec({ userId: 'alice' });
+      expect(defaultSpec.networkMode).toBe('none');
+
+      const explicitNoneSpec = adapter.createDefaultUserSpec({ userId: 'alice', networkMode: 'none' });
+      expect(explicitNoneSpec.networkMode).toBe('none');
+
+      const bridgeSpec = adapter.createDefaultUserSpec({ userId: 'alice', networkMode: 'bridge', llmEnabled: true });
+      expect(bridgeSpec.networkMode).toBe('bridge');
+
+      // Preserve loopback platform proxy inside container even when networkMode is bridge
+      expect(bridgeSpec.environment.ENKEEP_LLM_BASE_URL).toBe('http://127.0.0.1:8787/llm');
+      // No published ports permitted under bridge or none
+      expect('publishedPorts' in (bridgeSpec as Record<string, unknown>)).toBe(false);
+    });
+
+    it('rejects null, unknown or unsupported container networkMode fail-closed', () => {
+      expect(() =>
+        adapter.createDefaultUserSpec({
+          userId: 'alice',
+          networkMode: 'host' as any,
+        })
+      ).toThrow(/Invalid caller-supplied networkMode "host": must be "none" or "bridge"/);
+
+      expect(() =>
+        adapter.createDefaultUserSpec({
+          userId: 'alice',
+          networkMode: null as any,
+        })
+      ).toThrow(/Invalid caller-supplied networkMode "null": must be "none" or "bridge"/);
+
+      expect(() =>
+        adapter.createDefaultUserSpec({
+          userId: 'alice',
+          networkMode: 'direct' as any,
+        })
+      ).toThrow(/Invalid caller-supplied networkMode "direct": must be "none" or "bridge"/);
+
+      expect(() =>
+        adapter.createDefaultUserSpec({
+          userId: 'alice',
+          networkMode: 'overlay' as any,
+        })
+      ).toThrow(/Invalid caller-supplied networkMode "overlay": must be "none" or "bridge"/);
+
+      expect(() =>
+        new DockerRuntimeAdapter({ defaultNetworkMode: 'invalid' as any })
+      ).toThrow(/Invalid defaultNetworkMode "invalid": must be "none" or "bridge"/);
+
+      expect(() =>
+        new DockerRuntimeAdapter({ defaultNetworkMode: null as any })
+      ).toThrow(/Invalid defaultNetworkMode "null": must be "none" or "bridge"/);
+    });
+
+    it('verifies explicit docker run arguments for networkMode ("none" vs "bridge")', async () => {
+      const client = new SafeDockerClient();
+      let capturedArgs: string[] = [];
+      vi.spyOn(client as any, 'executeDockerRun').mockImplementation(async (spec: any) => {
+        capturedArgs = [
+          'run', '-d', '--name', spec.containerName,
+          '--user', spec.user, '--workdir', spec.workingDir,
+          '--network', spec.networkMode,
+        ];
+        return 'a'.repeat(64);
+      });
+
+      const noneSpec = adapter.createDefaultUserSpec({ userId: 'alice', networkMode: 'none' });
+      await (client as any).executeDockerRun(noneSpec);
+      expect(capturedArgs).toContain('--network');
+      const noneIdx = capturedArgs.indexOf('--network');
+      expect(capturedArgs[noneIdx + 1]).toBe('none');
+
+      const bridgeSpec = adapter.createDefaultUserSpec({ userId: 'alice', networkMode: 'bridge' });
+      await (client as any).executeDockerRun(bridgeSpec);
+      const bridgeIdx = capturedArgs.indexOf('--network');
+      expect(capturedArgs[bridgeIdx + 1]).toBe('bridge');
+    });
   });
 
   describe('Transport Probing & Platform Diagnostics', () => {

@@ -7,6 +7,7 @@ import {
   NotFoundError,
   PlatformError,
 } from '@enkeep/platform-core';
+import { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS } from '@enkeep/web-channel';
 import type {
   TaskInputPreparationContext,
   TaskInputPreparationResult,
@@ -73,6 +74,8 @@ export interface StagedPipelineObservationEnvelope {
   readonly records?: Array<{
     readonly id: string;
     readonly sessionId: string;
+    readonly spaceId?: string;
+    readonly folder?: string;
     readonly role: string;
     readonly content: string;
     readonly createdAt: string;
@@ -360,16 +363,16 @@ export class PipelineTaskInputPreparerService {
     }
 
     // Determine executionBudget for registered pipeline observation/aggregation tasks
-    // Finite safe integer <= 900000, default 900000, invalid fail closed
-    const rawMaxWaitMs = registration.maxWaitMs ?? 900_000;
+    // Finite safe integer <= 1800000, default 1800000, invalid fail closed
+    const rawMaxWaitMs = registration.maxWaitMs ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
     if (
       typeof rawMaxWaitMs !== 'number' ||
       !Number.isSafeInteger(rawMaxWaitMs) ||
       rawMaxWaitMs <= 0 ||
-      rawMaxWaitMs > 900_000
+      rawMaxWaitMs > DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS
     ) {
       throw new ValidationError(
-        '[INVALID_EXECUTION_BUDGET] Registered task maxWaitMs must be a finite integer between 1 and 900000'
+        `[INVALID_EXECUTION_BUDGET] Registered task maxWaitMs must be a finite integer between 1 and ${DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS}`
       );
     }
     const executionBudget: TaskExecutionBudget = {
@@ -533,27 +536,49 @@ export class PipelineTaskInputPreparerService {
       try {
         const obsRead = await this.executeFileOp(tenantId, sp.id, { op: 'read', path: 'observations.md', encoding: 'utf8' });
         if (obsRead && 'content' in obsRead && typeof obsRead.content === 'string' && obsRead.content.trim().length > 0) {
-          const lines = obsRead.content.split('\n');
-          const filteredLines: string[] = [];
-          for (const line of lines) {
-            const dateMatch = line.match(/\b(20\d\d-[01]\d-[0-3]\d)\b/);
-            if (dateMatch) {
-              const d = dateMatch[1];
-              if (d >= sinceDate && d < untilDate) {
-                filteredLines.push(line);
+          const dateSectionSplitRegex = /(?=^##\s+(?:\[\s*)?\b(?:20\d\d-[01]\d-[0-3]\d)\b)/m;
+          const hasDateHeadings = /(?:^|\n)##\s+(?:\[\s*)?\b(?:20\d\d-[01]\d-[0-3]\d)\b/m.test(obsRead.content);
+
+          const filteredObservations: string[] = [];
+          if (hasDateHeadings) {
+            // Split by markdown date headings (## YYYY-MM-DD or ## [YYYY-MM-DD...]) to preserve date headers and bounded window
+            const sections = obsRead.content.split(dateSectionSplitRegex);
+            for (const sec of sections) {
+              const headerMatch = sec.match(/^##\s+\[?\b(20\d\d-[01]\d-[0-3]\d)\b/);
+              if (headerMatch) {
+                const secDate = headerMatch[1];
+                if (secDate >= sinceDate && secDate < untilDate) {
+                  const trimmed = sec.trim();
+                  if (trimmed.length > 0) {
+                    filteredObservations.push(trimmed);
+                  }
+                }
               }
-            } else if (line.trim().length > 0) {
-              filteredLines.push(line);
+            }
+          } else {
+            // Fallback for legacy format without markdown date headings
+            const lines = obsRead.content.split('\n');
+            for (const line of lines) {
+              const dateMatch = line.match(/\b(20\d\d-[01]\d-[0-3]\d)\b/);
+              if (dateMatch) {
+                const d = dateMatch[1];
+                if (d >= sinceDate && d < untilDate) {
+                  filteredObservations.push(line);
+                }
+              } else if (line.trim().length > 0) {
+                filteredObservations.push(line);
+              }
             }
           }
-          if (filteredLines.length > 0) {
+
+          if (filteredObservations.length > 0) {
             spaceObservations.push({
               spaceId: sp.id,
               folder: sp.folder,
               name: sp.name,
-              observations: filteredLines,
+              observations: filteredObservations,
             });
-            totalObsCount += filteredLines.length;
+            totalObsCount += filteredObservations.length;
           }
         }
       } catch (obsErr: any) {
@@ -908,28 +933,29 @@ export class PipelineTaskInputPreparerService {
     // 5. Query web_messages strictly scoped to tenant + eligible spaces with active canonical session routes
     const spacePlaceholders = eligibleSpaceIds.map(() => '?').join(', ');
     let querySql = `
-      SELECT m.id, m.session_id, m.role, m.content, m.status, m.turn_id, m.created_at
+      SELECT m.id, m.session_id, m.role, m.content, m.status, m.turn_id, m.created_at,
+             canonical.space_id, canonical.folder
       FROM web_messages m
+      JOIN (
+        SELECT r.id AS session_id, s.id AS space_id, s.folder AS folder
+        FROM session_routes r
+        JOIN spaces s ON r.space_id = s.id AND r.user_id = s.user_id
+        WHERE r.user_id = ?
+          AND r.status = 'active'
+          AND s.status = 'active'
+          AND (
+            r.id = s.canonical_session_id
+            OR (s.canonical_session_id IS NULL AND r.id = (
+              SELECT r2.id FROM session_routes r2
+              WHERE r2.space_id = s.id AND r2.user_id = s.user_id AND r2.status = 'active'
+              ORDER BY r2.created_at ASC LIMIT 1
+            ))
+          )
+          AND s.id IN (${spacePlaceholders})
+      ) canonical ON m.session_id = canonical.session_id
       WHERE m.user_id = ?
-        AND m.session_id IN (
-          SELECT r.id
-          FROM session_routes r
-          JOIN spaces s ON r.space_id = s.id AND r.user_id = s.user_id
-          WHERE r.user_id = ?
-            AND r.status = 'active'
-            AND s.status = 'active'
-            AND (
-              r.id = s.canonical_session_id
-              OR (s.canonical_session_id IS NULL AND r.id = (
-                SELECT r2.id FROM session_routes r2
-                WHERE r2.space_id = s.id AND r2.user_id = s.user_id AND r2.status = 'active'
-                ORDER BY r2.created_at ASC LIMIT 1
-              ))
-            )
-            AND s.id IN (${spacePlaceholders})
-        )
     `;
-    const queryParams: any[] = [tenantId, tenantId, ...eligibleSpaceIds];
+    const queryParams: any[] = [tenantId, ...eligibleSpaceIds, tenantId];
 
     if (sinceCreatedAt && sinceId) {
       // Keyset cursor: strictly greater than composite watermark
@@ -948,6 +974,8 @@ export class PipelineTaskInputPreparerService {
     const rawMessages = this.db.prepare(querySql).all(...queryParams) as Array<{
       id: string;
       session_id: string;
+      space_id: string;
+      folder: string;
       role: string;
       content: string;
       status: string;
@@ -966,6 +994,8 @@ export class PipelineTaskInputPreparerService {
     const sanitizedRecords = rawMessages.map((m) => ({
       id: m.id,
       sessionId: m.session_id,
+      spaceId: m.space_id,
+      folder: m.folder,
       role: m.role,
       content: m.content,
       createdAt: m.created_at,

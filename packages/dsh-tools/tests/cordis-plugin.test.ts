@@ -26,17 +26,18 @@ class MockToolsService extends Service {
 describe('dsh-tools: Cordis plugin and dispose lifecycle', () => {
   const dummyWorkspaceRoot = path.join(os.tmpdir(), 'dsh-plugin-test-ws');
 
-  it('registers all 4 tools on ctx.tools service and cleans up on dispose', async () => {
+  it('registers all 5 tools on ctx.tools service and cleans up on dispose', async () => {
     const ctx = new Context();
     const toolsService = new MockToolsService(ctx);
 
     const fork = await ctx.plugin(dshToolsPlugin, { workspaceRoot: dummyWorkspaceRoot });
 
-    expect(toolsService.registeredTools.length).toBe(4);
+    expect(toolsService.registeredTools.length).toBe(5);
     const names = toolsService.registeredTools.map((t) => t.name);
     expect(names).toContain('send_platform_message');
     expect(names).toContain('send_file');
     expect(names).toContain('create_task');
+    expect(names).toContain('update_task');
     expect(names).toContain('check_quota');
 
     // Dispose test
@@ -55,7 +56,7 @@ describe('dsh-tools: Cordis plugin and dispose lifecycle', () => {
     const toolsService = new MockToolsService(ctx);
     await fork.await();
 
-    expect(toolsService.registeredTools.length).toBe(4);
+    expect(toolsService.registeredTools.length).toBe(5);
 
     await fork.dispose();
     expect(toolsService.registeredTools.length).toBe(0);
@@ -66,12 +67,12 @@ describe('dsh-tools: Cordis plugin and dispose lifecycle', () => {
     const toolsService = new MockToolsService(ctx);
 
     const fork1 = await ctx.plugin(dshToolsPlugin, { workspaceRoot: dummyWorkspaceRoot });
-    expect(toolsService.registeredTools.length).toBe(4);
+    expect(toolsService.registeredTools.length).toBe(5);
     await fork1.dispose();
     expect(toolsService.registeredTools.length).toBe(0);
 
     const fork2 = await ctx.plugin(dshToolsPlugin, { workspaceRoot: dummyWorkspaceRoot });
-    expect(toolsService.registeredTools.length).toBe(4);
+    expect(toolsService.registeredTools.length).toBe(5);
     await fork2.dispose();
     expect(toolsService.registeredTools.length).toBe(0);
   });

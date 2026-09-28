@@ -434,9 +434,13 @@ describe('LlmProxyHandler Unit Tests', () => {
       }
       await handlePromise;
 
-      expect(calls.length).toBe(2);
+      // 1 initial + 3 retries on primary (claude) before rotating to fallback (gemini)
+      expect(calls.length).toBe(5);
       expect(calls[0]).toContain('messages');
-      expect(calls[1]).toContain('gemini');
+      expect(calls[1]).toContain('messages');
+      expect(calls[2]).toContain('messages');
+      expect(calls[3]).toContain('messages');
+      expect(calls[4]).toContain('gemini');
 
       const fullResponse = Buffer.concat(receivedChunks).toString('utf8');
       expect(fullResponse).toContain('HTTP/1.1 200 OK');

@@ -723,7 +723,7 @@ describe('DockerExecTransport Readiness & Fail-Closed Behavior', () => {
   });
 
   describe('DockerExecTransport.sendFollowup Behavior', () => {
-    it('dispatches followup successfully with completed status and verifies timeoutMs defaults to 300000ms', async () => {
+    it('dispatches followup successfully with completed status and verifies timeoutMs defaults to 600000ms', async () => {
       const expectation = createMockExpectation();
       const mockClient = new SafeDockerClient();
       const mockEnvelope: ExecCliEnvelope = {
@@ -755,7 +755,7 @@ describe('DockerExecTransport Readiness & Fail-Closed Behavior', () => {
       expect(execSpy).toHaveBeenCalledWith(
         expectation,
         expect.objectContaining({ action: 'followup' }),
-        expect.objectContaining({ timeoutMs: 300_000 })
+        expect.objectContaining({ timeoutMs: 600_000 })
       );
     });
 

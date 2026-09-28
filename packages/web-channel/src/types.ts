@@ -369,6 +369,11 @@ export interface InternalRuntimeDispatchResult {
 }
 
 /**
+ * Default execution timeout for interactive turns (1,800 seconds / 30 minutes).
+ */
+export const DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS = 1_800_000;
+
+/**
  * Server-owned options passed to runtime gateway dispatch.
  * Strictly internal / server-side; not deserializable from external user payload.
  */

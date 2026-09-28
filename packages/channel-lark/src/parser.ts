@@ -10,6 +10,7 @@ import type {
   LarkEventSender,
   LarkMention,
   LarkMessageResource,
+  LarkParsedCardAction,
   LarkParsedMessage,
   LarkRawEvent,
   LarkRawMention,
@@ -444,4 +445,114 @@ export function parseLarkEvent(rawEvent: LarkRawEvent): LarkParsedMessage | null
   };
 
   return parsed;
+}
+
+/**
+ * Checks whether the raw Lark event represents a card action callback.
+ */
+export function isCardActionEvent(rawEvent: LarkRawEvent | null | undefined): boolean {
+  if (!rawEvent) return false;
+  const eventType = rawEvent.header?.event_type ?? (rawEvent as any).event_type;
+  if (eventType === 'card.action.trigger') return true;
+  if (rawEvent.action || (rawEvent.event as any)?.action) return true;
+  return false;
+}
+
+/**
+ * Parses a Lark `card.action.trigger` callback event into a normalized LarkParsedCardAction object.
+ * Extracts operator identification, action metadata (action name, turnId, sessionId), and context messageId.
+ */
+export function parseLarkCardAction(rawEvent: LarkRawEvent | null | undefined): LarkParsedCardAction | null {
+  if (!rawEvent) return null;
+
+  const isAction = isCardActionEvent(rawEvent);
+  if (!isAction) {
+    return null;
+  }
+
+  const rawAction = rawEvent.action ?? (rawEvent.event as any)?.action ?? {};
+  const rawContext = rawEvent.context ?? (rawEvent.event as any)?.context ?? {};
+  const rawOperator = rawEvent.operator ?? (rawEvent.event as any)?.operator ?? {};
+
+  const actionValue =
+    typeof rawAction.value === 'object' && rawAction.value !== null
+      ? rawAction.value
+      : typeof rawAction.value === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(rawAction.value);
+            } catch {
+              return {};
+            }
+          })()
+        : {};
+
+  const actionType =
+    actionValue.action ??
+    actionValue.action_type ??
+    rawAction.tag ??
+    rawAction.option ??
+    'unknown';
+
+  const turnId =
+    typeof actionValue.turnId === 'string'
+      ? actionValue.turnId
+      : typeof actionValue.turn_id === 'string'
+        ? actionValue.turn_id
+        : undefined;
+
+  const sessionId =
+    typeof actionValue.sessionId === 'string'
+      ? actionValue.sessionId
+      : typeof actionValue.session_id === 'string'
+        ? actionValue.session_id
+        : undefined;
+
+  const messageId =
+    rawContext.open_message_id ??
+    rawEvent.open_message_id ??
+    (rawEvent as any).message_id ??
+    actionValue.messageId ??
+    actionValue.message_id ??
+    '';
+
+  const chatId =
+    rawContext.open_chat_id ??
+    rawEvent.open_chat_id ??
+    (rawEvent as any).chat_id ??
+    actionValue.chatId ??
+    actionValue.chat_id ??
+    undefined;
+
+  const operatorId =
+    rawOperator.open_id ??
+    rawOperator.operator_id?.open_id ??
+    rawEvent.open_id ??
+    (rawEvent.sender as any)?.sender_id?.open_id ??
+    '';
+
+  const operatorUserId =
+    rawOperator.user_id ??
+    rawOperator.operator_id?.user_id ??
+    (rawEvent.sender as any)?.sender_id?.user_id ??
+    undefined;
+
+  const operatorUnionId =
+    rawOperator.union_id ??
+    rawOperator.operator_id?.union_id ??
+    (rawEvent.sender as any)?.sender_id?.union_id ??
+    undefined;
+
+  return {
+    eventType: 'card.action.trigger',
+    actionType,
+    actionValue,
+    turnId,
+    sessionId,
+    messageId,
+    chatId,
+    operatorId,
+    operatorUserId,
+    operatorUnionId,
+  };
 }

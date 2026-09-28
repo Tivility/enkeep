@@ -74,6 +74,7 @@ export interface ContainerStreamingEventFrame {
     | 'assistant_delta'
     | 'assistant_stream_end'
     | 'thinking_delta'
+    | 'reasoning_delta'
     | 'tool_started'
     | 'tool_completed'
     | 'turn_completed'

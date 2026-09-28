@@ -1,6 +1,7 @@
 import type {
   Task,
   CreateTaskInput,
+  UpdateTaskInput,
   ClaimTaskInput,
   RenewLeaseInput,
   CompleteTaskInput,
@@ -26,6 +27,7 @@ import {
   validateTaskPriority,
   validateAgentPromptPayload,
   validateAgentPromptResult,
+  validateUpdateTaskInput,
   generateTaskId,
   TASK_PROTOCOL_ERROR_CODES,
 } from '../types/task.js';
@@ -180,6 +182,33 @@ export class TaskOperationService {
     }
 
     return { task, isIdempotentHit: false };
+  }
+
+  /**
+   * Update an existing task and its schedule.
+   * Atomically merges editable fields, recomputes next_run_at, and preserves immutable fields.
+   */
+  async updateTask(taskId: string, input: UpdateTaskInput): Promise<Task> {
+    const validTaskId = validateTaskId(taskId);
+    const validatedInput = validateUpdateTaskInput(input);
+
+    const task = await this.tasks.update(validTaskId, validatedInput);
+
+    if (this.auditLogs) {
+      await this.auditLogs.record({
+        userId: this.userId,
+        action: 'task_updated',
+        resourceType: 'task',
+        resourceId: task.id,
+        details: {
+          title: task.title,
+          priority: task.priority,
+          scheduleType: task.scheduleType,
+        },
+      });
+    }
+
+    return task;
   }
 
   /**

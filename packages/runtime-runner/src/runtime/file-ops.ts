@@ -343,6 +343,74 @@ export function computeFileETag(buf: Buffer): string {
 }
 
 /**
+ * Authoritatively computes a strong content ETag from byte contents using 64 KiB chunks.
+ * Formatted as HTTP quoted lowercase hex SHA-256 hash.
+ */
+export function computeFileETagStreaming(
+  filesystem: typeof fs,
+  fd: number,
+  size: number
+): string {
+  const hasher = crypto.createHash('sha256');
+  const chunkBuf = Buffer.alloc(64 * 1024);
+  let totalRead = 0;
+  while (totalRead < size) {
+    const toRead = Math.min(chunkBuf.length, size - totalRead);
+    const bytesRead = filesystem.readSync(fd, chunkBuf, 0, toRead, totalRead);
+    if (bytesRead === 0) break;
+    hasher.update(bytesRead === chunkBuf.length ? chunkBuf : chunkBuf.subarray(0, bytesRead));
+    totalRead += bytesRead;
+  }
+  return `"${hasher.digest('hex').toLowerCase()}"`;
+}
+
+/**
+ * In-memory LRU ETag cache keyed by (filePath:mtimeMs:size:inode) to avoid
+ * re-hashing large files on repeated directory listings.
+ */
+const MAX_FILE_ETAG_CACHE_ENTRIES = 10000;
+const fileETagCache = new Map<string, string>();
+
+export function getFileStatETagCacheKey(
+  filePath: string,
+  mtimeMs: number,
+  size: number,
+  ino?: number | bigint
+): string {
+  return `${path.normalize(filePath)}:${mtimeMs}:${size}:${ino !== undefined ? ino.toString() : '0'}`;
+}
+
+export function getCachedFileETag(key: string): string | undefined {
+  const val = fileETagCache.get(key);
+  if (val !== undefined) {
+    // Refresh LRU order
+    fileETagCache.delete(key);
+    fileETagCache.set(key, val);
+  }
+  return val;
+}
+
+export function setCachedFileETag(key: string, etag: string): void {
+  if (fileETagCache.has(key)) {
+    fileETagCache.delete(key);
+  } else if (fileETagCache.size >= MAX_FILE_ETAG_CACHE_ENTRIES) {
+    const oldestKey = fileETagCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      fileETagCache.delete(oldestKey);
+    }
+  }
+  fileETagCache.set(key, etag);
+}
+
+export function clearFileETagCache(): void {
+  fileETagCache.clear();
+}
+
+export function getFileETagCacheSize(): number {
+  return fileETagCache.size;
+}
+
+/**
  * Computes an authoritative directory ETag from canonical sorted entry metadata.
  * Formatted as HTTP quoted lowercase hex SHA-256 hash.
  */
@@ -733,36 +801,40 @@ export function inspectDirectory(
 
     let entryEtag: string | undefined;
     if (type === 'file') {
-      const flag = nofollow ?? getNoFollowFlag();
-      let fd: number | undefined;
-      try {
-        fd = filesystem.openSync(entryPath, fs.constants.O_RDONLY | flag);
-        const fstat = filesystem.fstatSync(fd);
-        if (fstat.isFile() && fstat.size <= MAX_FILE_OP_BYTES) {
-          const buf = Buffer.alloc(fstat.size);
-          let bytesRead = 0;
-          while (bytesRead < fstat.size) {
-            const n = filesystem.readSync(fd, buf, bytesRead, fstat.size - bytesRead, bytesRead);
-            if (n === 0) break;
-            bytesRead += n;
+      const cacheKey = getFileStatETagCacheKey(entryPath, mtimeMs, size, entryStat.ino);
+      const cached = getCachedFileETag(cacheKey);
+      if (cached !== undefined) {
+        entryEtag = cached;
+      } else {
+        const flag = nofollow ?? getNoFollowFlag();
+        let fd: number | undefined;
+        try {
+          fd = filesystem.openSync(entryPath, fs.constants.O_RDONLY | flag);
+          const fstat = filesystem.fstatSync(fd);
+          if (fstat.isFile()) {
+            entryEtag = computeFileETagStreaming(filesystem, fd, fstat.size);
+            setCachedFileETag(cacheKey, entryEtag);
+            if (fstat.mtimeMs !== mtimeMs || fstat.size !== size || fstat.ino !== entryStat.ino) {
+              const actualKey = getFileStatETagCacheKey(entryPath, fstat.mtimeMs, fstat.size, fstat.ino);
+              setCachedFileETag(actualKey, entryEtag);
+            }
           }
-          entryEtag = computeFileETag(bytesRead === fstat.size ? buf : buf.subarray(0, bytesRead));
-        }
-        filesystem.closeSync(fd);
-        fd = undefined;
-      } catch (err: unknown) {
-        if (fd !== undefined) {
-          try {
-            filesystem.closeSync(fd);
-          } catch (closeErr: unknown) {
-            const primary = err instanceof Error ? err : new FileOpError('STORAGE_METADATA_INVALID');
-            const cleanup = closeErr instanceof Error ? closeErr : new FileOpError('STORAGE_METADATA_INVALID');
-            throw new AggregateError([primary, cleanup], 'Failed to close entry file');
-          }
+          filesystem.closeSync(fd);
           fd = undefined;
+        } catch (err: unknown) {
+          if (fd !== undefined) {
+            try {
+              filesystem.closeSync(fd);
+            } catch (closeErr: unknown) {
+              const primary = err instanceof Error ? err : new FileOpError('STORAGE_METADATA_INVALID');
+              const cleanup = closeErr instanceof Error ? closeErr : new FileOpError('STORAGE_METADATA_INVALID');
+              throw new AggregateError([primary, cleanup], 'Failed to close entry file');
+            }
+            fd = undefined;
+          }
+          if (err instanceof FileOpError) throw err;
+          throw new FileOpError('STORAGE_METADATA_INVALID');
         }
-        if (err instanceof FileOpError) throw err;
-        throw new FileOpError('STORAGE_METADATA_INVALID');
       }
     } else if (type === 'directory') {
       try {
@@ -2523,22 +2595,16 @@ export function executeFileOperation(
 
         const { mtimeMs } = extractValidMetadata(fstat);
 
-        // Streaming ETag calculation in 64 KiB chunks (NO large buffer in memory)
-        const hasher = crypto.createHash('sha256');
-        const chunkBuf = Buffer.alloc(64 * 1024);
-        let totalRead = 0;
-        while (totalRead < fstat.size) {
-          const toRead = Math.min(chunkBuf.length, fstat.size - totalRead);
-          const bytesRead = filesystem.readSync(fd, chunkBuf, 0, toRead, totalRead);
-          if (bytesRead === 0) break;
-          hasher.update(bytesRead === chunkBuf.length ? chunkBuf : chunkBuf.subarray(0, bytesRead));
-          totalRead += bytesRead;
+        // Streaming ETag calculation in 64 KiB chunks with in-memory stat-keyed cache
+        const cacheKey = getFileStatETagCacheKey(targetPath, mtimeMs, fstat.size, fstat.ino);
+        let etag = getCachedFileETag(cacheKey);
+        if (etag === undefined) {
+          etag = computeFileETagStreaming(filesystem, fd, fstat.size);
+          setCachedFileETag(cacheKey, etag);
         }
 
         filesystem.closeSync(fd);
         fd = undefined;
-
-        const etag = `"${hasher.digest('hex').toLowerCase()}"`;
 
         return {
           op: 'stat',
@@ -2886,7 +2952,7 @@ export function executeFileOperation(
       if (reqObj.stageToken !== undefined) {
         stageToken = validateStageToken(reqObj.stageToken);
       } else {
-        stageToken = `.${path.basename(targetPath)}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
+        stageToken = `.stage.${crypto.randomBytes(8).toString('hex')}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
       }
 
       const tempPath = path.join(parentDir, stageToken);
@@ -2967,7 +3033,7 @@ export function executeFileOperation(
       }
       const stageToken = validateStageToken(reqObj.stageToken);
       const expectedPrefix = `.${path.basename(targetPath)}.`;
-      if (!stageToken.startsWith(expectedPrefix)) {
+      if (!stageToken.startsWith('.stage.') && !stageToken.startsWith(expectedPrefix)) {
         throw new FileOpError('INVALID_REQUEST');
       }
       const expectedEtag = typeof reqObj.expectedEtag === 'string' ? reqObj.expectedEtag : undefined;
@@ -3065,7 +3131,7 @@ export function executeFileOperation(
       }
       const stageToken = validateStageToken(reqObj.stageToken);
       const expectedPrefix = `.${path.basename(targetPath)}.`;
-      if (!stageToken.startsWith(expectedPrefix)) {
+      if (!stageToken.startsWith('.stage.') && !stageToken.startsWith(expectedPrefix)) {
         throw new FileOpError('INVALID_REQUEST');
       }
       const parentDir = path.dirname(targetPath);
@@ -3273,7 +3339,7 @@ export async function executeFileStageStream(
   }
   verifyOwnership(parentStat, expectedUid);
 
-  const tempFileName = `.${path.basename(targetPath)}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
+  const tempFileName = `.stage.${crypto.randomBytes(8).toString('hex')}.${crypto.randomBytes(8).toString('hex')}.stage.tmp`;
   const tempPath = path.join(parentDir, tempFileName);
   const nofollow = getNoFollowFlag();
 
@@ -3560,7 +3626,9 @@ export async function executeFileCommitStage(
         }
 
         // Overwrite: preserve target as backup rollbackToken
-        const backupToken = options.rollbackToken ? validateRollbackToken(options.rollbackToken) : `.${path.basename(targetPath)}.${crypto.randomBytes(8).toString('hex')}.rollback.tmp`;
+        const backupToken = options.rollbackToken
+          ? validateRollbackToken(options.rollbackToken)
+          : `.rollback.${crypto.randomBytes(8).toString('hex')}.${crypto.randomBytes(8).toString('hex')}.rollback.tmp`;
         const backupPath = path.join(parentDir, backupToken);
         try {
           filesystem.renameSync(targetPath, backupPath);
@@ -3864,7 +3932,8 @@ export async function executeFileFinalizeStage(
   const spaceRoot = path.join(spacesDir, space);
   const targetPath = path.join(spaceRoot, ...segments);
   const parentDir = path.dirname(targetPath);
-  const backupPath = path.join(parentDir, options.rollbackToken);
+  const rollbackToken = validateRollbackToken(options.rollbackToken);
+  const backupPath = path.join(parentDir, rollbackToken);
   const nofollow = getNoFollowFlag();
 
   try {
@@ -3908,7 +3977,8 @@ export async function executeFileRollbackCommit(
     const parentDir = path.dirname(targetPath);
 
     if (options.rollbackToken) {
-      const backupPath = path.join(parentDir, options.rollbackToken);
+      const rollbackToken = validateRollbackToken(options.rollbackToken);
+      const backupPath = path.join(parentDir, rollbackToken);
       try {
         if (filesystem.existsSync(backupPath)) {
           filesystem.renameSync(backupPath, targetPath);
@@ -3926,7 +3996,8 @@ export async function executeFileRollbackCommit(
 
     if (options.stageToken) {
       try {
-        const tempPath = path.join(parentDir, options.stageToken);
+        const stageToken = validateStageToken(options.stageToken);
+        const tempPath = path.join(parentDir, stageToken);
         filesystem.unlinkSync(tempPath);
       } catch {
         // Ignore

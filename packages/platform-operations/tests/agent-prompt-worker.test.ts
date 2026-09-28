@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { DatabaseSync } from 'node:sqlite';
 import { FakePlatformOperationsStorage } from './support/index.js';
 import { PlatformOperationsService } from '../src/services/platform-operations-service.js';
 import { TaskOperationService } from '../src/services/task-operation-service.js';
@@ -35,6 +36,7 @@ describe('AgentPromptTaskWorker (Single-Process Worker, Concurrency=1, Heartbeat
     options?: {
       leaseDurationMs?: number;
       heartbeatIntervalMs?: number;
+      defaultExecutionBudgetMs?: number;
       pollIntervalMs?: number;
       workerId?: string;
       onError?: (err: Error, ctx: any) => void;
@@ -48,6 +50,7 @@ describe('AgentPromptTaskWorker (Single-Process Worker, Concurrency=1, Heartbeat
       dispatcher,
       leaseDurationMs: options?.leaseDurationMs ?? 2000,
       heartbeatIntervalMs: options?.heartbeatIntervalMs ?? 200,
+      defaultExecutionBudgetMs: options?.defaultExecutionBudgetMs,
       pollIntervalMs: options?.pollIntervalMs ?? 100,
       recoverOnStart: true,
       systemRecovery: () => storage.recoverAfterRestart(),
@@ -622,5 +625,602 @@ describe('AgentPromptTaskWorker (Single-Process Worker, Concurrency=1, Heartbeat
 
     const completedTask2 = await ops.tasks.getTask(task2.id);
     expect(completedTask2?.status).toBe('completed');
+  });
+
+  it('multi-subagent long agent task progressing within execution budget continuously renews lease and completes successfully without TASK_LEASE_EXPIRED', async () => {
+    const ops = service.forTenant('user_test');
+    const { task } = await ops.tasks.createTask({
+      title: 'Multi-Subagent Pipeline Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Coordinate subagent 1 (cognitive), subagent 2 (knowledge), and subagent 3 (interaction)',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+      },
+    });
+
+    let renewalCount = 0;
+    const origRenew = ops.tasks.renewLease.bind(ops.tasks);
+    ops.tasks.renewLease = async (taskId, input) => {
+      renewalCount++;
+      return origRenew(taskId, input);
+    };
+
+    // Task takes 400ms, while lease duration is only 150ms.
+    // Without heartbeat renewal, lease would expire at 150ms and task would fail with TASK_LEASE_EXPIRED.
+    const worker = createWorker(async (ctx) => {
+      // Simulate multiple sequential/parallel subagent turn execution
+      for (let i = 0; i < 4; i++) {
+        if (ctx.signal.aborted) {
+          throw new Error('Aborted');
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return {
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+      };
+    }, {
+      leaseDurationMs: 150,
+      heartbeatIntervalMs: 40,
+      defaultExecutionBudgetMs: 5000,
+    });
+
+    const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+
+    expect(result).not.toBeNull();
+    expect(result?.status).toBe('completed');
+    expect(result?.error).toBeUndefined();
+    // Heartbeat must have renewed the lease multiple times while task was progressing
+    expect(renewalCount).toBeGreaterThanOrEqual(3);
+
+    const finished = await ops.tasks.getTask(task.id);
+    expect(finished?.status).toBe('completed');
+    expect(finished?.error).toBeNull();
+  });
+
+  it('task execution lease renewal is strictly bounded by execution budget (no immortal leases)', async () => {
+    const ops = service.forTenant('user_test');
+    const { task } = await ops.tasks.createTask({
+      title: 'Runaway Task Exceeding Execution Budget',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Runaway agent task that hangs or runs forever',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+      },
+    });
+
+    let renewalCount = 0;
+    const origRenew = ops.tasks.renewLease.bind(ops.tasks);
+    ops.tasks.renewLease = async (taskId, input) => {
+      renewalCount++;
+      return origRenew(taskId, input);
+    };
+
+    let signalAborted = false;
+    const worker = createWorker(async (ctx) => {
+      ctx.signal.addEventListener('abort', () => {
+        signalAborted = true;
+      });
+      // Simulate hung / runaway task waiting 600ms
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 600);
+        ctx.signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          resolve(undefined);
+        });
+      });
+      return {
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+      };
+    }, {
+      leaseDurationMs: 500,
+      heartbeatIntervalMs: 40,
+      defaultExecutionBudgetMs: 200, // Budget is strictly 200ms
+    });
+
+    const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+
+    // Must be aborted / lease_lost due to budget exhaustion, NOT immortal
+    expect(result?.status === 'lease_lost' || result?.status === 'aborted').toBe(true);
+    expect(signalAborted).toBe(true);
+    // Renewals should have stopped once the budget was reached
+    expect(renewalCount).toBeLessThan(6);
+  });
+
+  it('dynamic execution budget from prepareTaskInput overrides default and strictly bounds lease renewal', async () => {
+    const ops = service.forTenant('user_test');
+    const { task } = await ops.tasks.createTask({
+      title: 'Dynamic Budget Task',
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Task with custom execution budget from prepareTaskInput',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+      },
+    });
+
+    let signalAborted = false;
+    const worker = new AgentPromptTaskWorker({
+      workerId: 'worker_dyn_budget',
+      tenantEnumerator: () => ['user_test'],
+      getTenantOperations: (tenantId) => service.forTenant(tenantId),
+      prepareTaskInput: async () => ({
+        preparedPrompt: 'Prepared prompt with budget',
+        executionBudget: { maxWaitMs: 180 }, // Dynamic budget of 180ms
+      }),
+      dispatcher: async (ctx) => {
+        ctx.signal.addEventListener('abort', () => {
+          signalAborted = true;
+        });
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 600);
+          ctx.signal.addEventListener('abort', () => {
+            clearTimeout(timer);
+            resolve(undefined);
+          });
+        });
+        return {
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+        };
+      },
+      leaseDurationMs: 400,
+      heartbeatIntervalMs: 40,
+      defaultExecutionBudgetMs: 30_000, // Default is large, but overridden by prepareTaskInput
+    });
+    activeWorkers.push(worker);
+
+    const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+
+    expect(result?.status === 'lease_lost' || result?.status === 'aborted').toBe(true);
+    expect(signalAborted).toBe(true);
+  });
+
+  describe('Fallback proactive delivery resolution for agent_prompt tasks (origin session/space bindings)', () => {
+    let testDb: DatabaseSync;
+    let proactiveCalls: any[];
+    let fakeGateway: any;
+    let fakeChannelRuntimeManager: any;
+
+    beforeEach(() => {
+      proactiveCalls = [];
+      fakeGateway = {
+        sendProactiveMessage: vi.fn().mockImplementation(async (params: any) => {
+          proactiveCalls.push(params);
+          return { success: true, messageId: 'om_proactive_mock' };
+        }),
+      };
+
+      fakeChannelRuntimeManager = {
+        getActiveGateway: vi.fn().mockImplementation((userId: string, accountId: string) => {
+          if (userId === 'user_test' && (accountId === 'acc_lark_1' || accountId === 'acc_lark_2')) {
+            return fakeGateway;
+          }
+          return undefined;
+        }),
+      };
+
+      testDb = new DatabaseSync(':memory:');
+      testDb.exec(`
+        CREATE TABLE channel_accounts (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          type TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active'
+        );
+        CREATE TABLE session_routes (
+          id TEXT PRIMARY KEY,
+          space_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          channel TEXT NOT NULL DEFAULT 'web',
+          account_id TEXT,
+          native_context_id TEXT
+        );
+        CREATE TABLE channel_bindings (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          space_id TEXT NOT NULL,
+          native_context_id TEXT NOT NULL
+        );
+      `);
+
+      testDb.prepare(`
+        INSERT INTO channel_accounts (id, user_id, type, status)
+        VALUES ('acc_lark_1', 'user_test', 'lark', 'active'),
+               ('acc_lark_2', 'user_test', 'lark', 'active'),
+               ('acc_lark_disabled', 'user_test', 'lark', 'disabled');
+      `).run();
+    });
+
+    it('falls back to origin session channel binding when payload has no explicit delivery', async () => {
+      const sessionId = 'ses_11111111111111111111111111111111';
+      const spaceId = 'spc_11111111111111111111111111111111';
+
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'lark', 'acc_lark_1', 'oc_origin_session_chat');
+      `).run(sessionId, spaceId);
+
+      testDb.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id)
+        VALUES ('cb_1', 'user_test', 'acc_lark_1', ?, 'oc_origin_session_chat');
+      `).run(spaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Daily Review Prompt',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Is there a scenario to review today?',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId,
+          silent: false,
+          // no explicit delivery
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_fallback_session',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'No scenario today. Keep moving forward.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      expect(fakeGateway.sendProactiveMessage).toHaveBeenCalledTimes(1);
+      expect(proactiveCalls.length).toBe(1);
+      expect(proactiveCalls[0].chatId).toBe('oc_origin_session_chat');
+      expect(proactiveCalls[0].accountId).toBe('acc_lark_1');
+      expect(proactiveCalls[0].sessionId).toBe(sessionId);
+      expect(proactiveCalls[0].text).toBe('No scenario today. Keep moving forward.');
+    });
+
+    it('falls back to origin space channel binding when origin session is web and space has unique binding', async () => {
+      const sessionId = 'ses_22222222222222222222222222222222';
+      const spaceId = 'spc_22222222222222222222222222222222';
+
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'web', NULL, NULL);
+      `).run(sessionId, spaceId);
+
+      testDb.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id)
+        VALUES ('cb_space_1', 'user_test', 'acc_lark_1', ?, 'oc_space_chat_1');
+      `).run(spaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Space-Bound Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute space prompt',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId,
+          silent: false,
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_fallback_space',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'Space task executed.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      expect(fakeGateway.sendProactiveMessage).toHaveBeenCalledTimes(1);
+      expect(proactiveCalls.length).toBe(1);
+      expect(proactiveCalls[0].chatId).toBe('oc_space_chat_1');
+      expect(proactiveCalls[0].accountId).toBe('acc_lark_1');
+    });
+
+    it('falls back to web only when origin space has no channel bindings', async () => {
+      const sessionId = 'ses_33333333333333333333333333333333';
+      const spaceId = 'spc_33333333333333333333333333333333';
+
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'web', NULL, NULL);
+      `).run(sessionId, spaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Pure Web Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Pure web task execution',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId,
+          silent: false,
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_web_only',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'Pure web output.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      expect(fakeGateway.sendProactiveMessage).not.toHaveBeenCalled();
+      expect(proactiveCalls.length).toBe(0);
+    });
+
+    it('falls back to web only and never guesses when origin space has multiple conflicting chat bindings', async () => {
+      const sessionId = 'ses_44444444444444444444444444444444';
+      const spaceId = 'spc_44444444444444444444444444444444';
+
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'web', NULL, NULL);
+      `).run(sessionId, spaceId);
+
+      testDb.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id)
+        VALUES ('cb_amb_1', 'user_test', 'acc_lark_1', ?, 'oc_chat_alpha'),
+               ('cb_amb_2', 'user_test', 'acc_lark_2', ?, 'oc_chat_beta');
+      `).run(spaceId, spaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Ambiguous Space Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Prompt in space with multiple chats',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId,
+          silent: false,
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_ambiguous_no_guess',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'Ambiguous output.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      // Must NOT guess between oc_chat_alpha and oc_chat_beta: falls back to web only!
+      expect(fakeGateway.sendProactiveMessage).not.toHaveBeenCalled();
+      expect(proactiveCalls.length).toBe(0);
+    });
+
+    it('silent: true suppresses fallback proactive delivery even when channel binding exists', async () => {
+      const sessionId = 'ses_55555555555555555555555555555555';
+      const spaceId = 'spc_55555555555555555555555555555555';
+
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'lark', 'acc_lark_1', 'oc_silent_chat');
+      `).run(sessionId, spaceId);
+
+      testDb.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id)
+        VALUES ('cb_silent_1', 'user_test', 'acc_lark_1', ?, 'oc_silent_chat');
+      `).run(spaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Silent Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Silent execution',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId,
+          silent: true,
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_silent',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'Silent output.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      expect(fakeGateway.sendProactiveMessage).not.toHaveBeenCalled();
+      expect(proactiveCalls.length).toBe(0);
+    });
+
+    it('fails closed (web only) when payload.spaceId mismatches session_routes.space_id', async () => {
+      const sessionId = 'ses_66666666666666666666666666666666';
+      const sessionSpaceId = 'spc_6666666666666666666666666666666a';
+      const payloadSpaceId = 'spc_6666666666666666666666666666666b';
+
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'lark', 'acc_lark_1', 'oc_mismatch_chat');
+      `).run(sessionId, sessionSpaceId);
+
+      testDb.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id)
+        VALUES ('cb_mismatch_1', 'user_test', 'acc_lark_1', ?, 'oc_mismatch_chat');
+      `).run(sessionSpaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Mismatched Space Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Prompt with mismatched spaceId',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId: payloadSpaceId, // Differs from session_routes!
+          silent: false,
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_mismatch',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'Mismatched space output.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      expect(fakeGateway.sendProactiveMessage).not.toHaveBeenCalled();
+    });
+
+    it('fails closed (web only) when channel account is inactive/disabled', async () => {
+      const sessionId = 'ses_77777777777777777777777777777777';
+      const spaceId = 'spc_77777777777777777777777777777777';
+
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'lark', 'acc_lark_disabled', 'oc_disabled_chat');
+      `).run(sessionId, spaceId);
+
+      testDb.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id)
+        VALUES ('cb_dis_1', 'user_test', 'acc_lark_disabled', ?, 'oc_disabled_chat');
+      `).run(spaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Disabled Account Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Task with disabled account',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId,
+          silent: false,
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_disabled_acc',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'Disabled output.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      expect(fakeGateway.sendProactiveMessage).not.toHaveBeenCalled();
+    });
+
+    it('preserves explicit delivery target without invoking fallback resolution', async () => {
+      const sessionId = 'ses_88888888888888888888888888888888';
+      const spaceId = 'spc_88888888888888888888888888888888';
+
+      // Seed session_routes pointing to oc_session_chat
+      testDb.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id)
+        VALUES (?, ?, 'user_test', 'lark', 'acc_lark_1', 'oc_session_chat');
+      `).run(sessionId, spaceId);
+
+      // Seed channel_bindings for BOTH oc_session_chat and oc_explicit_target
+      testDb.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id)
+        VALUES ('cb_exp_1', 'user_test', 'acc_lark_1', ?, 'oc_session_chat'),
+               ('cb_exp_2', 'user_test', 'acc_lark_1', ?, 'oc_explicit_target');
+      `).run(spaceId, spaceId);
+
+      const ops = service.forTenant('user_test');
+      const { task } = await ops.tasks.createTask({
+        title: 'Explicit Delivery Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Task with explicit delivery target',
+          sessionId,
+          sessionPolicy: 'existing_session',
+          spaceId,
+          silent: false,
+          delivery: {
+            channel: 'lark',
+            accountId: 'acc_lark_1',
+            nativeContextId: 'oc_explicit_target',
+          },
+        },
+      });
+
+      const worker = new AgentPromptTaskWorker({
+        workerId: 'worker_explicit',
+        tenantEnumerator: () => ['user_test'],
+        getTenantOperations: (tenantId) => service.forTenant(tenantId),
+        dispatcher: async () => ({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          replyText: 'Explicit target output.',
+        }),
+        channelRuntimeManager: fakeChannelRuntimeManager,
+        db: testDb,
+      });
+      activeWorkers.push(worker);
+
+      const result = await worker.runNow({ taskId: task.id, tenantId: 'user_test' });
+      expect(result?.status).toBe('completed');
+      expect(fakeGateway.sendProactiveMessage).toHaveBeenCalledTimes(1);
+      expect(proactiveCalls[0].chatId).toBe('oc_explicit_target'); // Explicit target respected!
+    });
   });
 });

@@ -4,6 +4,9 @@ import {
   SqliteTenantScopedTaskRepository,
 } from '../src/repos/task-repo.js';
 import {
+  SqlitePlatformOperationsStorage,
+} from '../src/operations-storage.js';
+import {
   MIGRATION_001_SQL,
   MIGRATION_004_SQL,
   MIGRATION_018_TASK_SCHEDULES_AND_RUNS_SQL,
@@ -17,6 +20,7 @@ import {
   validateIntervalSeconds,
   validateMisfirePolicy,
   validateOverlapPolicy,
+  TASK_PROTOCOL_ERROR_CODES,
 } from '@enkeep/platform-operations';
 
 describe('Task Schedules, Recurrences and Execution Runs Storage', () => {
@@ -553,6 +557,227 @@ describe('Task Schedules, Recurrences and Execution Runs Storage', () => {
       expect(manualResult.run.status).toBe('claimed');
       expect(manualResult.run.attemptNumber).toBe(1);
     });
+
+    it('advances next_run_at on claim for migrated-style rows (platform_tasks schedule_type=once, cron null; task_schedules cron 0 4 * * *)', async () => {
+      const taskId = 'task_11112222333344445555666677778888';
+      const scheduleId = 'sched_11112222333344445555666677778888';
+      const scheduledFor = '2026-09-20T04:00:00.000Z';
+      const payloadJson = JSON.stringify({
+        type: 'agent_prompt',
+        prompt: 'Run migrated cron task',
+        sessionId: 'ses_0123456789abcdef0123456789abcdef',
+        sessionPolicy: 'existing_session',
+      });
+
+      // Insert platform_tasks with migrated-style values: schedule_type='once', cron_expression=NULL
+      db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, title, status, payload, schedule_type, cron_expression, interval_seconds,
+          next_run_at, timezone, created_at, updated_at
+        ) VALUES (
+          ?, ?, 'Migrated Cron Task', 'pending', ?, 'once', NULL, NULL,
+          ?, 'UTC', ?, ?
+        )
+      `).run(taskId, user1, payloadJson, scheduledFor, scheduledFor, scheduledFor);
+
+      // Insert task_schedules with cron schedule
+      db.prepare(`
+        INSERT INTO task_schedules (
+          id, task_id, user_id, schedule_type, cron_expression, interval_seconds,
+          next_run_at, timezone, enabled, misfire_policy, overlap_policy, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, 'cron', '0 4 * * *', NULL,
+          ?, 'UTC', 1, 'coalesce', 'skip', ?, ?
+        )
+      `).run(scheduleId, taskId, user1, scheduledFor, scheduledFor, scheduledFor);
+
+      const claimTime = new Date('2026-09-20T04:00:00.000Z');
+      // 1. Claim at 04:00 -> next_run_at becomes next day 04:00 in the same transaction
+      // Use 24h lease so it remains active against real test runner clock
+      const claimed = await repo1.claim({
+        claimantId: 'worker_node_1',
+        leaseDurationMs: 86_400_000,
+        preferredTaskId: taskId,
+        now: claimTime,
+      });
+
+      expect(claimed).not.toBeNull();
+      expect(claimed?.status).toBe('claimed');
+      expect(claimed?.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+      expect(claimed?.schedule?.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+
+      // Verify directly in database that both rows updated atomically in the same transaction
+      const taskRow = db.prepare('SELECT * FROM platform_tasks WHERE id = ?').get(taskId) as any;
+      const schedRow = db.prepare('SELECT * FROM task_schedules WHERE id = ?').get(scheduleId) as any;
+      expect(taskRow.next_run_at).toBe('2026-09-21T04:00:00.000Z');
+      expect(schedRow.next_run_at).toBe('2026-09-21T04:00:00.000Z');
+      expect(schedRow.last_run_at).toBe('2026-09-20T04:00:00.000Z');
+
+      // 2. A second claim immediately after returns nothing (null)
+      const secondClaimPreferred = await repo1.claim({
+        claimantId: 'worker_node_2',
+        leaseDurationMs: 86_400_000,
+        preferredTaskId: taskId,
+        now: new Date('2026-09-20T04:00:01.000Z'),
+      });
+      expect(secondClaimPreferred).toBeNull();
+
+      const secondClaimGeneral = await repo1.claim({
+        claimantId: 'worker_node_2',
+        leaseDurationMs: 86_400_000,
+        now: new Date('2026-09-20T04:00:01.000Z'),
+      });
+      expect(secondClaimGeneral).toBeNull();
+
+      // 3. Completion keeps next_run_at
+      const completed = await repo1.complete(
+        taskId,
+        'worker_node_1',
+        {
+          status: 'completed',
+          completedAt: '2026-09-20T04:00:20.000Z',
+        },
+        claimed?.currentRun?.id
+      );
+
+      expect(completed.status).toBe('pending');
+      expect(completed.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+      expect(completed.schedule?.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+
+      // Verify in DB that next_run_at is still next day 04:00
+      const schedRowAfterComplete = db.prepare('SELECT * FROM task_schedules WHERE id = ?').get(scheduleId) as any;
+      expect(schedRowAfterComplete.next_run_at).toBe('2026-09-21T04:00:00.000Z');
+
+      // Subsequent claim after completion still returns null since next run is tomorrow
+      const thirdClaim = await repo1.claim({
+        claimantId: 'worker_node_1',
+        leaseDurationMs: 60000,
+        preferredTaskId: taskId,
+        now: new Date('2026-09-20T04:00:21.000Z'),
+      });
+      expect(thirdClaim).toBeNull();
+    });
+
+    it('advances interval schedule by interval on claim', async () => {
+      const task = await repo1.create({
+        title: 'Interval Schedule Advancement Test',
+        scheduleType: 'interval',
+        intervalSeconds: 300, // 5 minutes
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute interval sync',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const initialNextRun = task.nextRunAt!;
+      expect(initialNextRun).toBeDefined();
+
+      const claimTime = new Date(initialNextRun);
+      const claimed = await repo1.claim({
+        claimantId: 'worker_interval_1',
+        leaseDurationMs: 60000,
+        preferredTaskId: task.id,
+        now: claimTime,
+      });
+
+      expect(claimed).not.toBeNull();
+      const expectedNextRun = new Date(claimTime.getTime() + 300 * 1000).toISOString();
+      expect(claimed?.nextRunAt).toBe(expectedNextRun);
+      expect(claimed?.schedule?.nextRunAt).toBe(expectedNextRun);
+
+      const schedRow = db.prepare('SELECT next_run_at FROM task_schedules WHERE task_id = ?').get(task.id) as any;
+      expect(schedRow.next_run_at).toBe(expectedNextRun);
+    });
+
+    it('does not alter next_run_at during manual run or upon its completion', async () => {
+      const task = await repo1.create({
+        title: 'Cron with Manual Run Preserves next_run_at',
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Prompt',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const originalNextRun = task.nextRunAt!;
+      expect(originalNextRun).toBeDefined();
+
+      // Execute manual run via createManualRun
+      const manualTime = new Date('2026-09-20T10:30:00.000Z');
+      const manualResult = await repo1.createManualRun(task.id, 'manual_worker', 60000, manualTime);
+
+      expect(manualResult.run.status).toBe('claimed');
+      expect(manualResult.task.nextRunAt).toBe(originalNextRun);
+      expect(manualResult.task.schedule?.nextRunAt).toBe(originalNextRun);
+
+      // Verify DB row unchanged
+      const schedRowManual = db.prepare('SELECT next_run_at FROM task_schedules WHERE task_id = ?').get(task.id) as any;
+      expect(schedRowManual.next_run_at).toBe(originalNextRun);
+
+      // Complete manual run
+      const completed = await repo1.complete(
+        task.id,
+        'manual_worker',
+        {
+          status: 'completed',
+          completedAt: '2026-09-20T10:31:00.000Z',
+        },
+        manualResult.run.id
+      );
+
+      expect(completed.status).toBe('pending');
+      expect(completed.nextRunAt).toBe(originalNextRun);
+      expect(completed.schedule?.nextRunAt).toBe(originalNextRun);
+
+      const schedRowFinal = db.prepare('SELECT next_run_at FROM task_schedules WHERE task_id = ?').get(task.id) as any;
+      expect(schedRowFinal.next_run_at).toBe(originalNextRun);
+    });
+
+    it('guards overlap: overlap_policy skip prevents claiming a schedule whose previous run is still claimed/running', async () => {
+      const task = await repo1.create({
+        title: 'Overlap Guard Test',
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        overlapPolicy: 'skip',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Overlap prompt',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const claimTime = new Date(task.nextRunAt!);
+      const claim1 = await repo1.claim({
+        claimantId: 'worker_1',
+        leaseDurationMs: 60000,
+        preferredTaskId: task.id,
+        now: claimTime,
+      });
+      expect(claim1).not.toBeNull();
+
+      // Try claiming concurrently via preferredTaskId
+      const claimPreferred = await repo1.claim({
+        claimantId: 'worker_2',
+        leaseDurationMs: 60000,
+        preferredTaskId: task.id,
+        now: new Date(claimTime.getTime() + 10000),
+      });
+      expect(claimPreferred).toBeNull();
+
+      // Try claiming concurrently via general queue
+      const claimGeneral = await repo1.claim({
+        claimantId: 'worker_2',
+        leaseDurationMs: 60000,
+        now: new Date(claimTime.getTime() + 10000),
+      });
+      expect(claimGeneral).toBeNull();
+    });
   });
 
   describe('6. Multi-Tenant Isolation', () => {
@@ -575,6 +800,276 @@ describe('Task Schedules, Recurrences and Execution Runs Storage', () => {
 
       const user2Runs = await repo2.listRuns(task1.id);
       expect(user2Runs.total).toBe(0);
+    });
+  });
+
+  describe('7. Recurring Task State Machine & Recovery (T1)', () => {
+    it('recurring task failure resets claim_count, records run failure, computes next_run and returns to pending', async () => {
+      const task = await repo1.create({
+        title: 'Recurring Cron Fail Test',
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute daily crawl',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const initialNextRun = task.nextRunAt!;
+      expect(initialNextRun).toBeDefined();
+
+      // Claim task
+      const claimed = await repo1.claim({
+        claimantId: 'worker_fail_node',
+        leaseDurationMs: 60000,
+        preferredTaskId: task.id,
+        now: new Date(initialNextRun),
+      });
+
+      expect(claimed).not.toBeNull();
+      expect(claimed?.status).toBe('claimed');
+      expect(claimed?.claimCount).toBe(1);
+
+      // Fail task with non-retryable error
+      const failed = await repo1.fail(
+        task.id,
+        'worker_fail_node',
+        'Model rate limit exceeded',
+        false, // non-retryable!
+        claimed?.currentRun?.id,
+        'RATE_LIMIT_EXCEEDED',
+        new Date(new Date(initialNextRun).getTime() + 1000)
+      );
+
+      // Invariant: Recurring tasks MUST NEVER end in 'failed' terminal status!
+      expect(failed.status).toBe('pending');
+      expect(failed.completedAt).toBeNull();
+      expect(failed.claimCount).toBe(0); // claim_count reset to 0
+      expect(failed.nextRunAt).toBeDefined();
+      expect(new Date(failed.nextRunAt!).getTime()).toBeGreaterThan(new Date(initialNextRun).getTime());
+
+      // Task run must be marked failed
+      expect(failed.currentRun?.status).toBe('failed');
+      expect(failed.currentRun?.errorCode).toBe('RATE_LIMIT_EXCEEDED');
+      expect(failed.currentRun?.error).toBe('Model rate limit exceeded');
+    });
+
+    it('recurring task completion resets claim_count, computes next_run, and returns to pending with null completedAt', async () => {
+      const task = await repo1.create({
+        title: 'Recurring Interval Complete Test',
+        scheduleType: 'interval',
+        intervalSeconds: 600, // 10 minutes
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute interval sync',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const initialNextRun = task.nextRunAt!;
+      const claimTime = new Date(initialNextRun);
+
+      const claimed = await repo1.claim({
+        claimantId: 'worker_interval_node',
+        leaseDurationMs: 60000,
+        preferredTaskId: task.id,
+        now: claimTime,
+      });
+
+      expect(claimed).not.toBeNull();
+      expect(claimed?.status).toBe('claimed');
+      expect(claimed?.claimCount).toBe(1);
+
+      const completed = await repo1.complete(
+        task.id,
+        'worker_interval_node',
+        {
+          status: 'completed',
+          completedAt: new Date(claimTime.getTime() + 5000).toISOString(),
+        },
+        claimed?.currentRun?.id
+      );
+
+      // Invariant: Recurring tasks MUST NEVER end in 'completed' terminal status!
+      expect(completed.status).toBe('pending');
+      expect(completed.completedAt).toBeNull();
+      expect(completed.claimCount).toBe(0); // reset claim_count
+      const expectedNextRun = new Date(claimTime.getTime() + 600 * 1000).toISOString();
+      expect(completed.nextRunAt).toBe(expectedNextRun);
+      expect(completed.schedule?.nextRunAt).toBe(expectedNextRun);
+
+      // Run record is completed
+      expect(completed.currentRun?.status).toBe('completed');
+    });
+
+    it('lease-expiry recovery resets recurring task claim_count to 0, keeps it pending, and marks run failed', async () => {
+      const taskId = 'task_aaaa1111bbbb2222cccc3333dddd4444';
+      const scheduleId = 'sched_aaaa1111bbbb2222cccc3333dddd4444';
+      const runId = 'run_aaaa1111bbbb2222cccc3333dddd4444';
+      const pastTime = '2026-09-20T04:00:00.000Z';
+      const expiredLease = '2026-09-20T04:01:00.000Z';
+      const recoveryTime = '2026-09-20T05:00:00.000Z';
+
+      // Insert task with claim_count (199) >= max_retries (3) to simulate long-running recurring task
+      db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, title, status, payload, schedule_type, cron_expression,
+          next_run_at, timezone, claimant_id, lease_expires_at, claim_count, max_retries,
+          created_at, updated_at
+        ) VALUES (
+          ?, ?, 'Expired Lease Recurring Task', 'running', '{}', 'cron', '0 4 * * *',
+          ?, 'UTC', 'worker_dead', ?, 199, 3, ?, ?
+        )
+      `).run(taskId, user1, pastTime, expiredLease, pastTime, pastTime);
+
+      db.prepare(`
+        INSERT INTO task_schedules (
+          id, task_id, user_id, schedule_type, cron_expression,
+          next_run_at, timezone, enabled, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, 'cron', '0 4 * * *', ?, 'UTC', 1, ?, ?
+        )
+      `).run(scheduleId, taskId, user1, pastTime, pastTime, pastTime);
+
+      db.prepare(`
+        INSERT INTO task_runs (
+          id, task_id, schedule_id, user_id, attempt_number, status,
+          claimant_id, lease_expires_at, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, 199, 'running', 'worker_dead', ?, ?, ?
+        )
+      `).run(runId, taskId, scheduleId, user1, expiredLease, pastTime, pastTime);
+
+      // Run lease-expiry recovery
+      const recoveryResult = await repo1.recoverExpiredLeases(recoveryTime);
+
+      expect(recoveryResult.recoveredCount).toBe(1);
+      expect(recoveryResult.retriedIds).toContain(taskId);
+      expect(recoveryResult.failedIds).toHaveLength(0);
+
+      // Verify task in DB: must be pending, claim_count=0, completed_at=NULL, next_run schedulable
+      const taskRow = db.prepare('SELECT * FROM platform_tasks WHERE id = ?').get(taskId) as any;
+      expect(taskRow.status).toBe('pending');
+      expect(taskRow.completed_at).toBeNull();
+      expect(taskRow.claim_count).toBe(0);
+      expect(taskRow.claimant_id).toBeNull();
+      expect(taskRow.lease_expires_at).toBeNull();
+      expect(taskRow.next_run_at).toBe('2026-09-21T04:00:00.000Z');
+
+      // Verify run in DB: must be failed with TASK_LEASE_EXPIRED
+      const runRow = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(runId) as any;
+      expect(runRow.status).toBe('failed');
+      expect(runRow.error_code).toBe(TASK_PROTOCOL_ERROR_CODES.LEASE_EXPIRED);
+    });
+
+    it('restart recovery in operations-storage resets recurring task to pending and keeps it schedulable', async () => {
+      const taskId = 'task_bbbb1111cccc2222dddd3333eeee4444';
+      const scheduleId = 'sched_bbbb1111cccc2222dddd3333eeee4444';
+      const runId = 'run_bbbb1111cccc2222dddd3333eeee4444';
+      const pastTime = '2026-09-20T04:00:00.000Z';
+      const expiredLease = '2026-09-20T04:01:00.000Z';
+      const restartTime = '2026-09-20T06:00:00.000Z';
+
+      db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, title, status, payload, schedule_type, cron_expression,
+          next_run_at, timezone, claimant_id, lease_expires_at, claim_count, max_retries,
+          created_at, updated_at
+        ) VALUES (
+          ?, ?, 'Restart Recovery Recurring Task', 'running', '{}', 'cron', '0 4 * * *',
+          ?, 'UTC', 'crashed_worker', ?, 250, 3, ?, ?
+        )
+      `).run(taskId, user1, pastTime, expiredLease, pastTime, pastTime);
+
+      db.prepare(`
+        INSERT INTO task_schedules (
+          id, task_id, user_id, schedule_type, cron_expression,
+          next_run_at, timezone, enabled, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, 'cron', '0 4 * * *', ?, 'UTC', 1, ?, ?
+        )
+      `).run(scheduleId, taskId, user1, pastTime, pastTime, pastTime);
+
+      db.prepare(`
+        INSERT INTO task_runs (
+          id, task_id, schedule_id, user_id, attempt_number, status,
+          claimant_id, lease_expires_at, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, 250, 'running', 'crashed_worker', ?, ?, ?
+        )
+      `).run(runId, taskId, scheduleId, user1, expiredLease, pastTime, pastTime);
+
+      const opsStorage = new SqlitePlatformOperationsStorage(db);
+      const res = await opsStorage.recoverAfterRestart(restartTime);
+
+      expect(res.recoveredTasks).toBeGreaterThanOrEqual(1);
+
+      const taskRow = db.prepare('SELECT * FROM platform_tasks WHERE id = ?').get(taskId) as any;
+      expect(taskRow.status).toBe('pending');
+      expect(taskRow.completed_at).toBeNull();
+      expect(taskRow.claim_count).toBe(0);
+      expect(taskRow.claimant_id).toBeNull();
+      expect(taskRow.lease_expires_at).toBeNull();
+      expect(taskRow.next_run_at).toBe('2026-09-21T04:00:00.000Z');
+
+      const runRow = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(runId) as any;
+      expect(runRow.status).toBe('failed');
+      expect(runRow.error_code).toBe(TASK_PROTOCOL_ERROR_CODES.LEASE_EXPIRED);
+    });
+
+    it('resume() resets a stuck recurring task (in completed or failed status) to pending with claim_count 0', async () => {
+      const taskId = 'task_cccc1111dddd2222eeee3333ffff4444';
+      const scheduleId = 'sched_cccc1111dddd2222eeee3333ffff4444';
+      const pastTime = '2026-09-11T06:18:31.594Z';
+      const resumeClock = new Date('2026-09-26T12:00:00.000Z');
+
+      const validPayload = JSON.stringify({
+        type: 'agent_prompt',
+        prompt: 'Monthly bill reminder',
+        sessionId: 'ses_0123456789abcdef0123456789abcdef',
+        sessionPolicy: 'existing_session',
+      });
+
+      // Simulate historical bug: task is stuck in 'completed' with completed_at set
+      db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, title, status, payload, schedule_type, cron_expression,
+          next_run_at, timezone, claim_count, completed_at, created_at, updated_at
+        ) VALUES (
+          ?, ?, 'Monthly Bill Stuck Task', 'completed', ?, 'cron', '0 9 1 * *',
+          '2026-10-01T16:00:00.000Z', 'America/Los_Angeles', 5, ?, ?, ?
+        )
+      `).run(taskId, user1, validPayload, pastTime, pastTime, pastTime);
+
+      db.prepare(`
+        INSERT INTO task_schedules (
+          id, task_id, user_id, schedule_type, cron_expression,
+          next_run_at, timezone, enabled, paused_at, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, 'cron', '0 9 1 * *', '2026-10-01T16:00:00.000Z', 'America/Los_Angeles', 0, ?, ?, ?
+        )
+      `).run(scheduleId, taskId, user1, pastTime, pastTime, pastTime);
+
+      const resumed = await repo1.resume(taskId, resumeClock);
+
+      // Invariant: Resumed recurring task must be reset to pending!
+      expect(resumed.status).toBe('pending');
+      expect(resumed.completedAt).toBeNull();
+      expect(resumed.claimCount).toBe(0);
+      expect(resumed.schedule?.enabled).toBe(true);
+      expect(resumed.schedule?.pausedAt).toBeNull();
+      expect(resumed.nextRunAt).toBe('2026-10-01T16:00:00.000Z');
+
+      // Direct DB verification
+      const taskRow = db.prepare('SELECT * FROM platform_tasks WHERE id = ?').get(taskId) as any;
+      expect(taskRow.status).toBe('pending');
+      expect(taskRow.completed_at).toBeNull();
+      expect(taskRow.claim_count).toBe(0);
+      expect(taskRow.claimant_id).toBeNull();
+      expect(taskRow.lease_expires_at).toBeNull();
     });
   });
 });

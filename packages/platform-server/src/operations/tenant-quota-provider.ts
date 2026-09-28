@@ -245,7 +245,7 @@ export class OperationsTenantQuotaProvider implements TenantQuotaProvider {
       }
       this.defaultTtlSeconds = options.defaultTtlSeconds;
     } else {
-      this.defaultTtlSeconds = 900;
+      this.defaultTtlSeconds = 2100;
     }
   }
 

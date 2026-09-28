@@ -114,6 +114,21 @@ export interface RuntimeArtifactPort {
     dshSessionId?: string;
     workspaceFolder?: string;
   }): Promise<any>;
+
+  compactSession?(options: {
+    userId: string;
+    dshSessionId: string;
+    workspaceFolder?: string;
+  }): Promise<{
+    status: string;
+    sessionId: string;
+    beforeTokens?: number;
+    afterTokens?: number;
+    eventsBefore: number;
+    eventsAfter: number;
+    summaryChars: number;
+    error?: string;
+  }>;
 }
 
 export interface CopyAttachmentOptions {

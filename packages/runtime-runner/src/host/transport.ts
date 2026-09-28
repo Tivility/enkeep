@@ -49,6 +49,9 @@ import {
   type InstructionsReadResponse,
   type InstructionsWriteRequest,
   type InstructionsWriteResponse,
+  type CompactSessionRequest,
+  type CompactSessionResponse,
+  DEFAULT_DAEMON_SOCKET_PATH,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
 import {
@@ -59,6 +62,16 @@ import {
   RUNTIME_ERROR_CODES,
   RuntimeProtocolError,
   DEFAULT_FOLLOWUP_TIMEOUT_MS,
+  HC_DEFAULT_EXECUTION_BUDGET_MS,
+  HC_DEFAULT_IDLE_TIMEOUT_MS,
+  calculateTurnBudgets,
+  clearWaiterTimers,
+  pauseWaiterIdleTimer,
+  refreshWaiterIdleTimer,
+  extractVerifiedApprovalAsked,
+  extractVerifiedApprovalDecided,
+  isGenuineTurnProgress,
+  type TurnWatchdogWaiter,
 } from '../transport/types.js';
 import {
   HostDaemonError,
@@ -83,20 +96,17 @@ interface PendingRpc {
   createdAt: number;
 }
 
-interface TurnWaiter {
-  turnId: string;
-  sessionId: string;
-  resolve: (res: AgentFollowupResponse) => void;
-  reject: (err: Error) => void;
-  timer?: NodeJS.Timeout;
-  createdAt: number;
-}
+type TurnWaiter = TurnWatchdogWaiter;
 
 export interface HostDaemonTransportOptions {
-  socketPath: string;
+  socketPath?: string;
   maxConcurrentRequests?: number;
   defaultTimeoutMs?: number;
   autoReconnect?: boolean;
+  /** Optional default idle timeout in ms for followup turns */
+  defaultIdleTimeoutMs?: number;
+  /** Optional default execution budget hardcap in ms for followup turns */
+  defaultExecutionBudgetMs?: number;
 }
 
 export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTransportPort {
@@ -118,14 +128,32 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
 
   constructor(options: HostDaemonTransportOptions) {
     super();
-    this.socketPath = options.socketPath;
-    this.endpoint = `uds://${options.socketPath}`;
+    this.socketPath = options.socketPath ?? DEFAULT_DAEMON_SOCKET_PATH;
+    this.endpoint = `uds://${this.socketPath}`;
     this.options = {
-      socketPath: options.socketPath,
+      socketPath: this.socketPath,
       maxConcurrentRequests: options.maxConcurrentRequests ?? MAX_CONCURRENT_HOST_REQUESTS,
       defaultTimeoutMs: options.defaultTimeoutMs ?? DEFAULT_HOST_DAEMON_TIMEOUT_MS,
       autoReconnect: options.autoReconnect ?? true,
-    };
+      defaultIdleTimeoutMs: options.defaultIdleTimeoutMs,
+      defaultExecutionBudgetMs: options.defaultExecutionBudgetMs,
+    } as Required<HostDaemonTransportOptions>;
+  }
+
+  private clearWaiterTimers(waiter: TurnWaiter): void {
+    clearWaiterTimers(waiter);
+  }
+
+  private refreshWaiterIdleTimer(waiter: TurnWaiter): void {
+    refreshWaiterIdleTimer(waiter, () => {
+      const activeWaiter = this.turnWaiters.get(waiter.turnId);
+      if (!activeWaiter) return;
+      this.turnWaiters.delete(waiter.turnId);
+      this.clearWaiterTimers(activeWaiter);
+      const reason = `Followup turn execution timed out after ${waiter.idleTimeoutMs}ms (idle activity deadline expired without progress)`;
+      this.cancelTurn(waiter.turnId, reason).catch(() => {});
+      activeWaiter.reject(new HostDaemonError(`Followup turn execution timed out after ${waiter.idleTimeoutMs}ms (idle without activity)`));
+    });
   }
 
   public isConnected(): boolean {
@@ -233,12 +261,33 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       this.emit('stream', event);
       this.emit(event.event, event);
 
+      // Refresh idle activity deadline or pause during approval waiting
+      const progressTurnId = 'turnId' in event && typeof event.turnId === 'string' ? event.turnId : undefined;
+      if (progressTurnId && this.turnWaiters.has(progressTurnId)) {
+        const waiter = this.turnWaiters.get(progressTurnId)!;
+        const asked = extractVerifiedApprovalAsked(event);
+        if (asked) {
+          waiter.pendingApprovals.add(asked.approvalId);
+          pauseWaiterIdleTimer(waiter);
+        } else {
+          const decided = extractVerifiedApprovalDecided(event);
+          if (decided) {
+            waiter.pendingApprovals.delete(decided.decisionId);
+            if (waiter.pendingApprovals.size === 0) {
+              this.refreshWaiterIdleTimer(waiter);
+            }
+          } else if (isGenuineTurnProgress(event)) {
+            this.refreshWaiterIdleTimer(waiter);
+          }
+        }
+      }
+
       if (event.event === DAEMON_STREAM_EVENTS.TURN_COMPLETED) {
         const turnId = event.turnId;
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
           waiter.resolve(event.result);
         }
       } else if (event.event === DAEMON_STREAM_EVENTS.TURN_CANCELLED) {
@@ -246,7 +295,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
           waiter.resolve({
             status: 'cancelled',
             turnId,
@@ -260,7 +309,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
           const errCode = (event.error?.code as DaemonErrorCode) || DAEMON_ERROR_CODES.AGENT_EXECUTION_FAILED;
           const errMsg = event.error?.message || 'Agent turn execution failed in daemon';
           const protoErr = new DaemonProtocolError(errCode, errMsg, (event.error as any)?.details);
@@ -309,7 +358,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
 
     // Reject all active turn waiters immediately with typed HostRuntimeExitedError
     for (const [turnId, waiter] of this.turnWaiters.entries()) {
-      if (waiter.timer) clearTimeout(waiter.timer);
+      this.clearWaiterTimers(waiter);
       waiter.reject(new HostRuntimeExitedError('Host daemon transport disconnected while turn was executing', err));
     }
     this.turnWaiters.clear();
@@ -328,7 +377,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
     this.pendingRequests.clear();
 
     for (const [turnId, waiter] of this.turnWaiters.entries()) {
-      if (waiter.timer) clearTimeout(waiter.timer);
+      this.clearWaiterTimers(waiter);
       waiter.reject(new HostRuntimeExitedError('HostDaemonTransport closed before turn completed'));
     }
     this.turnWaiters.clear();
@@ -410,23 +459,51 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
 
     const turnId = request.turnId;
     const sessionId = request.sessionId;
-    const timeoutMs = request.timeoutMs ?? DEFAULT_FOLLOWUP_TIMEOUT_MS;
+
+    // 1. Determine execution budget (hard cap) & idle timeout via unified helper
+    const { rawBudgetMs, clientWaitTimeoutMs, idleTimeoutMs } = calculateTurnBudgets(
+      request,
+      this.options
+    );
 
     const submitPromise = new Promise<AgentFollowupResponse>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      // 1. Overall hard cap timer: never resets, overall cap always wins
+      const hardCapTimer = setTimeout(() => {
+        const waiter = this.turnWaiters.get(turnId);
+        if (!waiter) return;
         this.turnWaiters.delete(turnId);
+        this.clearWaiterTimers(waiter);
         // Actively cancel the exact timed-out turn in the host daemon to prevent orphaned execution
-        this.cancelTurn(turnId, `Followup turn execution timed out after ${timeoutMs}ms`).catch(() => {});
-        reject(new HostDaemonError(`Followup turn execution timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+        const reason = `Followup turn execution timed out after ${rawBudgetMs}ms (overall execution budget hard cap exceeded)`;
+        this.cancelTurn(turnId, reason).catch(() => {});
+        reject(new HostDaemonError(`Followup turn execution timed out after ${rawBudgetMs}ms`));
+      }, clientWaitTimeoutMs);
+
+      // 2. Idle activity timer: refreshed on genuine progress frames, paused during approvals
+      const idleTimer = setTimeout(() => {
+        const waiter = this.turnWaiters.get(turnId);
+        if (!waiter) return;
+        this.turnWaiters.delete(turnId);
+        this.clearWaiterTimers(waiter);
+        const reason = `Followup turn execution timed out after ${idleTimeoutMs}ms (idle activity deadline expired without progress)`;
+        this.cancelTurn(turnId, reason).catch(() => {});
+        reject(new HostDaemonError(`Followup turn execution timed out after ${idleTimeoutMs}ms (idle without activity)`));
+      }, idleTimeoutMs);
 
       this.turnWaiters.set(turnId, {
         turnId,
         sessionId,
         resolve,
         reject,
-        timer,
+        timer: hardCapTimer,
+        hardCapTimer,
+        idleTimer,
         createdAt: Date.now(),
+        lastActivityAt: Date.now(),
+        idleTimeoutMs,
+        rawTimeoutMs: rawBudgetMs,
+        clientWaitTimeoutMs,
+        pendingApprovals: new Set<string>(),
       });
     });
 
@@ -441,8 +518,12 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       attachments: request.attachments as any,
       modelSelection: request.modelSelection ?? undefined,
       replyReference: request.replyReference ?? null,
-      timeoutMs,
+      timeoutMs: rawBudgetMs,
+      idleTimeoutMs,
+      maxExecutionBudgetMs: rawBudgetMs,
       mounts: request.mounts,
+      extensionPlan: request.extensionPlan ?? null,
+      extraReadableRoots: request.extraReadableRoots,
     };
 
     try {
@@ -451,7 +532,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
         }
         throw new HostDaemonError(`Submit turn rejected: ${ackRes.error?.message || 'Unknown error'}`);
       }
@@ -459,7 +540,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       const waiter = this.turnWaiters.get(turnId);
       if (waiter) {
         this.turnWaiters.delete(turnId);
-        if (waiter.timer) clearTimeout(waiter.timer);
+        this.clearWaiterTimers(waiter);
       }
       throw err;
     }
@@ -603,6 +684,14 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       filename: request.filename as any,
       expectedEtag: request.expectedEtag,
       requireAbsent: request.requireAbsent,
+    });
+  }
+
+  public async compactSession(sessionId: string): Promise<CompactSessionResponse> {
+    return this.request<CompactSessionRequest, CompactSessionResponse>({
+      id: `compact_${sessionId}_${crypto.randomBytes(4).toString('hex')}`,
+      op: DAEMON_OPS.COMPACT_SESSION,
+      sessionId,
     });
   }
 }

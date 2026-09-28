@@ -33,6 +33,7 @@ import {
   DockerRuntimeAdapter,
   SafeDockerClient,
   DockerNotFoundError,
+  NetworkModeMismatchError,
   computeSessionEventsChecksum,
   canonicalJsonStringify,
   loadDshDeploymentConfig,
@@ -45,6 +46,7 @@ import {
 } from '@enkeep/runtime-runner';
 import {
   validateContainerSpec,
+  type RuntimeNetworkMode,
 } from '@enkeep/runtime-runner/spec';
 import type {
   ProbeSnapshot,
@@ -129,6 +131,16 @@ export interface UserRuntimeHandle {
   meta?: SignedContainerMetadata;
   rawHandle?: ActiveRuntimeHandle;
   checkHealth(): Promise<UserRuntimeHealthInfo>;
+  compactSession?(sessionId: string): Promise<{
+    status: string;
+    sessionId: string;
+    beforeTokens?: number;
+    afterTokens?: number;
+    eventsBefore: number;
+    eventsAfter: number;
+    summaryChars: number;
+    error?: string;
+  }>;
   checkSessionArtifact?(sessionId: string, workspaceFolder?: string): Promise<{ exists: boolean; valid: boolean; checksum?: string; eventCount?: number }>;
   inspectSessionCorruption?(sessionId: string, workspaceFolder?: string): Promise<any>;
   recoverSessionPrefix?(options: { sourceSessionId: string; targetSessionId: string; workspaceFolder?: string; maxValidSeq?: number }): Promise<any>;
@@ -142,8 +154,9 @@ export interface UserRuntimeHandle {
     request: RuntimeTurnRequest
   ): Promise<{
     replyText: string;
-    persisted: true;
+    persisted: boolean;
     eventsCount: number;
+    status?: 'completed' | 'cancelled';
     usage?: { totalTokens: number };
     modelInfo?: { provider: string; model: string; reasoningEffort?: string | null; source?: string; fallbackUsed?: boolean };
     routeAttempts?: Array<{ provider: string; model: string; latencyMs: number; statusCode: number; success: boolean; errorType?: string | null }>;
@@ -180,6 +193,7 @@ export interface RuntimeContainerPort {
     llmModel?: string;
     llmProviders?: string | Record<string, unknown>;
     browserService?: import('@enkeep/platform-core').BrowserService;
+    networkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
     mounts?: readonly import('@enkeep/platform-core').RuntimeMountSpec[];
   }): Promise<UserRuntimeHandle>;
   connectUserRuntime?(options: {
@@ -303,6 +317,24 @@ function createUserRuntimeHandle(
         userId: health.userId,
       };
     },
+    compactSession: activeHandle.compactSession
+      ? async (sessionId: string) => {
+          if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+            throw new Error('FAIL-CLOSED: compactSession requires a non-empty sessionId');
+          }
+          const res = await activeHandle.compactSession!(sessionId);
+          return {
+            status: res.status ?? 'ok',
+            sessionId,
+            beforeTokens: (res as any).beforeTokens,
+            afterTokens: (res as any).afterTokens,
+            eventsBefore: ((res as any).eventsBefore as number) ?? 0,
+            eventsAfter: ((res as any).eventsAfter as number) ?? 0,
+            summaryChars: ((res as any).summaryChars as number) ?? 0,
+            error: res.error,
+          };
+        }
+      : undefined,
     checkSessionArtifact: activeHandle.checkSessionArtifact
       ? async (sessionId: string, workspaceFolder?: string) => {
           if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
@@ -427,7 +459,7 @@ function createUserRuntimeHandle(
       if (!request || typeof request !== 'object' || Array.isArray(request)) {
         throw new Error('FAIL-CLOSED: sendTurn requires a RuntimeTurnRequest object');
       }
-      const { prompt, sessionId, turnId, profileSnapshot, workspaceFolder, timeoutMs, attachments, modelSelection, mounts, extensionPlan } = request;
+      const { prompt, sessionId, turnId, profileSnapshot, workspaceFolder, timeoutMs, attachments, modelSelection, mounts, extensionPlan, extraReadableRoots } = request;
       validateTurnPrompt(prompt);
       if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
         throw new Error('FAIL-CLOSED: sendTurn requires a non-empty sessionId');
@@ -460,6 +492,7 @@ function createUserRuntimeHandle(
           timeoutMs,
           mounts,
           extensionPlan,
+          extraReadableRoots: extraReadableRoots ?? undefined,
         });
         if (followupRes.status === 'completed') {
           res = {
@@ -478,6 +511,10 @@ function createUserRuntimeHandle(
             error: (followupRes as any).error,
             persisted: followupRes.persisted,
             eventsCount: followupRes.eventsCount,
+            replyText: (followupRes as any).replyText,
+            usage: (followupRes as any).usage,
+            modelInfo: (followupRes as any).modelInfo,
+            routeAttempts: (followupRes as any).routeAttempts,
           };
         }
       } else {
@@ -492,7 +529,19 @@ function createUserRuntimeHandle(
           modelSelection,
           mounts,
           extensionPlan,
+          extraReadableRoots: extraReadableRoots ?? undefined,
         });
+      }
+      if (res.status === 'cancelled') {
+        return {
+          replyText: typeof res.replyText === 'string' ? res.replyText : '',
+          persisted: Boolean(res.persisted),
+          eventsCount: typeof res.eventsCount === 'number' ? res.eventsCount : 0,
+          status: 'cancelled',
+          usage: res.usage,
+          modelInfo: res.modelInfo,
+          routeAttempts: res.routeAttempts,
+        };
       }
       if (res.status !== 'completed') {
         throw new Error(
@@ -604,10 +653,17 @@ function createUserRuntimeHandle(
 export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
   private readonly adapter: DockerRuntimeAdapter;
   private readonly client: SafeDockerClient;
+  private readonly defaultNetworkMode: import('@enkeep/runtime-runner').RuntimeNetworkMode;
 
-  constructor(client: SafeDockerClient = new SafeDockerClient()) {
+  constructor(
+    client: SafeDockerClient = new SafeDockerClient(),
+    options?: { defaultNetworkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode }
+  ) {
     this.client = client;
-    this.adapter = new DockerRuntimeAdapter(client);
+    this.defaultNetworkMode = options?.defaultNetworkMode ?? 'none';
+    this.adapter = new DockerRuntimeAdapter(client, {
+      defaultNetworkMode: this.defaultNetworkMode,
+    });
   }
 
   async startUserRuntime(options: {
@@ -619,6 +675,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
     resourceSuffix?: string;
     timeoutMs?: number;
     llmEnabled?: boolean;
+    networkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
     mounts?: readonly import('@enkeep/platform-core').RuntimeMountSpec[];
   }): Promise<UserRuntimeHandle> {
     const pathOptions: DemoPathOptions = {
@@ -641,11 +698,13 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
 
     // 1. Build initial temporary spec only to derive deterministic container and volume names
     const tempRunId = generateRunId();
+    const networkMode = options.networkMode ?? this.defaultNetworkMode;
     const tempSpec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
       image: options.image ?? 'enkeep-demo-runtime:latest',
       nameSuffix: options.resourceSuffix,
       runId: tempRunId,
+      networkMode,
     });
     const expectedVolumeName = tempSpec.volume.volumeName;
 
@@ -660,6 +719,22 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       existingContainer &&
       existingContainer.id === existingContainerMeta.containerId
     );
+
+    if (isExistingContainerReconnect && existingContainer) {
+      const existingMode = (existingContainer.networkMode as RuntimeNetworkMode) || 'none';
+      const desiredMode = networkMode;
+      if (existingMode !== desiredMode) {
+        // Actionable guidance error rather than raw fatal unknown error or silent rebuild.
+        // No self-stop or automatic destruction: controlled deployer must drain active turns and perform teardown or recreate externally.
+        throw new NetworkModeMismatchError(
+          existingMode,
+          desiredMode,
+          `Container networkMode mismatch for "${tempSpec.containerName}": existing container is running with mode "${existingMode}", but requested "${desiredMode}". ` +
+          `Automatic rebuild is disabled to prevent interrupting active turns. ` +
+          `A controlled deployer must drain active turns and perform teardown or recreate.`
+        );
+      }
+    }
 
     let selectedVolumeId: string;
     let finalRunId: string;
@@ -764,17 +839,23 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       ? createInContainerProvidersSpec(dshConfig.providers)
       : undefined;
 
+    const compactionThreshold = process.env.DSH_COMPACTION_THRESHOLD_TOKENS || '200000';
+
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
       image: options.image ?? 'enkeep-demo-runtime:latest',
       nameSuffix: options.resourceSuffix,
       runId: finalRunId,
       volumeId: selectedVolumeId,
+      networkMode,
       llmEnabled: isLlmEnabled,
       llmProvider,
       llmModel,
       llmProviders: inContainerProviders,
     });
+    if (spec.environment) {
+      spec.environment.DSH_COMPACTION_THRESHOLD_TOKENS = compactionThreshold;
+    }
     if (options.mounts && options.mounts.length > 0) {
       spec.mounts = [...options.mounts];
     }
@@ -1178,6 +1259,7 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
 
     const runId = generateRunId();
     const storageId = `vol_host_${randomBytes(16).toString('hex').toLowerCase()}`;
+    const compactionThreshold = process.env.DSH_COMPACTION_THRESHOLD_TOKENS || '200000';
 
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
@@ -1192,6 +1274,9 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
       platformProxyOptions: options.platformProxyOptions,
       platformProxyHandler: options.platformProxyHandler,
       mounts: options.mounts ? [...options.mounts] : undefined,
+      extraEnv: {
+        DSH_COMPACTION_THRESHOLD_TOKENS: compactionThreshold,
+      },
     });
 
     let activeHandle: ActiveRuntimeHandle;

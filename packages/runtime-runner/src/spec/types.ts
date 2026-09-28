@@ -9,7 +9,8 @@
 
 export type RuntimeUserId = 'alice' | 'bob' | (string & {});
 
-export type RuntimeNetworkMode = 'none';
+export type RuntimeNetworkMode = 'none' | 'bridge';
+export const SUPPORTED_NETWORK_MODES: readonly RuntimeNetworkMode[] = ['none', 'bridge'] as const;
 
 /**
  * Authoritative Controlled Mount Specification from platform.

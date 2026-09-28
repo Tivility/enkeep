@@ -606,7 +606,7 @@ export class SqliteTenantScopedQuotaLedgerRepository implements TenantScopedQuot
     const messages = assertPositiveInteger(input.messages, 'messages');
     const tokens = assertNonNegativeInteger(input.tokens, 'tokens');
     const isEstimateTokens = Boolean(input.isEstimateTokens);
-    const ttlSeconds = input.ttlSeconds !== undefined ? assertPositiveInteger(input.ttlSeconds, 'ttlSeconds') : 900;
+    const ttlSeconds = input.ttlSeconds !== undefined ? assertPositiveInteger(input.ttlSeconds, 'ttlSeconds') : 2100;
 
     const requestHash = input.requestHash ?? computeCanonicalQuotaRequestHash({
       userId: this.userId,
@@ -782,15 +782,8 @@ export class SqliteTenantScopedQuotaLedgerRepository implements TenantScopedQuot
       throw new ReservationSettledError('', bundle.status);
     }
 
-    if (bundle.expiresAt <= nowIso) {
-      db.prepare(`
-        UPDATE quota_bundles SET status = 'expired' WHERE id = ? AND user_id = ? AND status = 'reserved'
-      `).run(bundleId, this.userId);
-      db.prepare(`
-        UPDATE quota_reservations SET status = 'expired' WHERE bundle_id = ? AND user_id = ? AND status = 'reserved'
-      `).run(bundleId, this.userId);
-      throw new ReservationSettledError('', 'expired');
-    }
+    // Note: Do not lazily expire active reserved bundles on commit.
+    // If background cleaner has not settled it as expired, allow committing actual usage.
 
     // actualUsage is strictly REQUIRED: no fallback to reserved amounts
     if (!input.actualUsage || typeof input.actualUsage !== 'object' || Array.isArray(input.actualUsage)) {

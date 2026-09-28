@@ -359,6 +359,12 @@ export interface ExtensionMigrationPlan {
   readonly spaceBinding: string
 }
 
+export interface TaskDeliveryTargetPlan {
+  readonly channel: string
+  readonly accountId: string
+  readonly nativeContextId: string
+}
+
 export interface TaskMigrationPlan {
   readonly sourceTaskId: string
   readonly title: string
@@ -366,6 +372,8 @@ export interface TaskMigrationPlan {
   readonly cronExpression?: string | null
   readonly priority: 'low' | 'normal' | 'high' | 'urgent'
   readonly targetSpaceFolder: string
+  readonly delivery?: TaskDeliveryTargetPlan | null
+  readonly contextMode?: string | null
 }
 
 export interface ChannelBindingMigrationPlan {

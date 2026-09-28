@@ -15,6 +15,7 @@ import type {
   CheckQuotaResult,
   TenantQuotaLimit,
   SafeTask,
+  UpdateTaskInput,
 } from '../management/types.js';
 
 export function createManagementOperationsAdapter(
@@ -56,6 +57,11 @@ export function createManagementOperationsAdapter(
     async resumeTask(userId: string, taskId: string): Promise<SafeTask> {
       const tenantOps = operationsService.forTenant(userId);
       return tenantOps.tasks.resumeTask(taskId);
+    },
+
+    async updateTask(userId: string, taskId: string, input: UpdateTaskInput): Promise<SafeTask> {
+      const tenantOps = operationsService.forTenant(userId);
+      return tenantOps.tasks.updateTask(taskId, input);
     },
 
     async getTask(userId: string, taskId: string): Promise<SafeTask | null> {

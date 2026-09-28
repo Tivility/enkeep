@@ -186,6 +186,21 @@ describe('Demo Runner Fail-Closed Security & Runtime Integrity', () => {
         persisted: true,
         eventsCount: 3,
       });
+
+      // 7. Accepts status 'cancelled' envelope as normal termination without throwing FAIL-CLOSED
+      (mockActiveHandle.sendFollowup as any).mockResolvedValueOnce({
+        status: 'cancelled',
+        replyText: '',
+        persisted: true,
+        eventsCount: 4,
+      });
+      const cancelRes = await handle.sendTurn({ prompt: 'valid prompt', sessionId, turnId, profileSnapshot: null });
+      expect(cancelRes).toEqual({
+        replyText: '',
+        persisted: true,
+        eventsCount: 4,
+        status: 'cancelled',
+      });
     });
 
     it('enforces importSeed invariants: fails closed on invalid status, unpersisted, receipt mismatch, or non-boolean duplicate', async () => {

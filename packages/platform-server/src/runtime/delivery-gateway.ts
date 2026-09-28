@@ -12,13 +12,14 @@ import {
   type ExtensionActivationPlan,
   type ExtensionPlanResolver,
 } from '@enkeep/platform-core';
-import type {
-  InboundEnvelope,
-  RuntimeGateway,
-  InternalRuntimeDispatchResult,
-  TurnExecutionStatus,
-  PublicEventCode,
-  DeliveryDispatchOptions,
+import {
+  DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
+  type InboundEnvelope,
+  type RuntimeGateway,
+  type InternalRuntimeDispatchResult,
+  type TurnExecutionStatus,
+  type PublicEventCode,
+  type DeliveryDispatchOptions,
 } from '@enkeep/web-channel';
 import {
   SqliteWebMessageStore,
@@ -77,6 +78,7 @@ export interface DeliveryExecutionRequest {
   readonly timeoutMs?: number;
 }
 
+export { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS };
 export type { DeliveryDispatchOptions };
 
 export type InspectedTurnErrorCode =
@@ -85,7 +87,8 @@ export type InspectedTurnErrorCode =
   | 'TURN_CANCELLED'
   | 'QUOTA_EXCEEDED'
   | 'INTERRUPTED'
-  | 'SESSION_CORRUPTED';
+  | 'SESSION_CORRUPTED'
+  | 'RATE_LIMITED';
 
 export interface InspectedTurnResult {
   readonly status: 'absent' | 'running' | 'completed' | 'failed';
@@ -438,6 +441,32 @@ export interface DeliveryRuntimeGatewayOptions {
   fileProvider?: TenantRuntimeFileProvider;
   modelSelectionService?: ModelSelectionService;
   chatCommandService?: ChatCommandService;
+  chatCommandDeps?: {
+    resetSession?: (
+      userId: string,
+      sessionId: string,
+      options: { idempotencyKey: string; reason?: string }
+    ) => Promise<any>;
+    compactSession?: (
+      userId: string,
+      sessionId: string
+    ) => Promise<any>;
+    createTask?: (
+      userId: string,
+      input: {
+        title: string;
+        payload: Record<string, unknown>;
+        scheduleType?: string;
+        priority?: string;
+      }
+    ) => Promise<any>;
+    taskOperations?: (userId: string) => {
+      createTask: (input: any) => Promise<any>;
+    };
+  };
+  taskOperations?: (userId: string) => {
+    createTask: (input: any) => Promise<any>;
+  };
   externalInteractionService?: {
     listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
@@ -596,7 +625,25 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     this.fileService = options.fileService;
     this.fileProvider = options.fileProvider;
     this.modelSelectionService = options.modelSelectionService ?? (this.db ? new ModelSelectionServiceImpl({ db: this.db }) : undefined);
-    this.chatCommandService = options.chatCommandService ?? (this.modelSelectionService ? new ChatCommandService(this.modelSelectionService) : undefined);
+    const resetSessionFn = options.chatCommandDeps?.resetSession ?? (options as any).platformApi?.resetSession;
+    const compactSessionFn = options.chatCommandDeps?.compactSession ?? (options as any).platformApi?.compactSession;
+    const createTaskFn = options.chatCommandDeps?.createTask ?? (options as any).platformApi?.createTask;
+    const taskOps = options.chatCommandDeps?.taskOperations ?? options.taskOperations;
+    this.chatCommandService =
+      options.chatCommandService ??
+      (this.modelSelectionService
+        ? new ChatCommandService({
+            modelSelectionService: this.modelSelectionService,
+            platformApi: (resetSessionFn || compactSessionFn || createTaskFn) ? {
+              resetSession: resetSessionFn,
+              compactSession: compactSessionFn,
+              createTask: createTaskFn,
+            } : undefined,
+            taskOperations: taskOps,
+            gateway: this,
+            db: this.db,
+          })
+        : undefined);
     this.externalInteractionService = options.externalInteractionService;
     this.mountResolver = options.mountResolver;
 
@@ -639,6 +686,47 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
   public setExtensionResolver(resolver: ExtensionPlanResolver): void {
     this.extensionResolver = resolver;
+  }
+
+  public getChatCommandService(): ChatCommandService | undefined {
+    return this.chatCommandService;
+  }
+
+  public setChatCommandDeps(deps: {
+    resetSession?: (
+      userId: string,
+      sessionId: string,
+      options: { idempotencyKey: string; reason?: string }
+    ) => Promise<any>;
+    compactSession?: (
+      userId: string,
+      sessionId: string
+    ) => Promise<any>;
+    createTask?: (
+      userId: string,
+      input: {
+        title: string;
+        payload: Record<string, unknown>;
+        scheduleType?: string;
+        priority?: string;
+      }
+    ) => Promise<any>;
+    taskOperations?: (userId: string) => {
+      createTask: (input: any) => Promise<any>;
+    };
+  }): void {
+    if (this.chatCommandService) {
+      const currentPlatformApi = (this.chatCommandService as any).platformApi ?? {};
+      this.chatCommandService.setPlatformApi({
+        ...currentPlatformApi,
+        ...(deps.resetSession ? { resetSession: deps.resetSession } : {}),
+        ...(deps.compactSession ? { compactSession: deps.compactSession } : {}),
+        ...(deps.createTask ? { createTask: deps.createTask } : {}),
+      });
+      if (deps.taskOperations) {
+        this.chatCommandService.setTaskOperations(deps.taskOperations);
+      }
+    }
   }
 
   public getFileProvider(): TenantRuntimeFileProvider | undefined {
@@ -817,10 +905,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           typeof options.timeoutMs !== 'number' ||
           !Number.isSafeInteger(options.timeoutMs) ||
           options.timeoutMs <= 0 ||
-          options.timeoutMs > 900_000
+          options.timeoutMs > DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS
         ) {
           throw new ValidationError(
-            'Dispatch timeoutMs must be a finite integer between 1 and 900000'
+            `Dispatch timeoutMs must be a finite integer between 1 and ${DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS}`
           );
         }
         requestedTimeoutMs = options.timeoutMs;
@@ -913,10 +1001,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     const authoritativeSpaceId = route.space_id;
     const currentGen = typeof route.current_generation === 'number' ? route.current_generation : 1;
 
-    // Profile resolution pre-check: fail closed if profile snapshot is tampered/corrupted
-    await this.profileResolver.resolve(userId, sessionId, currentGen);
-
-    // Chat command interception hook (before attachments, idempotency, and runtime dispatch)
+    // Chat command interception hook (before profile resolution, attachments, idempotency, and runtime dispatch)
     const chatCmd = parseChatCommand(envelope.content);
     if (chatCmd && this.chatCommandService) {
       return await this.dispatchChatCommand({
@@ -928,6 +1013,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         timestamp,
       });
     }
+
+    // Profile resolution pre-check: fail closed if profile snapshot is tampered/corrupted
+    await this.profileResolver.resolve(userId, sessionId, currentGen);
 
     // 0a. Process and validate attachments
     const canonicalAttachments = await this.processInboundAttachments(
@@ -1172,6 +1260,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       sessionId,
       spaceId,
       content: envelope.content,
+      idempotencyKey,
     });
 
     // 3. Atomically persist synthetic turn in SQLite transaction
@@ -1811,6 +1900,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             ceiling: this.quotaTokenCeiling,
           });
 
+          const effectiveTimeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
+          const reservationTtlSeconds = Math.ceil(effectiveTimeoutMs / 1000) + 300;
+
           const quotaRequest: QuotaReservationRequest = {
             userId,
             sessionId,
@@ -1819,6 +1911,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             messages: 1,
             tokens: reservationTokens,
             isEstimateTokens: true,
+            ttlSeconds: reservationTtlSeconds,
           };
 
           try {
@@ -2026,7 +2119,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
           }
 
-          const timeoutMs = this.turnTimeouts.get(turnId) ?? 300_000;
+          const timeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
           const executionRequest: DeliveryExecutionRequest = {
             userId,
             platformSpaceId: spaceId,
@@ -2059,6 +2152,16 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             throw new ValidationError('Assistant replyText exceeds maximum allowed size (64 KiB)');
           }
         } catch (execErr) {
+          // If turn was already interrupted/cancelled by user, do not cancel again or treat as execution failure
+          const existingTurn = this.db.prepare(
+            'SELECT status FROM turn_runs WHERE turn_id = ? AND user_id = ?'
+          ).get(turnId, userId) as { status: string } | undefined;
+          if (existingTurn?.status === 'interrupted') {
+            this.turnTimeouts.delete(turnId);
+            this.notifyScheduler();
+            return;
+          }
+
           // Explicitly signal cancel to the executor for this exact turn to terminate orphaned daemon/host processes
           try {
             await Promise.race([
@@ -2071,6 +2174,16 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
               error: cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
             });
           }
+
+          const recheckTurn = this.db.prepare(
+            'SELECT status FROM turn_runs WHERE turn_id = ? AND user_id = ?'
+          ).get(turnId, userId) as { status: string } | undefined;
+          if (recheckTurn?.status === 'interrupted') {
+            this.turnTimeouts.delete(turnId);
+            this.notifyScheduler();
+            return;
+          }
+
           await this.persistExecutionFailure({
             userId,
             sessionId,
@@ -2343,11 +2456,21 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
       // 6. Commit quota in same transaction
       if (reservationBundle) {
-        reservationBundle.commitInTransaction(this.db, {
-          turns: 1,
-          messages: 1,
-          tokens: tokenUsage.tokens,
-        });
+        try {
+          reservationBundle.commitInTransaction(this.db, {
+            turns: 1,
+            messages: 1,
+            tokens: tokenUsage.tokens,
+          });
+        } catch (quotaErr) {
+          this.recordSettledError(quotaErr);
+          console.warn('[delivery-gateway] quota commit failed; preserving delivered assistant reply', { turnId, error: quotaErr });
+          try {
+            reservationBundle.releaseInTransaction(this.db);
+          } catch (relErr) {
+            this.recordSettledError(relErr);
+          }
+        }
       }
 
       // 7. Release active lease in session_execution_leases
@@ -2591,12 +2714,57 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       isSessionCorrupted = isCorruptedSessionError(error),
     } = params;
 
-    const nowIso = new Date().toISOString();
+    // If turn was already interrupted/cancelled by user, skip failure persistence and avoid sending error fallback
+    const existingTurn = this.db.prepare(
+      'SELECT status FROM turn_runs WHERE turn_id = ? AND user_id = ?'
+    ).get(turnId, userId) as { status: string } | undefined;
+    if (existingTurn?.status === 'interrupted') {
+      return;
+    }
+
+    const nowMs = Date.now();
+    const userMsgRow = this.db.prepare("SELECT created_at FROM web_messages WHERE session_id = ? AND user_id = ? AND role = 'user' AND turn_id = ?").get(sessionId, userId, turnId) as { created_at: string } | undefined;
+    const userCreatedAtMs = userMsgRow ? new Date(userMsgRow.created_at).getTime() : 0;
+    const assistantTimestampMs = Math.max(nowMs, userCreatedAtMs + 1);
+    const nowIso = new Date(assistantTimestampMs).toISOString();
+
     const isQuota =
       error instanceof QuotaExceededError ||
       (error as { code?: string })?.code === 'QUOTA_EXCEEDED' ||
       (error as { name?: string })?.name === 'QuotaExceededError';
     const isLeaseLost = (error as { code?: string })?.code === 'LEASE_LOST';
+    const isTimeout =
+      params.code === 'TURN_TIMEOUT' ||
+      (error as { code?: string })?.code === 'TURN_TIMEOUT' ||
+      (error as { code?: string })?.code === 'TIMEOUT' ||
+      (error as { errorCode?: string })?.errorCode === 'TURN_TIMEOUT' ||
+      (error as { name?: string })?.name === 'TURN_TIMEOUT' ||
+      (error instanceof Error && (
+        error.message === 'TURN_TIMEOUT' ||
+        error.message.startsWith('TURN_TIMEOUT') ||
+        error.message.includes('Followup turn execution timed out')
+      )) ||
+      (typeof error === 'string' && (error === 'TURN_TIMEOUT' || error.startsWith('TURN_TIMEOUT')));
+
+    const isUpstreamTransient =
+      (error as { name?: string })?.name === 'UpstreamModelError' ||
+      (error as { code?: string })?.code === 'UPSTREAM_MODEL_ERROR' ||
+      (error as { code?: string })?.code === 'UPSTREAM_TRANSIENT_ERROR' ||
+      (error as { code?: string })?.code === 'RATE_LIMIT' ||
+      (error as { code?: string })?.code === 'RATE_LIMITED' ||
+      (error as { code?: string })?.code === 'upstream_transient_error' ||
+      (error as { code?: string })?.code === 'upstream_fetch_error' ||
+      (error instanceof Error && (
+        error.name === 'UpstreamModelError' ||
+        error.message.includes('upstream_transient_error') ||
+        error.message.includes('upstream_fetch_error') ||
+        error.message.includes('Upstream returned status 429') ||
+        error.message.includes('Upstream returned status 502') ||
+        error.message.includes('Upstream returned status 503') ||
+        error.message.includes('Upstream returned status 504') ||
+        error.message.includes('Upstream gateway request failed') ||
+        error.message.includes('Upstream model request failed')
+      ));
 
     const safeErrorMessage = params.reason || (isQuota
       ? 'Quota exceeded'
@@ -2604,13 +2772,48 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       ? 'Session corrupted: recovery required'
       : isLeaseLost
       ? 'Lease lost during execution'
+      : isTimeout
+      ? 'TURN_TIMEOUT'
+      : isUpstreamTransient
+      ? '模型服务暂时繁忙，请稍后重试。'
       : 'Turn execution failed');
 
     const safeErrorCode: PublicEventCode = params.code || (isQuota
       ? 'QUOTA_EXCEEDED'
       : isSessionCorrupted
       ? 'RECOVERY_REQUIRED'
+      : isTimeout
+      ? 'TURN_TIMEOUT'
+      : isUpstreamTransient
+      ? 'RATE_LIMITED'
       : 'EXECUTION_FAILED');
+
+    let spaceId = params.spaceId;
+    if (!spaceId) {
+      try {
+        const turnRow = this.db.prepare('SELECT space_id FROM turn_runs WHERE turn_id = ? AND user_id = ?').get(turnId, userId) as { space_id?: string } | undefined;
+        spaceId = turnRow?.space_id;
+      } catch {}
+    }
+    spaceId = spaceId || 'space-a';
+    const routeKey = `${userId}:web:${spaceId}:${sessionId}`;
+
+    let noticeContent = '';
+    if (isTimeout) {
+      const effectiveTimeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
+      const durationText = effectiveTimeoutMs >= 60_000 && effectiveTimeoutMs % 60_000 === 0
+        ? `${effectiveTimeoutMs / 60_000} 分钟`
+        : `${Math.round(effectiveTimeoutMs / 1000)} 秒`;
+
+      const stepCount = (error as any)?.stepCount ?? (error as any)?.steps ?? (error as any)?.eventsCount;
+      const stepClause = (typeof stepCount === 'number' && Number.isFinite(stepCount) && stepCount >= 0)
+        ? `（已执行 ${stepCount} 步）`
+        : '';
+
+      noticeContent = `⏱️ 本轮处理超过 ${durationText}已被终止${stepClause}。请缩小范围或用 /new 开新一代后重试。`;
+    } else if (isUpstreamTransient) {
+      noticeContent = '模型服务暂时繁忙，请稍后重试。';
+    }
 
     console.error('[delivery-gateway] turn failed', {
       turnId,
@@ -2628,7 +2831,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         UPDATE turn_runs
         SET status = 'failed', error = ?, finished_at = ?, updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status IN ('queued', 'running')
-      `).run(safeErrorMessage, nowIso, turnId, userId);
+      `).run(isTimeout ? 'TURN_TIMEOUT' : safeErrorMessage, nowIso, turnId, userId);
 
       // 2. Update delivery_inbox to failed
       this.db.prepare(`
@@ -2650,6 +2853,51 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         SET status = 'failed'
         WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'user'
       `).run(sessionId, userId, turnId);
+
+      // 3c. If timeout or upstream transient, insert assistant system notice message into web_messages
+      if ((isTimeout || isUpstreamTransient) && noticeContent) {
+        const existingAssistantMsg = this.db.prepare(`
+          SELECT id, content, status, created_at FROM web_messages
+          WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
+        `).get(sessionId, userId, turnId) as WebMessageRecord | undefined;
+
+        if (!existingAssistantMsg) {
+          const assistantMsgId = generate32HexId('msg');
+          this.db.prepare(`
+            INSERT INTO web_messages (
+              id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+            ) VALUES (?, ?, ?, 'assistant', ?, 'delivered', ?, ?, ?)
+          `).run(
+            assistantMsgId,
+            sessionId,
+            userId,
+            noticeContent,
+            routeKey,
+            turnId,
+            nowIso
+          );
+
+          const assistantMsgRecord: WebMessageRecord = {
+            id: assistantMsgId,
+            role: 'assistant',
+            content: noticeContent,
+            status: 'delivered',
+            createdAt: nowIso,
+          };
+
+          const eventPayload = JSON.stringify({ message: assistantMsgRecord });
+          this.db.prepare(`
+            INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+            VALUES (?, ?, ?, 'message', ?, ?)
+          `).run(
+            generate32HexId('evt'),
+            sessionId,
+            userId,
+            eventPayload,
+            nowIso
+          );
+        }
+      }
 
       // 4. Insert turn_failed event into web_events
       this.db.prepare(`
@@ -2733,26 +2981,56 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       this.db.exec('COMMIT');
       inTx = false;
 
-      // 6. Safely notify turnFailedListeners outside the transaction
-      for (const listener of this.turnFailedListeners) {
-        try {
-          const res = listener({
-            userId,
-            sessionId,
-            spaceId: params.spaceId,
-            turnId,
-            deliveryId,
-            idempotencyKey,
-            code: safeErrorCode,
-            reason: safeErrorMessage,
-          });
-          if (res && typeof (res as Promise<void>).catch === 'function') {
-            (res as Promise<void>).catch((listenerErr) => {
-              this.recordSettledError(listenerErr);
+      // 6. Safely notify listeners outside the transaction
+      if ((isTimeout || isUpstreamTransient) && noticeContent) {
+        const executionResult: TurnExecutionResult = {
+          replyText: noticeContent,
+          usage: { totalTokens: 0 },
+        };
+        const tokenUsage = { tokens: 0 };
+        for (const listener of this.turnCompletedListeners) {
+          try {
+            const res = listener({
+              userId,
+              sessionId,
+              spaceId,
+              turnId,
+              deliveryId,
+              idempotencyKey,
+              executionResult,
+              tokenUsage,
+              executionMode: 'command',
             });
+            if (res && typeof (res as Promise<void>).catch === 'function') {
+              (res as Promise<void>).catch((listenerErr) => {
+                this.recordSettledError(listenerErr);
+              });
+            }
+          } catch (listenerErr) {
+            this.recordSettledError(listenerErr);
           }
-        } catch (listenerErr) {
-          this.recordSettledError(listenerErr);
+        }
+      } else {
+        for (const listener of this.turnFailedListeners) {
+          try {
+            const res = listener({
+              userId,
+              sessionId,
+              spaceId: params.spaceId,
+              turnId,
+              deliveryId,
+              idempotencyKey,
+              code: safeErrorCode,
+              reason: safeErrorMessage,
+            });
+            if (res && typeof (res as Promise<void>).catch === 'function') {
+              (res as Promise<void>).catch((listenerErr) => {
+                this.recordSettledError(listenerErr);
+              });
+            }
+          } catch (listenerErr) {
+            this.recordSettledError(listenerErr);
+          }
         }
       }
     } catch (err) {
@@ -3352,6 +3630,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             inspected.errorCode === 'TURN_CANCELLED' ? 'TURN_CANCELLED' :
             inspected.errorCode === 'INTERRUPTED' ? 'INTERRUPTED' :
             inspected.errorCode === 'SESSION_CORRUPTED' ? 'RECOVERY_REQUIRED' :
+            inspected.errorCode === 'RATE_LIMITED' ? 'RATE_LIMITED' :
             'EXECUTION_FAILED';
 
           await this.finalizeFailedTurn({

@@ -32,7 +32,7 @@ import {
   DockerNotFoundError,
   DockerDaemonError,
 } from '../spec/validator.js';
-import type { RuntimeContainerSpec, ExactContainerIdentity } from '../spec/types.js';
+import type { RuntimeContainerSpec, ExactContainerIdentity, RuntimeNetworkMode } from '../spec/types.js';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
 import type { RuntimeTurnRequest } from '@enkeep/protocol';
@@ -63,6 +63,12 @@ export type DaemonTransportFactory = (
 export interface DockerRuntimeAdapterOptions {
   client?: SafeDockerClient;
   daemonTransportFactory?: DaemonTransportFactory;
+  /** Optional default execution budget hardcap in ms for followup turns */
+  defaultExecutionBudgetMs?: number;
+  /** Optional default idle timeout in ms for followup turns */
+  defaultIdleTimeoutMs?: number;
+  /** Optional default container network isolation mode ('none' | 'bridge', default 'none') */
+  defaultNetworkMode?: RuntimeNetworkMode;
 }
 
 export interface UserSpecOptions {
@@ -73,6 +79,8 @@ export interface UserSpecOptions {
   containerName?: string;
   volumeName?: string;
   nameSuffix?: string;
+  /** Container network isolation mode ('none' | 'bridge', default 'none') */
+  networkMode?: RuntimeNetworkMode;
   /** Whether real LLM is enabled (injects ENKEEP_LLM_ENABLED=1) */
   llmEnabled?: boolean;
   /** Optional LLM provider identifier (injects ENKEEP_LLM_PROVIDER) */
@@ -352,27 +360,47 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
   readonly kind = 'docker' as const;
   private readonly client: SafeDockerClient;
   private readonly daemonTransportFactory: DaemonTransportFactory;
+  private readonly defaultNetworkMode: RuntimeNetworkMode;
 
   constructor(
     clientOrOptions?: SafeDockerClient | DockerRuntimeAdapterOptions,
     options?: DockerRuntimeAdapterOptions
   ) {
+    const rawDefaultNetMode =
+      options?.defaultNetworkMode ??
+      (clientOrOptions as DockerRuntimeAdapterOptions)?.defaultNetworkMode;
+    if (rawDefaultNetMode !== undefined && rawDefaultNetMode !== 'none' && rawDefaultNetMode !== 'bridge') {
+      throw new DockerOwnershipError(
+        `Invalid defaultNetworkMode "${String(rawDefaultNetMode)}": must be "none" or "bridge"`
+      );
+    }
+    this.defaultNetworkMode = rawDefaultNetMode ?? 'none';
+
+    const defaultTransportOpts: DaemonDockerTransportOptions = {
+      defaultExecutionBudgetMs:
+        options?.defaultExecutionBudgetMs ??
+        (clientOrOptions as DockerRuntimeAdapterOptions)?.defaultExecutionBudgetMs,
+      defaultIdleTimeoutMs:
+        options?.defaultIdleTimeoutMs ??
+        (clientOrOptions as DockerRuntimeAdapterOptions)?.defaultIdleTimeoutMs,
+    };
+
     if (clientOrOptions && typeof (clientOrOptions as SafeDockerClient).runContainer === 'function') {
       this.client = clientOrOptions as SafeDockerClient;
       this.daemonTransportFactory =
         options?.daemonTransportFactory ??
-        ((client, exp, opts) => new DaemonDockerTransport(client, exp, opts));
+        ((client, exp, opts) => new DaemonDockerTransport(client, exp, { ...defaultTransportOpts, ...opts }));
     } else if (clientOrOptions && typeof clientOrOptions === 'object') {
       const opts = clientOrOptions as DockerRuntimeAdapterOptions;
       this.client = opts.client ?? new SafeDockerClient();
       this.daemonTransportFactory =
         opts.daemonTransportFactory ??
-        ((client, exp, o) => new DaemonDockerTransport(client, exp, o));
+        ((client, exp, o) => new DaemonDockerTransport(client, exp, { ...defaultTransportOpts, ...o }));
     } else {
       this.client = new SafeDockerClient();
       this.daemonTransportFactory =
         options?.daemonTransportFactory ??
-        ((client, exp, opts) => new DaemonDockerTransport(client, exp, opts));
+        ((client, exp, opts) => new DaemonDockerTransport(client, exp, { ...defaultTransportOpts, ...opts }));
     }
   }
 
@@ -422,10 +450,17 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
     const llmProvider = options.llmProvider || process.env.ENKEEP_LLM_PROVIDER || 'cpa-claude';
     const llmModel = options.llmModel || process.env.ENKEEP_LLM_MODEL || 'claude-fable-5';
 
+    const compactionThresholdTokens =
+      (options as any).compactionThresholdTokens ||
+      (options as any).extraEnv?.DSH_COMPACTION_THRESHOLD_TOKENS ||
+      process.env.DSH_COMPACTION_THRESHOLD_TOKENS ||
+      '200000';
+
     const env: Record<string, string> = {
       DSH_USER: userId,
       DSH_HOME: '/home/dsh/.dsh',
       DSH_SPACES: '/home/dsh/spaces',
+      DSH_COMPACTION_THRESHOLD_TOKENS: String(compactionThresholdTokens),
     };
 
     if (isLlmEnabled) {
@@ -442,6 +477,15 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       }
     }
 
+    let networkMode = options.networkMode;
+    if (networkMode === undefined) {
+      networkMode = this.defaultNetworkMode;
+    } else if (networkMode !== 'none' && networkMode !== 'bridge') {
+      throw new DockerOwnershipError(
+        `Invalid caller-supplied networkMode "${String(networkMode)}": must be "none" or "bridge"`
+      );
+    }
+
     const spec: RuntimeContainerSpec = {
       userId,
       runId,
@@ -454,7 +498,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
         volumeId,
         containerPath: '/home/dsh',
       },
-      networkMode: 'none', // Strictly zero-network
+      networkMode,
       labels: {
         app: 'enkeep-demo',
         'enkeep.user': userId,
@@ -509,6 +553,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      networkMode: spec.networkMode,
     };
 
     const handle = this.createActiveRuntimeHandle(spec, containerId, expectation, volumeCreated);
@@ -715,6 +760,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       volumeId: spec.volume.volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      networkMode: spec.networkMode,
     };
 
     // Inspect with brief retry to handle daemon state transitions
@@ -898,6 +944,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
             timeoutMs: effTimeout,
             mounts: inContainerMounts,
             extensionPlan: request.extensionPlan ?? null,
+            extraReadableRoots: request.extraReadableRoots,
           });
 
           if (followupRes.status === 'completed') {
@@ -1221,6 +1268,31 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           };
         }
         return { status: 'ok', exists: false, code: 'NOT_FOUND' };
+      },
+      compactSession: async (sessionId: string): Promise<ExecCliEnvelope> => {
+        try {
+          const transport = await getOrStartTransport();
+          if (!transport.compactSession) {
+            throw new DockerDaemonError('Transport does not support compactSession');
+          }
+          const res = await transport.compactSession(sessionId);
+          return {
+            status: res.ok ? 'ok' : 'error',
+            sessionId,
+            beforeTokens: res.beforeTokens,
+            afterTokens: res.afterTokens,
+            eventsBefore: res.eventsBefore,
+            eventsAfter: res.eventsAfter,
+            summaryChars: res.summaryChars,
+            error: res.error?.message,
+          };
+        } catch (err: unknown) {
+          return {
+            status: 'error',
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
       },
       fileOperation: async (request: FileOperationRequest): Promise<ExecCliEnvelope> => {
         try {

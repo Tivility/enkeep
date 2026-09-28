@@ -30,6 +30,7 @@ import type {
   RuntimeMountSpec,
   ExtensionActivationPlan,
 } from '@enkeep/protocol';
+import { validateExtraReadableRoots } from '../spec/mount-security.js';
 
 export const MAX_DAEMON_FRAME_SIZE = 10 * 1024 * 1024; // 10 MiB frame limit
 export const MAX_JSON_DEPTH = 64; // Safe nested levels for deep tool schemas, session events and profile snapshots
@@ -52,6 +53,7 @@ export const DAEMON_OPS = {
   SHUTDOWN: 'shutdown',
   ANSWER_APPROVAL: 'answerApproval',
   LIST_APPROVALS: 'listApprovals',
+  COMPACT_SESSION: 'compactSession',
 } as const;
 
 export type DaemonOp = (typeof DAEMON_OPS)[keyof typeof DAEMON_OPS];
@@ -171,8 +173,11 @@ export interface SubmitTurnRequest extends DaemonRequestBase {
     readonly role?: string;
   } | null;
   readonly timeoutMs?: number;
+  readonly idleTimeoutMs?: number;
+  readonly maxExecutionBudgetMs?: number;
   readonly mounts?: readonly RuntimeMountSpec[] | null;
   readonly extensionPlan?: ExtensionActivationPlan | null;
+  readonly extraReadableRoots?: readonly string[];
 }
 
 export interface CancelRequest extends DaemonRequestBase {
@@ -277,6 +282,11 @@ export interface ShutdownRequest extends DaemonRequestBase {
   readonly drainTimeoutMs?: number;
 }
 
+export interface CompactSessionRequest extends DaemonRequestBase {
+  readonly op: 'compactSession';
+  readonly sessionId: string;
+}
+
 export type DaemonRequest =
   | SubmitTurnRequest
   | CancelRequest
@@ -293,7 +303,8 @@ export type DaemonRequest =
   | InstructionsWriteRequest
   | AnswerApprovalRequest
   | ListApprovalsRequest
-  | ShutdownRequest;
+  | ShutdownRequest
+  | CompactSessionRequest;
 
 // ---------------------------------------------------------------------------
 // Response Envelopes
@@ -462,6 +473,16 @@ export interface ShutdownResponse extends DaemonResponseBase {
   readonly status: 'shutting_down';
 }
 
+export interface CompactSessionResponse extends DaemonResponseBase {
+  readonly op: 'compactSession';
+  readonly ok: true;
+  readonly beforeTokens?: number;
+  readonly afterTokens?: number;
+  readonly eventsBefore: number;
+  readonly eventsAfter: number;
+  readonly summaryChars: number;
+}
+
 export interface DaemonErrorResponse extends DaemonResponseBase {
   readonly ok: false;
   readonly error: {
@@ -488,6 +509,7 @@ export type DaemonResponse =
   | AnswerApprovalResponse
   | ListApprovalsResponse
   | ShutdownResponse
+  | CompactSessionResponse
   | DaemonErrorResponse;
 
 // ---------------------------------------------------------------------------
@@ -580,7 +602,8 @@ export type DaemonEvictionReason =
   | 'lru_capacity'
   | 'profile_mismatch'
   | 'space_mismatch'
-  | 'mount_mismatch';
+  | 'mount_mismatch'
+  | 'roots_mismatch';
 
 export interface DaemonStreamAgentEvictedEvent {
   readonly type: 'event';
@@ -667,6 +690,20 @@ export function decodeDaemonRequest(raw: string | Buffer): DaemonRequest {
     );
   }
 
+  if (op === DAEMON_OPS.SUBMIT_TURN || op === 'submitTurn') {
+    if ((parsed as any).extraReadableRoots !== undefined && (parsed as any).extraReadableRoots !== null) {
+      try {
+        validateExtraReadableRoots((parsed as any).extraReadableRoots);
+      } catch (err: unknown) {
+        throw new DaemonProtocolError(
+          DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          err instanceof Error ? err.message : String(err),
+          err
+        );
+      }
+    }
+  }
+
   return parsed as unknown as DaemonRequest;
 }
 
@@ -701,6 +738,20 @@ export function decodeDaemonMessage(raw: string | Buffer): DaemonMessage {
       DAEMON_ERROR_CODES.INVALID_FRAME_STRUCTURE,
       'Message envelope must be a JSON object'
     );
+  }
+
+  if (parsed.op === DAEMON_OPS.SUBMIT_TURN || parsed.op === 'submitTurn') {
+    if ((parsed as any).extraReadableRoots !== undefined && (parsed as any).extraReadableRoots !== null) {
+      try {
+        validateExtraReadableRoots((parsed as any).extraReadableRoots);
+      } catch (err: unknown) {
+        throw new DaemonProtocolError(
+          DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          err instanceof Error ? err.message : String(err),
+          err
+        );
+      }
+    }
   }
 
   return parsed as unknown as DaemonMessage;

@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
+import {
+  SqlitePlatformStorage,
+  SqlitePlatformOperationsStorage,
+} from '@enkeep/platform-storage-sqlite';
+import {
+  PlatformOperationsService,
+  validateTaskPriority,
+} from '@enkeep/platform-operations';
 import {
   PlatformServerMigrationRunner,
   ALL_PLATFORM_MIGRATIONS,
@@ -109,9 +116,98 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       expect(multiArgParsed?.subcommand).toBe('unknown');
     });
 
+    it('parses /help command', () => {
+      const parsed = parseChatCommand('/help');
+      expect(parsed).not.toBeNull();
+      expect(parsed?.command).toBe('help');
+      expect(parsed?.type).toBe('help');
+      expect(parsed?.subcommand).toBe('show');
+
+      const wsParsed = parseChatCommand('   /help   ');
+      expect(wsParsed).not.toBeNull();
+      expect(wsParsed?.command).toBe('help');
+    });
+
+    it('parses /status command', () => {
+      const parsed = parseChatCommand('/status');
+      expect(parsed).not.toBeNull();
+      expect(parsed?.command).toBe('status');
+      expect(parsed?.type).toBe('status');
+      expect(parsed?.subcommand).toBe('show');
+
+      const wsParsed = parseChatCommand('   /status   ');
+      expect(wsParsed).not.toBeNull();
+      expect(wsParsed?.command).toBe('status');
+    });
+
+    it('parses /stop command', () => {
+      const parsed = parseChatCommand('/stop');
+      expect(parsed).not.toBeNull();
+      expect(parsed?.command).toBe('stop');
+      expect(parsed?.type).toBe('stop');
+      expect(parsed?.subcommand).toBe('stop');
+
+      const wsParsed = parseChatCommand('   /stop   ');
+      expect(wsParsed).not.toBeNull();
+      expect(wsParsed?.command).toBe('stop');
+    });
+
+    it('parses /new and aliases /reset and /clear', () => {
+      const newParsed = parseChatCommand('/new');
+      expect(newParsed).not.toBeNull();
+      expect(newParsed?.command).toBe('new');
+      expect(newParsed?.type).toBe('new');
+
+      const resetParsed = parseChatCommand('/reset');
+      expect(resetParsed).not.toBeNull();
+      expect(resetParsed?.command).toBe('new');
+
+      const clearParsed = parseChatCommand('/clear');
+      expect(clearParsed).not.toBeNull();
+      expect(clearParsed?.command).toBe('new');
+
+      const wsParsed = parseChatCommand('   /new   ');
+      expect(wsParsed).not.toBeNull();
+      expect(wsParsed?.command).toBe('new');
+    });
+
+    it('parses /sw and /spawn commands with aliases, case-insensitivity, and arguments', () => {
+      const emptySw = parseChatCommand('/sw');
+      expect(emptySw).not.toBeNull();
+      expect(emptySw?.command).toBe('spawn');
+      expect(emptySw?.subcommand).toBe('show');
+
+      const emptySpawn = parseChatCommand('/spawn');
+      expect(emptySpawn).not.toBeNull();
+      expect(emptySpawn?.command).toBe('spawn');
+      expect(emptySpawn?.subcommand).toBe('show');
+
+      const swWithArg = parseChatCommand('/sw run parallel analysis on dataset');
+      expect(swWithArg).not.toBeNull();
+      expect(swWithArg?.command).toBe('spawn');
+      expect(swWithArg?.subcommand).toBe('spawn');
+      expect(swWithArg?.arg).toBe('run parallel analysis on dataset');
+
+      const spawnWithArg = parseChatCommand('/spawn perform background audit');
+      expect(spawnWithArg).not.toBeNull();
+      expect(spawnWithArg?.command).toBe('spawn');
+      expect(spawnWithArg?.subcommand).toBe('spawn');
+      expect(spawnWithArg?.arg).toBe('perform background audit');
+
+      const caseInsensitiveSw = parseChatCommand('/SW test uppercase SW');
+      expect(caseInsensitiveSw).not.toBeNull();
+      expect(caseInsensitiveSw?.command).toBe('spawn');
+      expect(caseInsensitiveSw?.arg).toBe('test uppercase SW');
+
+      const caseInsensitiveSpawn = parseChatCommand('/SPAWN test uppercase SPAWN');
+      expect(caseInsensitiveSpawn).not.toBeNull();
+      expect(caseInsensitiveSpawn?.command).toBe('spawn');
+      expect(caseInsensitiveSpawn?.arg).toBe('test uppercase SPAWN');
+    });
+
     it('returns null for regular messages and non-matching commands', () => {
       expect(parseChatCommand('hello world')).toBeNull();
-      expect(parseChatCommand('/help')).toBeNull();
+      expect(parseChatCommand('/unknown_cmd')).toBeNull();
       expect(parseChatCommand('/other command')).toBeNull();
       expect(parseChatCommand('')).toBeNull();
       expect(parseChatCommand(null)).toBeNull();
@@ -119,11 +215,19 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       expect(parseChatCommand(123)).toBeNull();
     });
 
-    it('respects word boundary: rejects /modeling, /effortless, /models', () => {
+    it('respects word boundary: rejects /modeling, /effortless, /models, /helpful, /statuses, /stopping, /newbie, /swift, /spawning', () => {
       expect(parseChatCommand('/modeling')).toBeNull();
       expect(parseChatCommand('/effortless')).toBeNull();
       expect(parseChatCommand('/models')).toBeNull();
       expect(parseChatCommand('/model_test')).toBeNull();
+      expect(parseChatCommand('/helpful')).toBeNull();
+      expect(parseChatCommand('/statuses')).toBeNull();
+      expect(parseChatCommand('/stopping')).toBeNull();
+      expect(parseChatCommand('/newbie')).toBeNull();
+      expect(parseChatCommand('/resetting')).toBeNull();
+      expect(parseChatCommand('/cleared')).toBeNull();
+      expect(parseChatCommand('/swift')).toBeNull();
+      expect(parseChatCommand('/spawning')).toBeNull();
     });
   });
 
@@ -394,6 +498,291 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       });
       expect(result.replyText).toContain('No session override active');
     });
+
+    it('handles /help command with full command list', async () => {
+      const result = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/help',
+      });
+      expect(result.replyText).toContain('Available commands:');
+      expect(result.replyText).toContain('/help');
+      expect(result.replyText).toContain('/status');
+      expect(result.replyText).toContain('/new');
+      expect(result.replyText).toContain('/stop');
+      expect(result.replyText).toContain('/model');
+      expect(result.replyText).toContain('/effort');
+    });
+
+    it('handles /status command with space, session, generation, model, turn, last activity', async () => {
+      const result = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/status',
+      });
+      const lines = result.replyText.split('\n');
+      expect(lines.some((l) => l.startsWith('space:'))).toBe(true);
+      expect(lines.some((l) => l.startsWith('session:'))).toBe(true);
+      expect(lines.some((l) => l.startsWith('generation:'))).toBe(true);
+      expect(lines.some((l) => l.startsWith('model:'))).toBe(true);
+      expect(lines.some((l) => l.startsWith('turn:'))).toBe(true);
+      expect(lines.some((l) => l.startsWith('last activity:'))).toBe(true);
+      expect(result.replyText).toContain('openai/gpt-4o');
+      expect(result.replyText).toContain('turn: idle');
+    });
+
+    it('handles /stop command when a turn is running vs idle', async () => {
+      let turnRunning = false;
+      const stubGateway = {
+        cancelCurrentTurn: vi.fn(async () => turnRunning),
+        getCurrentTurnStatus: vi.fn(async () => (turnRunning ? { status: 'running' } : null)),
+      };
+      chatCommandService.setGateway(stubGateway);
+
+      // Nothing running
+      const idleRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/stop',
+      });
+      expect(idleRes.replyText).toBe('nothing running');
+      expect(stubGateway.cancelCurrentTurn).toHaveBeenCalledWith(userId, sessionId);
+
+      // Turn running
+      turnRunning = true;
+      const runningRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/stop',
+      });
+      expect(runningRes.replyText).toBe('cancelled');
+    });
+
+    it('handles /new (and aliases /reset, /clear) when turn is active vs idle', async () => {
+      let turnActive = true;
+      const stubGateway = {
+        cancelCurrentTurn: vi.fn(async () => true),
+        getCurrentTurnStatus: vi.fn(async () => (turnActive ? { status: 'running' } : null)),
+      };
+      let currentGen = 1;
+      const stubPlatformApi = {
+        resetSession: vi.fn(async (_uId: string, _sId: string, opts: any) => {
+          currentGen += 1;
+          return {
+            session: {},
+            generation: { generation: currentGen, resetReason: opts.reason },
+          };
+        }),
+      };
+
+      chatCommandService.setGateway(stubGateway);
+      chatCommandService.setPlatformApi(stubPlatformApi);
+
+      // 1. When turn is active
+      const activeRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/new',
+      });
+      expect(activeRes.replyText).toBe('a turn is active, use /stop first');
+      expect(stubPlatformApi.resetSession).not.toHaveBeenCalled();
+
+      // Same rejection on /reset and /clear aliases
+      const resetAliasRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/reset',
+      });
+      expect(resetAliasRes.replyText).toBe('a turn is active, use /stop first');
+
+      const clearAliasRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/clear',
+      });
+      expect(clearAliasRes.replyText).toBe('a turn is active, use /stop first');
+
+      // 2. When idle
+      turnActive = false;
+      const idleRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/new',
+        idempotencyKey: '00000000-0000-4000-8000-000000000001',
+      });
+      expect(idleRes.replyText).toBe('Started generation 2 (was 1)');
+      expect(stubPlatformApi.resetSession).toHaveBeenCalledWith(
+        userId,
+        sessionId,
+        expect.objectContaining({
+          idempotencyKey: '00000000-0000-4000-8000-000000000001',
+          reason: 'chat_command',
+        })
+      );
+
+      // Test /reset alias when idle
+      const resetRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/reset',
+      });
+      expect(resetRes.replyText).toBe('Started generation 3 (was 2)');
+
+      // Test /clear alias when idle
+      const clearRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/clear',
+      });
+      expect(clearRes.replyText).toBe('Started generation 4 (was 3)');
+    });
+
+    it('handles /sw and /spawn commands: empty usage, task creation, and receipt formatting', async () => {
+      // 1. Empty args returns usage
+      const emptySwRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/sw',
+      });
+      expect(emptySwRes.replyText).toBe('用法: /sw <任务描述>\n在当前工作区创建并行任务');
+
+      const emptySpawnRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/spawn',
+      });
+      expect(emptySpawnRes.replyText).toBe('用法: /sw <任务描述>\n在当前工作区创建并行任务');
+
+      // 2. Task creation with mock taskOperations
+      let capturedInput: any = null;
+      const stubTaskOperations = vi.fn((_uId: string) => ({
+        createTask: vi.fn(async (input: any) => {
+          capturedInput = input;
+          return {
+            task: {
+              id: 'task_abcd1234ef567890',
+              title: input.title,
+              status: 'pending',
+            },
+            isIdempotentHit: false,
+          };
+        }),
+      }));
+
+      chatCommandService.setTaskOperations(stubTaskOperations);
+
+      const spawnRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/sw parallel benchmark',
+      });
+
+      expect(spawnRes.replyText).toBe('⚡ 并行任务已启动 [abcd]: parallel benchmark');
+      expect(stubTaskOperations).toHaveBeenCalledWith(userId);
+      expect(capturedInput).toEqual({
+        title: '⚡ parallel benchmark',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'parallel benchmark',
+          sessionId,
+          spaceId,
+          sessionPolicy: 'isolated',
+          contextMode: 'isolated',
+        },
+        scheduleType: 'once',
+      });
+      // Verify validator accepts default medium priority when priority is omitted
+      expect(validateTaskPriority(capturedInput.priority ?? 'medium')).toBe('medium');
+
+      // 3. Truncation of task description > 30 chars
+      const longPrompt = 'this is a very long prompt description exceeding thirty characters threshold';
+      const longSpawnRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: `/spawn ${longPrompt}`,
+      });
+
+      const expectedTruncated = longPrompt.slice(0, 30) + '…';
+      expect(longSpawnRes.replyText).toBe(`⚡ 并行任务已启动 [abcd]: ${expectedTruncated}`);
+      expect(capturedInput.title).toBe(`⚡ ${expectedTruncated}`);
+    });
+
+    it('proves /sw creates and persists task through real TaskOperationService with valid default priority', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_test_real_ops';
+      const spaceId = 'spc_11112222333344445555666677778888';
+      const sessionId = 'ses_aaaabbbbccccddddeeeeffff00001111';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1)").run(sessionId, userId, spaceId);
+
+      const opsStorage = new SqlitePlatformOperationsStorage(db);
+      const opsService = new PlatformOperationsService({ storage: opsStorage });
+
+      const modelSelectionService = new ModelSelectionService({ db });
+      const chatCommandService = new ChatCommandService({
+        modelSelectionService,
+        taskOperations: (uId: string) => opsService.forTenant(uId).tasks,
+      });
+
+      const cmdRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/sw benchmark task',
+      });
+
+      expect(cmdRes.replyText).toMatch(/^⚡ 并行任务已启动 \[([0-9a-f]{4})\]: benchmark task$/);
+      const match = cmdRes.replyText.match(/^⚡ 并行任务已启动 \[([0-9a-f]{4})\]/);
+      expect(match).not.toBeNull();
+      const shortId = match![1];
+
+      // Verify task actually persisted in SQLite platform_tasks table with valid default medium priority
+      const rows = db.prepare('SELECT * FROM platform_tasks WHERE user_id = ?').all(userId) as any[];
+      expect(rows).toHaveLength(1);
+      const row = rows[0];
+      expect(row.id).toBeDefined();
+      expect(row.id.startsWith('task_')).toBe(true);
+      expect(row.id.slice(5, 9)).toBe(shortId);
+      expect(row.title).toBe('⚡ benchmark task');
+      expect(row.priority).toBe('medium');
+      expect(row.status).toBe('pending');
+      expect(row.schedule_type).toBe('once');
+
+      // Verify task retrieval via real TaskOperationService
+      const fetchedTask = await opsService.forTenant(userId).tasks.getTask(row.id);
+      expect(fetchedTask).toBeDefined();
+      expect(fetchedTask?.priority).toBe('medium');
+      expect(fetchedTask?.payload.prompt).toBe('benchmark task');
+      expect(fetchedTask?.payload.sessionPolicy).toBe('isolated');
+      expect(fetchedTask?.payload.contextMode).toBe('isolated');
+    });
+
+    it('rejects invalid priority "normal" in validator and ensures omission defaults to medium', () => {
+      expect(() => validateTaskPriority('normal')).toThrow('Invalid task priority');
+      expect(validateTaskPriority('medium')).toBe('medium');
+      expect(validateTaskPriority('low')).toBe('low');
+      expect(validateTaskPriority('high')).toBe('high');
+      expect(validateTaskPriority('urgent')).toBe('urgent');
+    });
   });
 
   // =========================================================================
@@ -515,6 +904,295 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       expect(retryResult.isDuplicate).toBe(true);
       expect(retryResult.turnId).toBe(dispatchResult.turnId);
       expect(executorCalled).toBe(false);
+    });
+
+    it('handles gateway-level /stop while turn is active: cancel called and reply persisted', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_test_stop';
+      const spaceId = 'spc_test_stop';
+      const sessionId = 'ses_test_stop';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1)").run(sessionId, userId, spaceId);
+
+      const storage = new SqlitePlatformStorage(db);
+      const messageStore = new SqliteWebMessageStore(db);
+      const profileResolver = { resolve: async () => null };
+      const modelSelectionService = new ModelSelectionService({ db });
+
+      let cancelCalled = false;
+      const executor = {
+        execute: async () => ({ replyText: 'runtime reply', usage: { totalTokens: 50 } }),
+        cancel: async () => {
+          cancelCalled = true;
+          return true;
+        },
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        database: db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+        modelSelectionService,
+      });
+
+      // Insert an active running turn into turn_runs and delivery_inbox
+      const activeTurnId = 'turn_fake_active_001';
+      db.prepare(`
+        INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+        VALUES ('inbox_fake_1', ?, ?, 'msg_fake_1', 'deliv_fake_1', '{}', 'processing', ?, datetime('now'), datetime('now'))
+      `).run(userId, sessionId, activeTurnId);
+
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_fake_1', ?, ?, ?, ?, 'runtime', 'running', datetime('now'), datetime('now'))
+      `).run(activeTurnId, spaceId, sessionId, userId);
+
+      const dispatchResult = await gateway.dispatchInbound({
+        id: 'deliv_stop_001',
+        channel: 'web',
+        userId,
+        sessionId,
+        content: '/stop',
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(dispatchResult.accepted).toBe(true);
+      expect(cancelCalled).toBe(true);
+
+      const history = await messageStore.listMessages(userId, sessionId);
+      const assistantMsg = history.messages.find((m) => m.role === 'assistant');
+      expect(assistantMsg).toBeDefined();
+      expect(assistantMsg?.content).toBe('cancelled');
+    });
+
+    it('handles gateway-level /new: reset called with reason chat_command and generation increments', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_test_new';
+      const spaceId = 'spc_test_new';
+      const sessionId = 'ses_test_new';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation, reset_count) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1, 0)").run(sessionId, userId, spaceId);
+
+      const storage = new SqlitePlatformStorage(db);
+      const messageStore = new SqliteWebMessageStore(db);
+      const profileResolver = { resolve: async () => null };
+      const modelSelectionService = new ModelSelectionService({ db });
+
+      const executor = {
+        execute: async () => ({ replyText: 'runtime reply', usage: { totalTokens: 50 } }),
+        cancel: async () => true,
+      };
+
+      let resetOptsCaptured: any = null;
+      const resetSessionSpy = vi.fn(async (_uId: string, _sId: string, opts: any) => {
+        resetOptsCaptured = opts;
+        // Bump current_generation in db
+        db.prepare('UPDATE session_routes SET current_generation = 2 WHERE id = ?').run(sessionId);
+        return {
+          session: {},
+          generation: { generation: 2, resetReason: opts.reason },
+        };
+      });
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        database: db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+        modelSelectionService,
+        chatCommandDeps: {
+          resetSession: resetSessionSpy,
+        },
+      });
+
+      const dispatchResult = await gateway.dispatchInbound({
+        id: 'deliv_new_001',
+        channel: 'web',
+        userId,
+        sessionId,
+        content: '/new',
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(dispatchResult.accepted).toBe(true);
+      expect(resetSessionSpy).toHaveBeenCalledTimes(1);
+      expect(resetOptsCaptured.reason).toBe('chat_command');
+
+      // Assert generation in db is now 2
+      const routeRow = db.prepare('SELECT current_generation FROM session_routes WHERE id = ?').get(sessionId) as any;
+      expect(routeRow.current_generation).toBe(2);
+
+      // Assert reply in messageStore is "Started generation 2 (was 1)"
+      const history = await messageStore.listMessages(userId, sessionId);
+      const assistantMsg = history.messages.find((m) => m.role === 'assistant');
+      expect(assistantMsg).toBeDefined();
+      expect(assistantMsg?.content).toBe('Started generation 2 (was 1)');
+
+      // Verify the synthetic turn was recorded
+      const turnRun = db.prepare('SELECT * FROM turn_runs WHERE turn_id = ?').get(dispatchResult.turnId) as any;
+      expect(turnRun).toBeDefined();
+      expect(turnRun.execution_mode).toBe('command');
+      expect(turnRun.status).toBe('completed');
+    });
+
+    it('handles gateway-level /sw: creates task and persists receipt without invoking turn executor', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_test_sw';
+      const spaceId = 'spc_test_sw';
+      const sessionId = 'ses_test_sw';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1)").run(sessionId, userId, spaceId);
+
+      const storage = new SqlitePlatformStorage(db);
+      const messageStore = new SqliteWebMessageStore(db);
+      const profileResolver = { resolve: async () => null };
+      const modelSelectionService = new ModelSelectionService({ db });
+
+      const executor = {
+        execute: vi.fn(async () => ({ replyText: 'runtime reply', usage: { totalTokens: 50 } })),
+        cancel: async () => true,
+      };
+
+      let taskCreatedPayload: any = null;
+      const stubCreateTask = vi.fn(async (_uId: string, input: any) => {
+        taskCreatedPayload = input;
+        return {
+          task: {
+            id: 'task_e3f211009988aabb',
+            title: input.title,
+            status: 'pending',
+          },
+          isIdempotentHit: false,
+        };
+      });
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        database: db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+        modelSelectionService,
+        chatCommandDeps: {
+          createTask: stubCreateTask,
+        },
+      });
+
+      const dispatchResult = await gateway.dispatchInbound({
+        id: 'deliv_sw_001',
+        channel: 'web',
+        userId,
+        sessionId,
+        content: '/sw analyze database performance in background',
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(dispatchResult.accepted).toBe(true);
+      expect(dispatchResult.executionMode).toBe('command');
+      expect(executor.execute).not.toHaveBeenCalled();
+      expect(stubCreateTask).toHaveBeenCalledTimes(1);
+      expect(taskCreatedPayload.payload.sessionPolicy).toBe('isolated');
+      expect(taskCreatedPayload.payload.prompt).toBe('analyze database performance in background');
+
+      // Assert receipt message persisted
+      const history = await messageStore.listMessages(userId, sessionId);
+      const assistantMsg = history.messages.find((m) => m.role === 'assistant');
+      expect(assistantMsg).toBeDefined();
+      expect(assistantMsg?.content).toBe('⚡ 并行任务已启动 [e3f2]: analyze database performance i…');
+
+      // Verify turn_runs record
+      const turnRun = db.prepare('SELECT * FROM turn_runs WHERE turn_id = ?').get(dispatchResult.turnId) as any;
+      expect(turnRun).toBeDefined();
+      expect(turnRun.execution_mode).toBe('command');
+      expect(turnRun.status).toBe('completed');
+    });
+
+    it('handles gateway-level /sw with real TaskOperationService: creates and persists task in database', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_test_gw_real';
+      const spaceId = 'spc_22223333444455556666777788889999';
+      const sessionId = 'ses_bbbbccccddddeeeeffff000011112222';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1)").run(sessionId, userId, spaceId);
+
+      const storage = new SqlitePlatformStorage(db);
+      const messageStore = new SqliteWebMessageStore(db);
+      const profileResolver = { resolve: async () => null };
+      const modelSelectionService = new ModelSelectionService({ db });
+      const opsStorage = new SqlitePlatformOperationsStorage(db);
+      const opsService = new PlatformOperationsService({ storage: opsStorage });
+
+      const executor = {
+        execute: vi.fn(async () => ({ replyText: 'runtime reply', usage: { totalTokens: 50 } })),
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        database: db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+        modelSelectionService,
+        chatCommandDeps: {
+          taskOperations: (uId: string) => opsService.forTenant(uId).tasks,
+        },
+      });
+
+      const dispatchResult = await gateway.dispatchInbound({
+        id: 'deliv_sw_real_001',
+        channel: 'web',
+        userId,
+        sessionId,
+        content: '/sw gateway task',
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(dispatchResult.accepted).toBe(true);
+      expect(dispatchResult.executionMode).toBe('command');
+      expect(executor.execute).not.toHaveBeenCalled();
+
+      // Verify task row persisted in platform_tasks via real TaskOperationService
+      const tasks = await opsService.forTenant(userId).tasks.listTasks();
+      expect(tasks).toHaveLength(1);
+      const persistedTask = tasks[0];
+      expect(persistedTask.title).toBe('⚡ gateway task');
+      expect(persistedTask.priority).toBe('medium');
+      expect(persistedTask.status).toBe('pending');
+
+      // Verify receipt message persisted in messageStore
+      const history = await messageStore.listMessages(userId, sessionId);
+      const assistantMsg = history.messages.find((m) => m.role === 'assistant');
+      expect(assistantMsg).toBeDefined();
+      const shortId = persistedTask.id.slice(5, 9);
+      expect(assistantMsg?.content).toBe(`⚡ 并行任务已启动 [${shortId}]: gateway task`);
     });
   });
 });

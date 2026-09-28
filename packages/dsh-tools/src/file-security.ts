@@ -122,11 +122,18 @@ function mapNodeErrorToSecurityError(
 /**
  * Resolves the actual filesystem path pointed to by an open file descriptor.
  * On Linux, /proc/self/fd/${fd} is mandatory and authoritative.
- * On non-Linux platforms (e.g. macOS /dev/fd), if kernel resolution is unsupported or cannot
- * resolve the real underlying target path, the system fails closed by throwing FD_RESOLUTION_UNSUPPORTED.
+ * On Darwin (macOS), /dev/fd is a devfs character device rather than a kernel procfs symlink;
+ * path identity is established by verifying descriptor fstat identity against targetPath lstat,
+ * physical parent directory canonical checks, and workspace boundary confinement.
+ * On unsupported platforms (or if resolution fails), the system fails closed with FD_RESOLUTION_UNSUPPORTED.
  * Test hooks can provide resolveFdPath to simulate kernel resolution.
  */
-function getActualFdPath(fd: number, hooks?: FileSecurityHooks, targetPath?: string): string {
+function getActualFdPath(
+  fd: number,
+  hooks?: FileSecurityHooks,
+  targetPath?: string,
+  canonicalWorkspace?: string
+): string {
   if (hooks?.resolveFdPath) {
     const resolved = hooks.resolveFdPath(fd, targetPath);
     if (!resolved || typeof resolved !== 'string' || resolved.trim() === '' || resolved.startsWith('/dev/fd/')) {
@@ -168,7 +175,30 @@ function getActualFdPath(fd: number, hooks?: FileSecurityHooks, targetPath?: str
     return resolved;
   }
 
-  // Non-Linux platforms (e.g. macOS /dev/fd)
+  if (process.platform === 'darwin') {
+    // Attempt devfs resolution if available
+    try {
+      const devFdPath = `/dev/fd/${fd}`;
+      const resolved = fs.realpathSync(devFdPath);
+      if (resolved && !resolved.startsWith('/dev/fd/')) {
+        return resolved;
+      }
+    } catch {
+      // Fall through to Darwin authorized file validation
+    }
+
+    if (!targetPath || typeof targetPath !== 'string' || !path.isAbsolute(targetPath)) {
+      throw new FileSecurityError(
+        'Kernel file descriptor path resolution is unsupported or failed on this platform (fail-closed policy)',
+        'FD_RESOLUTION_UNSUPPORTED',
+        500
+      );
+    }
+
+    return resolveDarwinAuthorizedFdPath(fd, targetPath, canonicalWorkspace);
+  }
+
+  // Non-Linux, non-Darwin platforms (e.g. Windows or other unsupported OS)
   try {
     const devFdPath = `/dev/fd/${fd}`;
     const resolved = fs.realpathSync(devFdPath);
@@ -184,6 +214,178 @@ function getActualFdPath(fd: number, hooks?: FileSecurityHooks, targetPath?: str
     'FD_RESOLUTION_UNSUPPORTED',
     500
   );
+}
+
+/**
+ * On Darwin (macOS), the kernel does not provide a /proc/self/fd symlink mechanism
+ * (/dev/fd is a character device in devfs/fdescfs).
+ * This helper establishes the open-FD / path identity invariant without disabling guards or
+ * adding native dependencies:
+ * 1. Verifies the open descriptor is a regular file.
+ * 2. Re-verifies targetPath lstat: must not be a symbolic link.
+ * 3. Enforces strict FD identity: fdStat.dev === targetLstat.dev && fdStat.ino === targetLstat.ino.
+ * 4. Physical parent canonical check:
+ *    - parent directory lstat: must exist, must be directory, must NOT be a symlink.
+ *    - canonical parent via realpathSync: must not be symlink, dev/ino must match parent directory.
+ *    - canonical target path reconstructed from canonicalParent and basename.
+ * 5. Canonical target check:
+ *    - realpathSync(targetPath) must match reconstructed canonical target path.
+ *    - realpath lstat must not be a symlink and must match fdStat dev/ino.
+ * 6. Confinement check:
+ *    - if canonicalWorkspace is provided, canonicalTarget must reside strictly inside canonicalWorkspace.
+ *
+ * If any check fails, fails closed with appropriate security error.
+ */
+function resolveDarwinAuthorizedFdPath(
+  fd: number,
+  targetPath: string,
+  canonicalWorkspace?: string
+): string {
+  let fdStat: fs.Stats;
+  try {
+    fdStat = fs.fstatSync(fd);
+  } catch (err: unknown) {
+    throw mapNodeErrorToSecurityError(err, 'Failed to inspect open file descriptor', 'FILE_STAT_FAILED', 400);
+  }
+
+  if (!fdStat.isFile()) {
+    throw new FileSecurityError(
+      'Target is not a regular file (e.g. is a directory, socket, or device)',
+      'NOT_A_REGULAR_FILE',
+      400
+    );
+  }
+
+  let targetLstat: fs.Stats;
+  try {
+    targetLstat = fs.lstatSync(targetPath);
+  } catch (err: unknown) {
+    throw mapNodeErrorToSecurityError(err, 'Failed to inspect target file path', 'FILE_STAT_FAILED', 400);
+  }
+
+  if (targetLstat.isSymbolicLink()) {
+    throw new FileSecurityError(
+      'Symbolic link detected for target file. Symlinks are strictly disallowed.',
+      'SYMLINK_DISALLOWED',
+      403
+    );
+  }
+
+  if (fdStat.dev !== targetLstat.dev || fdStat.ino !== targetLstat.ino) {
+    throw new FileSecurityError(
+      'File identity mismatch between descriptor and path (TOCTOU swap detected)',
+      'TOCTOU_SWAP_DETECTED',
+      403
+    );
+  }
+
+  const parentDir = path.dirname(targetPath);
+  let parentLstat: fs.Stats;
+  try {
+    parentLstat = fs.lstatSync(parentDir);
+  } catch (err: unknown) {
+    throw mapNodeErrorToSecurityError(err, 'Failed to inspect parent directory', 'FILE_STAT_FAILED', 400);
+  }
+
+  if (parentLstat.isSymbolicLink()) {
+    throw new FileSecurityError(
+      'Parent directory cannot be a symbolic link',
+      'SYMLINK_DISALLOWED',
+      403
+    );
+  }
+
+  if (!parentLstat.isDirectory()) {
+    throw new FileSecurityError(
+      'Parent path component is not a directory',
+      'NOT_A_DIRECTORY',
+      400
+    );
+  }
+
+  let canonicalParent: string;
+  try {
+    canonicalParent = fs.realpathSync(parentDir);
+  } catch (err: unknown) {
+    throw mapNodeErrorToSecurityError(err, 'Failed to resolve canonical parent directory', 'FILE_STAT_FAILED', 400);
+  }
+
+  let canonicalParentLstat: fs.Stats;
+  try {
+    canonicalParentLstat = fs.lstatSync(canonicalParent);
+  } catch (err: unknown) {
+    throw mapNodeErrorToSecurityError(err, 'Failed to inspect canonical parent directory', 'FILE_STAT_FAILED', 400);
+  }
+
+  if (canonicalParentLstat.isSymbolicLink() || !canonicalParentLstat.isDirectory()) {
+    throw new FileSecurityError(
+      'Canonical parent directory is invalid or a symlink',
+      'SYMLINK_DISALLOWED',
+      403
+    );
+  }
+
+  if (canonicalParentLstat.dev !== parentLstat.dev || canonicalParentLstat.ino !== parentLstat.ino) {
+    throw new FileSecurityError(
+      'Parent directory component swapped or modified during verification (TOCTOU detected)',
+      'TOCTOU_SWAP_DETECTED',
+      403
+    );
+  }
+
+  const filename = path.basename(targetPath);
+  const reconstructedCanonical = path.join(canonicalParent, filename);
+
+  let targetRealpath: string;
+  try {
+    targetRealpath = fs.realpathSync(targetPath);
+  } catch (err: unknown) {
+    throw mapNodeErrorToSecurityError(err, 'Failed to resolve canonical target path', 'FILE_STAT_FAILED', 400);
+  }
+
+  if (targetRealpath !== reconstructedCanonical) {
+    throw new FileSecurityError(
+      'Target file canonical path divergence detected (possible symlink alias or race condition)',
+      'TOCTOU_SWAP_DETECTED',
+      403
+    );
+  }
+
+  let realStat: fs.Stats;
+  try {
+    realStat = fs.lstatSync(targetRealpath);
+  } catch (err: unknown) {
+    throw mapNodeErrorToSecurityError(err, 'Failed to inspect canonical target path', 'FILE_STAT_FAILED', 400);
+  }
+
+  if (realStat.isSymbolicLink()) {
+    throw new FileSecurityError(
+      'Canonical target path is a symbolic link',
+      'SYMLINK_DISALLOWED',
+      403
+    );
+  }
+
+  if (realStat.dev !== fdStat.dev || realStat.ino !== fdStat.ino) {
+    throw new FileSecurityError(
+      'Canonical target identity mismatch with open descriptor (TOCTOU swap detected)',
+      'TOCTOU_SWAP_DETECTED',
+      403
+    );
+  }
+
+  if (canonicalWorkspace) {
+    const rel = path.relative(canonicalWorkspace, targetRealpath);
+    if (!rel || rel === '' || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new FileSecurityError(
+        'Opened file descriptor resolves outside workspace boundary',
+        'PATH_TRAVERSAL_DETECTED',
+        403
+      );
+    }
+  }
+
+  return targetRealpath;
 }
 
 /**
@@ -499,7 +701,7 @@ export function readValidatedFile(options: ValidateFileOptions): ValidatedFileWi
     }
 
     // Validate actual opened file descriptor target containment (fail-closed if unsupported or outside workspace)
-    const actualFdPath = getActualFdPath(fd, effectiveHooks, resolvedTarget);
+    const actualFdPath = getActualFdPath(fd, effectiveHooks, resolvedTarget, canonicalWorkspace);
     const fdRel = path.relative(canonicalWorkspace, actualFdPath);
     if (!fdRel || fdRel === '' || fdRel === '.' || fdRel.startsWith('..') || path.isAbsolute(fdRel)) {
       throw new FileSecurityError(

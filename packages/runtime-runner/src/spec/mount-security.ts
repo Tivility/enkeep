@@ -383,6 +383,82 @@ export function computeMountHash(mounts?: readonly (RuntimeMountSpec | ResolvedR
 }
 
 /**
+ * Computes a deterministic SHA-256 hash of extra readable roots.
+ */
+export function computeExtraRootsHash(roots?: readonly string[]): string {
+  if (!roots || roots.length === 0) {
+    return crypto.createHash('sha256').update('[]').digest('hex');
+  }
+
+  const normalized = Array.from(new Set(roots.map((r) => path.resolve(r)))).sort();
+  return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+}
+
+/**
+ * Validates trusted per-turn extraReadableRoots.
+ * Enforces:
+ * - Must be an array of non-empty strings.
+ * - Each path must be absolute and normalized (no directory traversal e.g. '..').
+ * - Must not contain null bytes.
+ * - Must not be a prohibited system root (e.g. '/', '/etc', '/root', '/proc', '/sys', '/dev')
+ *   or sensitive user configuration directories.
+ */
+export function validateExtraReadableRoots(roots: unknown): readonly string[] | undefined {
+  if (roots === undefined || roots === null) {
+    return undefined;
+  }
+
+  if (!Array.isArray(roots)) {
+    throw new HostOwnershipError('extraReadableRoots must be an array of absolute path strings');
+  }
+
+  const validated: string[] = [];
+  for (const item of roots) {
+    if (typeof item !== 'string' || !item.trim()) {
+      throw new HostOwnershipError('extraReadableRoots items must be non-empty strings');
+    }
+    if (item.includes('\0')) {
+      throw new HostOwnershipError('extraReadableRoots path contains null byte');
+    }
+    if (!path.isAbsolute(item)) {
+      throw new HostOwnershipError(`extraReadableRoots path must be absolute: "${item}"`);
+    }
+
+    const normalized = path.normalize(item);
+    const resolved = path.resolve(normalized);
+
+    // Disallow directory traversal segments
+    if (item.includes('..') || (normalized !== resolved && path.resolve(item) !== resolved)) {
+      throw new HostOwnershipError(`extraReadableRoots contains invalid traversal path: "${item}"`);
+    }
+
+    // Check prohibited system roots
+    if (resolved === '/' || resolved === path.resolve('/')) {
+      throw new HostOwnershipError(`extraReadableRoots cannot be root directory: "${item}"`);
+    }
+
+    for (const protectedRoot of DEFAULT_SYSTEM_PROTECTED_ROOTS) {
+      if (protectedRoot === '/') continue;
+      if (isPathContained(resolved, protectedRoot) || isPathContained(protectedRoot, resolved)) {
+        throw new HostOwnershipError(`extraReadableRoots contains prohibited system root: "${item}"`);
+      }
+    }
+
+    // Check sensitive user configuration directories
+    const parts = resolved.split(path.sep);
+    for (const sensitive of SENSITIVE_USER_DIRECTORIES) {
+      if (parts.includes(sensitive)) {
+        throw new HostOwnershipError(`extraReadableRoots cannot target sensitive user directory: "${item}"`);
+      }
+    }
+
+    validated.push(resolved);
+  }
+
+  return Object.freeze(Array.from(new Set(validated)));
+}
+
+/**
  * Sanitizes an error message by replacing any physical host or target paths with virtual /mnt/<name>.
  */
 export function sanitizePathInError(

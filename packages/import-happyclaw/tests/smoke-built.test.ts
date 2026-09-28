@@ -31,6 +31,7 @@ describe('Built JS Distribution Smoke Test', () => {
     expect(typeof distExports.importFixedHappyClawFixture).toBe('function')
     expect(typeof distExports.sessionIdFor).toBe('function')
     expect(typeof distExports.messageIdFor).toBe('function')
+    expect(typeof distExports.deterministicMessageId).toBe('function')
     // Ensure internal functions / aliases are NOT exposed
     expect(distExports.importHappyClaw).toBeUndefined()
     expect(distExports.readSource).toBeUndefined()

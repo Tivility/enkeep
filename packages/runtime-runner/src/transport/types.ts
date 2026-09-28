@@ -25,6 +25,7 @@ import type {
   InstructionsWriteResponse,
   AnswerApprovalResponse,
   ListApprovalsResponse,
+  CompactSessionResponse,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
 
@@ -152,8 +153,28 @@ export interface RuntimeHealthStatus {
   mountGeneration?: number;
 }
 
-/** Default execution timeout for followup turns (300 seconds / 5 minutes to accommodate large context LLM calls) */
-export const DEFAULT_FOLLOWUP_TIMEOUT_MS = 300_000;
+/** Default execution timeout for followup turns (600 seconds / 10 minutes to accommodate large context LLM calls) */
+export const DEFAULT_FOLLOWUP_TIMEOUT_MS = 600_000;
+
+/** HappyClaw source canonical default execution timeout (1,800,000 ms / 30 minutes) */
+export const HC_DEFAULT_EXECUTION_BUDGET_MS = 1_800_000;
+
+/** HappyClaw source canonical default idle activity timeout (1,800,000 ms / 30 minutes) */
+export const HC_DEFAULT_IDLE_TIMEOUT_MS = 1_800_000;
+
+export {
+  calculateTurnBudgets,
+  clearWaiterTimers,
+  pauseWaiterIdleTimer,
+  refreshWaiterIdleTimer,
+  extractVerifiedApprovalAsked,
+  extractVerifiedApprovalDecided,
+  isGenuineTurnProgress,
+  type CalculatedTurnBudgets,
+  type TurnBudgetInput,
+  type WatchdogOptionsInput,
+  type TurnWatchdogWaiter,
+} from './timer-helper.js';
 
 export interface FallbackTarget {
   readonly provider: string;
@@ -172,8 +193,12 @@ export interface AgentFollowupRequest {
   workspaceFolder?: string | RuntimeWorkspaceSegment;
   /** @deprecated Optional legacy spaceId property name */
   spaceId?: string;
-  /** Optional turn execution timeout override in ms (default: 300,000ms) */
+  /** Optional turn execution timeout override in ms (default: 600,000ms or explicit caller budget) */
   timeoutMs?: number;
+  /** Optional idle activity deadline in ms (refreshed upon genuine frame/progress) */
+  idleTimeoutMs?: number;
+  /** Optional maximum total execution budget hardcap in ms (overall ceiling, cannot be extended) */
+  maxExecutionBudgetMs?: number;
   /** Optional attachments for the turn */
   attachments?: readonly CanonicalAttachment[];
   /** Optional effective model selection resolved for this turn */
@@ -194,6 +219,8 @@ export interface AgentFollowupRequest {
   mounts?: readonly RuntimeMountSpec[] | null;
   /** Optional generic extension activation plan */
   extensionPlan?: ExtensionActivationPlan | null;
+  /** Optional extra readable roots for sandbox boundary allowlist */
+  extraReadableRoots?: readonly string[];
 }
 
 export interface AgentFollowupCompletedResponse {
@@ -288,6 +315,7 @@ export interface RuntimeDaemonTransportPort {
   instructionsWrite?(request: { target: 'global' | 'space'; content: string; spaceFolder?: string; filename?: string; expectedEtag?: string | null; requireAbsent?: boolean }): Promise<InstructionsWriteResponse>;
   answerApproval?(sessionId: string, approvalId: string, decision: 'allowed-once' | 'rejected' | 'allowed-always'): Promise<AnswerApprovalResponse>;
   listApprovals?(sessionId: string): Promise<ListApprovalsResponse>;
+  compactSession?(sessionId: string): Promise<CompactSessionResponse>;
   request?<TReq extends DaemonRequest, TRes extends DaemonResponse>(
     req: TReq,
     timeoutMs?: number

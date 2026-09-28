@@ -9,6 +9,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
   FsError,
@@ -22,7 +23,9 @@ import type { ResolvedRuntimeMount, RuntimeMountSpec } from '../spec/types.js';
 import { verifyMountTOCTOU } from '../spec/mount-security.js';
 
 export function isPathInside(childPath: string, parentPath: string): boolean {
-  const rel = path.relative(parentPath, childPath);
+  const normChild = path.resolve(childPath);
+  const normParent = path.resolve(parentPath);
+  const rel = path.relative(normParent, normChild);
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
@@ -33,6 +36,21 @@ export interface ResolvedVirtualTarget {
   readonly subpath?: string;
   readonly physicalPath?: string;
   readonly displayPath: string;
+  readonly isExtraRoot?: boolean;
+  readonly isWritableExtraRoot?: boolean;
+}
+
+export interface VirtualMountResolverOptions {
+  extraReadableRoots?: string[];
+  extraWritableRoots?: string[];
+  /**
+   * Roots that are blocked by default (e.g. the DSH home with sessions/DB, and the parent
+   * spaces directory holding sibling spaces). An explicit grant in extraReadableRoots
+   * or extraWritableRoots overrides an ancestor deniedRoot (e.g. a sibling space under
+   * the parent spaces directory), while descendant deniedRoots (e.g. sensitive subtrees
+   * inside a grant) remain strictly denied.
+   */
+  deniedRoots?: string[];
 }
 
 /**
@@ -41,10 +59,62 @@ export interface ResolvedVirtualTarget {
 export class VirtualMountResolver {
   private readonly mounts: readonly ResolvedRuntimeMount[];
   private readonly spacePath: string;
+  private readonly extraReadableRoots: readonly string[];
+  private readonly extraWritableRoots: readonly string[];
+  private readonly deniedRoots: readonly string[];
 
-  constructor(spacePath: string, mounts?: readonly ResolvedRuntimeMount[]) {
+  constructor(
+    spacePath: string,
+    mounts?: readonly ResolvedRuntimeMount[],
+    options?: VirtualMountResolverOptions
+  ) {
     this.spacePath = path.resolve(spacePath);
     this.mounts = mounts ?? [];
+
+    const resolveRoots = (roots: readonly string[]): string[] => {
+      const resolved: string[] = [];
+      for (const r of roots) {
+        if (!r) continue;
+        const norm = path.resolve(r);
+        resolved.push(norm);
+        try {
+          const real = fs.realpathSync(norm);
+          if (real !== norm) {
+            resolved.push(real);
+          }
+        } catch {
+          // Retain normalized path if path does not exist on disk yet
+        }
+      }
+      return Array.from(new Set(resolved));
+    };
+
+    // Default writable roots: [os.tmpdir(), '/tmp', '/private/tmp']
+    const defaultWritable = [os.tmpdir(), '/tmp', '/private/tmp'];
+    const rawWritable = options?.extraWritableRoots ?? defaultWritable;
+    this.extraWritableRoots = resolveRoots(rawWritable);
+
+    // Default readable roots: [os.homedir()]
+    const defaultReadable = [os.homedir()];
+    const rawReadable = options?.extraReadableRoots ?? defaultReadable;
+    this.extraReadableRoots = resolveRoots(rawReadable);
+
+    // Denied roots: broad parent spaces directory and explicitly configured deniedRoots.
+    const parentDir = path.dirname(this.spacePath);
+    let realParentDir: string | undefined;
+    try {
+      realParentDir = path.dirname(fs.realpathSync(this.spacePath));
+    } catch {}
+    const rawDenied = [
+      parentDir,
+      ...(realParentDir && realParentDir !== parentDir ? [realParentDir] : []),
+      ...(options?.deniedRoots ?? []),
+    ];
+    this.deniedRoots = resolveRoots(rawDenied);
+  }
+
+  getDeniedRoots(): readonly string[] {
+    return this.deniedRoots;
   }
 
   getMounts(): readonly ResolvedRuntimeMount[] {
@@ -53,6 +123,14 @@ export class VirtualMountResolver {
 
   getSpacePath(): string {
     return this.spacePath;
+  }
+
+  getExtraReadableRoots(): readonly string[] {
+    return this.extraReadableRoots;
+  }
+
+  getExtraWritableRoots(): readonly string[] {
+    return this.extraWritableRoots;
   }
 
   findMountByName(name: string): ResolvedRuntimeMount | undefined {
@@ -162,10 +240,13 @@ export class VirtualMountResolver {
               const target = fs.readlinkSync(cur);
               const resolved = path.isAbsolute(target) ? path.resolve(target) : path.resolve(path.dirname(cur), target);
               if (!isPathInside(resolved, realSpaceRoot)) {
-                throw new FsError(
-                  `Access denied: symlink "${inputPath}" points outside space boundary "${this.spacePath}"`,
-                  'FS_SANDBOX_DENIED'
-                );
+                const extraMatch = path.isAbsolute(inputPath) ? this.matchExtraRoots(resolved) : null;
+                if (!extraMatch) {
+                  throw new FsError(
+                    `Access denied: symlink "${inputPath}" points outside space boundary "${this.spacePath}"`,
+                    'FS_SANDBOX_DENIED'
+                  );
+                }
               }
             }
           } catch (symErr) {
@@ -174,10 +255,13 @@ export class VirtualMountResolver {
           if (fs.existsSync(cur)) {
             const realCur = fs.realpathSync(cur);
             if (!isPathInside(realCur, realSpaceRoot)) {
-              throw new FsError(
-                `Access denied: path "${inputPath}" resolves outside space boundary "${this.spacePath}"`,
-                'FS_SANDBOX_DENIED'
-              );
+              const extraMatch = path.isAbsolute(inputPath) ? this.matchExtraRoots(realCur) : null;
+              if (!extraMatch) {
+                throw new FsError(
+                  `Access denied: path "${inputPath}" resolves outside space boundary "${this.spacePath}"`,
+                  'FS_SANDBOX_DENIED'
+                );
+              }
             }
             realCandidate = path.join(realCur, path.relative(cur, candidate));
             foundExisting = true;
@@ -194,10 +278,35 @@ export class VirtualMountResolver {
     }
 
     if (!isPathInside(realCandidate!, realSpaceRoot)) {
+      // Check allowlist roots if candidate path was absolute
+      if (path.isAbsolute(inputPath)) {
+        const extraMatch = this.matchExtraRoots(realCandidate!);
+        if (extraMatch) {
+          return {
+            isMount: false,
+            isVirtualRoot: false,
+            isExtraRoot: true,
+            isWritableExtraRoot: extraMatch.isWritableExtraRoot,
+            physicalPath: realCandidate!,
+            displayPath: realCandidate!,
+          };
+        }
+      }
+
       throw new FsError(
         `Access denied: path "${inputPath}" resolves outside space boundary "${this.spacePath}"`,
         'FS_SANDBOX_DENIED'
       );
+    }
+
+    // Check descendant denies inside space boundary
+    for (const denied of this.deniedRoots) {
+      if (isPathInside(denied, realSpaceRoot) && isPathInside(realCandidate!, denied)) {
+        throw new FsError(
+          `Access denied: path "${inputPath}" matches denied root "${denied}"`,
+          'FS_SANDBOX_DENIED'
+        );
+      }
     }
 
     const relFromSpace = path.relative(realSpaceRoot, realCandidate!);
@@ -286,6 +395,68 @@ export class VirtualMountResolver {
     };
   }
 
+  /**
+   * Matches candidate path against extra roots using most-specific grant ordering:
+   * 1. If candidate is not inside any grant root (readable or writable), returns null.
+   * 2. Selects the most-specific matching grant root (deepest descendant).
+   * 3. Evaluates all matching denied roots against the most-specific grant:
+   *    - Descendant deny (denied root inside or equal to grant, e.g. explicit sensitive subtree):
+   *      Denial is preserved; returns null.
+   *    - Ancestor deny (denied root is a strict ancestor of grant, e.g. broad spacesDir parent):
+   *      Overridden by the more-specific grant.
+   *    - Unrelated deny: returns null.
+   */
+  private matchExtraRoots(
+    candidatePhysicalPath: string
+  ): { isExtraRoot: boolean; isWritableExtraRoot: boolean } | null {
+    const normCandidate = path.resolve(candidatePhysicalPath);
+
+    const matchingWritable = this.extraWritableRoots.filter((r) => isPathInside(normCandidate, r));
+    const matchingReadable = this.extraReadableRoots.filter((r) => isPathInside(normCandidate, r));
+
+    if (matchingWritable.length === 0 && matchingReadable.length === 0) {
+      return null;
+    }
+
+    type GrantEntry = { root: string; writable: boolean };
+    const allMatchingGrants: GrantEntry[] = [
+      ...matchingWritable.map((root) => ({ root, writable: true })),
+      ...matchingReadable.map((root) => ({ root, writable: false })),
+    ];
+
+    // Find the most-specific grant: the deepest descendant among all matching grants.
+    let bestGrant = allMatchingGrants[0];
+    for (let i = 1; i < allMatchingGrants.length; i++) {
+      const g = allMatchingGrants[i];
+      if (isPathInside(g.root, bestGrant.root) && g.root !== bestGrant.root) {
+        bestGrant = g;
+      } else if (g.root === bestGrant.root && g.writable && !bestGrant.writable) {
+        bestGrant = g;
+      }
+    }
+
+    // Check all matching denied roots against bestGrant
+    const matchingDenied = this.deniedRoots.filter((d) => isPathInside(normCandidate, d));
+    for (const denied of matchingDenied) {
+      // Descendant deny: denied root is equal to or inside the grant root.
+      // E.g. configured explicit secret deny within the grant root.
+      if (isPathInside(denied, bestGrant.root)) {
+        return null;
+      }
+      // Ancestor deny: denied root is a strict ancestor of the grant root.
+      // E.g. broad spacesDir ancestor enclosing the sibling space grant.
+      // If it is NOT an ancestor, fail-safe reject.
+      if (!isPathInside(bestGrant.root, denied)) {
+        return null;
+      }
+    }
+
+    return {
+      isExtraRoot: true,
+      isWritableExtraRoot: bestGrant.writable,
+    };
+  }
+
   assertMutationAllowed(target: ResolvedVirtualTarget, op: 'write' | 'edit' = 'write'): void {
     if (target.isMount && target.mount) {
       if (target.mount.mode === 'ro') {
@@ -295,6 +466,13 @@ export class VirtualMountResolver {
           'FS_SANDBOX_DENIED'
         );
       }
+    }
+    if (target.isExtraRoot && !target.isWritableExtraRoot) {
+      const action = op === 'edit' ? 'edit file in' : 'write to';
+      throw new FsError(
+        `Access denied: cannot ${action} read-only root "${target.physicalPath}"`,
+        'FS_SANDBOX_DENIED'
+      );
     }
   }
 

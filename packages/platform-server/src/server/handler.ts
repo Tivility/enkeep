@@ -73,8 +73,8 @@ import type {
   UserRuntimeStatus,
   OperationsReadinessStatus,
 } from "../management/types.js";
-import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority } from "@enkeep/platform-operations";
-import { QuotaExceededError, validateTimezone } from "@enkeep/platform-operations";
+import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority, UpdateTaskInput, AgentPromptSessionPolicy, AgentPromptContextMode, ScriptTaskPayload, TaskPayload } from "@enkeep/platform-operations";
+import { QuotaExceededError, validateTimezone, validateUpdateTaskInput } from "@enkeep/platform-operations";
 import Busboy from "busboy";
 import {
   RuntimeFileApiService,
@@ -162,6 +162,8 @@ const ALLOWED_CREATE_TASK_KEYS = new Set([
   "title",
   "prompt",
   "sessionId",
+  "sessionPolicy",
+  "contextMode",
   "dueDate",
   "priority",
   "scheduleType",
@@ -171,6 +173,14 @@ const ALLOWED_CREATE_TASK_KEYS = new Set([
   "misfirePolicy",
   "overlapPolicy",
   "delivery",
+  "execution_type",
+  "task_type",
+  "type",
+  "command",
+  "script_command",
+  "script",
+  "spaceId",
+  "timeoutMs",
 ]);
 const ALLOWED_PROFILE_KEYS = new Set([
   "name",
@@ -2036,6 +2046,11 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                   }
                 })();
 
+                // Mark the rejection as observed now: the promise is awaited only after
+                // busboy finishes, and an early synchronous validation failure (e.g. bad
+                // spaceId) would otherwise surface as an unhandled rejection and crash the
+                // process before Promise.all attaches its handler.
+                writePromise.catch(() => {});
                 filePromises.push(writePromise);
               });
 
@@ -3606,35 +3621,163 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                 throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
               }
 
-              if (body.prompt === undefined || body.prompt === null) {
-                throw new ValidationError('Task prompt is required');
-              }
-              if (typeof body.prompt !== "string" || !body.prompt.trim()) {
-                throw new ValidationError('Task prompt must be a non-empty string under 64 KiB');
-              }
-              if (Buffer.byteLength(body.prompt, "utf8") > 65536) {
-                throw new ValidationError('Task prompt exceeds maximum limit of 64 KiB');
-              }
-              if (body.sessionId === undefined || body.sessionId === null) {
-                throw new ValidationError('Task sessionId is required');
-              }
-              if (typeof body.sessionId !== "string" || !body.sessionId.trim()) {
-                throw new ValidationError('Task sessionId is required');
-              }
-              const sessionId = validatePathId(body.sessionId, "sessionId");
-              const session = await platformApi.getSession(user.id, sessionId);
-              if (!session) {
-                throw new NotFoundError(`Session "${sessionId}" not found`);
-              }
+              const isScriptTask =
+                body.type === "script" ||
+                body.execution_type === "script" ||
+                body.task_type === "shell_script" ||
+                body.script_command !== undefined ||
+                body.script !== undefined ||
+                (body.command !== undefined && body.prompt === undefined);
 
-              const payload: any = {
-                type: "agent_prompt" as const,
-                prompt: body.prompt as string,
-                sessionId,
-                sessionPolicy: "existing_session" as const,
-              };
-              if (body.delivery !== undefined && body.delivery !== null) {
-                payload.delivery = body.delivery;
+              let payload: TaskPayload;
+              let taskTitle: string;
+              let scriptSpaceId: string | undefined;
+
+              if (isScriptTask) {
+                if (user.role !== "admin") {
+                  throw new ForbiddenError("Script tasks can only be created by administrators");
+                }
+
+                const command = body.command ?? body.script_command ?? body.script;
+                if (command === undefined || command === null) {
+                  throw new ValidationError("Task command is required for script tasks");
+                }
+                if (typeof command !== "string" || !command.trim()) {
+                  throw new ValidationError("Task command must be a non-empty string under 64 KiB");
+                }
+                if (Buffer.byteLength(command, "utf8") > 65536) {
+                  throw new ValidationError("Task command exceeds maximum limit of 64 KiB");
+                }
+
+                let space: any = null;
+                if (body.spaceId !== undefined && body.spaceId !== null) {
+                  const spaceId = validatePathId(body.spaceId, "spaceId");
+                  space = await platformApi.getSpace(user.id, spaceId);
+                  if (!space) {
+                    throw new NotFoundError(`Space "${spaceId}" not found`);
+                  }
+                } else if (body.sessionId !== undefined && body.sessionId !== null) {
+                  const sessionId = validatePathId(body.sessionId, "sessionId");
+                  const session = await platformApi.getSession(user.id, sessionId);
+                  if (!session) {
+                    throw new NotFoundError(`Session "${sessionId}" not found`);
+                  }
+                  space = await platformApi.getSpace(user.id, session.spaceId);
+                  if (!space) {
+                    throw new NotFoundError(`Space "${session.spaceId}" not found`);
+                  }
+                } else {
+                  const spaces = await platformApi.listSpaces(user.id);
+                  const hostSpace =
+                    spaces.find((s) => s.executionMode === "host" && s.status === "active") ||
+                    spaces.find((s) => s.executionMode === "host");
+                  if (!hostSpace) {
+                    throw new ValidationError("Script tasks can only be executed in host mode spaces");
+                  }
+                  space = hostSpace;
+                }
+
+                if (space.executionMode !== "host") {
+                  throw new ValidationError("Script tasks can only be executed in host mode spaces");
+                }
+
+                scriptSpaceId = space.id;
+                let spaceFolder: string | undefined;
+                if (db) {
+                  const spaceRow = db
+                    .prepare("SELECT folder FROM spaces WHERE id = ? AND user_id = ?")
+                    .get(space.id, user.id) as { folder: string } | undefined;
+                  spaceFolder = spaceRow?.folder;
+                }
+
+                let timeoutMs: number | undefined;
+                if (body.timeoutMs !== undefined && body.timeoutMs !== null) {
+                  if (
+                    typeof body.timeoutMs !== "number" ||
+                    !Number.isSafeInteger(body.timeoutMs) ||
+                    body.timeoutMs <= 0 ||
+                    body.timeoutMs > 1_800_000
+                  ) {
+                    throw new ValidationError("Invalid timeoutMs: must be a positive integer <= 1800000");
+                  }
+                  timeoutMs = body.timeoutMs;
+                }
+
+                const scriptPayload: ScriptTaskPayload = {
+                  type: "script",
+                  command: command.trim(),
+                  spaceId: space.id,
+                  ...(spaceFolder ? { spaceFolder } : {}),
+                  ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                };
+                if (body.delivery !== undefined && body.delivery !== null) {
+                  scriptPayload.delivery = body.delivery as any;
+                }
+                payload = scriptPayload;
+
+                taskTitle =
+                  body.title && typeof body.title === "string" && body.title.trim()
+                    ? body.title.trim()
+                    : "Host Script Task";
+              } else {
+                if (body.prompt === undefined || body.prompt === null) {
+                  throw new ValidationError('Task prompt is required');
+                }
+                if (typeof body.prompt !== "string" || !body.prompt.trim()) {
+                  throw new ValidationError('Task prompt must be a non-empty string under 64 KiB');
+                }
+                if (Buffer.byteLength(body.prompt, "utf8") > 65536) {
+                  throw new ValidationError('Task prompt exceeds maximum limit of 64 KiB');
+                }
+                if (body.sessionId === undefined || body.sessionId === null) {
+                  throw new ValidationError('Task sessionId is required');
+                }
+                if (typeof body.sessionId !== "string" || !body.sessionId.trim()) {
+                  throw new ValidationError('Task sessionId is required');
+                }
+                const sessionId = validatePathId(body.sessionId, "sessionId");
+                const session = await platformApi.getSession(user.id, sessionId);
+                if (!session) {
+                  throw new NotFoundError(`Session "${sessionId}" not found`);
+                }
+
+                let sessionPolicy: AgentPromptSessionPolicy = "existing_session";
+                if (body.sessionPolicy !== undefined && body.sessionPolicy !== null) {
+                  if (body.sessionPolicy !== "existing_session" && body.sessionPolicy !== "isolated") {
+                    throw new ValidationError(`Invalid sessionPolicy "${String(body.sessionPolicy)}". Expected "existing_session" or "isolated"`);
+                  }
+                  sessionPolicy = body.sessionPolicy as AgentPromptSessionPolicy;
+                }
+
+                let contextMode: AgentPromptContextMode | undefined;
+                if (body.contextMode !== undefined && body.contextMode !== null) {
+                  if (body.contextMode !== "group" && body.contextMode !== "isolated") {
+                    throw new ValidationError(`Invalid contextMode "${String(body.contextMode)}". Expected "group" or "isolated"`);
+                  }
+                  contextMode = body.contextMode as AgentPromptContextMode;
+                  if (body.sessionPolicy === undefined) {
+                    sessionPolicy = contextMode === "isolated" ? "isolated" : "existing_session";
+                  } else if (
+                    (sessionPolicy === "isolated" && contextMode === "group") ||
+                    (sessionPolicy === "existing_session" && contextMode === "isolated")
+                  ) {
+                    throw new ValidationError("Conflicting sessionPolicy and contextMode specified");
+                  }
+                }
+
+                const agentPayload: any = {
+                  type: "agent_prompt" as const,
+                  prompt: body.prompt as string,
+                  sessionId,
+                  sessionPolicy,
+                  ...(contextMode ? { contextMode } : {}),
+                };
+                if (body.delivery !== undefined && body.delivery !== null) {
+                  agentPayload.delivery = body.delivery;
+                }
+                payload = agentPayload;
+
+                taskTitle = body.title as string;
               }
 
               let validatedMisfirePolicy: 'coalesce' | 'skip' | undefined;
@@ -3660,7 +3803,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
 
               const result = opsProvider
                 ? await opsProvider.createTask(user.id, {
-                    title: body.title as string,
+                    title: taskTitle,
                     dueDate: body.dueDate as string,
                     priority: body.priority as TaskPriority,
                     scheduleType: body.scheduleType as any,
@@ -3670,10 +3813,10 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                     misfirePolicy: validatedMisfirePolicy,
                     overlapPolicy: validatedOverlapPolicy,
                     idempotencyKey,
-                    payload,
+                    payload: payload as any,
                   })
                 : await operations.forTenant(user.id).tasks.createTask({
-                    title: body.title as string,
+                    title: taskTitle,
                     dueDate: body.dueDate as string,
                     priority: body.priority as TaskPriority,
                     scheduleType: body.scheduleType as any,
@@ -3685,6 +3828,26 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                     idempotencyKey,
                     payload,
                   });
+
+              if (isScriptTask && db) {
+                try {
+                  db.prepare(`
+                    INSERT INTO auth_audit_log (id, user_id, username, action, details, created_at)
+                    VALUES (?, ?, ?, 'script_task_created', ?, CURRENT_TIMESTAMP)
+                  `).run(
+                    randomUUID(),
+                    user.id,
+                    user.username ?? null,
+                    JSON.stringify({
+                      taskId: result.task.id,
+                      title: result.task.title,
+                      command: (payload as ScriptTaskPayload).command,
+                      spaceId: scriptSpaceId,
+                      scheduleType: result.task.scheduleType,
+                    })
+                  );
+                } catch (_auditErr) {}
+              }
               sendJsonResponse(res, 201, createSuccessEnvelope({
                 id: result.task.id,
                 status: result.task.status,
@@ -3717,18 +3880,93 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
 
             if (action === "" || action === "/") {
               if (method === "GET") {
-                if (!operations) {
+                if (!operations && !opsProvider) {
                   throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
                 }
                 const task = opsProvider
                   ? await opsProvider.getTask(user.id, taskId)
-                  : await operations.forTenant(user.id).tasks.getTask(taskId);
+                  : await (operations as PlatformOperationsService).forTenant(user.id).tasks.getTask(taskId);
                 if (!task) {
                   throw new NotFoundError(`Task "${taskId}" not found`);
                 }
                 sendJsonResponse(res, 200, createSuccessEnvelope(task));
                 return;
               }
+
+              if (method === "PUT") {
+                validateCsrf(req, { csrfToken });
+                if (!operations && !opsProvider) {
+                  throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
+                }
+                const body = await parseJsonBody(req, maxBodyBytes);
+                if (body !== null && typeof body === "object" && !Array.isArray(body)) {
+                  for (const key of Object.keys(body)) {
+                    if (key === "userId" || key === "user_id" || key === "owner") {
+                      throw new ValidationError("Task ownership is immutable");
+                    }
+                    if (key === "spaceId" || key === "sessionId") {
+                      throw new ValidationError("Task session and space bindings are immutable");
+                    }
+                  }
+                }
+                const existingTask = opsProvider
+                  ? await opsProvider.getTask(user.id, taskId)
+                  : await (operations as PlatformOperationsService).forTenant(user.id).tasks.getTask(taskId);
+                if (!existingTask) {
+                  throw new NotFoundError(`Task "${taskId}" not found`);
+                }
+                if (
+                  user.role !== "admin" &&
+                  ((existingTask.payload as any)?.type === "script" ||
+                    (body as any).command !== undefined ||
+                    (body as any).script_command !== undefined ||
+                    (body as any).payload?.command !== undefined)
+                ) {
+                  throw new ForbiddenError("Administrative access required to update script tasks");
+                }
+
+                const validatedInput = validateUpdateTaskInput(body);
+
+                const updated = opsProvider && opsProvider.updateTask
+                  ? await opsProvider.updateTask(user.id, taskId, validatedInput)
+                  : (operations ? await (operations as PlatformOperationsService).forTenant(user.id).tasks.updateTask(taskId, validatedInput) : null);
+
+                if (!updated) {
+                  throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
+                }
+
+                if (
+                  db &&
+                  ((updated.payload as any)?.type === "script" ||
+                    body.command !== undefined ||
+                    body.script_command !== undefined)
+                ) {
+                  try {
+                    db.prepare(`
+                      INSERT INTO auth_audit_log (id, user_id, username, action, details, created_at)
+                      VALUES (?, ?, ?, 'script_task_updated', ?, CURRENT_TIMESTAMP)
+                    `).run(
+                      randomUUID(),
+                      user.id,
+                      user.username ?? null,
+                      JSON.stringify({
+                        taskId: updated.id,
+                        title: updated.title,
+                      })
+                    );
+                  } catch (_auditErr) {}
+                }
+
+                sendJsonResponse(res, 200, createSuccessEnvelope({
+                  id: updated.id,
+                  status: updated.status,
+                  updated: true,
+                  task: updated,
+                }));
+                return;
+              }
+
+              throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
             }
 
             if (action === "/cancel") {
@@ -3787,6 +4025,19 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
               const task = await opsProvider.getTask(user.id, taskId);
               if (!task) {
                 throw new NotFoundError(`Task "${taskId}" not found`);
+              }
+              if ((task.payload as any)?.type === "script") {
+                if (user.role !== "admin") {
+                  throw new ForbiddenError("Administrative access required to execute script tasks");
+                }
+                if (db && (task.payload as any).spaceId) {
+                  const spaceRow = db
+                    .prepare("SELECT execution_mode FROM spaces WHERE id = ? AND user_id = ?")
+                    .get((task.payload as any).spaceId, user.id) as { execution_mode: string } | undefined;
+                  if (spaceRow && spaceRow.execution_mode !== "host") {
+                    throw new ValidationError("Script tasks can only be executed in host mode spaces");
+                  }
+                }
               }
               const runResult = await (taskWorker.runNow as any)({ taskId, tenantId: user.id }) ?? await (taskWorker.runNow as any)(taskId);
               const runStatus = (runResult && typeof runResult === 'object' && 'status' in runResult) ? (runResult as any).status : 'completed';

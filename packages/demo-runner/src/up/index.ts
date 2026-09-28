@@ -121,6 +121,10 @@ import {
   ensureLarkTestResources,
   getLarkTestCredentialRef,
 } from '../utils/lark-credentials.js';
+import {
+  resolveSiblingExtraReadableRoots,
+  type ResolveSiblingRootsOptions,
+} from './sibling-roots.js';
 import type {
   DemoUpOptions,
   DemoUpResult,
@@ -148,6 +152,11 @@ export interface RunningDemoSystem {
   createHostSession(userId: string, input: { spaceId: string; title?: string }): Promise<import('@enkeep/platform-core').SessionRoute>;
   close(options?: { removeVolumes?: boolean; crash?: boolean }): Promise<void>;
 }
+
+export {
+  resolveSiblingExtraReadableRoots,
+  type ResolveSiblingRootsOptions,
+};
 
 export async function upDemo(options: DemoUpOptions = {}): Promise<RunningDemoSystem> {
   return launchDemoSystem(options);
@@ -482,9 +491,21 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     options.allowHostRuntime ??
     (process.env.ENKEEP_ALLOW_HOST_RUNTIME === '1' || process.env.ENKEEP_ALLOW_HOST_RUNTIME === 'true');
 
+  const dshDeploymentConfig = loadDshDeploymentConfig();
+
+  const containerNetworkMode =
+    options.containerNetworkMode ??
+    (process.env.ENKEEP_CONTAINER_NETWORK_MODE as import('@enkeep/runtime-runner').RuntimeNetworkMode) ??
+    (process.env.DSH_CONTAINER_NETWORK_MODE as import('@enkeep/runtime-runner').RuntimeNetworkMode) ??
+    dshDeploymentConfig?.containerNetworkMode ??
+    'none';
+
   // 3. Prepare Container Adapter (No production escape hatches)
   const containerAdapter: RuntimeContainerPort =
-    options.runtimeAdapter ?? new DockerRuntimeContainerAdapter(new SafeDockerClient());
+    options.runtimeAdapter ??
+    new DockerRuntimeContainerAdapter(new SafeDockerClient(), {
+      defaultNetworkMode: containerNetworkMode,
+    });
   const hostAdapter: RuntimeContainerPort =
     options.hostRuntimeAdapter ?? new HostRuntimePortAdapter();
 
@@ -656,6 +677,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         llmEnabled: options.llmEnabled,
         llmProvider: options.llmProvider,
         llmModel: options.llmModel,
+        networkMode: containerNetworkMode,
       });
       newlyCreatedHandles.push(userHandle);
       if (userHandle.meta) {
@@ -834,6 +856,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           mode: options.mode,
           resourceSuffix: options.resourceSuffix,
           timeoutMs: options.timeoutMs ?? 15000,
+          networkMode: containerNetworkMode,
         });
 
         // Phase 2 Binding: Bind full platform proxy & events stream handlers with authoritative user UUID
@@ -980,6 +1003,15 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         }
       }
 
+      const extraReadableRoots = resolveSiblingExtraReadableRoots({
+        db: db!,
+        userId,
+        currentSpaceId: platformSpaceId,
+        currentSpaceFolder: spaceFolder,
+        isHost,
+        dataRoot: paths.dataRoot,
+      });
+
       const res = await userHandle.sendTurn({
         prompt,
         sessionId: dshSessionId,
@@ -991,6 +1023,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         mounts: spaceMountSpecs,
         extensionPlan: request.extensionPlan ?? null,
         timeoutMs,
+        extraReadableRoots,
       });
       if (typeof res.replyText !== 'string' || res.replyText.trim().length === 0) {
         throw new Error('FAIL-CLOSED: DSH runtime returned empty or invalid replyText');
@@ -2521,6 +2554,31 @@ fs.appendFileSync(p, corruptData);
       }
       return { corrupted: true };
     },
+
+    async compactSession(opts: { userId: string; dshSessionId: string; workspaceFolder?: string }) {
+      const targetUserId = opts.userId;
+      let handle = await resolveArtifactHandle(targetUserId, opts.workspaceFolder);
+      if (!handle) {
+        throw new Error('User runtime handle is unavailable');
+      }
+      if (typeof handle.compactSession === 'function') {
+        return handle.compactSession(opts.dshSessionId);
+      }
+      if (handle.rawHandle && typeof handle.rawHandle.compactSession === 'function') {
+        const res = await handle.rawHandle.compactSession(opts.dshSessionId);
+        return {
+          status: res.status ?? 'ok',
+          sessionId: opts.dshSessionId,
+          beforeTokens: (res as any).beforeTokens,
+          afterTokens: (res as any).afterTokens,
+          eventsBefore: ((res as any).eventsBefore as number) ?? 0,
+          eventsAfter: ((res as any).eventsAfter as number) ?? 0,
+          summaryChars: ((res as any).summaryChars as number) ?? 0,
+          error: res.error,
+        };
+      }
+      throw new Error('User runtime handle does not support compactSession');
+    },
   };
 
   // 8. Start Platform Server
@@ -2577,6 +2635,14 @@ fs.appendFileSync(p, corruptData);
       larkCredentialKeyFilePath: pathOptions.mode === 'test'
         ? join(paths.dataRoot, 'credentials', 'lark-vault.key')
         : join(homedir(), '.config', 'enkeep', 'keys', `${createHash('sha256').update(paths.dbPath).digest('hex').slice(0, 16)}-lark-vault.key`),
+      wechatRuntimeManager: options.wechatRuntimeManager,
+      wechatCredentialResolver: options.wechatCredentialResolver,
+      wechatTransportFactory: options.wechatTransportFactory,
+      wechatDefaultSpaceResolver: options.wechatDefaultSpaceResolver,
+      wechatMasterKey: options.wechatMasterKey,
+      wechatCredentialKeyFilePath: options.wechatCredentialKeyFilePath ?? (pathOptions.mode === 'test'
+        ? join(paths.dataRoot, 'credentials', 'lark-vault.key')
+        : join(homedir(), '.config', 'enkeep', 'keys', `${createHash('sha256').update(paths.dbPath).digest('hex').slice(0, 16)}-lark-vault.key`)),
       webhookSecurityOptions: options.webhookSecurityOptions ?? { allowTestLoopback: true, enforceHttps: false },
       spacesDir: options.spacesDir ?? paths.spacesDir,
       dshHome: options.dshHome ?? paths.dataRoot,

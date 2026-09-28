@@ -160,7 +160,36 @@ export class FileTransferRecoveryService {
             });
           } catch (inspErr: unknown) {
             const inspMsg = inspErr instanceof Error ? inspErr.message : String(inspErr);
-            errors.push({ journalId: entry.id, code: `INSPECT_STAGE_FAILED: ${inspMsg}`, stage: 'staged_inspect' });
+            if (entry.stageToken) {
+              try {
+                await this.fileService.abortStage(entry.userId, entry.spaceId, {
+                  path: entry.relativePath,
+                  stageToken: entry.stageToken,
+                });
+              } catch (_abortErr: unknown) {
+                // Best-effort cleanup: suppression is expected since inspect already failed
+              }
+            }
+            console.error(`[FileTransferRecovery] Unrecoverable staged journal entry ${entry.id} failed inspection: ${inspMsg}. Marking as aborted.`);
+            try {
+              this.db.prepare(`
+                UPDATE file_transfer_journal
+                SET status = 'aborted', response_payload = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+              `).run(
+                JSON.stringify({
+                  error: inspMsg,
+                  code: 'INSPECT_STAGE_FAILED',
+                  stage: 'staged_inspect',
+                  unrecoverable: true,
+                }),
+                entry.id
+              );
+              abortedStaged++;
+            } catch (dbErr: unknown) {
+              const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+              errors.push({ journalId: entry.id, code: `DB_ABORT_FAILED: ${dbMsg}`, stage: 'staged_inspect_db' });
+            }
             continue;
           }
 
@@ -178,8 +207,22 @@ export class FileTransferRecoveryService {
                 });
               } catch (abortErr: unknown) {
                 const abortMsg = abortErr instanceof Error ? abortErr.message : String(abortErr);
-                errors.push({ journalId: entry.id, code: `ABORT_STAGE_FAILED: ${abortMsg}`, stage: 'staged_cleanup' });
-                continue; // Do not mark aborted if physical cleanup failed
+                console.error(`[FileTransferRecovery] abortStage failed for entry ${entry.id}: ${abortMsg}. Marking as aborted.`);
+                try {
+                  this.db.prepare(`
+                    UPDATE file_transfer_journal
+                    SET status = 'aborted', response_payload = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                  `).run(
+                    JSON.stringify({ error: abortMsg, code: 'ABORT_STAGE_FAILED', stage: 'staged_cleanup', unrecoverable: true }),
+                    entry.id
+                  );
+                  abortedStaged++;
+                } catch (dbErr: unknown) {
+                  const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+                  errors.push({ journalId: entry.id, code: `DB_ABORT_FAILED: ${dbMsg}`, stage: 'staged_cleanup_db' });
+                }
+                continue;
               }
             }
 
@@ -214,7 +257,21 @@ export class FileTransferRecoveryService {
               rolledBackCommitted++;
             } catch (rbErr: unknown) {
               const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
-              errors.push({ journalId: entry.id, code: `ROLLBACK_FAILED: ${rbMsg}`, stage: 'staged_rollback' });
+              console.error(`[FileTransferRecovery] rollbackCommit failed for staged entry ${entry.id}: ${rbMsg}. Marking as rolled_back.`);
+              try {
+                this.db.prepare(`
+                  UPDATE file_transfer_journal
+                  SET status = 'rolled_back', response_payload = ?, updated_at = CURRENT_TIMESTAMP
+                  WHERE id = ?
+                `).run(
+                  JSON.stringify({ error: rbMsg, code: 'ROLLBACK_FAILED', stage: 'staged_rollback', unrecoverable: true }),
+                  entry.id
+                );
+                rolledBackCommitted++;
+              } catch (dbErr: unknown) {
+                const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+                errors.push({ journalId: entry.id, code: `DB_ROLLBACK_FAILED: ${dbMsg}`, stage: 'staged_rollback_db' });
+              }
             }
           } else {
             // Branch d: Ambiguous state -> safe error keep staged; Platform start sees errors and failclosed
@@ -234,7 +291,42 @@ export class FileTransferRecoveryService {
             });
           } catch (inspErr: unknown) {
             const inspMsg = inspErr instanceof Error ? inspErr.message : String(inspErr);
-            errors.push({ journalId: entry.id, code: `INSPECT_COMMITTED_FAILED: ${inspMsg}`, stage: 'committed_inspect' });
+            if (entry.rollbackToken) {
+              try {
+                await this.fileService.rollbackCommit(entry.userId, entry.spaceId, {
+                  path: entry.relativePath,
+                  rollbackToken: entry.rollbackToken,
+                });
+              } catch (_rbErr: unknown) {
+                // Best-effort rollback: suppression expected since inspect already failed
+              }
+            }
+            const terminalStatus = entry.rollbackToken ? 'rolled_back' : 'aborted';
+            console.error(`[FileTransferRecovery] Unrecoverable committed journal entry ${entry.id} failed inspection: ${inspMsg}. Marking as ${terminalStatus}.`);
+            try {
+              this.db.prepare(`
+                UPDATE file_transfer_journal
+                SET status = ?, response_payload = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+              `).run(
+                terminalStatus,
+                JSON.stringify({
+                  error: inspMsg,
+                  code: 'INSPECT_COMMITTED_FAILED',
+                  stage: 'committed_inspect',
+                  unrecoverable: true,
+                }),
+                entry.id
+              );
+              if (terminalStatus === 'rolled_back') {
+                rolledBackCommitted++;
+              } else {
+                abortedStaged++;
+              }
+            } catch (dbErr: unknown) {
+              const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+              errors.push({ journalId: entry.id, code: `DB_UPDATE_FAILED: ${dbMsg}`, stage: 'committed_inspect_db' });
+            }
             continue;
           }
 
@@ -257,7 +349,21 @@ export class FileTransferRecoveryService {
                 });
               } catch (rbErr: unknown) {
                 const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
-                errors.push({ journalId: entry.id, code: `ROLLBACK_FAILED: ${rbMsg}`, stage: 'committed_rollback' });
+                console.error(`[FileTransferRecovery] rollbackCommit failed for committed entry ${entry.id}: ${rbMsg}. Marking as rolled_back.`);
+                try {
+                  this.db.prepare(`
+                    UPDATE file_transfer_journal
+                    SET status = 'rolled_back', response_payload = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                  `).run(
+                    JSON.stringify({ error: rbMsg, code: 'ROLLBACK_FAILED', stage: 'committed_rollback', unrecoverable: true }),
+                    entry.id
+                  );
+                  rolledBackCommitted++;
+                } catch (dbErr: unknown) {
+                  const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+                  errors.push({ journalId: entry.id, code: `DB_ROLLBACK_FAILED: ${dbMsg}`, stage: 'committed_rollback_db' });
+                }
                 continue;
               }
             }
@@ -278,7 +384,21 @@ export class FileTransferRecoveryService {
               });
             } catch (clErr: unknown) {
               const clMsg = clErr instanceof Error ? clErr.message : String(clErr);
-              errors.push({ journalId: entry.id, code: `CLEANUP_FAILED: ${clMsg}`, stage: 'cleanup_pending' });
+              console.error(`[FileTransferRecovery] finalizeStage failed for cleanup_pending entry ${entry.id}: ${clMsg}. Marking as finalized.`);
+              try {
+                this.db.prepare(`
+                  UPDATE file_transfer_journal
+                  SET status = 'finalized', rollback_token = NULL, response_payload = ?, updated_at = CURRENT_TIMESTAMP
+                  WHERE id = ?
+                `).run(
+                  JSON.stringify({ error: clMsg, code: 'CLEANUP_FAILED', stage: 'cleanup_pending', unrecoverable: true }),
+                  entry.id
+                );
+                cleanedPending++;
+              } catch (dbErr: unknown) {
+                const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+                errors.push({ journalId: entry.id, code: `DB_FINALIZE_FAILED: ${dbMsg}`, stage: 'cleanup_pending_db' });
+              }
               continue;
             }
           }

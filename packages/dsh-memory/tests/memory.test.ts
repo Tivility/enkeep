@@ -146,10 +146,10 @@ describe('dsh-memory: Tools & Confinement', () => {
     expect(res.etag).toBeDefined();
   });
 
-  it('executes memory_write tool with append, overwrite, and OCC', async () => {
+  it('executes memory_write tool with append, overwrite, and OCC, returning lossless JSON without undefined previousEtag', async () => {
     const writeTool = createMemoryWriteTool({ dshHome, spacePath, userId: 'u1', spaceId: 's1' });
 
-    // 1. Initial write (overwrite)
+    // 1. Initial write (new file creation)
     const writeRes = (await writeTool.execute({
       path: 'notes.md',
       scope: 'global',
@@ -158,10 +158,35 @@ describe('dsh-memory: Tools & Confinement', () => {
     } as any, {} as any)) as any;
 
     expect(writeRes.success).toBe(true);
+    expect(writeRes.isNewFile).toBe(true);
     expect(writeRes.bytesWritten).toBeGreaterThan(0);
+    expect(writeRes.path).toBe('notes.md');
+    expect(writeRes.scope).toBe('global');
+    expect(writeRes.mode).toBe('overwrite');
+    expect(typeof writeRes.etag).toBe('string');
+    // Crucial G05 regression assertion: new file must omit previousEtag rather than returning undefined
+    expect('previousEtag' in writeRes).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(writeRes, 'previousEtag')).toBe(false);
+    expect(Object.keys(writeRes).sort()).toEqual([
+      'bytesWritten',
+      'etag',
+      'isNewFile',
+      'mode',
+      'path',
+      'scope',
+      'success',
+    ]);
+    // Lossless JSON roundtrip validation
+    expect(JSON.parse(JSON.stringify(writeRes))).toEqual(writeRes);
+
+    // Verify physical persistence
+    const targetFile = path.join(dshHome, 'memory', 'notes.md');
+    expect(fs.existsSync(targetFile)).toBe(true);
+    expect(fs.readFileSync(targetFile, 'utf-8')).toBe('Initial content');
+
     const initialEtag = writeRes.etag;
 
-    // 2. Append write
+    // 2. Append write (existing file update)
     const appendRes = (await writeTool.execute({
       path: 'notes.md',
       scope: 'global',
@@ -170,6 +195,11 @@ describe('dsh-memory: Tools & Confinement', () => {
     } as any, {} as any)) as any;
 
     expect(appendRes.success).toBe(true);
+    expect(appendRes.isNewFile).toBe(false);
+    expect('previousEtag' in appendRes).toBe(true);
+    expect(appendRes.previousEtag).toBe(initialEtag);
+    expect(JSON.parse(JSON.stringify(appendRes))).toEqual(appendRes);
+
     const readTool = createMemoryReadTool({ dshHome, spacePath });
     const readRes = (await readTool.execute({ path: 'notes.md', scope: 'global' } as any, {} as any)) as any;
     expect(readRes.content).toContain('Initial content');
@@ -185,6 +215,97 @@ describe('dsh-memory: Tools & Confinement', () => {
         expectedEtag: initialEtag, // outdated etag
       } as any, {} as any)
     ).rejects.toThrow(/Memory write conflict/);
+  });
+
+  it('handles optimistic concurrency with read-returned quoted ETag, rejects stale tokens, and supports backwards-compatible unquoted hash', async () => {
+    const writeTool = createMemoryWriteTool({ dshHome, spacePath });
+    const readTool = createMemoryReadTool({ dshHome, spacePath });
+
+    // Step 1: Initialize file and read its exact quoted ETag
+    await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'overwrite',
+      content: 'Version 1 content',
+    } as any, {} as any);
+
+    const read1 = (await readTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+    } as any, {} as any)) as any;
+
+    expect(read1.etag).toMatch(/^"[0-9a-f]{16}"$/);
+    const tokenV1Quoted = read1.etag;
+    const tokenV1Unquoted = read1.etag.replace(/"/g, '');
+
+    // Test 1: Write with exact quoted ETag returned by memory_read succeeds
+    const write2 = (await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'overwrite',
+      content: 'Version 2 content',
+      expectedEtag: tokenV1Quoted,
+    } as any, {} as any)) as any;
+
+    expect(write2.success).toBe(true);
+    expect(write2.previousEtag).toBe(tokenV1Quoted);
+    const tokenV2Quoted = write2.etag;
+
+    // Test 2: Stale tokens, mismatched tokens, and unsupported tokens are rejected with conflict
+    await expect(
+      writeTool.execute({
+        path: 'concurrency.md',
+        scope: 'global',
+        mode: 'overwrite',
+        content: 'Version 3 stale overwrite',
+        expectedEtag: tokenV1Quoted, // stale v1 token
+      } as any, {} as any)
+    ).rejects.toThrow(/Memory write conflict: expectedEtag .* does not match current etag/);
+
+    await expect(
+      writeTool.execute({
+        path: 'concurrency.md',
+        scope: 'global',
+        mode: 'overwrite',
+        content: 'Version 3 invalid token',
+        expectedEtag: 'invalid-random-etag',
+      } as any, {} as any)
+    ).rejects.toThrow(/Memory write conflict: expectedEtag .* does not match current etag/);
+
+    await expect(
+      writeTool.execute({
+        path: 'concurrency.md',
+        scope: 'global',
+        mode: 'overwrite',
+        content: 'Version 3 wildcard token',
+        expectedEtag: '*',
+      } as any, {} as any)
+    ).rejects.toThrow(/Memory write conflict: expectedEtag .* does not match current etag/);
+
+    // Test 3: Unquoted hash and weak ETag variants are supported for backward compatibility
+    const tokenV2Unquoted = tokenV2Quoted.replace(/"/g, '');
+    const write3 = (await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'overwrite',
+      content: 'Version 3 content',
+      expectedEtag: tokenV2Unquoted, // unquoted 16-char hash
+    } as any, {} as any)) as any;
+
+    expect(write3.success).toBe(true);
+    expect(write3.previousEtag).toBe(tokenV2Quoted);
+
+    // Weak ETag syntax W/"..."
+    const tokenV3Quoted = write3.etag;
+    const write4 = (await writeTool.execute({
+      path: 'concurrency.md',
+      scope: 'global',
+      mode: 'append',
+      content: '\nVersion 4 appended',
+      expectedEtag: `W/${tokenV3Quoted}`,
+    } as any, {} as any)) as any;
+
+    expect(write4.success).toBe(true);
   });
 
   it('executes memory_search tool and finds keyword matches', async () => {

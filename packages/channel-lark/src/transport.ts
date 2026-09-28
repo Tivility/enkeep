@@ -10,6 +10,8 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import {
   REAL_LARK_CREDENTIAL_ACCEPTANCE,
   REAL_LARK_CREDENTIAL_SKIP_REASON,
+  type CardFinalMetadata,
+  type CardToolStatusEntry,
   type LarkAccountConfig,
   type LarkCredentialResolver,
   type LarkEventHandler,
@@ -21,7 +23,12 @@ import {
   type ILarkApiClient,
   type ILarkWSClient,
 } from './types.js';
-import { optimizeMarkdownStyle, chunkMarkdown } from './markdown-card.js';
+import {
+  optimizeMarkdownStyle,
+  chunkMarkdown,
+  markdownToCardElements,
+  type LarkCardBodyElement,
+} from './markdown-card.js';
 
 export const SAFE_RESOURCE_ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
 export const MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-image cap
@@ -224,13 +231,273 @@ export interface FakeRemovedReactionRecord {
 }
 
 export interface FakeStreamingCallRecord {
-  readonly type: 'card_create' | 'push' | 'finalize';
+  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'finalize';
   readonly cardId?: string;
   readonly messageId?: string;
   readonly content?: string;
-  readonly status?: 'completed' | 'failed';
+  readonly toolStatus?: string | readonly CardToolStatusEntry[];
+  readonly thinkingText?: string;
+  readonly status?: 'completed' | 'failed' | 'stopped';
+  readonly metadata?: CardFinalMetadata;
+  readonly card?: any;
   readonly params?: any;
   readonly timestamp: string;
+}
+
+/**
+ * Format tool status entries into Lark Schema 2.0 markdown content.
+ * Displays tool name and short status, e.g. 🔨 web_search: 正在执行… / ✅ web_search: 已完成.
+ */
+export function formatToolStatusMarkdown(
+  toolStatus?: string | readonly CardToolStatusEntry[]
+): string | null {
+  if (!toolStatus) return null;
+  if (typeof toolStatus === 'string') {
+    const trimmed = toolStatus.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (!Array.isArray(toolStatus) || toolStatus.length === 0) {
+    return null;
+  }
+
+  return toolStatus
+    .map((entry) => {
+      const isSubagent = entry.toolName === 'subagent';
+      if (entry.status === 'started' || entry.status === 'running') {
+        const icon = isSubagent ? '🤖' : '🔨';
+        return `${icon} **${entry.toolName}**: 正在执行…`;
+      } else if (entry.status === 'completed') {
+        const icon = isSubagent ? '🤖' : '✅';
+        return `${icon} **${entry.toolName}**: 已完成`;
+      } else if (entry.status === 'failed') {
+        return `❌ **${entry.toolName}**: 执行失败`;
+      }
+      return `• **${entry.toolName}**: ${entry.status}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Build Schema 2.0 collapsible_panel element.
+ * Header uses valid enum colors: "wathet-50", "blue-50", "grey", etc.
+ */
+export function buildCollapsibleStatusPanel(opts: {
+  content: string;
+  expanded?: boolean;
+  elementId?: string;
+  contentElementId?: string;
+  title?: string;
+  backgroundColor?: string;
+}): Record<string, unknown> {
+  const panel: Record<string, unknown> = {
+    tag: 'collapsible_panel',
+    expanded: opts.expanded ?? false,
+    header: {
+      title: {
+        tag: 'markdown',
+        content: opts.title ?? '**🔧 执行过程**',
+      },
+      background_color: opts.backgroundColor ?? 'wathet-50',
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: opts.content,
+        ...(opts.contentElementId ? { element_id: opts.contentElementId } : {}),
+      },
+    ],
+  };
+
+  if (opts.elementId) {
+    panel.element_id = opts.elementId;
+  }
+
+  return panel;
+}
+
+/**
+ * Build Schema 2.0 collapsible_panel element for model thinking / reasoning.
+ * Header uses "blue-50" (matching HappyClaw PANEL_TINT.thinking) or custom background_color.
+ * Title defaults to "**💭 思考过程**".
+ */
+export function buildCollapsibleThinkingPanel(opts: {
+  content: string;
+  expanded?: boolean;
+  elementId?: string;
+  contentElementId?: string;
+  title?: string;
+  backgroundColor?: string;
+}): Record<string, unknown> {
+  const panel: Record<string, unknown> = {
+    tag: 'collapsible_panel',
+    expanded: opts.expanded ?? false,
+    header: {
+      title: {
+        tag: 'markdown',
+        content: opts.title ?? '**💭 思考过程**',
+      },
+      background_color: opts.backgroundColor ?? 'blue-50',
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: opts.content,
+        ...(opts.contentElementId ? { element_id: opts.contentElementId } : {}),
+      },
+    ],
+  };
+
+  if (opts.elementId) {
+    panel.element_id = opts.elementId;
+  }
+
+  return panel;
+}
+
+export const THINKING_MAX_CONTENT_LENGTH = 3800;
+export const THINKING_TRUNCATION_NOTICE = '... (思考过程超长，已截断展示)\n\n';
+
+/**
+ * Guard thinking text to safe maximum length (default 3800 characters) for Feishu CardKit.
+ * When text exceeds maxLength, truncates and prepends a notice.
+ */
+export function applyThinkingLengthGuard(
+  text: string,
+  maxLength: number = THINKING_MAX_CONTENT_LENGTH,
+  notice: string = THINKING_TRUNCATION_NOTICE
+): string {
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+  if (notice.length >= maxLength) {
+    return text.slice(text.length - maxLength);
+  }
+  const allowed = maxLength - notice.length;
+  return notice + text.slice(text.length - allowed);
+}
+
+/**
+ * Format reasoning content during streaming (HappyClaw style).
+ * Wraps text into blockquote or summarized form with safe length cap.
+ */
+export function formatThinkingContent(text: string, maxLength: number = 2000): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "<font color='grey'>正在思考…</font>";
+  const sliced = trimmed.length > maxLength ? '…' + trimmed.slice(-(maxLength - 1)) : trimmed;
+  return sliced
+    .split('\n')
+    .map((l) => (l.trim() ? `> ${l}` : '>'))
+    .join('\n');
+}
+
+/**
+ * Strip <think>...</think> tags from text so that card body contains only the final answer.
+ */
+export function stripThinkingTags(text: string): string {
+  if (!text || !text.includes('<think>')) return text;
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/gi, '')
+    .trim();
+}
+
+/**
+ * Extract reasoning from inline <think> tags if present in text.
+ */
+export function extractThinkingFromText(text: string): { text: string; thinking?: string } {
+  if (!text || !text.includes('<think>')) return { text };
+  const thinkMatches: string[] = [];
+  let cleaned = text.replace(/<think>([\s\S]*?)<\/think>/gi, (_, p1) => {
+    if (p1.trim()) thinkMatches.push(p1.trim());
+    return '';
+  });
+  cleaned = cleaned.replace(/<think>([\s\S]*)$/gi, (_, p1) => {
+    if (p1.trim()) thinkMatches.push(p1.trim());
+    return '';
+  });
+  const thinking = thinkMatches.length > 0 ? thinkMatches.join('\n\n') : undefined;
+  return {
+    text: cleaned.trim(),
+    thinking,
+  };
+}
+
+/**
+ * Build Schema 2.0 stop reply danger button element.
+ * Statically strips in final cards to prevent post-completion clicks.
+ */
+export function buildStopReplyButton(turnId?: string, sessionId?: string): Record<string, unknown> {
+  return {
+    tag: 'button',
+    element_id: 'stop_reply_button',
+    text: {
+      tag: 'plain_text',
+      content: '⏹ 停止回复',
+    },
+    type: 'danger',
+    value: {
+      action: 'stop_reply',
+      ...(turnId ? { turnId } : {}),
+      ...(sessionId ? { sessionId } : {}),
+    },
+  };
+}
+
+/**
+ * Format compact usage footer metadata for final Lark cards.
+ * Template: <font color='grey'>🤖 ${model} · ⏱ ${duration}s · 💡 ${promptTokens}+${completionTokens} tokens · 💰 $${cost}</font>
+ * Gracefully degrades when fields are missing; returns null if no valid fields exist.
+ */
+export function formatCardUsageFooter(metadata?: CardFinalMetadata): string | null {
+  if (!metadata) return null;
+
+  const parts: string[] = [];
+
+  // 1. Model
+  if (typeof metadata.model === 'string' && metadata.model.trim().length > 0) {
+    parts.push(`🤖 ${metadata.model.trim()}`);
+  }
+
+  // 2. Elapsed time / duration
+  let durationSec: number | undefined;
+  if (typeof metadata.durationSeconds === 'number' && Number.isFinite(metadata.durationSeconds) && metadata.durationSeconds >= 0) {
+    durationSec = metadata.durationSeconds;
+  } else if (typeof metadata.durationMs === 'number' && Number.isFinite(metadata.durationMs) && metadata.durationMs >= 0) {
+    durationSec = metadata.durationMs / 1000;
+  }
+  if (durationSec !== undefined) {
+    const rounded = Math.round(durationSec * 10) / 10;
+    parts.push(`⏱ ${rounded}s`);
+  }
+
+  // 3. Tokens (prompt + completion or total)
+  const hasPrompt = typeof metadata.promptTokens === 'number' && Number.isFinite(metadata.promptTokens) && metadata.promptTokens > 0;
+  const hasCompletion = typeof metadata.completionTokens === 'number' && Number.isFinite(metadata.completionTokens) && metadata.completionTokens > 0;
+  const hasTotal = typeof metadata.totalTokens === 'number' && Number.isFinite(metadata.totalTokens) && metadata.totalTokens > 0;
+
+  if (hasPrompt && hasCompletion) {
+    parts.push(`💡 ${metadata.promptTokens}+${metadata.completionTokens} tokens`);
+  } else if (hasTotal) {
+    parts.push(`💡 ${metadata.totalTokens} tokens`);
+  } else if (hasPrompt) {
+    parts.push(`💡 ${metadata.promptTokens} tokens`);
+  } else if (hasCompletion) {
+    parts.push(`💡 ${metadata.completionTokens} tokens`);
+  }
+
+  // 4. Cost (only if available from existing turn metadata; no fabricated numbers)
+  if (typeof metadata.cost === 'number' && Number.isFinite(metadata.cost) && metadata.cost > 0) {
+    const formattedCost = Number.isInteger(metadata.cost)
+      ? String(metadata.cost)
+      : String(Number(metadata.cost.toFixed(4)));
+    parts.push(`💰 $${formattedCost}`);
+  }
+
+  if (parts.length === 0) {
+    return null;
+  }
+
+  return `<font color='grey'>${parts.join(' · ')}</font>`;
 }
 
 export class FakeLarkTransport implements LarkTransport {
@@ -289,12 +556,13 @@ export class FakeLarkTransport implements LarkTransport {
     this.handlers.delete(handler);
   }
 
-  async simulateInboundEvent(event: LarkRawEvent): Promise<void> {
+  async simulateInboundEvent(event: LarkRawEvent): Promise<any> {
     if (!this._connected) {
       throw new Error('FakeLarkTransport is disconnected; cannot receive inbound events');
     }
     const promises = Array.from(this.handlers).map((h) => h(event));
-    await Promise.all(promises);
+    const results = await Promise.all(promises);
+    return results.find((r) => r && typeof r === 'object') ?? results[0];
   }
 
   async addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }> {
@@ -442,6 +710,13 @@ export class FakeLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    withStatusPanel?: boolean;
+    collapsibleToolStatus?: boolean;
+    withThinkingPanel?: boolean;
+    collapsibleThinking?: boolean;
+    withStopButton?: boolean;
+    turnId?: string;
+    sessionId?: string;
   }): Promise<LarkStreamingCardSession | null> {
     if (!this._connected || !this.streamingCardsEnabled || this.failStreamingCard) {
       console.warn('[lark-stream] createStreamingCard returned null', {
@@ -454,37 +729,233 @@ export class FakeLarkTransport implements LarkTransport {
 
     const cardId = `crd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const messageId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
+    const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+    const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
+
+    const initialElements: Array<Record<string, unknown>> = [];
+    if (withThinking) {
+      initialElements.push(
+        buildCollapsibleThinkingPanel({
+          content: '正在思考…',
+          expanded: true,
+          elementId: 'thinking_panel',
+          contentElementId: 'thinking_content',
+          title: '**💭 思考过程**',
+          backgroundColor: 'blue-50',
+        })
+      );
+    }
+    if (withStatus) {
+      initialElements.push(
+        buildCollapsibleStatusPanel({
+          content: '正在准备…',
+          expanded: true,
+          elementId: 'tool_status_panel',
+          contentElementId: 'tool_status_content',
+          title: '**🔧 执行过程**',
+          backgroundColor: 'wathet-50',
+        })
+      );
+    }
+    initialElements.push({
+      tag: 'markdown',
+      element_id: 'main_content',
+      content: '正在思考…',
+    });
+    if (withStop) {
+      initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
+    }
+
+    const initialCard = {
+      schema: '2.0',
+      config: {
+        update_multi: true,
+        streaming_mode: true,
+      },
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: params.title ?? 'Enkeep',
+        },
+        template: 'blue',
+      },
+      body: {
+        direction: 'vertical',
+        elements: initialElements,
+      },
+    };
 
     this._streamingCalls.push({
       type: 'card_create',
       cardId,
       messageId,
       params,
+      card: initialCard,
       timestamp: new Date().toISOString(),
     });
 
     const session: LarkStreamingCardSession = {
       cardId,
       messageId,
-      pushText: async (accumulatedText: string): Promise<void> => {
+      pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void> => {
         this._streamingCalls.push({
           type: 'push',
           cardId,
           messageId,
           content: accumulatedText,
+          toolStatus,
+          thinkingText,
           timestamp: new Date().toISOString(),
         });
       },
-      finalize: async (finalText: string, status: 'completed' | 'failed'): Promise<void> => {
+      pushToolStatus: async (statusText: string): Promise<void> => {
+        this._streamingCalls.push({
+          type: 'push_status',
+          cardId,
+          messageId,
+          content: statusText,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      pushThinking: async (thinkingText: string): Promise<void> => {
+        this._streamingCalls.push({
+          type: 'push_thinking',
+          cardId,
+          messageId,
+          content: thinkingText,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      finalize: async (
+        finalText: string,
+        status: 'completed' | 'failed' | 'stopped',
+        metadata?: CardFinalMetadata,
+        toolStatus?: string | readonly CardToolStatusEntry[],
+        thinkingText?: string
+      ): Promise<void> => {
         if (this.finalizeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, this.finalizeDelayMs));
         }
+
+        let cleanFinalText = finalText;
+        let cleanThinking = thinkingText?.trim();
+        if (cleanFinalText && cleanFinalText.includes('<think>')) {
+          const extracted = extractThinkingFromText(cleanFinalText);
+          cleanFinalText = extracted.text;
+          if (!cleanThinking && extracted.thinking) {
+            cleanThinking = extracted.thinking;
+          }
+        }
+
+        const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
+        let hasProcessArea = false;
+
+        // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
+        if (cleanThinking) {
+          const guardedThinking = applyThinkingLengthGuard(cleanThinking);
+          bodyElements.push(
+            buildCollapsibleThinkingPanel({
+              content: guardedThinking,
+              expanded: false, // collapsed on completion
+              title: '**💭 思考过程**',
+              backgroundColor: 'blue-50',
+            })
+          );
+          hasProcessArea = true;
+        }
+
+        // 2. Process panel (tool status panel)
+        const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
+        if (formattedToolStatus) {
+          bodyElements.push(
+            buildCollapsibleStatusPanel({
+              content: formattedToolStatus,
+              expanded: false, // collapsed on completion
+              title: '**🔧 执行过程**',
+              backgroundColor: 'wathet-50',
+            })
+          );
+          hasProcessArea = true;
+        } else if (withStatus) {
+          bodyElements.push(
+            buildCollapsibleStatusPanel({
+              content: '暂无工具调用',
+              expanded: false,
+              title: '**🔧 执行过程**',
+              backgroundColor: 'wathet-50',
+            })
+          );
+          hasProcessArea = true;
+        }
+
+        if (hasProcessArea) {
+          bodyElements.push({ tag: 'hr' });
+        }
+
+        const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
+        const contentElements = markdownToCardElements(cleanFinalText, {
+          maxChunkLen: 4000,
+          emptyFallback,
+        });
+        if (contentElements.length === 0) {
+          bodyElements.push({
+            tag: 'markdown',
+            content: emptyFallback,
+          });
+        } else {
+          for (const el of contentElements) {
+            bodyElements.push(el);
+          }
+        }
+
+        const footer = formatCardUsageFooter(metadata);
+        if (footer) {
+          bodyElements.push({
+            tag: 'markdown',
+            text_size: 'notation',
+            content: footer,
+          });
+        }
+
+        const card = {
+          schema: '2.0',
+          header:
+            status === 'completed'
+              ? {
+                  title: { tag: 'plain_text', content: params.title ?? '已完成' },
+                  template: 'violet',
+                }
+              : status === 'stopped'
+                ? {
+                    title: {
+                      tag: 'plain_text',
+                      content: params.title ? `${params.title} (已中止)` : '已中止',
+                    },
+                    template: 'orange',
+                  }
+                : {
+                    title: {
+                      tag: 'plain_text',
+                      content: params.title ? `${params.title} (处理失败)` : '处理失败',
+                    },
+                    template: 'red',
+                  },
+          body: {
+            direction: 'vertical',
+            elements: bodyElements,
+          },
+        };
+
         this._streamingCalls.push({
           type: 'finalize',
           cardId,
           messageId,
           content: finalText,
           status,
+          metadata,
+          toolStatus,
+          card,
           timestamp: new Date().toISOString(),
         });
       },
@@ -664,6 +1135,27 @@ export class CredentialedLarkTransport implements LarkTransport {
         };
         const promises = Array.from(this.handlers).map((h) => h(rawEvent));
         await Promise.all(promises);
+      },
+      'card.action.trigger': async (data: any) => {
+        const rawEvent: LarkRawEvent = {
+          header: data.header ?? {
+            event_id: data.event_id ?? (data.context?.open_message_id ? `act_${data.context.open_message_id}_${Date.now()}` : undefined),
+            event_type: 'card.action.trigger',
+            create_time: data.create_time,
+            token: data.token,
+            app_id: data.app_id,
+            tenant_key: data.tenant_key,
+          },
+          action: data.action,
+          operator: data.operator,
+          context: data.context,
+          open_message_id: data.open_message_id ?? data.context?.open_message_id,
+          open_chat_id: data.open_chat_id ?? data.context?.open_chat_id,
+          open_id: data.operator?.open_id ?? data.open_id,
+        };
+        const results = await Promise.all(Array.from(this.handlers).map((h) => h(rawEvent)));
+        const resWithToast = results.find((r) => r && typeof r === 'object' && ('toast' in r || 'card' in r));
+        return resWithToast ?? {};
       },
     });
 
@@ -1121,6 +1613,13 @@ export class CredentialedLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    withStatusPanel?: boolean;
+    collapsibleToolStatus?: boolean;
+    withThinkingPanel?: boolean;
+    collapsibleThinking?: boolean;
+    withStopButton?: boolean;
+    turnId?: string;
+    sessionId?: string;
   }): Promise<LarkStreamingCardSession | null> {
     if (!this.apiClient) {
       this.logger.warn('[lark-stream] createStreamingCard failed: no apiClient');
@@ -1132,6 +1631,43 @@ export class CredentialedLarkTransport implements LarkTransport {
       if (typeof cardCreateFn !== 'function') {
         this.logger.warn('[lark-stream] createStreamingCard failed: cardkit.v1.card.create is not a function');
         return null;
+      }
+
+      const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
+      const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+      const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
+      const initialElements: Array<Record<string, unknown>> = [];
+      if (withThinking) {
+        initialElements.push(
+          buildCollapsibleThinkingPanel({
+            content: '正在思考…',
+            expanded: true,
+            elementId: 'thinking_panel',
+            contentElementId: 'thinking_content',
+            title: '**💭 思考过程**',
+            backgroundColor: 'blue-50',
+          })
+        );
+      }
+      if (withStatus) {
+        initialElements.push(
+          buildCollapsibleStatusPanel({
+            content: '正在准备…',
+            expanded: true,
+            elementId: 'tool_status_panel',
+            contentElementId: 'tool_status_content',
+            title: '**🔧 执行过程**',
+            backgroundColor: 'wathet-50',
+          })
+        );
+      }
+      initialElements.push({
+        tag: 'markdown',
+        element_id: 'main_content',
+        content: '正在思考…',
+      });
+      if (withStop) {
+        initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
       }
 
       // 1. Build schema 2.0 card JSON
@@ -1150,13 +1686,7 @@ export class CredentialedLarkTransport implements LarkTransport {
         },
         body: {
           direction: 'vertical',
-          elements: [
-            {
-              tag: 'markdown',
-              element_id: 'main_content',
-              content: '正在思考…',
-            },
-          ],
+          elements: initialElements,
         },
       };
 
@@ -1292,7 +1822,7 @@ export class CredentialedLarkTransport implements LarkTransport {
       const session: LarkStreamingCardSession = {
         cardId,
         messageId: boundMessageId,
-        pushText: async (accumulatedText: string): Promise<void> => {
+        pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void> => {
           try {
             const contentFn = client.cardkit?.v1?.cardElement?.content;
             if (typeof contentFn !== 'function') return;
@@ -1384,6 +1914,34 @@ export class CredentialedLarkTransport implements LarkTransport {
                 },
               });
             }
+
+            if (toolStatus) {
+              seq += 1;
+              await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: 'tool_status_content',
+                },
+                data: {
+                  content: toolStatus,
+                  sequence: seq,
+                },
+              });
+            }
+
+            if (thinkingText) {
+              seq += 1;
+              await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: 'thinking_content',
+                },
+                data: {
+                  content: thinkingText,
+                  sequence: seq,
+                },
+              });
+            }
           } catch (err) {
             logger.warn('[lark-stream] pushText error', {
               code: (err as any)?.code,
@@ -1391,7 +1949,59 @@ export class CredentialedLarkTransport implements LarkTransport {
             });
           }
         },
-        finalize: async (finalText: string, status: 'completed' | 'failed'): Promise<void> => {
+        pushToolStatus: async (statusText: string): Promise<void> => {
+          try {
+            const contentFn = client.cardkit?.v1?.cardElement?.content;
+            if (typeof contentFn !== 'function') return;
+
+            seq += 1;
+            await contentFn({
+              path: {
+                card_id: cardId,
+                element_id: 'tool_status_content',
+              },
+              data: {
+                content: statusText,
+                sequence: seq,
+              },
+            });
+          } catch (err) {
+            logger.warn('[lark-stream] pushToolStatus error', {
+              code: (err as any)?.code,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        },
+        pushThinking: async (thinkingText: string): Promise<void> => {
+          try {
+            const contentFn = client.cardkit?.v1?.cardElement?.content;
+            if (typeof contentFn !== 'function') return;
+
+            seq += 1;
+            await contentFn({
+              path: {
+                card_id: cardId,
+                element_id: 'thinking_content',
+              },
+              data: {
+                content: thinkingText,
+                sequence: seq,
+              },
+            });
+          } catch (err) {
+            logger.warn('[lark-stream] pushThinking error', {
+              code: (err as any)?.code,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        },
+        finalize: async (
+          finalText: string,
+          status: 'completed' | 'failed' | 'stopped',
+          metadata?: CardFinalMetadata,
+          toolStatus?: string | readonly CardToolStatusEntry[],
+          thinkingText?: string
+        ): Promise<void> => {
           // Close streaming mode via card.settings (swallow errors)
           try {
             const settingsFn = client.cardkit?.v1?.card?.settings;
@@ -1412,26 +2022,110 @@ export class CredentialedLarkTransport implements LarkTransport {
             });
           }
 
+          let cleanFinalText = finalText;
+          let cleanThinking = thinkingText?.trim();
+          if (cleanFinalText && cleanFinalText.includes('<think>')) {
+            const extracted = extractThinkingFromText(cleanFinalText);
+            cleanFinalText = extracted.text;
+            if (!cleanThinking && extracted.thinking) {
+              cleanThinking = extracted.thinking;
+            }
+          }
+
           // Build final card JSON
-          const optimized = optimizeMarkdownStyle(finalText);
-          const chunks = chunkMarkdown(optimized, 4000);
-          const bodyElements =
-            chunks.length === 0 || (chunks.length === 1 && chunks[0].trim() === '')
-              ? [{ tag: 'markdown', content: '(空回复)' }]
-              : chunks.map((c) => ({ tag: 'markdown', content: c }));
+          const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
+          let hasProcessArea = false;
+
+          // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
+          if (cleanThinking) {
+            const guardedThinking = applyThinkingLengthGuard(cleanThinking);
+            bodyElements.push(
+              buildCollapsibleThinkingPanel({
+                content: guardedThinking,
+                expanded: false, // collapsed on completion
+                title: '**💭 思考过程**',
+                backgroundColor: 'blue-50',
+              })
+            );
+            hasProcessArea = true;
+          }
+
+          // 2. Process panel (tool status panel)
+          const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
+          if (formattedToolStatus) {
+            bodyElements.push(
+              buildCollapsibleStatusPanel({
+                content: formattedToolStatus,
+                expanded: false, // collapsed on completion
+                title: '**🔧 执行过程**',
+                backgroundColor: 'wathet-50',
+              })
+            );
+            hasProcessArea = true;
+          } else if (withStatus) {
+            bodyElements.push(
+              buildCollapsibleStatusPanel({
+                content: '暂无工具调用',
+                expanded: false,
+                title: '**🔧 执行过程**',
+                backgroundColor: 'wathet-50',
+              })
+            );
+            hasProcessArea = true;
+          }
+
+          if (hasProcessArea) {
+            bodyElements.push({ tag: 'hr' });
+          }
+
+          const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
+          const contentElements = markdownToCardElements(cleanFinalText, {
+            maxChunkLen: 4000,
+            emptyFallback,
+          });
+          if (contentElements.length === 0) {
+            bodyElements.push({
+              tag: 'markdown',
+              content: emptyFallback,
+            });
+          } else {
+            for (const el of contentElements) {
+              bodyElements.push(el);
+            }
+          }
+
+          const footer = formatCardUsageFooter(metadata);
+          if (footer) {
+            bodyElements.push({
+              tag: 'markdown',
+              text_size: 'notation',
+              content: footer,
+            });
+          }
 
           const finalCard = {
             schema: '2.0',
             header:
               status === 'completed'
                 ? {
-                    title: { tag: 'plain_text', content: params.title ?? 'Enkeep' },
-                    template: 'green',
+                    title: { tag: 'plain_text', content: params.title ?? '已完成' },
+                    template: 'violet',
                   }
-                : {
-                    title: { tag: 'plain_text', content: '处理失败' },
-                    template: 'red',
-                  },
+                : status === 'stopped'
+                  ? {
+                      title: {
+                        tag: 'plain_text',
+                        content: params.title ? `${params.title} (已中止)` : '已中止',
+                      },
+                      template: 'orange',
+                    }
+                  : {
+                      title: {
+                        tag: 'plain_text',
+                        content: params.title ? `${params.title} (处理失败)` : '处理失败',
+                      },
+                      template: 'red',
+                    },
             body: {
               direction: 'vertical',
               elements: bodyElements,

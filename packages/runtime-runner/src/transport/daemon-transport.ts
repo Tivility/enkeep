@@ -71,6 +71,8 @@ import {
   type AnswerApprovalResponse,
   type ListApprovalsRequest,
   type ListApprovalsResponse,
+  type CompactSessionRequest,
+  type CompactSessionResponse,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
@@ -92,6 +94,16 @@ import {
   RUNTIME_ERROR_CODES,
   RuntimeProtocolError,
   DEFAULT_FOLLOWUP_TIMEOUT_MS,
+  HC_DEFAULT_EXECUTION_BUDGET_MS,
+  HC_DEFAULT_IDLE_TIMEOUT_MS,
+  calculateTurnBudgets,
+  clearWaiterTimers,
+  pauseWaiterIdleTimer,
+  refreshWaiterIdleTimer,
+  extractVerifiedApprovalAsked,
+  extractVerifiedApprovalDecided,
+  isGenuineTurnProgress,
+  type TurnWatchdogWaiter,
 } from './types.js';
 
 export const MAX_CONCURRENT_DAEMON_REQUESTS = 32;
@@ -105,6 +117,10 @@ export interface DaemonDockerTransportOptions {
   initialBackoffMs?: number;
   maxBackoffMs?: number;
   autoReconnect?: boolean;
+  /** Optional default idle timeout in ms for followup turns */
+  defaultIdleTimeoutMs?: number;
+  /** Optional default execution budget hardcap in ms for followup turns */
+  defaultExecutionBudgetMs?: number;
 }
 
 export type DaemonTransportState =
@@ -124,14 +140,7 @@ interface PendingRpc {
   createdAt: number;
 }
 
-interface TurnWaiter {
-  turnId: string;
-  sessionId: string;
-  resolve: (res: AgentFollowupResponse) => void;
-  reject: (err: Error) => void;
-  timer?: NodeJS.Timeout;
-  createdAt: number;
-}
+type TurnWaiter = TurnWatchdogWaiter;
 
 export class DaemonDockerTransport extends EventEmitter implements RuntimeTransport, RuntimeDaemonTransportPort {
   readonly mode = 'exec' as const;
@@ -175,7 +184,27 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       initialBackoffMs: options.initialBackoffMs ?? 200,
       maxBackoffMs: options.maxBackoffMs ?? 5000,
       autoReconnect: options.autoReconnect ?? true,
-    };
+      defaultIdleTimeoutMs: options.defaultIdleTimeoutMs,
+      defaultExecutionBudgetMs: options.defaultExecutionBudgetMs,
+    } as Required<DaemonDockerTransportOptions>;
+  }
+
+  private clearWaiterTimers(waiter: TurnWaiter): void {
+    clearWaiterTimers(waiter);
+  }
+
+  private refreshWaiterIdleTimer(waiter: TurnWaiter): void {
+    refreshWaiterIdleTimer(waiter, () => {
+      const activeWaiter = this.turnWaiters.get(waiter.turnId);
+      if (!activeWaiter) return;
+      this.turnWaiters.delete(waiter.turnId);
+      this.clearWaiterTimers(activeWaiter);
+      const reason = `Followup turn execution timed out after ${waiter.idleTimeoutMs}ms (idle activity deadline expired without progress)`;
+      this.cancelTurn(waiter.turnId, reason).catch(() => {});
+      activeWaiter.reject(
+        new RuntimeProtocolError(RUNTIME_ERROR_CODES.FOLLOWUP_FAILED)
+      );
+    });
   }
 
   public getState(): DaemonTransportState {
@@ -286,13 +315,34 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       this.emit('stream', event);
       this.emit(event.event, event);
 
+      // Refresh idle activity deadline or pause during approval waiting
+      const progressTurnId = 'turnId' in event && typeof event.turnId === 'string' ? event.turnId : undefined;
+      if (progressTurnId && this.turnWaiters.has(progressTurnId)) {
+        const waiter = this.turnWaiters.get(progressTurnId)!;
+        const asked = extractVerifiedApprovalAsked(event);
+        if (asked) {
+          waiter.pendingApprovals.add(asked.approvalId);
+          pauseWaiterIdleTimer(waiter);
+        } else {
+          const decided = extractVerifiedApprovalDecided(event);
+          if (decided) {
+            waiter.pendingApprovals.delete(decided.decisionId);
+            if (waiter.pendingApprovals.size === 0) {
+              this.refreshWaiterIdleTimer(waiter);
+            }
+          } else if (isGenuineTurnProgress(event)) {
+            this.refreshWaiterIdleTimer(waiter);
+          }
+        }
+      }
+
       // Correlation for turn completion / cancellation / failure
       if (event.event === DAEMON_STREAM_EVENTS.TURN_COMPLETED) {
         const turnId = event.turnId;
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
           waiter.resolve(event.result);
         }
       } else if (event.event === DAEMON_STREAM_EVENTS.TURN_CANCELLED) {
@@ -300,7 +350,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
           waiter.resolve({
             status: 'cancelled',
             turnId,
@@ -314,7 +364,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
           const errCode = (event.error?.code as DaemonErrorCode) || DAEMON_ERROR_CODES.AGENT_EXECUTION_FAILED;
           const errMsg = event.error?.message || 'Turn execution failed in daemon';
           waiter.reject(new DaemonProtocolError(errCode, errMsg, (event.error as any)?.details));
@@ -411,7 +461,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       }
 
       for (const [turnId, waiter] of this.turnWaiters.entries()) {
-        if (waiter.timer) clearTimeout(waiter.timer);
+        this.clearWaiterTimers(waiter);
         waiter.reject(fatalErr);
         this.turnWaiters.delete(turnId);
       }
@@ -451,11 +501,11 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
         if (inspectRes.ok) {
           if (inspectRes.journalStatus === 'completed' && inspectRes.result) {
             this.turnWaiters.delete(turnId);
-            if (waiter.timer) clearTimeout(waiter.timer);
+            this.clearWaiterTimers(waiter);
             waiter.resolve(inspectRes.result);
           } else if (inspectRes.journalStatus === 'cancelled') {
             this.turnWaiters.delete(turnId);
-            if (waiter.timer) clearTimeout(waiter.timer);
+            this.clearWaiterTimers(waiter);
             waiter.resolve({
               status: 'cancelled',
               turnId,
@@ -465,7 +515,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
             });
           } else if (inspectRes.journalStatus === 'failed') {
             this.turnWaiters.delete(turnId);
-            if (waiter.timer) clearTimeout(waiter.timer);
+            this.clearWaiterTimers(waiter);
             const errCode = (inspectRes.error?.code as DaemonErrorCode) || DAEMON_ERROR_CODES.AGENT_EXECUTION_FAILED;
             waiter.reject(new DaemonProtocolError(errCode, 'Turn failed during previous run'));
           }
@@ -537,7 +587,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
    */
   public async submitTurnAndWait(
     request: SubmitTurnRequest,
-    timeoutMs: number = DEFAULT_FOLLOWUP_TIMEOUT_MS
+    timeoutMs?: number
   ): Promise<AgentFollowupResponse> {
     const { turnId, sessionId } = request;
 
@@ -545,23 +595,58 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       await this.start();
     }
 
+    // 1. Determine execution budget (hard cap) & idle timeout via unified helper
+    const { rawBudgetMs, clientWaitTimeoutMs, idleTimeoutMs } = calculateTurnBudgets(
+      {
+        timeoutMs: timeoutMs ?? request.timeoutMs,
+        idleTimeoutMs: request.idleTimeoutMs,
+        maxExecutionBudgetMs: request.maxExecutionBudgetMs,
+      },
+      this.options
+    );
+
     const completionPromise = new Promise<AgentFollowupResponse>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      // 1. Overall hard cap timer: never resets, overall cap always wins
+      const hardCapTimer = setTimeout(() => {
+        const waiter = this.turnWaiters.get(turnId);
+        if (!waiter) return;
         this.turnWaiters.delete(turnId);
+        this.clearWaiterTimers(waiter);
         // Actively cancel the exact timed-out turn in the daemon to prevent orphaned execution
-        this.cancelTurn(turnId, `Followup turn execution timed out after ${timeoutMs}ms`).catch(() => {});
+        const reason = `Followup turn execution timed out after ${rawBudgetMs}ms (overall execution budget hard cap exceeded)`;
+        this.cancelTurn(turnId, reason).catch(() => {});
         reject(
           new RuntimeProtocolError(RUNTIME_ERROR_CODES.FOLLOWUP_FAILED)
         );
-      }, timeoutMs);
+      }, clientWaitTimeoutMs);
+
+      // 2. Idle activity timer: refreshed on genuine progress frames, paused during approvals
+      const idleTimer = setTimeout(() => {
+        const waiter = this.turnWaiters.get(turnId);
+        if (!waiter) return;
+        this.turnWaiters.delete(turnId);
+        this.clearWaiterTimers(waiter);
+        const reason = `Followup turn execution timed out after ${idleTimeoutMs}ms (idle activity deadline expired without progress)`;
+        this.cancelTurn(turnId, reason).catch(() => {});
+        reject(
+          new RuntimeProtocolError(RUNTIME_ERROR_CODES.FOLLOWUP_FAILED)
+        );
+      }, idleTimeoutMs);
 
       this.turnWaiters.set(turnId, {
         turnId,
         sessionId,
         resolve,
         reject,
-        timer,
+        timer: hardCapTimer,
+        hardCapTimer,
+        idleTimer,
         createdAt: Date.now(),
+        lastActivityAt: Date.now(),
+        idleTimeoutMs,
+        rawTimeoutMs: rawBudgetMs,
+        clientWaitTimeoutMs,
+        pendingApprovals: new Set<string>(),
       });
     });
     // Suppress unhandled rejection on completionPromise if submission itself fails earlier
@@ -586,14 +671,14 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
     try {
       const submitRes = await this.request<SubmitTurnRequest, SubmitTurnResponse>(
         effRequest,
-        Math.min(timeoutMs, 10_000)
+        Math.min(rawBudgetMs, 10_000)
       );
 
       if (!submitRes.ok) {
         const waiter = this.turnWaiters.get(turnId);
         if (waiter) {
           this.turnWaiters.delete(turnId);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          this.clearWaiterTimers(waiter);
         }
         const errCode = (submitRes.error?.code as DaemonErrorCode) || DAEMON_ERROR_CODES.INTERNAL_ERROR;
         throw new DaemonProtocolError(errCode, 'Failed to submit turn to daemon');
@@ -604,7 +689,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       const waiter = this.turnWaiters.get(turnId);
       if (waiter) {
         this.turnWaiters.delete(turnId);
-        if (waiter.timer) clearTimeout(waiter.timer);
+        this.clearWaiterTimers(waiter);
       }
       throw err;
     }
@@ -628,10 +713,13 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       modelSelection: request.modelSelection,
       replyReference: request.replyReference ?? null,
       timeoutMs: request.timeoutMs,
+      idleTimeoutMs: request.idleTimeoutMs,
+      maxExecutionBudgetMs: request.maxExecutionBudgetMs,
       mounts: request.mounts,
       extensionPlan: request.extensionPlan ?? null,
+      extraReadableRoots: request.extraReadableRoots,
     };
-    return this.submitTurnAndWait(submitReq, request.timeoutMs ?? DEFAULT_FOLLOWUP_TIMEOUT_MS);
+    return this.submitTurnAndWait(submitReq, request.timeoutMs);
   }
 
   public async checkHealth(): Promise<RuntimeHealthStatus> {
@@ -809,6 +897,14 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
     });
   }
 
+  public async compactSession(sessionId: string): Promise<CompactSessionResponse> {
+    return this.request<CompactSessionRequest, CompactSessionResponse>({
+      id: `req_${crypto.randomUUID()}`,
+      op: DAEMON_OPS.COMPACT_SESSION,
+      sessionId,
+    });
+  }
+
   /**
    * Cleanly closes the transport and terminates the bridge process.
    */
@@ -834,7 +930,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
     }
 
     for (const [turnId, waiter] of this.turnWaiters.entries()) {
-      if (waiter.timer) clearTimeout(waiter.timer);
+      this.clearWaiterTimers(waiter);
       waiter.reject(new DaemonProtocolError(DAEMON_ERROR_CODES.SHUTTING_DOWN, 'Transport closed'));
       this.turnWaiters.delete(turnId);
     }

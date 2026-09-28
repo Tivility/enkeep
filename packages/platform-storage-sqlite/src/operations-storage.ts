@@ -9,6 +9,7 @@ import type {
 import {
   CoreAuthAuditLogAdapter,
   StandardPathPolicyValidator,
+  computeNextRun,
 } from '@enkeep/platform-operations';
 import { SqliteAuthAuditLogRepository } from './repos/audit-repo.js';
 import { SqliteTenantScopedDeliveryReceiptRepository } from './repos/delivery-receipt-repo.js';
@@ -71,16 +72,119 @@ export class SqlitePlatformOperationsStorage implements PlatformOperationsStorag
       let expiredReservationsCount = 0;
 
       // 1. Recover expired tasks across all tenants with atomic CAS
-      const taskStmt = this.db.prepare(`
-        SELECT id, user_id, claim_count, max_retries
-        FROM platform_tasks
-        WHERE (status = 'claimed' OR status = 'running')
-          AND lease_expires_at <= ?
-      `);
-      const expiredTasks = taskStmt.all(currentTime) as { id: string; user_id: string; claim_count: number; max_retries: number }[];
+      let hasTaskSchedules = false;
+      try {
+        this.db.prepare('SELECT schedule_type FROM platform_tasks LIMIT 0').all();
+        hasTaskSchedules = true;
+      } catch {
+        hasTaskSchedules = false;
+      }
+
+      const taskQuery = hasTaskSchedules
+        ? `
+          SELECT t.id, t.user_id, t.claim_count, t.max_retries,
+                 t.schedule_type, t.cron_expression, t.interval_seconds, t.next_run_at, t.timezone,
+                 s.schedule_type as s_schedule_type, s.cron_expression as s_cron_expression,
+                 s.interval_seconds as s_interval_seconds, s.next_run_at as s_next_run_at,
+                 s.timezone as s_timezone, s.enabled as s_enabled, s.paused_at as s_paused_at
+          FROM platform_tasks t
+          LEFT JOIN task_schedules s ON t.id = s.task_id
+          WHERE (t.status = 'claimed' OR t.status = 'running')
+            AND t.lease_expires_at <= ?
+        `
+        : `
+          SELECT t.id, t.user_id, t.claim_count, t.max_retries,
+                 NULL as schedule_type, NULL as cron_expression, NULL as interval_seconds, NULL as next_run_at, NULL as timezone,
+                 NULL as s_schedule_type, NULL as s_cron_expression,
+                 NULL as s_interval_seconds, NULL as s_next_run_at,
+                 NULL as s_timezone, NULL as s_enabled, NULL as s_paused_at
+          FROM platform_tasks t
+          WHERE (t.status = 'claimed' OR t.status = 'running')
+            AND t.lease_expires_at <= ?
+        `;
+
+      const taskStmt = this.db.prepare(taskQuery);
+      const expiredTasks = taskStmt.all(currentTime) as any[];
 
       for (const t of expiredTasks) {
-        if (t.claim_count >= t.max_retries) {
+        const schedType = (t.s_schedule_type as string) || (t.schedule_type as string) || 'once';
+        const cronExpr = t.s_cron_expression || t.cron_expression;
+        const intervalSec = t.s_interval_seconds ?? t.interval_seconds;
+        const isRecurring =
+          schedType === 'cron' ||
+          schedType === 'interval' ||
+          Boolean(cronExpr) ||
+          (intervalSec !== null && intervalSec !== undefined && intervalSec > 0);
+
+        if (isRecurring) {
+          // Recurring tasks must NEVER end in terminal 'failed' status after lease expiry/restart!
+          // Keep task schedulable: reset claim_count to 0, compute next_run, return to pending
+          let nextRun = t.s_next_run_at || t.next_run_at;
+          if (!nextRun || new Date(nextRun).getTime() <= new Date(currentTime).getTime()) {
+            nextRun = computeNextRun(
+              {
+                scheduleType: (schedType === 'cron' || schedType === 'interval') ? schedType : (cronExpr ? 'cron' : 'interval'),
+                cronExpression: cronExpr,
+                intervalSeconds: intervalSec,
+                enabled: t.s_enabled !== null && t.s_enabled !== undefined ? t.s_enabled !== 0 : true,
+                pausedAt: t.s_paused_at,
+                timezone: t.s_timezone || t.timezone || 'UTC',
+              },
+              new Date(currentTime)
+            );
+          }
+
+          if (hasTaskSchedules) {
+            const res = this.db.prepare(`
+              UPDATE platform_tasks
+              SET status = 'pending',
+                  claimant_id = NULL,
+                  lease_expires_at = NULL,
+                  claim_count = 0,
+                  completed_at = NULL,
+                  error = 'Task lease expired during restart recovery',
+                  next_run_at = ?,
+                  updated_at = ?
+              WHERE id = ?
+                AND user_id = ?
+                AND (status = 'claimed' OR status = 'running')
+                AND lease_expires_at <= ?
+            `).run(nextRun, currentTime, t.id, t.user_id, currentTime);
+
+            if (res.changes > 0) {
+              recoveredTasksCount += Number(res.changes);
+              try {
+                this.db.prepare(`
+                  UPDATE task_schedules
+                  SET next_run_at = ?,
+                      updated_at = ?
+                  WHERE task_id = ? AND user_id = ?
+                `).run(nextRun, currentTime, t.id, t.user_id);
+              } catch {
+                // Ignore if error updating schedule
+              }
+            }
+          } else {
+            const res = this.db.prepare(`
+              UPDATE platform_tasks
+              SET status = 'pending',
+                  claimant_id = NULL,
+                  lease_expires_at = NULL,
+                  claim_count = 0,
+                  completed_at = NULL,
+                  error = 'Task lease expired during restart recovery',
+                  updated_at = ?
+              WHERE id = ?
+                AND user_id = ?
+                AND (status = 'claimed' OR status = 'running')
+                AND lease_expires_at <= ?
+            `).run(currentTime, t.id, t.user_id, currentTime);
+
+            if (res.changes > 0) {
+              recoveredTasksCount += Number(res.changes);
+            }
+          }
+        } else if (t.claim_count >= t.max_retries) {
           const res = this.db.prepare(`
             UPDATE platform_tasks
             SET status = 'failed',

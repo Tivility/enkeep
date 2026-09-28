@@ -488,6 +488,55 @@ describe('AgentPromptDeliveryDispatcher', () => {
         /\[SPACE_MISMATCH\]/i
       );
     });
+
+    it('accepts legacy bare-UUID spaceId when matching target route spaceId and rejects path-like spaceId', async () => {
+      const legacySpaceId = '123e4567-e89b-12d3-a456-426614174000';
+      const legacySessionId = 'ses_33333333333333333333333333333333';
+
+      await storage.forTenant(tenantAlice).spaces.create({
+        id: legacySpaceId,
+        name: 'Legacy Alice Space',
+        folder: 'space-legacy123',
+        executionMode: 'container',
+      });
+
+      await storage.forTenant(tenantAlice).sessionRoutes.create({
+        id: legacySessionId,
+        spaceId: legacySpaceId,
+        channel: 'web',
+        accountId: 'web-demo',
+        nativeContextId: legacySessionId,
+        peerId: 'alice_legacy_peer',
+        dshSessionId: 'ses_44444444444444444444444444444444',
+        executionMode: 'container',
+      });
+
+      const ctx = createDispatchContext({
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Legacy space prompt',
+          sessionId: legacySessionId,
+          spaceId: legacySpaceId,
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const result = await dispatcher.dispatch(ctx);
+      expect(result).toBeDefined();
+      expect(result.status).toBe('completed');
+
+      // Invalid path-like spaceId in payload is rejected
+      const invalidCtx = createDispatchContext({
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Invalid space prompt',
+          sessionId: legacySessionId,
+          spaceId: '../escape',
+          sessionPolicy: 'existing_session',
+        },
+      });
+      await expect(dispatcher.dispatch(invalidCtx)).rejects.toThrow(ValidationError);
+    });
   });
 
   describe('3. Authoritative Envelope Context & No Metadata Leakage', () => {

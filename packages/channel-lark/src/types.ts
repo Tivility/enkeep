@@ -58,13 +58,52 @@ export interface LarkRawEventHeader {
 export interface LarkRawEvent {
   header?: LarkRawEventHeader;
   event?: {
-    sender: LarkEventSender;
-    message: LarkEventMessage;
+    sender?: LarkEventSender;
+    message?: LarkEventMessage;
+    operator?: any;
+    action?: any;
+    context?: any;
   };
   // Flat format compatibility for test payloads
   sender?: LarkEventSender;
   message?: LarkEventMessage;
   uuid?: string;
+  action?: any;
+  operator?: any;
+  context?: any;
+  open_message_id?: string;
+  open_chat_id?: string;
+  open_id?: string;
+}
+
+export interface LarkCardActionTriggerEvent {
+  action?: {
+    value?: Record<string, any>;
+    tag?: string;
+    option?: string;
+  };
+  operator?: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+  };
+  context?: {
+    open_message_id?: string;
+    open_chat_id?: string;
+  };
+}
+
+export interface LarkParsedCardAction {
+  readonly eventType: 'card.action.trigger';
+  readonly actionType: string;
+  readonly actionValue: Record<string, any>;
+  readonly turnId?: string;
+  readonly sessionId?: string;
+  readonly messageId: string;
+  readonly chatId?: string;
+  readonly operatorId: string;
+  readonly operatorUserId?: string;
+  readonly operatorUnionId?: string;
 }
 
 export interface LarkMention {
@@ -126,13 +165,30 @@ export interface OutboundReplyPayload {
 
 export interface StreamAssistantEvent {
   rowId: number;
-  type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status';
+  type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status' | 'reasoning_delta' | 'thinking';
   delta?: string;
   streamId?: string;
   status?: string;
   toolName?: string;
   turnId?: string;
   originTurnId?: string;
+}
+
+export interface CardToolStatusEntry {
+  readonly toolName: string;
+  readonly status: 'started' | 'running' | 'completed' | 'failed';
+  readonly timestamp?: string;
+  readonly detail?: string;
+}
+
+export interface CardFinalMetadata {
+  readonly model?: string;
+  readonly durationSeconds?: number;
+  readonly durationMs?: number;
+  readonly promptTokens?: number;
+  readonly completionTokens?: number;
+  readonly totalTokens?: number;
+  readonly cost?: number;
 }
 
 export interface StreamEventSource {
@@ -148,6 +204,10 @@ export interface StreamEventSource {
   ): Promise<'queued' | 'running' | 'completed' | 'failed' | 'unknown'>;
   hasPendingPlatformTurn?(sessionRouteId: string): Promise<boolean>;
   resolveTurnOrigin?(turnId: string): Promise<ChannelTurnOrigin | null>;
+  getTurnMetrics?(
+    sessionRouteId: string,
+    turnId: string
+  ): Promise<CardFinalMetadata | null>;
 }
 
 export interface OutboundReplyResult {
@@ -159,11 +219,19 @@ export interface OutboundReplyResult {
 export interface LarkStreamingCardSession {
   readonly cardId: string;
   readonly messageId: string;
-  pushText(accumulatedText: string): Promise<void>;
-  finalize(finalText: string, status: 'completed' | 'failed'): Promise<void>;
+  pushText(accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void>;
+  pushToolStatus?(statusText: string): Promise<void>;
+  pushThinking?(thinkingText: string): Promise<void>;
+  finalize(
+    finalText: string,
+    status: 'completed' | 'failed' | 'stopped',
+    metadata?: CardFinalMetadata,
+    toolStatus?: string | readonly CardToolStatusEntry[],
+    thinkingText?: string
+  ): Promise<void>;
 }
 
-export type LarkEventHandler = (event: LarkRawEvent) => Promise<void>;
+export type LarkEventHandler = (event: LarkRawEvent) => Promise<any>;
 
 export interface LarkTransport {
   readonly connected: boolean;
@@ -186,6 +254,15 @@ export interface LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    withStatusPanel?: boolean;
+    collapsibleToolStatus?: boolean;
+    withThinkingPanel?: boolean;
+    collapsibleThinking?: boolean;
+    withStopButton?: boolean;
+    turnId?: string;
+    sessionId?: string;
+    enableCot?: boolean;
+    cotEnabled?: boolean;
   }): Promise<LarkStreamingCardSession | null>;
   addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;

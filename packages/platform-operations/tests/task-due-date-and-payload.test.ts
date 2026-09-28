@@ -9,6 +9,8 @@ import {
   generateTaskId,
   validateTaskId,
   validateCanonicalDueDate,
+  validateSpaceId,
+  SPACE_ID_REGEX,
 } from '../src/types/task.js';
 import {
   validateMisfirePolicy,
@@ -242,7 +244,35 @@ describe('Task Payload Contract (agent_prompt) & Due Date Hardening', () => {
       expect(task.payload?.spaceId).toBe(validSpaceId);
     });
 
-    it('requires type to be strictly "agent_prompt", sessionPolicy to be "existing_session", and prompt to be non-empty', () => {
+    it('accepts legacy bare-UUID spaceId in task payload and validateSpaceId while rejecting invalid path-like IDs', async () => {
+      const legacySpaceId = '123e4567-e89b-12d3-a456-426614174000';
+      const ops = service.forTenant('user_1');
+
+      const { task } = await ops.tasks.createTask({
+        title: 'Task with Legacy Space',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute with legacy spaceId',
+          sessionId: validSessionId,
+          sessionPolicy: 'existing_session',
+          spaceId: legacySpaceId,
+        },
+      });
+
+      expect(task.id).toBeDefined();
+      expect(task.payload?.spaceId).toBe(legacySpaceId);
+      expect(validateSpaceId(legacySpaceId)).toBe(legacySpaceId);
+      expect(SPACE_ID_REGEX.test(legacySpaceId)).toBe(true);
+
+      // Rejects invalid path-like IDs
+      const invalidPathIds = ['../escape', '/root', 'workspace-1', 'default', '', '   ', ` ${legacySpaceId} `, 'invalid!'];
+      for (const invalid of invalidPathIds) {
+        expect(SPACE_ID_REGEX.test(invalid)).toBe(false);
+        expect(() => validateSpaceId(invalid)).toThrow(ValidationError);
+      }
+    });
+
+    it('requires type to be strictly "agent_prompt", validates sessionPolicy with default "existing_session", and requires prompt to be non-empty', () => {
       // Missing type
       expect(() =>
         validateAgentPromptPayload({
@@ -281,21 +311,71 @@ describe('Task Payload Contract (agent_prompt) & Due Date Hardening', () => {
         })
       ).toThrow(ValidationError);
 
-      // Missing or wrong sessionPolicy
+      // Omitted sessionPolicy defaults to existing_session
+      const defaultPolicyPayload = validateAgentPromptPayload({
+        type: 'agent_prompt',
+        prompt: 'Do something',
+        sessionId: validSessionId,
+      });
+      expect(defaultPolicyPayload.sessionPolicy).toBe('existing_session');
+
+      // sessionPolicy: 'isolated' is valid
+      const isolatedPayload = validateAgentPromptPayload({
+        type: 'agent_prompt',
+        prompt: 'Do something isolated',
+        sessionId: validSessionId,
+        sessionPolicy: 'isolated',
+      });
+      expect(isolatedPayload.sessionPolicy).toBe('isolated');
+
+      // contextMode: 'isolated' maps to sessionPolicy: 'isolated'
+      const contextIsolatedPayload = validateAgentPromptPayload({
+        type: 'agent_prompt',
+        prompt: 'Do something context isolated',
+        sessionId: validSessionId,
+        contextMode: 'isolated',
+      });
+      expect(contextIsolatedPayload.sessionPolicy).toBe('isolated');
+      expect(contextIsolatedPayload.contextMode).toBe('isolated');
+
+      // contextMode: 'group' maps to sessionPolicy: 'existing_session'
+      const contextGroupPayload = validateAgentPromptPayload({
+        type: 'agent_prompt',
+        prompt: 'Do something group',
+        sessionId: validSessionId,
+        contextMode: 'group',
+      });
+      expect(contextGroupPayload.sessionPolicy).toBe('existing_session');
+      expect(contextGroupPayload.contextMode).toBe('group');
+
+      // Conflicting sessionPolicy and contextMode is rejected
       expect(() =>
         validateAgentPromptPayload({
           type: 'agent_prompt',
-          prompt: 'Do something',
+          prompt: 'Conflicting policies',
           sessionId: validSessionId,
+          sessionPolicy: 'isolated',
+          contextMode: 'group',
         })
       ).toThrow(ValidationError);
 
+      // Invalid sessionPolicy is rejected
       expect(() =>
         validateAgentPromptPayload({
           type: 'agent_prompt',
           prompt: 'Do something',
           sessionId: validSessionId,
           sessionPolicy: 'new_session' as any,
+        })
+      ).toThrow(ValidationError);
+
+      // Invalid contextMode is rejected
+      expect(() =>
+        validateAgentPromptPayload({
+          type: 'agent_prompt',
+          prompt: 'Do something',
+          sessionId: validSessionId,
+          contextMode: 'invalid_mode' as any,
         })
       ).toThrow(ValidationError);
     });

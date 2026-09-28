@@ -77,6 +77,9 @@ export class ChannelRuntimeManager {
     idempotencyKey: string;
     executionResult: { replyText: string };
     tokenUsage: { tokens: number };
+    executionMode?: 'runtime' | 'command';
+    taskId?: string;
+    scheduled?: boolean;
   }) => Promise<void> | void;
   private turnFailedListener?: (event: {
     userId: string;
@@ -325,6 +328,8 @@ export class ChannelRuntimeManager {
     executionResult: { replyText: string };
     tokenUsage: { tokens: number };
     executionMode?: 'runtime' | 'command';
+    taskId?: string;
+    scheduled?: boolean;
   }): Promise<void> {
     if (!this.isRunning || this.isDisposing) return;
 
@@ -375,59 +380,214 @@ export class ChannelRuntimeManager {
       accountId = route.accountId;
     }
 
-    if (!accountId || !nativeEventId) {
-      // Not an inbound Lark message turn (e.g. manual Web message in same session); do NOT send to Lark
-      return;
-    }
-
-    // 3. Query the exact, durable inbox item for this native event (never use 'latest' by context!)
-    const inboxItem = await tenant.channels.findInboxByEvent(accountId, nativeEventId);
-    if (!inboxItem) {
-      // No corresponding inbox record; ignore
-      return;
-    }
-
-    let replyToMessageId: string | undefined;
-    let rootId: string | undefined;
-    let threadId: string | undefined;
-    let chatId: string | undefined;
-
-    try {
-      const parsedPayload = JSON.parse(inboxItem.payloadJson);
-      const parsed = parsedPayload.parsed;
-      if (parsed) {
-        replyToMessageId = parsed.messageId;
-        chatId = parsed.chatId;
-        rootId = parsed.rootId;
-        threadId = parsed.threadId || parsed.rootId;
+    // 2. Inbound Lark event path (nativeEventId present)
+    if (accountId && nativeEventId) {
+      // 3. Query the exact, durable inbox item for this native event (never use 'latest' by context!)
+      const inboxItem = await tenant.channels.findInboxByEvent(accountId, nativeEventId);
+      if (!inboxItem) {
+        // No corresponding inbox record; ignore
+        return;
       }
-    } catch {}
 
-    // 4. Ensure gateway is active
-    let gateway = this.getActiveGateway(userId, accountId);
-    if (!gateway) {
-      gateway = (await this.syncAccount(userId, accountId)) ?? undefined;
-    }
+      let replyToMessageId: string | undefined;
+      let rootId: string | undefined;
+      let threadId: string | undefined;
+      let chatId: string | undefined;
 
-    if (!gateway) {
-      // Account disabled or no transport; cannot deliver
+      try {
+        const parsedPayload = JSON.parse(inboxItem.payloadJson);
+        const parsed = parsedPayload.parsed;
+        if (parsed) {
+          replyToMessageId = parsed.messageId;
+          chatId = parsed.chatId;
+          rootId = parsed.rootId;
+          threadId = parsed.threadId || parsed.rootId;
+        }
+      } catch {}
+
+      // 4. Ensure gateway is active
+      let gateway = this.getActiveGateway(userId, accountId);
+      if (!gateway) {
+        gateway = (await this.syncAccount(userId, accountId)) ?? undefined;
+      }
+
+      if (!gateway) {
+        // Account disabled or no transport; cannot deliver
+        return;
+      }
+
+      // 5. Delegate to gateway to create structured outbox item and deliver
+      await gateway.handleTurnCompleted({
+        sessionId,
+        turnId,
+        replyText: executionResult.replyText,
+        idempotencyKey: idempotencyKey || `idem_lark_${accountId}_${nativeEventId}`,
+        nativeContextId: route?.nativeContextId || '',
+        replyToMessageId,
+        rootId,
+        threadId,
+        chatId,
+        nativeEventId,
+        executionMode: event.executionMode,
+      });
       return;
     }
 
-    // 5. Delegate to gateway to create structured outbox item and deliver
-    await gateway.handleTurnCompleted({
-      sessionId,
-      turnId,
-      replyText: executionResult.replyText,
-      idempotencyKey: idempotencyKey || `idem_lark_${accountId}_${nativeEventId}`,
-      nativeContextId: route?.nativeContextId || '',
-      replyToMessageId,
-      rootId,
-      threadId,
-      chatId,
-      nativeEventId,
-      executionMode: event.executionMode,
-    });
+    // 3. Proactive scheduled deliveries / task-originated turns (no nativeEventId)
+    let taskInfo: {
+      taskId: string;
+      title?: string;
+      payload?: any;
+    } | undefined;
+
+    if (event.taskId || (event as any).scheduled) {
+      taskInfo = {
+        taskId: event.taskId || 'scheduled_task',
+      };
+    }
+
+    if (this.db) {
+      try {
+        const taskRow = this.db.prepare(`
+          SELECT tr.task_id, pt.title, pt.payload
+          FROM task_runs tr
+          JOIN platform_tasks pt ON pt.id = tr.task_id
+          WHERE (tr.turn_id = ? OR tr.delivery_id = ?) AND tr.user_id = ?
+          LIMIT 1
+        `).get(turnId, event.deliveryId || turnId, userId) as {
+          task_id: string;
+          title?: string;
+          payload?: string;
+        } | undefined;
+
+        if (taskRow) {
+          let parsedPayload: any;
+          if (taskRow.payload) {
+            try {
+              parsedPayload = JSON.parse(taskRow.payload);
+            } catch {}
+          }
+          taskInfo = {
+            taskId: taskRow.task_id,
+            title: taskRow.title,
+            payload: parsedPayload,
+          };
+        }
+      } catch {}
+    }
+
+    if (!taskInfo && this.db && event.taskId) {
+      try {
+        const ptRow = this.db.prepare(
+          'SELECT id, title, payload FROM platform_tasks WHERE id = ? AND user_id = ? LIMIT 1'
+        ).get(event.taskId, userId) as { id: string; title?: string; payload?: string } | undefined;
+        if (ptRow) {
+          let parsedPayload: any;
+          if (ptRow.payload) {
+            try {
+              parsedPayload = JSON.parse(ptRow.payload);
+            } catch {}
+          }
+          taskInfo = {
+            taskId: ptRow.id,
+            title: ptRow.title,
+            payload: parsedPayload,
+          };
+        }
+      } catch {}
+    }
+
+    // Not a task-originated turn (e.g. manual Web message in session); keep web-origin non-forwarding
+    if (!taskInfo) {
+      return;
+    }
+
+    // Silent tasks must not deliver outbound
+    if (taskInfo.payload && taskInfo.payload.silent === true) {
+      return;
+    }
+
+    // Resolve target channel account and chat ID for proactive delivery
+    let targetAccountId: string | undefined;
+    let targetChatId: string | undefined;
+
+    if (taskInfo.payload?.delivery) {
+      const delivery = taskInfo.payload.delivery;
+      if (delivery.channel === 'lark') {
+        targetAccountId = delivery.accountId;
+        targetChatId = delivery.nativeContextId;
+      }
+    }
+
+    if (!targetAccountId && route && route.channel === 'lark' && route.accountId) {
+      targetAccountId = route.accountId;
+      targetChatId = route.nativeContextId;
+    }
+
+    if (!targetAccountId && accountId) {
+      targetAccountId = accountId;
+      if (!targetChatId && route?.nativeContextId) {
+        targetChatId = route.nativeContextId;
+      }
+    }
+
+    const effectiveSpaceId = event.spaceId || route?.spaceId;
+    if ((!targetAccountId || !targetChatId) && this.db && effectiveSpaceId) {
+      try {
+        const binding = this.db.prepare(`
+          SELECT cb.account_id, cb.native_context_id
+          FROM channel_bindings cb
+          JOIN channel_accounts ca ON ca.id = cb.account_id
+          WHERE cb.space_id = ? AND cb.user_id = ? AND ca.type = 'lark' AND ca.status = 'active'
+          LIMIT 1
+        `).get(effectiveSpaceId, userId) as { account_id: string; native_context_id: string } | undefined;
+        if (binding) {
+          targetAccountId = targetAccountId || binding.account_id;
+          targetChatId = targetChatId || binding.native_context_id;
+        }
+      } catch {}
+    }
+
+    if (targetChatId && targetChatId.includes(':')) {
+      targetChatId = targetChatId.split(':')[0];
+    }
+
+    if (!targetAccountId || !targetChatId) {
+      return;
+    }
+
+    let proactiveGateway = this.getActiveGateway(userId, targetAccountId);
+    if (!proactiveGateway) {
+      proactiveGateway = (await this.syncAccount(userId, targetAccountId)) ?? undefined;
+    }
+    if (!proactiveGateway) {
+      return;
+    }
+
+    const outboxId = `out_task_${turnId}`;
+    if (this.db) {
+      try {
+        const existingOutbox = this.db.prepare(`
+          SELECT id, status FROM channel_outbox
+          WHERE session_id = ? AND account_id = ?
+            AND (id = ? OR json_extract(payload_json, '$.turnId') = ?)
+          LIMIT 1
+        `).get(sessionId, targetAccountId, outboxId, turnId) as { id: string; status: string } | undefined;
+        if (existingOutbox && (existingOutbox.status === 'delivered' || existingOutbox.status === 'sending')) {
+          return;
+        }
+      } catch {}
+    }
+
+    if (typeof proactiveGateway.sendProactiveMessage === 'function') {
+      await proactiveGateway.sendProactiveMessage({
+        chatId: targetChatId,
+        text: executionResult.replyText,
+        title: taskInfo.title,
+        sessionId,
+        outboxId,
+      });
+    }
   }
 
   /**
@@ -445,6 +605,7 @@ export class ChannelRuntimeManager {
     reason: string;
   }): Promise<void> {
     if (!this.isRunning || this.isDisposing) return;
+    if (event.code === 'TURN_TIMEOUT') return;
 
     const { userId, sessionId, turnId, idempotencyKey, code, reason } = event;
     const tenant = this.storage.forTenant(userId);
@@ -589,9 +750,75 @@ export class ChannelRuntimeManager {
           tokenUsage: { tokens: 0 },
         });
       }
+
+      // Reconcile un-outboxed task-originated scheduled deliveries
+      try {
+        const unOutboxedTaskRows = this.db.prepare(`
+          SELECT wm.id as message_id, wm.session_id, wm.user_id, wm.turn_id, wm.content as reply_text,
+                 sr.space_id, tr.task_id
+          FROM web_messages wm
+          JOIN session_routes sr ON sr.id = wm.session_id
+          JOIN task_runs tr ON tr.turn_id = wm.turn_id AND tr.user_id = wm.user_id
+          LEFT JOIN channel_outbox co ON co.session_id = wm.session_id
+               AND (co.id = 'out_task_' || wm.turn_id OR json_extract(co.payload_json, '$.turnId') = wm.turn_id)
+          WHERE wm.role = 'assistant' AND wm.status = 'delivered'
+            AND wm.created_at < datetime('now', '-15 seconds')
+            AND co.id IS NULL
+        `).all() as Array<{
+          message_id: string;
+          session_id: string;
+          user_id: string;
+          turn_id: string;
+          reply_text: string;
+          space_id: string;
+          task_id: string;
+        }>;
+
+        for (const row of unOutboxedTaskRows) {
+          if (!this.isRunning || this.isDisposing) break;
+          await this.handleTurnCompleted({
+            userId: row.user_id,
+            sessionId: row.session_id,
+            spaceId: row.space_id,
+            turnId: row.turn_id,
+            deliveryId: '',
+            idempotencyKey: '',
+            executionResult: { replyText: row.reply_text },
+            tokenUsage: { tokens: 0 },
+            taskId: row.task_id,
+            scheduled: true,
+          });
+        }
+      } catch {}
     } catch {
       // Ignore scan query errors if tables not ready
     }
+  }
+
+  /**
+   * Proactively sends a message to a Lark chat via an active account gateway.
+   */
+  async sendProactiveMessage(params: {
+    userId: string;
+    accountId: string;
+    chatId: string;
+    text: string;
+    title?: string;
+    sessionId?: string;
+    outboxId?: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const { userId, accountId } = params;
+    let gateway = this.getActiveGateway(userId, accountId);
+    if (!gateway) {
+      gateway = (await this.syncAccount(userId, accountId)) ?? undefined;
+    }
+    if (!gateway) {
+      throw new Error(`Lark account "${accountId}" not active or gateway unavailable for user "${userId}"`);
+    }
+    if (typeof gateway.sendProactiveMessage === 'function') {
+      return gateway.sendProactiveMessage(params);
+    }
+    throw new Error('Active Lark gateway does not support sendProactiveMessage');
   }
 
   /**

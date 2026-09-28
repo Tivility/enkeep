@@ -151,6 +151,8 @@
   /* Layout Dimensions (180px Nav + 260px Workspace Sidebar) */
   --topbar-height: 54px;
   --nav-width: 180px;
+  --space-rail-width: 220px;
+  --space-rail-collapsed-width: 56px;
   --workspace-sidebar-width: 260px;
   --chat-max-width: 860px;
   --max-content-width: 1200px;
@@ -1020,6 +1022,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 1rem;
   padding: 0 1.25rem;
   z-index: 20;
   flex-shrink: 0;
@@ -1030,6 +1033,7 @@ body {
   align-items: center;
   gap: 1.25rem;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .brand-badge {
@@ -1090,6 +1094,89 @@ body {
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
   font-size: 0.825rem;
+}
+
+/* Topbar Navigation & User Dropdown */
+.nav-topbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.nav-topbar-btn.active {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.user-menu-container {
+  position: relative;
+}
+
+.user-menu-trigger {
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+  transition: all var(--transition-fast);
+}
+
+.user-menu-trigger:hover {
+  background: var(--bg-card);
+  border-color: var(--border-hover);
+}
+
+.dropdown-caret {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.user-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  min-width: 160px;
+  padding: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 100;
+}
+
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.825rem;
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+  font-family: inherit;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.dropdown-item:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.btn-logout-item {
+  color: var(--danger);
+}
+
+.btn-logout-item:hover {
+  background: var(--danger-bg);
+  color: var(--danger);
 }
 
 .user-status-dot {
@@ -1375,6 +1462,255 @@ body {
   align-items: center;
   gap: 0.5rem;
   flex-shrink: 0;
+}
+
+/* ==========================================================================
+   9.5 SPACE RAIL (Left Column 1)
+   ========================================================================== */
+.space-rail {
+  width: var(--space-rail-width, 220px);
+  min-width: var(--space-rail-width, 220px);
+  max-width: var(--space-rail-width, 220px);
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  flex-shrink: 0;
+  transition: width var(--transition-normal), min-width var(--transition-normal), max-width var(--transition-normal);
+  user-select: none;
+  z-index: 10;
+}
+
+.space-rail.collapsed {
+  width: var(--space-rail-collapsed-width, 56px);
+  min-width: var(--space-rail-collapsed-width, 56px);
+  max-width: var(--space-rail-collapsed-width, 56px);
+}
+
+.space-rail-header {
+  padding: 0.75rem 0.65rem;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.space-rail.collapsed .space-rail-header {
+  justify-content: center;
+  padding: 0.75rem 0.25rem;
+}
+
+.space-rail-title {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  flex: 1;
+}
+
+.space-rail.collapsed .space-rail-title {
+  display: none;
+}
+
+.space-rail-toggle-btn {
+  padding: 0.2rem 0.4rem;
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
+
+.space-rail.collapsed .rail-toggle-icon {
+  display: inline-block;
+  transform: rotate(180deg);
+}
+
+.space-rail-search-wrapper {
+  padding: 0.5rem 0.65rem 0.25rem;
+  flex-shrink: 0;
+}
+
+.space-rail.collapsed .space-rail-search-wrapper {
+  display: none;
+}
+
+.space-rail-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0.4rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.space-rail.collapsed .space-rail-list {
+  padding: 0.4rem 0.25rem;
+  align-items: center;
+}
+
+.space-rail-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  text-decoration: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.space-rail-item:hover {
+  background: var(--bg-card);
+  color: var(--text-primary);
+}
+
+.space-rail-item.active {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent-nav, var(--accent));
+  font-weight: 600;
+}
+
+.space-rail-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  flex-shrink: 0;
+  color: var(--text-primary);
+}
+
+.space-rail-item.active .space-rail-icon {
+  background: var(--accent);
+  color: var(--text-inverse);
+}
+
+.space-rail-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.825rem;
+}
+
+.space-rail.collapsed .space-rail-name {
+  display: none;
+}
+
+.space-rail-chip {
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  padding: 0.1rem 0.35rem;
+}
+
+.space-rail.collapsed .space-rail-chip {
+  display: none;
+}
+
+.space-rail-footer {
+  padding: 0.5rem 0.65rem;
+  border-top: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.space-rail.collapsed .space-rail-footer {
+  padding: 0.5rem 0.25rem;
+}
+
+.space-rail.collapsed .space-rail-footer .btn {
+  font-size: 0;
+  padding: 0.4rem;
+  height: 32px;
+  overflow: hidden;
+}
+
+.space-rail.collapsed .space-rail-footer .btn::before {
+  content: '+';
+  font-size: 1rem;
+}
+
+.space-rail.collapsed #btn-toggle-archived-spaces {
+  display: none;
+}
+
+/* Workspace Sidebar Header with space name + kebab */
+.space-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.space-header-info {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.current-space-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 0;
+}
+
+.space-kebab-container {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.space-kebab-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 0.35rem;
+  z-index: 50;
+  min-width: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.management-top-bar {
+  padding: 0.75rem 1.25rem 0.25rem 1.25rem;
+  display: flex;
+  align-items: center;
+}
+
+.back-to-chat-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 500;
+  text-decoration: none;
 }
 
 /* ==========================================================================
@@ -3311,6 +3647,86 @@ aside.workspace-sidebar.is-collapsed {
 /* ==========================================================================
    16. RESPONSIVE BREAKPOINTS (1280px / 1024px / 768px / 480px)
    ========================================================================== */
+
+/* Responsive Drawer (under 900px) */
+@media (min-width: 901px) {
+  #btn-toggle-sidebar {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  #btn-toggle-sidebar {
+    display: inline-flex;
+  }
+
+  .space-rail,
+  aside#space-rail {
+    position: fixed;
+    top: var(--topbar-height);
+    bottom: 0;
+    left: 0;
+    width: 220px;
+    min-width: 220px;
+    max-width: 220px;
+    z-index: 60;
+    transform: translateX(-100%);
+    transition: transform var(--transition-normal);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .workspace-sidebar,
+  aside#workspace-sidebar {
+    position: fixed;
+    top: var(--topbar-height);
+    bottom: 0;
+    left: 220px;
+    width: min(280px, calc(100vw - 220px));
+    min-width: min(280px, calc(100vw - 220px));
+    max-width: min(280px, calc(100vw - 220px));
+    z-index: 59;
+    transform: translateX(calc(-100% - 220px));
+    transition: transform var(--transition-normal);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .drawer-open .space-rail,
+  .drawer-open .workspace-sidebar,
+  .space-rail.drawer-open,
+  .workspace-sidebar.drawer-open,
+  .app-body.drawer-active .space-rail,
+  .app-body.drawer-active .workspace-sidebar {
+    transform: translateX(0);
+  }
+
+  .workspace-layout {
+    width: 100%;
+    flex: 1;
+  }
+
+  .chat-layout {
+    width: 100%;
+    flex: 1;
+  }
+
+  .nav-breadcrumbs {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+  }
+
+  .topbar-right {
+    flex-shrink: 0;
+  }
+}
+
+@media (max-width: 640px) {
+  .nav-breadcrumbs {
+    display: none !important;
+  }
+}
 
 /* Tier 1: 1280px Standard Desktop */
 @media (max-width: 1280px) {

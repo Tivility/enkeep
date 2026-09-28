@@ -1,0 +1,1220 @@
+/**
+ * WeChat Channel Gateway & ContextTokenStore Unit Tests
+ *
+ * @module @enkeep/channel-wechat/tests/gateway.test
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { DatabaseSync } from 'node:sqlite';
+import {
+  ContextTokenStore,
+  WeChatChannelGateway,
+  FakeWeChatTransport,
+  type WeChatChannelAccount,
+  type WeChatChannelBinding,
+  type WeChatChannelInboxItem,
+  type WeChatChannelOutboxItem,
+  type WeChatChannelRepo,
+  type WeChatInboundEnvelope,
+  type WeChatParsedMessage,
+  type WeChatRuntimeGateway,
+  type WeChatSessionRoute,
+  type WeChatSessionRouteRepo,
+  type WeChatSpaceRepo,
+} from '../src/index.js';
+
+describe('ContextTokenStore', () => {
+  it('stores and retrieves tokens from L1 memory cache', async () => {
+    const store = new ContextTokenStore({ maxCapacity: 10, ttlMs: 10000 });
+    await store.set('user_123', 'ctx_tok_123');
+
+    const token = await store.get('user_123');
+    expect(token).toBe('ctx_tok_123');
+    expect(await store.has('user_123')).toBe(true);
+    expect(await store.get('non_existent')).toBeUndefined();
+  });
+
+  it('evicts oldest entry when maxCapacity is exceeded (LRU)', async () => {
+    const store = new ContextTokenStore({ maxCapacity: 2, ttlMs: 10000 });
+    await store.set('user_1', 'tok_1');
+    await store.set('user_2', 'tok_2');
+    expect(store.size).toBe(2);
+
+    // Access user_1 to refresh its recency
+    await store.get('user_1');
+
+    // Add user_3 -> should evict user_2
+    await store.set('user_3', 'tok_3');
+    expect(store.size).toBe(2);
+    expect(await store.get('user_1')).toBe('tok_1');
+    expect(await store.get('user_3')).toBe('tok_3');
+    expect(await store.get('user_2')).toBeUndefined();
+  });
+
+  it('expires entries after ttlMs', async () => {
+    const store = new ContextTokenStore({ maxCapacity: 10, ttlMs: 20 });
+    await store.set('user_short', 'tok_short');
+    expect(await store.get('user_short')).toBe('tok_short');
+
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    expect(await store.get('user_short')).toBeUndefined();
+  });
+
+  it('persists and restores tokens from SQLite (L2)', async () => {
+    const db = new DatabaseSync(':memory:');
+    const store1 = new ContextTokenStore({ db, ttlMs: 60000 });
+
+    await store1.set('wx_alice', 'ctx_alice_secret_token');
+    expect(await store1.get('wx_alice')).toBe('ctx_alice_secret_token');
+
+    // Create a new store instance pointing to same db (simulating process restart)
+    const store2 = new ContextTokenStore({ db, ttlMs: 60000 });
+    expect(store2.size).toBe(0); // L1 empty
+
+    const restoredToken = await store2.get('wx_alice');
+    expect(restoredToken).toBe('ctx_alice_secret_token');
+    expect(store2.size).toBe(1); // L1 populated from L2
+  });
+
+  it('falls back to channel_inbox payload when L2 table misses', async () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec(`
+      CREATE TABLE channel_inbox (
+        id TEXT PRIMARY KEY,
+        account_id TEXT,
+        native_context_id TEXT,
+        payload_json TEXT,
+        created_at TEXT DEFAULT (CURRENT_TIMESTAMP)
+      );
+    `);
+
+    // Insert historical inbox item with contextToken
+    db.prepare(`
+      INSERT INTO channel_inbox (id, account_id, native_context_id, payload_json)
+      VALUES ('inb_1', 'acc_1', 'wechat:bob', ?)
+    `).run(
+      JSON.stringify({
+        parsed: {
+          senderId: 'bob',
+          contextToken: 'ctx_bob_from_inbox',
+        },
+      })
+    );
+
+    const store = new ContextTokenStore({ db });
+    const token = await store.get('bob');
+    expect(token).toBe('ctx_bob_from_inbox');
+  });
+});
+
+describe('WeChatChannelGateway', () => {
+  let fakeTransport: FakeWeChatTransport;
+  let mockChannelRepo: WeChatChannelRepo;
+  let mockSessionRouteRepo: WeChatSessionRouteRepo;
+  let mockSpaceRepo: WeChatSpaceRepo;
+  let mockRuntimeGateway: WeChatRuntimeGateway;
+  let contextTokenStore: ContextTokenStore;
+
+  const testAccount: WeChatChannelAccount = {
+    id: 'acc_wechat_001',
+    userId: 'usr_owner_001',
+    type: 'wechat',
+    status: 'active',
+    defaultSpaceId: 'spc_default_001',
+  };
+
+  const sampleParsedMessage: WeChatParsedMessage = {
+    messageId: 'msg_wc_in_001',
+    senderId: 'wx_user_carol',
+    senderName: 'Carol',
+    chatId: 'wx_user_carol',
+    contextToken: 'ctx_carol_token_abc',
+    text: 'Hello Enkeep!',
+    timestamp: new Date().toISOString(),
+    dedupKey: 'mid:msg_wc_in_001',
+    isFromBot: false,
+  };
+
+  beforeEach(() => {
+    fakeTransport = new FakeWeChatTransport();
+    fakeTransport.start();
+
+    const inboxMap = new Map<string, WeChatChannelInboxItem>();
+    const outboxMap = new Map<string, WeChatChannelOutboxItem>();
+    const bindingMap = new Map<string, WeChatChannelBinding>();
+    const routeMap = new Map<string, WeChatSessionRoute>();
+
+    mockChannelRepo = {
+      findAccountById: vi.fn(async (id: string) => (id === testAccount.id ? testAccount : null)),
+      findBindingByContext: vi.fn(async (_accountId: string, ctxId: string) => bindingMap.get(ctxId) || null),
+      createBinding: vi.fn(async (input) => {
+        const binding: WeChatChannelBinding = {
+          id: `bind_${Math.random().toString(36).slice(2, 8)}`,
+          userId: testAccount.userId,
+          accountId: input.accountId,
+          spaceId: input.spaceId,
+          nativeContextId: input.nativeContextId,
+          activationMode: input.activationMode,
+          chatType: input.chatType,
+        };
+        bindingMap.set(input.nativeContextId, binding);
+        return binding;
+      }),
+      findInboxByEvent: vi.fn(async (_accountId: string, eventId: string) => inboxMap.get(eventId) || null),
+      createInboxItem: vi.fn(async (input) => {
+        const existing = inboxMap.get(input.nativeEventId);
+        if (existing) {
+          return { item: existing, isDuplicate: true };
+        }
+        const item: WeChatChannelInboxItem = {
+          id: `inb_${Math.random().toString(36).slice(2, 8)}`,
+          accountId: input.accountId,
+          nativeEventId: input.nativeEventId,
+          nativeContextId: input.nativeContextId,
+          payloadJson: input.payloadJson,
+          status: input.status,
+        };
+        inboxMap.set(input.nativeEventId, item);
+        return { item, isDuplicate: false };
+      }),
+      claimInboxForProcessing: vi.fn(async (id: string) => {
+        for (const item of inboxMap.values()) {
+          if (item.id === id) {
+            const updated: WeChatChannelInboxItem = { ...item, status: 'processing' };
+            inboxMap.set(item.nativeEventId, updated);
+            return updated;
+          }
+        }
+        return null;
+      }),
+      updateInboxStatus: vi.fn(async (id: string, status: any) => {
+        for (const [key, item] of inboxMap.entries()) {
+          if (item.id === id) {
+            const updated: WeChatChannelInboxItem = { ...item, status };
+            inboxMap.set(key, updated);
+            return updated;
+          }
+        }
+        throw new Error('Inbox item not found');
+      }),
+      findOutboxById: vi.fn(async (id: string) => outboxMap.get(id) || null),
+      createOutboxItem: vi.fn(async (input) => {
+        const item: WeChatChannelOutboxItem = {
+          id: input.id || `out_${Math.random().toString(36).slice(2, 8)}`,
+          accountId: input.accountId,
+          sessionId: input.sessionId,
+          nativeContextId: input.nativeContextId,
+          replyToNativeId: input.replyToNativeId,
+          payloadJson: input.payloadJson,
+          status: input.status || 'pending',
+          attempts: 0,
+        };
+        outboxMap.set(item.id, item);
+        return item;
+      }),
+      updateOutboxStatus: vi.fn(async (id: string, status: any, incrementAttempt?: boolean) => {
+        const existing = outboxMap.get(id);
+        if (!existing) throw new Error('Outbox item not found');
+        const updated: WeChatChannelOutboxItem = {
+          ...existing,
+          status,
+          attempts: incrementAttempt ? (existing.attempts || 0) + 1 : existing.attempts,
+        };
+        outboxMap.set(id, updated);
+        return updated;
+      }),
+    };
+
+    mockSessionRouteRepo = {
+      findById: vi.fn(async (id: string) => routeMap.get(id) || null),
+      findByRouteIdentity: vi.fn(async (_ch, _acc, ctxId) => routeMap.get(ctxId) || null),
+      create: vi.fn(async (input) => {
+        const route: WeChatSessionRoute = {
+          id: input.id || `ses_route_${Math.random().toString(36).slice(2, 8)}`,
+          spaceId: input.spaceId,
+          channel: input.channel,
+          accountId: input.accountId,
+          nativeContextId: input.nativeContextId,
+          peerId: input.peerId,
+          dshSessionId: input.dshSessionId,
+          title: input.title,
+        };
+        routeMap.set(route.id, route);
+        routeMap.set(input.nativeContextId, route);
+        return route;
+      }),
+    };
+
+    mockSpaceRepo = {
+      findById: vi.fn(async (id: string) => ({ id, status: 'active' })),
+    };
+
+    mockRuntimeGateway = {
+      dispatchInbound: vi.fn(async (_envelope: WeChatInboundEnvelope) => ({
+        turnId: `turn_${Date.now()}`,
+        executionMode: 'runtime',
+        status: 'accepted',
+      })),
+    };
+
+    contextTokenStore = new ContextTokenStore();
+  });
+
+  it('processes inbound text message, auto-binds default space, caches token, and dispatches to runtime', async () => {
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+
+    const result = await gateway.handleInboundMessage(sampleParsedMessage);
+
+    expect(result.handled).toBe(true);
+    expect(result.inboxItem?.status).toBe('delivered');
+    expect(result.turnId).toBeDefined();
+
+    // Verify context_token was cached
+    const cachedToken = await contextTokenStore.get('wx_user_carol');
+    expect(cachedToken).toBe('ctx_carol_token_abc');
+
+    // Verify runtime dispatch envelope
+    expect(mockRuntimeGateway.dispatchInbound).toHaveBeenCalledTimes(1);
+    const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls[0][0];
+    expect(envelope.content).toBe('Hello Enkeep!');
+    expect(envelope.userId).toBe(testAccount.userId);
+    expect(envelope.channelContext.channel).toBe('wechat');
+    expect(envelope.channelContext.accountId).toBe(testAccount.id);
+
+    // Verify channel binding was auto-created with activationMode: 'always' (p2p exemption)
+    expect(mockChannelRepo.createBinding).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: testAccount.id,
+        spaceId: testAccount.defaultSpaceId,
+        nativeContextId: 'wechat:wx_user_carol',
+        activationMode: 'always',
+        chatType: 'p2p',
+      })
+    );
+  });
+
+  it('generates runtime-valid dshSessionId matching canonical session id regex (ses_ + 32 lowercase hex)', async () => {
+    // Exact pattern used by packages/runtime-runner/src/runtime/dsh-boot.ts:127
+    // and validated in packages/runtime-runner/src/runtime/daemon.ts:569
+    const CANONICAL_SESSION_ID_PATTERN = /^(ses_[0-9a-f]{32}|import-[0-9a-f]{32})$/;
+
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+
+    const result = await gateway.handleInboundMessage(sampleParsedMessage);
+    expect(result.handled).toBe(true);
+
+    expect(mockSessionRouteRepo.create).toHaveBeenCalledTimes(1);
+    const createdRouteInput = (mockSessionRouteRepo.create as any).mock.calls[0][0];
+    expect(createdRouteInput.dshSessionId).toBeDefined();
+    expect(createdRouteInput.dshSessionId).toMatch(CANONICAL_SESSION_ID_PATTERN);
+    expect(createdRouteInput.dshSessionId).toMatch(/^ses_[0-9a-f]{32}$/);
+  });
+
+  it('handles inbound image message and falls back to placeholder content', async () => {
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+
+    const imageMessage: WeChatParsedMessage = {
+      ...sampleParsedMessage,
+      messageId: 'msg_img_002',
+      text: '', // Empty text
+      mediaItems: [
+        {
+          type: 'image',
+          encryptQueryParam: 'novac2c_param_123',
+          aesKey: '0123456789abcdef0123456789abcdef',
+        },
+      ],
+    };
+
+    const result = await gateway.handleInboundMessage(imageMessage);
+    expect(result.handled).toBe(true);
+
+    const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls[0][0];
+    expect(envelope.content).toBe('[图片]');
+  });
+
+  it('deduplicates duplicate inbound messages', async () => {
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+
+    // First arrival
+    const result1 = await gateway.handleInboundMessage(sampleParsedMessage);
+    expect(result1.handled).toBe(true);
+
+    // Duplicate arrival
+    const result2 = await gateway.handleInboundMessage(sampleParsedMessage);
+    expect(result2.handled).toBe(false);
+    expect(result2.ignoredReason).toBe('duplicate_event');
+    expect(mockRuntimeGateway.dispatchInbound).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores inbound messages when account is disabled', async () => {
+    const disabledAccount = { ...testAccount, status: 'disabled' };
+    mockChannelRepo.findAccountById = vi.fn(async () => disabledAccount);
+
+    const gateway = new WeChatChannelGateway({
+      account: disabledAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+
+    const result = await gateway.handleInboundMessage(sampleParsedMessage);
+    expect(result.handled).toBe(false);
+    expect(result.ignoredReason).toBe('account_disabled');
+    expect(mockRuntimeGateway.dispatchInbound).not.toHaveBeenCalled();
+  });
+
+  it('completes agent turn and delivers outbound reply using cached context_token', async () => {
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+
+    // 1. Process inbound to establish route and cache context_token
+    const inboundResult = await gateway.handleInboundMessage(sampleParsedMessage);
+    const sessionRouteId = inboundResult.sessionRouteId!;
+    expect(sessionRouteId).toBeDefined();
+
+    // 2. Trigger turn completed
+    const outboxItem = await gateway.handleTurnCompleted({
+      sessionId: sessionRouteId,
+      turnId: 'turn_finish_001',
+      replyText: 'Hello Carol! This is assistant replying via WeChat.',
+      nativeEventId: sampleParsedMessage.messageId,
+    });
+
+    expect(outboxItem).toBeDefined();
+    expect(outboxItem?.status).toBe('delivered');
+
+    // Verify reply in fakeTransport
+    expect(fakeTransport.sentReplies.length).toBe(1);
+    const reply = fakeTransport.sentReplies[0];
+    expect(reply.toUserId).toBe('wx_user_carol');
+    expect(reply.contextToken).toBe('ctx_carol_token_abc');
+    expect(reply.text).toBe('Hello Carol! This is assistant replying via WeChat.');
+  });
+
+  it('records outbox failure when context_token is missing', async () => {
+    const emptyContextStore = new ContextTokenStore();
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore: emptyContextStore,
+    });
+
+    const route = await mockSessionRouteRepo.create({
+      spaceId: 'spc_default_001',
+      channel: 'wechat',
+      accountId: testAccount.id,
+      nativeContextId: 'wechat:unknown_user',
+      peerId: 'unknown_user',
+    });
+
+    const outboxItem = await gateway.handleTurnCompleted({
+      sessionId: route.id,
+      turnId: 'turn_no_token',
+      replyText: 'Should fail due to missing context_token',
+    });
+
+    expect(outboxItem).toBeDefined();
+    expect(outboxItem?.status).toBe('failed');
+    expect(fakeTransport.sentReplies.length).toBe(0);
+  });
+
+  describe('Outbound Final Text & Plain Text Delivery (K2)', () => {
+    it('sends only final answer text when finalText is provided from runtime (K1 contract)', async () => {
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const route = await mockSessionRouteRepo.create({
+        spaceId: 'spc_default_001',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_carol',
+        peerId: 'wx_user_carol',
+      });
+      await contextTokenStore.set('wx_user_carol', 'ctx_carol_token_k2');
+
+      const outboxItem = await gateway.handleTurnCompleted({
+        sessionId: route.id,
+        turnId: 'turn_k2_final_text',
+        replyText: '<think>internal draft thoughts</think>raw reply',
+        finalText: 'Clean final answer from runtime K1',
+      });
+
+      expect(outboxItem?.status).toBe('delivered');
+      expect(fakeTransport.sentReplies.length).toBe(1);
+      expect(fakeTransport.sentReplies[0].text).toBe('Clean final answer from runtime K1');
+
+      const payload = JSON.parse(outboxItem!.payloadJson);
+      expect(payload.text).toBe('Clean final answer from runtime K1');
+      expect(payload.text).not.toContain('think');
+    });
+
+    it('strips thinking/reasoning blocks when K1 is not yet merged and converts Markdown to plain text', async () => {
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const route = await mockSessionRouteRepo.create({
+        spaceId: 'spc_default_001',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_carol',
+        peerId: 'wx_user_carol',
+      });
+      await contextTokenStore.set('wx_user_carol', 'ctx_carol_token_k2');
+
+      const replyWithMarkdownAndThinking = `
+<think>
+Let's see: user asks for service status.
+I should prepare a table with Gateway and Database.
+</think>
+
+系统运行概况如下：
+
+| 服务 | 状态 |
+| :--- | :---: |
+| 网关 | 正常 |
+| 存储 | 正常 |
+
+详情参考 [监控面板](https://monitor.example.com)。
+`;
+
+      const outboxItem = await gateway.handleTurnCompleted({
+        sessionId: route.id,
+        turnId: 'turn_k2_cot_strip',
+        replyText: replyWithMarkdownAndThinking,
+      });
+
+      expect(outboxItem?.status).toBe('delivered');
+      expect(fakeTransport.sentReplies.length).toBe(1);
+      const deliveredText = fakeTransport.sentReplies[0].text;
+
+      // Ensure thinking monologue is stripped
+      expect(deliveredText).not.toContain('<think>');
+      expect(deliveredText).not.toContain('Let\'s see');
+
+      // Ensure table is converted to plain text without separator row
+      expect(deliveredText).not.toContain('| :---');
+      expect(deliveredText).toContain('服务');
+      expect(deliveredText).toContain('状态');
+      expect(deliveredText).toContain('网关');
+      expect(deliveredText).toContain('存储');
+
+      // Ensure link is sensibly formatted as text (url)
+      expect(deliveredText).toContain('监控面板 (https://monitor.example.com)');
+
+      // Outbox payload also contains clean plain text
+      const payload = JSON.parse(outboxItem!.payloadJson);
+      expect(payload.text).toBe(deliveredText);
+    });
+
+    it('splits message exceeding MSG_SPLIT_LIMIT (2000 chars) into multiple chunks per HappyClaw', async () => {
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const route = await mockSessionRouteRepo.create({
+        spaceId: 'spc_default_001',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_carol',
+        peerId: 'wx_user_carol',
+      });
+      await contextTokenStore.set('wx_user_carol', 'ctx_carol_token_k2');
+
+      // Generate text with 3 paragraphs of 800 chars each = ~2400 chars > 2000
+      const p1 = '第1段：' + 'A'.repeat(800);
+      const p2 = '第2段：' + 'B'.repeat(800);
+      const p3 = '第3段：' + 'C'.repeat(800);
+      const longMessage = `${p1}\n\n${p2}\n\n${p3}`;
+
+      const outboxItem = await gateway.handleTurnCompleted({
+        sessionId: route.id,
+        turnId: 'turn_k2_long_message',
+        replyText: longMessage,
+      });
+
+      expect(outboxItem?.status).toBe('delivered');
+      // Sent in multiple chunks via transport
+      expect(fakeTransport.sentReplies.length).toBeGreaterThan(1);
+      for (const sent of fakeTransport.sentReplies) {
+        expect(sent.text.length).toBeLessThanOrEqual(2000);
+      }
+
+      // Reassembled content matches original paragraphs
+      const combinedSentText = fakeTransport.sentReplies.map((r) => r.text).join('\n\n');
+      expect(combinedSentText).toContain('第1段');
+      expect(combinedSentText).toContain('第2段');
+      expect(combinedSentText).toContain('第3段');
+    });
+  });
+
+  describe('Inbound Media Ingestion (WF3)', () => {
+    const rawKey = Buffer.alloc(16, 0x42);
+    const aesKeyBase64 = rawKey.toString('base64');
+    const imagePayload = Buffer.from('fake-image-png-binary-content-12345');
+    const filePayload = Buffer.from('fake-file-pdf-binary-content-67890');
+
+    it('downloads, decrypts, and ingests inbound image attachment via mediaAttachmentIngestor', async () => {
+      const { encryptAesEcb } = await import('../src/crypto.js');
+      const ciphertext = encryptAesEcb(imagePayload, rawKey);
+
+      const mockFetch = vi.fn(async () => {
+        return new Response(ciphertext, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(ciphertext.length),
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(async ({ fileKey }: any) => ({
+          path: `.attachments/incoming/${fileKey}.jpg`,
+          etag: `"${fileKey}_etag"`,
+          mediaType: 'image/jpeg',
+          displayName: `${fileKey}.jpg`,
+        })),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_100',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_100',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockIngestor.ingestImage).toHaveBeenCalledTimes(1);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeDefined();
+      expect(envelope.attachments.length).toBe(1);
+      expect(envelope.attachments[0]).toMatchObject({
+        type: 'image',
+        path: expect.stringContaining('.attachments/incoming/'),
+        etag: expect.any(String),
+        mediaType: 'image/jpeg',
+      });
+    });
+
+    it('downloads, decrypts, and ingests inbound file attachment via mediaAttachmentIngestor', async () => {
+      const { encryptAesEcb } = await import('../src/crypto.js');
+      const ciphertext = encryptAesEcb(filePayload, rawKey);
+
+      const mockFetch = vi.fn(async () => {
+        return new Response(ciphertext, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(ciphertext.length),
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(async () => {
+          throw new Error('Not an image');
+        }),
+        ingestFile: vi.fn(async ({ fileName, fileKey }: any) => ({
+          path: `.attachments/incoming/${fileKey}.pdf`,
+          etag: `"${fileKey}_etag"`,
+          mediaType: 'application/pdf',
+          displayName: fileName || 'doc.pdf',
+        })),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const fileMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_file_200',
+        text: '',
+        mediaItems: [
+          {
+            type: 'file',
+            name: 'quarterly_report.pdf',
+            encryptQueryParam: 'cdn_enc_param_file_200',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(fileMsg);
+      expect(result.handled).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockIngestor.ingestFile).toHaveBeenCalledTimes(1);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[文件: quarterly_report.pdf]');
+      expect(envelope.attachments).toBeDefined();
+      expect(envelope.attachments.length).toBe(1);
+      expect(envelope.attachments[0]).toMatchObject({
+        type: 'file',
+        displayName: 'quarterly_report.pdf',
+        mediaType: 'application/pdf',
+      });
+    });
+
+    it('falls back to text placeholder when image exceeds size limit (>20MB)', async () => {
+      const mockFetch = vi.fn(async () => {
+        return new Response('dummy', {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(25 * 1024 * 1024), // 25 MiB > 20 MiB limit
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_toolarge',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_huge',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockIngestor.ingestImage).not.toHaveBeenCalled();
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeUndefined();
+    });
+
+    it('falls back to text placeholder gracefully when download or decryption fails', async () => {
+      const mockFetch = vi.fn(async () => {
+        return new Response('Not Found on CDN', { status: 404 });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_error',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_err',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockIngestor.ingestImage).not.toHaveBeenCalled();
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeUndefined();
+    });
+
+    it('falls back to text placeholder gracefully when ingestImage throws', async () => {
+      const { encryptAesEcb } = await import('../src/crypto.js');
+      const ciphertext = encryptAesEcb(imagePayload, rawKey);
+
+      const mockFetch = vi.fn(async () => {
+        return new Response(ciphertext, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(ciphertext.length),
+          },
+        });
+      });
+
+      const mockIngestor = {
+        ingestImage: vi.fn(async () => {
+          throw new Error('Disk full or storage failure');
+        }),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: mockFetch as any,
+      });
+
+      const imageMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_img_ingest_fail',
+        text: '',
+        mediaItems: [
+          {
+            type: 'image',
+            encryptQueryParam: 'cdn_enc_param_fail',
+            aesKey: aesKeyBase64,
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(imageMsg);
+      expect(result.handled).toBe(true);
+      expect(mockIngestor.ingestImage).toHaveBeenCalledTimes(1);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.content).toBe('[图片]');
+      expect(envelope.attachments).toBeUndefined();
+    });
+  });
+
+  describe('Canonical Session & Bound Space Resolution (WX-FIX-6)', () => {
+    it('existing imported session for peer is reused via getOrCreateCanonicalSession', async () => {
+      const canonicalSession: WeChatSessionRoute = {
+        id: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+        spaceId: 'spc_28c452e0fd9aa266664d3650416da79a',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        peerId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        dshSessionId: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+        title: 'WeChat Canonical Session',
+      };
+
+      const getOrCreateCanonicalSession = vi.fn(async (_spaceId: string, _params: any) => canonicalSession);
+      const sessionRouteRepoWithCanonical: WeChatSessionRouteRepo = {
+        ...mockSessionRouteRepo,
+        getOrCreateCanonicalSession,
+      };
+
+      // Existing binding points to dedicated wechat space
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_hpc_wechat',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: 'spc_28c452e0fd9aa266664d3650416da79a',
+        nativeContextId: 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat') return existingBinding;
+        return null;
+      });
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: sessionRouteRepoWithCanonical,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_canonical_001',
+        senderId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        chatId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledTimes(1);
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledWith(
+        'spc_28c452e0fd9aa266664d3650416da79a',
+        expect.objectContaining({
+          channel: 'wechat',
+          accountId: testAccount.id,
+          nativeContextId: 'wechat:owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+          peerId: 'owxba7a691c8b4cadd86ea7f2eea@im.wechat',
+        })
+      );
+      // No new session created
+      expect(mockSessionRouteRepo.create).not.toHaveBeenCalled();
+      expect(result.sessionRouteId).toBe(canonicalSession.id);
+
+      const envelope = (mockRuntimeGateway.dispatchInbound as any).mock.calls.at(-1)[0];
+      expect(envelope.sessionId).toBe(canonicalSession.id);
+    });
+
+    it('existing imported session for peer is reused via findByRouteIdentity prefix fallback', async () => {
+      // Mock session stored with bare nativeContextId (no wechat: prefix, typical of HappyClaw migration)
+      const importedSession: WeChatSessionRoute = {
+        id: 'import-fa878f4a856c7cfa02668978de99c5b7',
+        spaceId: 'spc_imported_space_cxx',
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        peerId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        dshSessionId: 'import-fa878f4a856c7cfa02668978de99c5b7',
+      };
+
+      // Mock sessionRouteRepo WITHOUT getOrCreateCanonicalSession to exercise fallback
+      const fallbackRepo: WeChatSessionRouteRepo = {
+        findById: vi.fn(async (id: string) => (id === importedSession.id ? importedSession : null)),
+        findByRouteIdentity: vi.fn(async (channel: string, accId: string, ctxId: string) => {
+          if (channel === 'wechat' && accId === testAccount.id && ctxId === 'owxe59f0c1c911f11e4b9fce97ba@im.wechat') {
+            return importedSession;
+          }
+          return null;
+        }),
+        create: vi.fn(),
+      };
+
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_cxx_wechat',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: 'spc_imported_space_cxx',
+        nativeContextId: 'wechat:owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:owxe59f0c1c911f11e4b9fce97ba@im.wechat') return existingBinding;
+        return null;
+      });
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: fallbackRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_bare_ctx_001',
+        senderId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+        chatId: 'owxe59f0c1c911f11e4b9fce97ba@im.wechat',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+      // findByRouteIdentity should have been called first with prefixed, then bare
+      expect(fallbackRepo.findByRouteIdentity).toHaveBeenCalledWith(
+        'wechat',
+        testAccount.id,
+        'wechat:owxe59f0c1c911f11e4b9fce97ba@im.wechat'
+      );
+      expect(fallbackRepo.findByRouteIdentity).toHaveBeenCalledWith(
+        'wechat',
+        testAccount.id,
+        'owxe59f0c1c911f11e4b9fce97ba@im.wechat'
+      );
+      expect(fallbackRepo.create).not.toHaveBeenCalled();
+      expect(result.sessionRouteId).toBe(importedSession.id);
+    });
+
+    it('new peer creates new session in bound space with runtime-valid ids', async () => {
+      const boundSpaceId = 'spc_custom_bound_project';
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_custom_project',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: boundSpaceId,
+        nativeContextId: 'wechat:wx_new_peer_001',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:wx_new_peer_001') return existingBinding;
+        return null;
+      });
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_new_peer_001',
+        senderId: 'wx_new_peer_001',
+        chatId: 'wx_new_peer_001',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+      expect(mockSessionRouteRepo.create).toHaveBeenCalledTimes(1);
+      const createInput = (mockSessionRouteRepo.create as any).mock.calls[0][0];
+
+      // Session must be in the bound space, NOT default
+      expect(createInput.spaceId).toBe(boundSpaceId);
+      // Valid runtime session IDs matching ses_[0-9a-f]{32}
+      expect(createInput.id).toMatch(/^ses_[0-9a-f]{32}$/);
+      expect(createInput.dshSessionId).toMatch(/^ses_[0-9a-f]{32}$/);
+      expect(createInput.channel).toBe('wechat');
+      expect(createInput.nativeContextId).toBe('wechat:wx_new_peer_001');
+    });
+
+    it('binding space is used, not user default space', async () => {
+      // User default space is testAccount.defaultSpaceId ('spc_default_space_123')
+      const boundSpaceId = 'spc_dedicated_wechat_container';
+      expect(testAccount.defaultSpaceId).not.toBe(boundSpaceId);
+
+      const existingBinding: WeChatChannelBinding = {
+        id: 'bind_dedicated',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: boundSpaceId,
+        nativeContextId: 'wechat:wx_user_frank',
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === 'wechat:wx_user_frank') return existingBinding;
+        return null;
+      });
+
+      const getOrCreateCanonicalSession = vi.fn(async (spaceId: string, _params: any) => ({
+        id: 'ses_bound_canonical_123',
+        spaceId,
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: 'wechat:wx_user_frank',
+        peerId: 'wx_user_frank',
+        dshSessionId: 'ses_bound_canonical_123',
+      }));
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount, // has defaultSpaceId: 'spc_default_space_123'
+        defaultSpaceId: 'spc_default_space_123',
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: {
+          ...mockSessionRouteRepo,
+          getOrCreateCanonicalSession,
+        },
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_bound_space_001',
+        senderId: 'wx_user_frank',
+        chatId: 'wx_user_frank',
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+
+      // Verify canonical session resolution received the bound space, NOT default
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledWith(
+        boundSpaceId,
+        expect.anything()
+      );
+      expect(getOrCreateCanonicalSession).not.toHaveBeenCalledWith(
+        testAccount.defaultSpaceId,
+        expect.anything()
+      );
+    });
+
+    it('resolves binding imported with bare contextId and routes to that space instead of user default', async () => {
+      const importedSpaceId = 'spc_28c452e0fd9aa266664d3650416da79a';
+      const barePeerId = 'owxba7a691c8b4cadd86ea7f2eea@im.wechat';
+
+      // Binding in DB has bare nativeContextId (no wechat: prefix)
+      const importedBinding: WeChatChannelBinding = {
+        id: 'bind_hpc_74ab_bare',
+        userId: testAccount.userId,
+        accountId: testAccount.id,
+        spaceId: importedSpaceId,
+        nativeContextId: barePeerId,
+        activationMode: 'always',
+        chatType: 'p2p',
+      };
+
+      (mockChannelRepo.findBindingByContext as any).mockImplementation(async (_accId: string, ctxId: string) => {
+        if (ctxId === barePeerId) return importedBinding;
+        return null;
+      });
+
+      const getOrCreateCanonicalSession = vi.fn(async (spaceId: string, _params: any) => ({
+        id: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+        spaceId,
+        channel: 'wechat',
+        accountId: testAccount.id,
+        nativeContextId: barePeerId,
+        peerId: barePeerId,
+        dshSessionId: 'ses_aaa935905a793ffcff025fb3839c9cb8',
+      }));
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        defaultSpaceId: testAccount.defaultSpaceId,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: {
+          ...mockSessionRouteRepo,
+          getOrCreateCanonicalSession,
+        },
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const msg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_bare_binding_001',
+        senderId: barePeerId,
+        chatId: barePeerId,
+      };
+
+      const result = await gateway.handleInboundMessage(msg);
+      expect(result.handled).toBe(true);
+
+      // Verify the bare binding was found and its space used
+      expect(getOrCreateCanonicalSession).toHaveBeenCalledWith(
+        importedSpaceId,
+        expect.anything()
+      );
+      // Did NOT create a fallback binding to default space
+      expect(mockChannelRepo.createBinding).not.toHaveBeenCalled();
+    });
+  });
+});

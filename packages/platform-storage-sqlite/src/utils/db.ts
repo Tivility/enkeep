@@ -29,6 +29,8 @@ import type {
   Task,
   TaskPriority,
   TaskStatus,
+  TaskPayload,
+  TaskDispatchResult,
   AgentPromptTaskPayload,
   AgentPromptDispatchResult,
   TenantQuotaLimit,
@@ -367,9 +369,9 @@ export function parseFileMetadataRow(row: DbRow): FileMetadata {
 }
 
 export function parsePlatformTaskRow(row: DbRow): Task {
-  const payload = getJson<AgentPromptTaskPayload>(row, 'payload');
-  if (!payload || typeof payload !== 'object' || payload.type !== 'agent_prompt') {
-    throw new Error(`Corrupted task row: missing or invalid agent_prompt payload for task '${getString(row, 'id')}'`);
+  const payload = getJson<TaskPayload>(row, 'payload');
+  if (!payload || typeof payload !== 'object' || (payload.type !== 'agent_prompt' && (payload as any).type !== 'script')) {
+    throw new Error(`Corrupted task row: missing or invalid payload for task '${getString(row, 'id')}'`);
   }
   const rawScheduleType = getNullableString(row, 'schedule_type');
   return {
@@ -382,7 +384,7 @@ export function parsePlatformTaskRow(row: DbRow): Task {
     priority: getString(row, 'priority') as TaskPriority,
     status: getString(row, 'status') as TaskStatus,
     payload,
-    result: getJson<AgentPromptDispatchResult>(row, 'result'),
+    result: getJson<TaskDispatchResult>(row, 'result'),
     error: getNullableString(row, 'error'),
     claimantId: getNullableString(row, 'claimant_id'),
     leaseExpiresAt: getNullableString(row, 'lease_expires_at'),

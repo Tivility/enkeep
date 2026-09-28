@@ -35,6 +35,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { Context, type Fiber } from '@deepseek-ai/cordis';
 import {
@@ -84,8 +85,12 @@ import * as ToolSubagentListAgentsPlugin from '@deepseek-ai/dsh-tool-subagent-co
 import ApprovalService, { type ApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy';
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets';
+import { WebRuntime } from '@deepseek-ai/dsh-web';
+import * as HttpFetchProviderPlugin from '@deepseek-ai/dsh-web-fetch-http';
+import * as ToolWebPlugin from '@deepseek-ai/dsh-tool-web';
 import * as McpGovernancePlugin from '@enkeep/dsh-mcp-governance';
 import * as CliToolsPlugin from '@enkeep/dsh-tool-cli';
+import type { LarkScopedConfigProvider } from '@enkeep/dsh-tool-cli';
 import { validateTrustedPluginDescriptor, type TrustedPluginDefinition } from '@enkeep/dsh-enkeep-bundle';
 import type { ResolvedRuntimeMount } from '../spec/types.js';
 import { verifyMountTOCTOU, sanitizePathInError } from '../spec/mount-security.js';
@@ -93,7 +98,14 @@ import { VirtualMountResolver, VirtualMountPathResolver, type ResolvedVirtualTar
 import type { ExtensionActivationPlan, ExtensionDshPluginContributionActivation } from '@enkeep/protocol';
 export { VirtualMountResolver, VirtualMountPathResolver };
 
+export function deriveCompactionThresholdRatio(thresholdTokens: number, contextWindow: number): number {
+  if (contextWindow <= 0) return 0.2;
+  const ratio = thresholdTokens / contextWindow;
+  return Math.min(0.8, Math.max(0.2, ratio));
+}
+
 export interface CompactionMountConfig {
+  readonly thresholdTokens?: number;
   readonly thresholdRatio?: number;
   readonly retainRatio?: number;
   readonly retainTokens?: number;
@@ -133,6 +145,25 @@ export interface FsMountConfig {
   readonly readLimit?: number;
   readonly readMaxLineLength?: number;
   readonly readMaxBytes?: number;
+  readonly extraReadableRoots?: string[];
+  readonly extraWritableRoots?: string[];
+}
+
+export interface WebMountConfig {
+  readonly search?: boolean;
+  readonly fetch?: boolean;
+  readonly searchProvider?: string;
+  readonly fetchProvider?: string;
+  readonly searchPlugin?: any;
+  readonly searchPluginConfig?: any;
+  readonly searchConfig?: {
+    readonly apiKeyEnv?: string;
+    readonly baseURL?: string;
+    readonly model?: string;
+    readonly maxUses?: number;
+    readonly maxTokens?: number;
+    readonly apiVersion?: string;
+  };
 }
 
 export interface ApprovalMountConfig {
@@ -152,6 +183,11 @@ export interface OfficialPluginsConfig {
   readonly shell?: ShellMountConfig;
   readonly fs?: FsMountConfig;
   readonly approval?: ApprovalMountConfig;
+  readonly web?: WebMountConfig;
+  readonly extraReadableRoots?: string[];
+  readonly extraWritableRoots?: string[];
+  readonly contextWindow?: number;
+  readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
 }
 
 export interface WorkspaceToolsMountOptions {
@@ -166,8 +202,13 @@ export interface WorkspaceToolsMountOptions {
   readonly subagents?: SubagentsMountConfig;
   readonly shell?: ShellMountConfig;
   readonly fs?: FsMountConfig;
+  readonly web?: WebMountConfig;
+  readonly extraReadableRoots?: string[];
+  readonly extraWritableRoots?: string[];
   readonly defaultPreset?: string;
   readonly extensionPlan?: ExtensionActivationPlan | null;
+  readonly onExtensionPlanUpdated?: (newPlan: ExtensionActivationPlan | null) => Promise<void> | void;
+  readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
 }
 
 export interface WorkspaceToolsHandle {
@@ -188,6 +229,11 @@ export interface RuntimeCapabilitiesStatus {
   readonly permissions: boolean;
   readonly filesystem: boolean;
   readonly shell: boolean;
+  readonly web?: {
+    readonly search: boolean;
+    readonly fetch: boolean;
+    readonly provider?: string;
+  };
   readonly maxSubagentDepth: number;
   readonly maxSubagentConcurrency: number;
   readonly activeSubagentsCount: number;
@@ -266,19 +312,52 @@ export function findMatchingMount(
 
 /**
  * Isolates workspace service symbols in a Cordis context so each agent has private instances.
+ * Uses Cordis prototypal inheritance (Object.create) so ancestor service isolation is preserved
+ * without mutating ancestor contexts or flattening prototypes.
  */
 export function isolateWorkspaceRealms(ctx: Context): void {
   const services = ['fs', 'subprocess', 'shell', 'shellEnv', 'jobs', 'spillStore', 'permissionPresets', 'attachments'];
   const isolateSym = Symbol.for('cordis.isolate');
+  const shadow = Object.create((ctx as any)[isolateSym] ?? null);
   for (const name of services) {
-    (ctx as any)[isolateSym] = { ...(ctx as any)[isolateSym], [name]: Symbol(name) };
+    shadow[name] = Symbol(name);
   }
+  (ctx as any)[isolateSym] = shadow;
+}
+
+/**
+ * Validates whether a given Cordis context derives from targetScope for isolated service resolution.
+ * Verifies both Cordis service isolation token equality (symbols.isolate) and prototype chain descent.
+ */
+export function isContextDerivedFrom(ctx: Context | undefined, targetScope: Context): boolean {
+  if (!ctx || !targetScope) return false;
+  if (ctx === targetScope) return true;
+
+  const isolateSym = Symbol.for('cordis.isolate');
+  const targetToken = (targetScope as any)[isolateSym]?.fs;
+  const ctxToken = (ctx as any)[isolateSym]?.fs;
+  if (!targetToken || ctxToken !== targetToken) {
+    return false;
+  }
+
+  let curr: unknown = ctx;
+  while (curr) {
+    if (curr === targetScope) return true;
+    try {
+      curr = Object.getPrototypeOf(curr);
+    } catch {
+      break;
+    }
+  }
+  return false;
 }
 
 export interface SpaceIsolatedFsConfig {
   cwd: string;
   dshHome?: string;
   mounts?: readonly ResolvedRuntimeMount[];
+  extraReadableRoots?: string[];
+  extraWritableRoots?: string[];
   diffBasisMaxBytes?: number;
 }
 
@@ -293,13 +372,17 @@ export class SpaceIsolatedFileSystem extends LocalFileSystem {
   private readonly mountResolver: VirtualMountResolver;
 
   constructor(ctx: Context, config: SpaceIsolatedFsConfig) {
-    const { mounts, dshHome, ...baseConfig } = config || {};
+    const { mounts, dshHome, extraReadableRoots, extraWritableRoots, ...baseConfig } = config || {};
     super(ctx, {
       cwd: baseConfig.cwd,
       diffBasisMaxBytes: baseConfig.diffBasisMaxBytes ?? 1024 * 1024,
     } as any);
     this.spaceFsConfig = config || { cwd: process.cwd() };
-    this.mountResolver = new VirtualMountResolver(this.spaceFsConfig.cwd, this.spaceFsConfig.mounts);
+    this.mountResolver = new VirtualMountResolver(this.spaceFsConfig.cwd, this.spaceFsConfig.mounts, {
+      extraReadableRoots: this.spaceFsConfig.extraReadableRoots,
+      extraWritableRoots: this.spaceFsConfig.extraWritableRoots,
+      deniedRoots: dshHome ? [dshHome] : [],
+    });
   }
 
   override get sandboxMode(): SandboxMode | undefined {
@@ -323,7 +406,7 @@ export class SpaceIsolatedFileSystem extends LocalFileSystem {
       };
     }
 
-    if (resolved.isMount) {
+    if (resolved.isMount || resolved.isExtraRoot) {
       return {
         displayPath: resolved.displayPath,
         targetKey: FsTargetKey(resolved.physicalPath!),
@@ -353,7 +436,7 @@ export class SpaceIsolatedFileSystem extends LocalFileSystem {
       };
     }
 
-    if (resolved.isMount) {
+    if (resolved.isMount || resolved.isExtraRoot) {
       try {
         const stat = await fs.promises.lstat(resolved.physicalPath!);
         return {
@@ -460,6 +543,26 @@ export class InstructionsFileSystem extends LocalFileSystem {
       } catch {}
     }
 
+    if (!isAllowed && path.isAbsolute(filePath)) {
+      const extraRoots = [
+        ...(this.config.extraWritableRoots ?? [os.tmpdir(), '/tmp', '/private/tmp']),
+        ...(this.config.extraReadableRoots ?? [os.homedir()]),
+      ];
+      for (const root of extraRoots) {
+        if (!root) continue;
+        let realRoot: string;
+        try {
+          realRoot = await fs.promises.realpath(root);
+        } catch {
+          realRoot = path.resolve(root);
+        }
+        if (isPathInside(targetRealPath, realRoot)) {
+          isAllowed = true;
+          break;
+        }
+      }
+    }
+
     if (!isAllowed) {
       throw new FsError(
         `Access denied: path "${filePath}" resolves outside instructions boundary`,
@@ -519,10 +622,32 @@ export class InstructionsFileSystem extends LocalFileSystem {
           return super.lstat(filePath, opts, signal);
         }
         if (!isPathInside(candidatePath, realCwd)) {
-          throw new FsError(
-            `Access denied: lstat path "${filePath}" is outside space boundary "${cwd}"`,
-            'FS_SANDBOX_DENIED'
-          );
+          let allowedMissing = false;
+          if (path.isAbsolute(filePath)) {
+            const extraRoots = [
+              ...(this.config.extraWritableRoots ?? [os.tmpdir(), '/tmp', '/private/tmp']),
+              ...(this.config.extraReadableRoots ?? [os.homedir()]),
+            ];
+            for (const root of extraRoots) {
+              if (!root) continue;
+              let realRoot: string;
+              try {
+                realRoot = await fs.promises.realpath(root);
+              } catch {
+                realRoot = path.resolve(root);
+              }
+              if (isPathInside(candidatePath, realRoot)) {
+                allowedMissing = true;
+                break;
+              }
+            }
+          }
+          if (!allowedMissing) {
+            throw new FsError(
+              `Access denied: lstat path "${filePath}" is outside space boundary "${cwd}"`,
+              'FS_SANDBOX_DENIED'
+            );
+          }
         }
         return super.lstat(filePath, opts, signal);
       }
@@ -533,7 +658,28 @@ export class InstructionsFileSystem extends LocalFileSystem {
       return super.lstat(filePath, opts, signal);
     }
 
-    if (!isPathInside(realCandidate, realCwd)) {
+    let isCandidateAllowed = isPathInside(realCandidate, realCwd);
+    if (!isCandidateAllowed && path.isAbsolute(filePath)) {
+      const extraRoots = [
+        ...(this.config.extraWritableRoots ?? [os.tmpdir(), '/tmp', '/private/tmp']),
+        ...(this.config.extraReadableRoots ?? [os.homedir()]),
+      ];
+      for (const root of extraRoots) {
+        if (!root) continue;
+        let realRoot: string;
+        try {
+          realRoot = await fs.promises.realpath(root);
+        } catch {
+          realRoot = path.resolve(root);
+        }
+        if (isPathInside(realCandidate, realRoot)) {
+          isCandidateAllowed = true;
+          break;
+        }
+      }
+    }
+
+    if (!isCandidateAllowed) {
       throw new FsError(
         `Access denied: lstat path "${filePath}" resolves outside space boundary "${cwd}"`,
         'FS_SANDBOX_DENIED'
@@ -547,6 +693,8 @@ export class InstructionsFileSystem extends LocalFileSystem {
 export interface SpaceIsolatedBashConfig {
   cwd?: string;
   mounts?: readonly ResolvedRuntimeMount[];
+  /** DSH home; always denied for shell workdir resolution. */
+  dshHome?: string;
   timeoutMs?: number;
   maxTimeoutMs?: number;
   maxOutputBytes?: number;
@@ -564,7 +712,7 @@ export class SpaceIsolatedBashExecutor extends LocalBashExecutor {
   private readonly mountResolver: VirtualMountResolver;
 
   constructor(ctx: Context, config: SpaceIsolatedBashConfig) {
-    const { mounts, ...baseConfig } = config || {};
+    const { mounts, dshHome: bashDshHome, ...baseConfig } = config || {};
     super(ctx, {
       cwd: baseConfig.cwd ?? process.cwd(),
       timeoutMs: baseConfig.timeoutMs ?? 60000,
@@ -576,7 +724,8 @@ export class SpaceIsolatedBashExecutor extends LocalBashExecutor {
     this.spaceBashConfig = config || {};
     this.mountResolver = new VirtualMountResolver(
       this.spaceBashConfig.cwd ?? this.config.cwd ?? process.cwd(),
-      this.spaceBashConfig.mounts
+      this.spaceBashConfig.mounts,
+      { deniedRoots: bashDshHome ? [bashDshHome] : [] }
     );
   }
 
@@ -754,18 +903,29 @@ export async function mountWorkspaceTools(
 
   try {
     // 1. Filesystem capability scoped to spacePath and controlled mounts
+    const extraReadableRoots = options.extraReadableRoots ?? options.fs?.extraReadableRoots;
+    const extraWritableRoots = options.extraWritableRoots ?? options.fs?.extraWritableRoots;
     const fsFiber = await agentCtx.plugin(SpaceIsolatedFileSystem, {
       cwd: spacePath,
       dshHome,
       mounts: options.mounts,
+      extraReadableRoots,
+      extraWritableRoots,
     } as any);
     fibers.push(fsFiber);
 
     // Allow inner nested injection contexts (e.g. ToolFs read_image imageCtx) to access space-isolated fs
-    agentCtx.on('internal/get', (ctx, prop, error, next) => {
-      if (prop === 'fs') return agentCtx.get('fs');
+    const getFsDisposer = agentCtx.on('internal/get', (ctx, prop, error, next) => {
+      if (prop === 'fs' && isContextDerivedFrom(ctx, agentCtx)) {
+        return agentCtx.get('fs');
+      }
       return next();
     });
+    fibers.push({
+      dispose: async () => {
+        getFsDisposer();
+      },
+    } as any);
 
     // 2. FsObservationPolicy (enforces read-before-write/edit)
     const fsPolicyFiber = await agentCtx.plugin(FsObservationPolicyPlugin);
@@ -784,7 +944,11 @@ export async function mountWorkspaceTools(
     fibers.push(toolFsFiber);
 
     // 4. Subprocess capability with automatic virtual mount path translation
-    const mountResolver = new VirtualMountResolver(spacePath, options.mounts);
+    const mountResolver = new VirtualMountResolver(spacePath, options.mounts, {
+      extraReadableRoots,
+      extraWritableRoots,
+      deniedRoots: [dshHome],
+    });
     const subprocessFiber = await agentCtx.plugin(SpaceIsolatedSubprocessRuntime, mountResolver as any);
     fibers.push(subprocessFiber);
 
@@ -803,6 +967,7 @@ export async function mountWorkspaceTools(
     // 7. Space-isolated Bash executor scoped to spacePath and controlled mounts
     const bashExecutorFiber = await agentCtx.plugin(SpaceIsolatedBashExecutor, {
       cwd: spacePath,
+      dshHome,
       mounts: options.mounts,
       timeoutMs: options.shell?.timeoutMs ?? 60000,
       maxTimeoutMs: options.shell?.maxTimeoutMs ?? 600000,
@@ -852,6 +1017,8 @@ export async function mountWorkspaceTools(
     const instructionsFsFiber = await instructionsCtx.plugin(InstructionsFileSystem, {
       cwd: spacePath,
       dshHome,
+      extraReadableRoots,
+      extraWritableRoots,
     } as any);
     fibers.push(instructionsFsFiber);
 
@@ -870,30 +1037,14 @@ export async function mountWorkspaceTools(
     // 13. Skills scoped to spacePath/.skills and bundled
     // If an authoritative ExtensionActivationPlan is provided, configure active skill directories from plan
     const userSpaceSkillsDir = path.join(spacePath, '.skills');
-    let customSkillDirs: string[];
-    if (options.extensionPlan !== undefined) {
-      if (options.extensionPlan && options.extensionPlan.skills && options.extensionPlan.skills.length > 0) {
-        const activeSkills = options.extensionPlan.skills.filter((s) => s.enabled);
-        if (activeSkills.length > 0) {
-          customSkillDirs = options.skills?.customSkillDirs
-            ? [...options.skills.customSkillDirs]
-            : [userSpaceSkillsDir];
-          if (!customSkillDirs.includes(userSpaceSkillsDir)) {
-            customSkillDirs.push(userSpaceSkillsDir);
-          }
-        } else {
-          customSkillDirs = options.skills?.customSkillDirs ? [...options.skills.customSkillDirs] : [];
-        }
-      } else {
-        customSkillDirs = options.skills?.customSkillDirs ? [...options.skills.customSkillDirs] : [];
-      }
-    } else {
-      customSkillDirs = options.skills?.customSkillDirs
-        ? [...options.skills.customSkillDirs]
-        : [userSpaceSkillsDir];
-      if (!customSkillDirs.includes(userSpaceSkillsDir)) {
-        customSkillDirs.push(userSpaceSkillsDir);
-      }
+    // The space-local `.skills` directory is always a discovery root; an extension
+    // activation plan (even one with zero enabled skills) must not remove it —
+    // otherwise the model-facing skill catalog is silently empty.
+    const customSkillDirs: string[] = options.skills?.customSkillDirs
+      ? [...options.skills.customSkillDirs]
+      : [];
+    if (!customSkillDirs.includes(userSpaceSkillsDir)) {
+      customSkillDirs.push(userSpaceSkillsDir);
     }
 
     const adminBundledSkillDir =
@@ -959,6 +1110,46 @@ export async function mountWorkspaceTools(
       defaultPreset: options.defaultPreset ?? 'workspace-write',
     });
     fibers.push(permissionFiber);
+
+    // 15.5 Web Tool Suite scoped to Agent (web_fetch default enabled; web_search registered only when provider is available)
+    const webFetchEnabled = options.web?.fetch !== false;
+    let webSearchEnabled = false;
+
+    if (options.web?.search !== false) {
+      const webService: any =
+        (agentCtx.get ? agentCtx.get('web') : undefined) ??
+        (agentCtx as any).web ??
+        (agentCtx as any).root?.get?.('web') ??
+        (agentCtx as any).root?.web;
+
+      if (webService && webService.searchProviders) {
+        const providersMap: Map<string, any> = webService.searchProviders;
+        const configuredId: string | undefined =
+          options.web?.searchProvider ?? webService.searchProviderId ?? process.env.DSH_WEB_SEARCH_PROVIDER;
+
+        if (configuredId) {
+          const provider = providersMap.get(configuredId);
+          if (provider && (typeof provider.available !== 'function' || provider.available())) {
+            webSearchEnabled = true;
+          }
+        } else if (providersMap.size > 0) {
+          for (const provider of providersMap.values()) {
+            if (typeof provider.available !== 'function' || provider.available()) {
+              webSearchEnabled = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (webFetchEnabled || webSearchEnabled) {
+      const toolWebFiber = await agentCtx.plugin(ToolWebPlugin, {
+        search: webSearchEnabled,
+        fetch: webFetchEnabled,
+      });
+      fibers.push(toolWebFiber);
+    }
 
     // 16. MCP Dynamic Tool Registration from ExtensionActivationPlan
     let mcpMountHandle: { dispose(): Promise<void> } | undefined;
@@ -1029,6 +1220,7 @@ export async function mountWorkspaceTools(
           sessionId: options.sessionId,
           userId: options.userId,
           spaceId: options.spaceId,
+          larkScopedConfigProvider: options.larkScopedConfigProvider,
         });
       }
     }
@@ -1080,6 +1272,9 @@ export async function mountWorkspaceTools(
     }
 
     const updateExtensionPlan = async (newPlan: ExtensionActivationPlan | null) => {
+      if (typeof options.onExtensionPlanUpdated === 'function') {
+        await options.onExtensionPlanUpdated(newPlan);
+      }
       if (mcpMountHandle && typeof mcpMountHandle.dispose === 'function') {
         try {
           await mcpMountHandle.dispose();
@@ -1159,6 +1354,7 @@ export async function mountWorkspaceTools(
             sessionId: options.sessionId,
             userId: options.userId,
             spaceId: options.spaceId,
+            larkScopedConfigProvider: options.larkScopedConfigProvider,
           });
         }
 
@@ -1167,12 +1363,15 @@ export async function mountWorkspaceTools(
       }
     };
 
+    let isDisposed = false;
     return {
       fibers,
       spacePath,
       context: agentCtx,
       updateExtensionPlan,
       dispose: async () => {
+        if (isDisposed) return;
+        isDisposed = true;
         const errors: Error[] = [];
         for (let i = pluginFibers.length - 1; i >= 0; i--) {
           const pf = pluginFibers[i];
@@ -1191,6 +1390,7 @@ export async function mountWorkspaceTools(
           } catch (err: unknown) {
             errors.push(err instanceof Error ? err : new Error(String(err)));
           }
+          cliMountHandle = undefined;
         }
         if (mcpMountHandle && typeof mcpMountHandle.dispose === 'function') {
           try {
@@ -1198,6 +1398,7 @@ export async function mountWorkspaceTools(
           } catch (err: unknown) {
             errors.push(err instanceof Error ? err : new Error(String(err)));
           }
+          mcpMountHandle = undefined;
         }
         for (let i = fibers.length - 1; i >= 0; i--) {
           const f = fibers[i];
@@ -1269,9 +1470,14 @@ export async function mountOfficialPlugins(
     mountedPlugins.set('tool-result-pruner', prunerFiber);
 
     // 1.3 BasicCompactionEngine (provides ctx.compaction)
+    let thresholdRatio = config.compaction?.thresholdRatio;
+    if (thresholdRatio === undefined && config.compaction?.thresholdTokens !== undefined) {
+      const effectiveContextWindow = config.contextWindow ?? 1000000;
+      thresholdRatio = deriveCompactionThresholdRatio(config.compaction.thresholdTokens, effectiveContextWindow);
+    }
     const compactionFiber = await ctx.plugin(BasicCompactionEngine, {
       auto: config.compaction?.auto ?? true,
-      thresholdRatio: config.compaction?.thresholdRatio,
+      thresholdRatio,
       retainRatio: config.compaction?.retainRatio,
       retainTokens: config.compaction?.retainTokens,
     });
@@ -1341,6 +1547,66 @@ export async function mountOfficialPlugins(
     fibers.push(mcpGovFiber);
     mountedPlugins.set('mcp-governance', mcpGovFiber);
 
+    // 7.1 Host-level Lark Scoped Configuration Provider (if provided)
+    if (config.larkScopedConfigProvider) {
+      if (typeof (ctx as any).provide === 'function') {
+        (ctx as any).provide('larkScopedConfigProvider', config.larkScopedConfigProvider);
+      } else {
+        (ctx as any).larkScopedConfigProvider = config.larkScopedConfigProvider;
+      }
+    }
+
+    // 7.5 Process-global Web Access Seam (WebRuntime + HttpFetchProvider + optional WebSearchProvider)
+    let webService: any = ctx.get ? ctx.get('web') : undefined;
+    if (!webService) {
+      try {
+        webService = (ctx as any).web;
+      } catch {}
+    }
+
+    if (!webService) {
+      const webRuntimeFiber = await ctx.plugin(WebRuntime, {
+        searchProvider: config.web?.searchProvider,
+        fetchProvider: config.web?.fetchProvider,
+      });
+      fibers.push(webRuntimeFiber);
+      mountedPlugins.set('web', webRuntimeFiber);
+      webService = ctx.get ? ctx.get('web') : (ctx as any).web;
+    }
+
+    if (!mountedPlugins.has('web-fetch-http')) {
+      const httpFetchFiber = await ctx.plugin(HttpFetchProviderPlugin);
+      fibers.push(httpFetchFiber);
+      mountedPlugins.set('web-fetch-http', httpFetchFiber);
+    }
+
+    // Optional Search Provider Plugin Mount (custom plugin or official DeepSeek search provider)
+    if (config.web?.searchPlugin) {
+      const searchPluginFiber = await ctx.plugin(config.web.searchPlugin, config.web.searchPluginConfig ?? {});
+      fibers.push(searchPluginFiber);
+      mountedPlugins.set('web-search-plugin', searchPluginFiber);
+    } else if (
+      config.web?.searchProvider === 'deepseek-official' ||
+      config.web?.searchProvider === 'deepseek' ||
+      config.web?.searchConfig !== undefined
+    ) {
+      try {
+        const deepseekPlugin = await import('@deepseek-ai/dsh-web-search-deepseek');
+        const dsFiber = await ctx.plugin(deepseekPlugin as any, {
+          apiKeyEnv: config.web?.searchConfig?.apiKeyEnv ?? 'DEEPSEEK_API_KEY',
+          baseURL: config.web?.searchConfig?.baseURL,
+          model: config.web?.searchConfig?.model,
+          maxUses: config.web?.searchConfig?.maxUses,
+          maxTokens: config.web?.searchConfig?.maxTokens,
+          apiVersion: config.web?.searchConfig?.apiVersion,
+        });
+        fibers.push(dsFiber);
+        mountedPlugins.set('web-search-deepseek', dsFiber);
+      } catch {
+        // Fail-safe: if official search plugin is unavailable, do not crash; web_search tool remains unadvertised
+      }
+    }
+
     // 8. Global Authoritative Policy Enforcement Gate at tool executor boundary
     ctx.on('tools/pre-execute', async (exec, next) => {
       const session = exec.agent?.session;
@@ -1353,7 +1619,7 @@ export async function mountOfficialPlugins(
       const toolName = exec.name;
 
       // 1. Safe read/inspection tools are unconditionally allowed in any mode
-      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'check_quota'].includes(toolName)) {
+      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'check_quota', 'web_search', 'web_fetch'].includes(toolName)) {
         return await next();
       }
 
@@ -1530,6 +1796,36 @@ export async function mountOfficialPlugins(
       }
     }
 
+    // Probe Web capabilities
+    const globalWebService: any = ctx.get ? ctx.get('web') : (ctx as any).web;
+    let webSearchOperational = false;
+    let webFetchOperational = false;
+    let activeWebSearchProvider: string | undefined;
+
+    if (globalWebService) {
+      if (globalWebService.fetchProviders && globalWebService.fetchProviders.size > 0) {
+        webFetchOperational = true;
+      }
+      if (globalWebService.searchProviders && globalWebService.searchProviders.size > 0) {
+        const configuredId = globalWebService.searchProviderId;
+        if (configuredId) {
+          const p = globalWebService.searchProviders.get(configuredId);
+          if (p && (typeof p.available !== 'function' || p.available())) {
+            webSearchOperational = true;
+            activeWebSearchProvider = configuredId;
+          }
+        } else {
+          for (const [id, p] of globalWebService.searchProviders.entries()) {
+            if (typeof p.available !== 'function' || p.available()) {
+              webSearchOperational = true;
+              activeWebSearchProvider = id;
+              break;
+            }
+          }
+        }
+      }
+    }
+
     return {
       compaction: compactionReady,
       instructions: instructionsReady,
@@ -1540,6 +1836,11 @@ export async function mountOfficialPlugins(
       permissions: permissionsReady,
       filesystem: fsOperational,
       shell: shellOperational,
+      web: {
+        search: webSearchOperational,
+        fetch: webFetchOperational,
+        provider: activeWebSearchProvider,
+      },
       maxSubagentDepth,
       maxSubagentConcurrency,
       activeSubagentsCount,

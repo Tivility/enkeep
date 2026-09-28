@@ -196,4 +196,74 @@ describe('Lark Inbound Slash Command Integration', () => {
     const latestRowId = await streamEventSource.getLatestRowId(normRouteId);
     expect(normWatcher!.getCursor()).toBe(latestRowId);
   });
+
+  it('handles /help and /status commands via Lark inbound event', async () => {
+    const gateway = runtimeManager.getActiveGateway(userId, accountId)!;
+    expect(gateway).toBeDefined();
+
+    // 1. Inbound /help command
+    const helpEvent = createEvent('evt_cmd_help_1', 'om_cmd_help_1', '/help');
+    const resHelp = await gateway.handleInboundEvent(helpEvent);
+    expect(resHelp.handled).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(transport.sentReplies).toHaveLength(1);
+    });
+
+    expect(transport.sentReplies[0].chatId).toBe(chatId);
+    expect(transport.sentReplies[0].replyToMessageId).toBe('om_cmd_help_1');
+    expect(transport.sentReplies[0].content).toContain('/help');
+    expect(transport.sentReplies[0].content).toContain('/status');
+    expect(transport.sentReplies[0].content).toContain('/new');
+    expect(transport.sentReplies[0].content).toContain('/stop');
+    expect(executorFn).toHaveBeenCalledTimes(0);
+
+    // 2. Inbound /status command
+    const statusEvent = createEvent('evt_cmd_status_1', 'om_cmd_status_1', '/status');
+    const resStatus = await gateway.handleInboundEvent(statusEvent);
+    expect(resStatus.handled).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(transport.sentReplies).toHaveLength(2);
+    });
+
+    expect(transport.sentReplies[1].chatId).toBe(chatId);
+    expect(transport.sentReplies[1].replyToMessageId).toBe('om_cmd_status_1');
+    expect(transport.sentReplies[1].content).toContain('space:');
+    expect(transport.sentReplies[1].content).toContain('model:');
+    expect(transport.sentReplies[1].content).toContain('turn:');
+  });
+
+  it('handles /new and /stop commands via Lark inbound event', async () => {
+    const gateway = runtimeManager.getActiveGateway(userId, accountId)!;
+    expect(gateway).toBeDefined();
+
+    const resetSpy = vi.fn(async () => ({
+      session: {},
+      generation: { generation: 2, resetReason: 'chat_command' },
+    }));
+    deliveryGateway.setChatCommandDeps({ resetSession: resetSpy });
+
+    // Inbound /stop command when idle
+    const stopEvent = createEvent('evt_cmd_stop_1', 'om_cmd_stop_1', '/stop');
+    const resStop = await gateway.handleInboundEvent(stopEvent);
+    expect(resStop.handled).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(transport.sentReplies).toHaveLength(1);
+    });
+    expect(transport.sentReplies[0].content).toBe('nothing running');
+
+    // Inbound /new command when idle
+    const newEvent = createEvent('evt_cmd_new_1', 'om_cmd_new_1', '/new');
+    const resNew = await gateway.handleInboundEvent(newEvent);
+    expect(resNew.handled).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(transport.sentReplies).toHaveLength(2);
+    });
+    expect(transport.sentReplies[1].content).toBe('Started generation 2 (was 1)');
+    expect(resetSpy).toHaveBeenCalledTimes(1);
+    expect(executorFn).toHaveBeenCalledTimes(0);
+  });
 });
