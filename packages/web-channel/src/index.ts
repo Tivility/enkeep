@@ -33,6 +33,10 @@ export type {
   ChannelType,
 } from './types.js';
 
+export {
+  DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
+} from './types.js';
+
 // Route Key Utilities
 export {
   DEFAULT_WEB_ACCOUNT_ID,
