@@ -1025,6 +1025,7 @@ export class PlatformServer {
           runId: options.runId,
           workerId: options.workerId,
           channelRuntimeManager: options.channelRuntimeManager ?? this.channelRuntimeManager,
+          wechatRuntimeManager: options.wechatRuntimeManager ?? this.wechatRuntimeManager,
           prepareTaskInput: taskPreparerHook,
           fileService: () => this.fileService ?? this.fileProvider,
           dataRoot: this.dataRoot,
@@ -1039,6 +1040,7 @@ export class PlatformServer {
     (this.larkOnboardingService as any).runtimeManager = this.channelRuntimeManager;
     if (this.taskWorker) {
       this.taskWorker.channelRuntimeManager = this.channelRuntimeManager;
+      this.taskWorker.wechatRuntimeManager = this.wechatRuntimeManager;
     }
 
     this.channelRoutes =
