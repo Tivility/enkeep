@@ -563,7 +563,8 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     claimantId: string,
     result: AgentPromptDispatchResult,
     runId?: string,
-    tokenUsage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number }
+    tokenUsage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number },
+    nowParam?: Date | string
   ): Promise<Task> {
     const validId = validateTaskId(id);
     const validClaimantId = validateClaimantId(claimantId);
@@ -580,10 +581,13 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       throw new TaskAlreadyClaimedError(validId, existing.claimantId || 'unknown');
     }
 
-    const now = new Date();
+    const completedAtTime = validatedResult.completedAt ? new Date(validatedResult.completedAt) : null;
+    const now = nowParam
+      ? (typeof nowParam === 'string' ? new Date(nowParam) : nowParam)
+      : (completedAtTime && !Number.isNaN(completedAtTime.getTime()) ? completedAtTime : new Date());
     const nowIso = now.toISOString();
 
-    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= now.getTime()) {
+    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() < now.getTime()) {
       throw new TaskLeaseExpiredError(validId);
     }
 
@@ -627,7 +631,8 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     error: string,
     retryable?: boolean,
     runId?: string,
-    errorCode?: string
+    errorCode?: string,
+    nowParam?: Date | string
   ): Promise<Task> {
     const validId = validateTaskId(id);
     const validClaimantId = validateClaimantId(claimantId);
@@ -643,10 +648,10 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       throw new TaskAlreadyClaimedError(validId, existing.claimantId || 'unknown');
     }
 
-    const now = new Date();
-    const nowIso = now.toISOString();
+    const clock = nowParam ? (typeof nowParam === 'string' ? new Date(nowParam) : nowParam) : new Date();
+    const nowIso = clock.toISOString();
 
-    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= now.getTime()) {
+    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() < clock.getTime()) {
       throw new TaskLeaseExpiredError(validId);
     }
 
