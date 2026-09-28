@@ -720,6 +720,9 @@ importers:
       '@enkeep/dsh-external-interaction':
         specifier: workspace:*
         version: link:../dsh-external-interaction
+      '@enkeep/dsh-tool-cli':
+        specifier: workspace:*
+        version: link:../dsh-tool-cli
       '@enkeep/import-happyclaw':
         specifier: workspace:*
         version: link:../import-happyclaw
