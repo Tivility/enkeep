@@ -271,8 +271,8 @@ describe('Two-Step AgentLoop Request-Level Fallback Test', () => {
       // Assert side effect was executed EXACTLY ONCE (not twice!)
       expect(sideEffectCounter).toBe(1);
 
-      // Assert request breakdown: Claude received 3 calls (1 success on step 1, 2 503 attempts with bounded retry on step 2), Gemini received 1 call (success on step 2)
-      expect(claudeRequests.length).toBe(3);
+      // Assert request breakdown: Claude received 9 calls (1 success on step 1, 2 DSH agent attempts * 4 proxy attempts on step 2), Gemini received 1 call (success on step 2)
+      expect(claudeRequests.length).toBe(9);
       expect(geminiRequests.length).toBe(1);
 
       // Assert session events invariant: exactly 1 human user/message, exactly 1 turn/start
