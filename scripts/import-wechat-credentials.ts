@@ -48,6 +48,7 @@ export interface WeChatMigrationOptions {
   readonly status?: 'disabled' | 'active';
   readonly activate?: boolean;
   readonly user?: string;
+  readonly targetAccountId?: string;
   readonly onlyActive?: boolean;
   readonly checkEndpoint?: boolean;
 }
@@ -84,6 +85,7 @@ Options:
   --vault-key=<secret>    Master encryption key (hex or string) for Enkeep credentials
   --status=<status>       Target account status: "disabled" | "active" (default: "disabled")
   --activate              Shorthand for --status=active
+  --target-account=<id>   Target account ID in Enkeep (e.g. "acc_f0e1cfba20eefc661520eb2e211d")
   --user=<name>           Filter migration to a single HappyClaw username or ID (e.g. "cxx")
   --only-active           Only import accounts that were active/enabled in HappyClaw
   --check                 Perform local offline endpoint connectivity check (fake server only)
@@ -109,6 +111,7 @@ function parseCliArgs(argv: string[]): {
   let masterKey: string | undefined;
   let status: 'disabled' | 'active' = 'disabled';
   let user: string | undefined;
+  let targetAccountId: string | undefined;
   let onlyActive = false;
   let checkEndpoint = false;
   let json = false;
@@ -129,6 +132,14 @@ function parseCliArgs(argv: string[]): {
       checkEndpoint = true;
     } else if (arg === '--json') {
       json = true;
+    } else if (arg.startsWith('--target-account=')) {
+      targetAccountId = arg.slice('--target-account='.length);
+    } else if (arg === '--target-account' && i + 1 < argv.length) {
+      targetAccountId = argv[++i];
+    } else if (arg.startsWith('--account-id=')) {
+      targetAccountId = arg.slice('--account-id='.length);
+    } else if (arg === '--account-id' && i + 1 < argv.length) {
+      targetAccountId = argv[++i];
     } else if (arg.startsWith('--hc-dir=')) {
       hcDir = arg.slice('--hc-dir='.length);
     } else if (arg === '--hc-dir' && i + 1 < argv.length) {
@@ -171,6 +182,7 @@ function parseCliArgs(argv: string[]): {
       status,
       dryRun,
       user,
+      targetAccountId,
       onlyActive,
       checkEndpoint,
     },
