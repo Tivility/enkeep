@@ -2821,6 +2821,7 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       expect(completedEvents.length).toBe(1);
       expect(completedEvents[0].executionResult.replyText).toBe(assistantMsgRow.content);
     });
+
     it('maps upstream transient model error to RATE_LIMITED code and delivered assistant notice fallback text', async () => {
       const { db, storage, messageStore, profileResolver } = await setupTestEnv();
 

@@ -349,4 +349,3 @@ describe('dsh-boot Upstream Error Class Preservation', () => {
     expect(err.message).toBe('Rate limited by upstream provider');
   });
 });
-
