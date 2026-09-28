@@ -6,6 +6,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { provisionFixtures } from '@enkeep/platform-auth';
 import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
 import {
+  validateAgentProfileSnapshot,
+  ALLOWED_PROFILE_KEYS,
+} from '../../runtime-runner/src/runtime/agent-profile.js';
+import { computeAgentProfilePromptHash } from '../src/profiles/profile-service.js';
+import {
   PlatformServer,
   SqliteWebMessageStore,
   type RuntimeArtifactPort,
@@ -564,6 +569,18 @@ describe('Space & Session Lifecycle: Archive, Restore & Online Fork', () => {
       expect(res.status).toBe(200);
       const json = await res.json();
       expect(json.data.status).toBe('active');
+
+      // Archive restored session so space has no active session left over for next describe block
+      await fetch(`${baseUrl}/api/sessions/${sessId}/archive`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: aliceCookie,
+          'X-Enkeep-CSRF': testCsrfToken,
+          Origin: baseUrl,
+        },
+        body: JSON.stringify({}),
+      });
     });
   });
 
@@ -999,11 +1016,12 @@ describe('Space & Session Lifecycle: Archive, Restore & Online Fork', () => {
         expect(boundaryOp.error_message).not.toContain(sub);
       }
 
-      // 3. Import Failure: throws sensitiveLeak
+      // 3. Import Failure: throws diagnosed seed error
+      const importFailureMsg = 'Profile snapshot unexpected key rejected';
       const failingImportPort: RuntimeArtifactPort = {
         ...testRuntimeArtifactPort,
         async importSeed() {
-          throw new Error(sensitiveLeak);
+          throw new Error(importFailureMsg);
         },
       };
       const importForkService = new ForkService({
@@ -1022,10 +1040,7 @@ describe('Space & Session Lifecycle: Archive, Restore & Online Fork', () => {
       expect(caughtImportErr).toBeDefined();
       expect(caughtImportErr.code).toBe('RUNTIME_SEED_FAILED');
       expect(caughtImportErr.status).toBe(502);
-      expect(caughtImportErr.message).toBe('Runtime fork seed failed');
-      for (const sub of sensitiveSubstrings) {
-        expect(caughtImportErr.message).not.toContain(sub);
-      }
+      expect(caughtImportErr.message).toBe(`Runtime fork seed failed: ${importFailureMsg}`);
 
       const importOp = db.prepare(`
         SELECT error_code, error_message FROM fork_operations
@@ -1034,10 +1049,7 @@ describe('Space & Session Lifecycle: Archive, Restore & Online Fork', () => {
       `).get(aliceId) as any;
       expect(importOp).toBeDefined();
       expect(importOp.error_code).toBe('RUNTIME_SEED_FAILED');
-      expect(importOp.error_message).toBe('Runtime fork seed failed');
-      for (const sub of sensitiveSubstrings) {
-        expect(importOp.error_message).not.toContain(sub);
-      }
+      expect(importOp.error_message).toBe(`Runtime fork seed failed: ${importFailureMsg}`);
 
       // 4. Attachment Copy Failure: targetSpaceId differs and message has attachment, throws sensitiveLeak
       // Create a second active space for alice
@@ -1151,6 +1163,121 @@ describe('Space & Session Lifecycle: Archive, Restore & Online Fork', () => {
       for (const sub of sensitiveSubstrings) {
         expect(serializedForkOps).not.toContain(sub);
       }
+    });
+
+    it('passes validated profile snapshot with only allowed camelCase keys to importSeed', async () => {
+      const { ForkService } = await import('../src/sessions/fork-service.js');
+
+      // 1. Create a valid agent profile and snapshot in the DB
+      const profId = 'prof_0123456789abcdef0123456789abcdef';
+      const snapId = 'snap_0123456789abcdef0123456789abcdef';
+      const promptSections = {
+        identity: 'Profile fork identity text',
+        soul: 'Profile fork soul text',
+        agents: 'Profile fork agents text',
+        tools: 'Profile fork tools text',
+      };
+      const pHash = computeAgentProfilePromptHash(promptSections);
+
+      db.prepare(`
+        INSERT INTO agent_profiles (id, user_id, name, status, active_version, created_at, updated_at)
+        VALUES (?, ?, 'Profile for Fork Test', 'active', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(profId, aliceId);
+
+      db.prepare(`
+        INSERT INTO agent_profile_snapshots (
+          id, user_id, profile_id, version, prompt_mode, prompt_hash,
+          identity, soul, agents, tools, created_at
+        ) VALUES (?, ?, ?, 1, 'append', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      `).run(
+        snapId,
+        aliceId,
+        profId,
+        pHash,
+        promptSections.identity,
+        promptSections.soul,
+        promptSections.agents,
+        promptSections.tools
+      );
+
+      // 2. Create a source session bound to this profile snapshot
+      const srcRouteId = 'ses_fork_prof_src_01';
+      const srcDshId = 'ses_fork_prof_dsh_01';
+      db.prepare(`
+        INSERT INTO session_routes (
+          id, user_id, space_id, channel, dsh_session_id, current_generation,
+          agent_profile_id, agent_profile_snapshot_id, status, created_at, updated_at
+        ) VALUES (?, ?, ?, 'web', ?, 1, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(srcRouteId, aliceId, aliceSpaceId, srcDshId, profId, snapId);
+
+      db.prepare(`
+        INSERT INTO session_generations (
+          id, user_id, route_id, generation_number, dsh_session_id,
+          agent_profile_snapshot_id, reset_reason, created_at
+        ) VALUES ('gen_fork_prof_01', ?, ?, 1, ?, ?, 'init', CURRENT_TIMESTAMP)
+      `).run(aliceId, srcRouteId, srcDshId, snapId);
+
+      db.prepare(`
+        INSERT INTO web_messages (
+          id, session_id, user_id, role, content, status, route_key, created_at
+        ) VALUES ('msg_fork_prof_01', ?, ?, 'user', 'Hello profile fork', 'delivered', 'rkey_1', CURRENT_TIMESTAMP)
+      `).run(srcRouteId, aliceId);
+
+      // 3. Spy on runtimeArtifactPort.importSeed to capture profile
+      let capturedProfile: any = null;
+      const capturingImportPort: RuntimeArtifactPort = {
+        ...testRuntimeArtifactPort,
+        async importSeed(opts) {
+          capturedProfile = opts.profile;
+          return {
+            status: 'ok',
+            sessionId: opts.targetDshId,
+            persisted: true,
+            eventsCount: opts.events.length,
+            receipt: opts.receipt,
+            duplicate: false,
+          };
+        },
+      };
+
+      const profileForkService = new ForkService({
+        db,
+        storage: server.storage,
+        runtimeArtifactPort: capturingImportPort,
+        attachmentCopyPort: testAttachmentCopyPort,
+      });
+
+      // 4. Execute forkSession
+      const forkedSession = await profileForkService.forkSession(aliceId, srcRouteId, {
+        title: 'Profile Forked Session',
+      });
+      expect(forkedSession).toBeDefined();
+
+      // 5. Assert captured profile has ONLY allowed camelCase keys and passes validateAgentProfileSnapshot
+      expect(capturedProfile).not.toBeNull();
+      expect(typeof capturedProfile).toBe('object');
+
+      const capturedKeys = Object.keys(capturedProfile);
+      expect(capturedKeys.length).toBe(7);
+      for (const k of capturedKeys) {
+        expect(ALLOWED_PROFILE_KEYS.has(k)).toBe(true);
+      }
+      expect(capturedProfile).not.toHaveProperty('id');
+      expect(capturedProfile).not.toHaveProperty('profile_id');
+      expect(capturedProfile).not.toHaveProperty('prompt_hash');
+      expect(capturedProfile).not.toHaveProperty('prompt_mode');
+      expect(capturedProfile).not.toHaveProperty('change_summary');
+      expect(capturedProfile).not.toHaveProperty('created_at');
+
+      const validated = validateAgentProfileSnapshot(capturedProfile);
+      expect(validated).toBeDefined();
+      expect(validated.profileId).toBe(profId);
+      expect(validated.version).toBe(1);
+      expect(validated.promptHash).toBe(pHash);
+      expect(validated.identity).toBe(promptSections.identity);
+      expect(validated.soul).toBe(promptSections.soul);
+      expect(validated.agents).toBe(promptSections.agents);
+      expect(validated.tools).toBe(promptSections.tools);
     });
   });
 });

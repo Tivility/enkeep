@@ -29,6 +29,7 @@ import type {
   AttachmentCopyPort,
   SessionSeedReceipt,
 } from './runtime-artifact-port.js';
+import type { RuntimeAgentProfileSnapshot } from '../profiles/profile-service.js';
 
 export interface ForkServiceOptions {
   db: DatabaseSync;
@@ -212,13 +213,30 @@ export class ForkService {
     const pinnedProfileSnapshotId = sourceGenRow?.agent_profile_snapshot_id ?? sourceSession.agentProfileSnapshotId ?? null;
     const pinnedProfileId = sourceSession.agentProfileId ?? null;
 
-    let profileSnapshotObj: unknown = null;
+    let profileSnapshotObj: RuntimeAgentProfileSnapshot | null = null;
     if (pinnedProfileSnapshotId) {
       const snapRow = this.db
         .prepare('SELECT id, profile_id, version, identity, soul, agents, tools, prompt_hash FROM agent_profile_snapshots WHERE id = ?')
-        .get(pinnedProfileSnapshotId);
+        .get(pinnedProfileSnapshotId) as {
+          id: string;
+          profile_id: string;
+          version: number;
+          identity: string | null;
+          soul: string | null;
+          agents: string | null;
+          tools: string | null;
+          prompt_hash: string;
+        } | undefined;
       if (snapRow) {
-        profileSnapshotObj = snapRow;
+        profileSnapshotObj = {
+          profileId: snapRow.profile_id,
+          version: snapRow.version,
+          promptHash: snapRow.prompt_hash,
+          identity: snapRow.identity ?? '',
+          soul: snapRow.soul ?? '',
+          agents: snapRow.agents ?? '',
+          tools: snapRow.tools ?? '',
+        };
       }
     }
 
@@ -381,15 +399,20 @@ export class ForkService {
         .run(JSON.stringify(receipt), JSON.stringify(plan), forkOpId);
     } catch (importErr: unknown) {
       console.error('[FORK IMPORT ERROR]', importErr);
+      const rawMsg = importErr instanceof Error ? importErr.message : String(importErr);
+      const truncated = rawMsg.slice(0, 300);
+      const errorMsg = truncated
+        ? (truncated.startsWith('Runtime fork seed failed') ? truncated : `Runtime fork seed failed: ${truncated}`)
+        : 'Runtime fork seed failed';
       this.db
         .prepare(`
           UPDATE fork_operations
-          SET status = 'failed', error_code = 'RUNTIME_SEED_FAILED', error_message = 'Runtime fork seed failed', updated_at = CURRENT_TIMESTAMP
+          SET status = 'failed', error_code = 'RUNTIME_SEED_FAILED', error_message = ?, updated_at = CURRENT_TIMESTAMP
           WHERE id = ?
         `)
-        .run(forkOpId);
+        .run(errorMsg, forkOpId);
       throw new PlatformError(
-        'Runtime fork seed failed',
+        errorMsg,
         'RUNTIME_SEED_FAILED',
         502
       );
