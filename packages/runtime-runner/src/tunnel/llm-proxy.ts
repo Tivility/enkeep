@@ -62,6 +62,8 @@ export interface LlmProxyOptions {
   operations?: any;
   /** Optional model selection service or circuit registry port for fallback and telemetry */
   modelRoutingPort?: ModelRoutingPort;
+  /** Optional custom sleep function for unit tests */
+  sleepFn?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 const IN_CONTAINER_PLACEHOLDER_VALUES = new Set([
@@ -383,6 +385,7 @@ export class LlmProxyHandler implements StreamHandler {
   private readonly explicitDeploymentConfig?: DshDeploymentConfig | null;
   private readonly operations?: any;
   private readonly modelRoutingPort?: ModelRoutingPort;
+  private readonly sleepFn?: (ms: number, signal?: AbortSignal) => Promise<void>;
   private customProviders?: Record<string, DshParsedProvider>;
   private customTokens?: Record<string, string>;
   private customAllowedHosts?: string[];
@@ -392,6 +395,7 @@ export class LlmProxyHandler implements StreamHandler {
     this.explicitDeploymentConfig = options.deploymentConfig;
     this.operations = options.operations;
     this.modelRoutingPort = options.modelRoutingPort;
+    this.sleepFn = options.sleepFn;
     if (options.deploymentConfig) {
       this.customProviders = options.deploymentConfig.providers;
       this.customTokens = options.deploymentConfig.tokens;
@@ -705,174 +709,212 @@ export class LlmProxyHandler implements StreamHandler {
         }
 
         let bytesWrittenToStream = false;
-        const startTime = Date.now();
-        try {
-          const fetchOptions: RequestInit = {
-            method: req.method,
-            headers: upstreamHeaders,
-            signal: abortController.signal,
-          };
-          if (req.method !== 'GET' && req.method !== 'HEAD' && reqBody && reqBody.length > 0) {
-            fetchOptions.body = reqBody as any;
+        const MAX_TRANSIENT_RETRIES = 3;
+
+        for (let retryAttempt = 0; retryAttempt <= MAX_TRANSIENT_RETRIES; retryAttempt++) {
+          if (stream.writableEnded || stream.destroyed || abortController.signal.aborted) {
+            return;
           }
 
-          const upstreamResponse = await this.fetchFn(targetUrlStr, fetchOptions);
-          const latencyMs = Math.max(1, Date.now() - startTime);
+          const startTime = Date.now();
+          let shouldRetry = false;
+          let retryDelayMs = 0;
 
-          if (upstreamResponse.status >= 200 && upstreamResponse.status < 300) {
-            // Success
-            if (this.modelRoutingPort) {
-              try {
-                await this.modelRoutingPort.recordHealth({
-                  provider: candidate.provider,
-                  model: candidate.model,
-                  latencyMs,
-                  statusCode: upstreamResponse.status,
-                  success: true,
-                });
-              } catch {}
+          try {
+            const fetchOptions: RequestInit = {
+              method: req.method,
+              headers: upstreamHeaders,
+              signal: abortController.signal,
+            };
+            if (req.method !== 'GET' && req.method !== 'HEAD' && reqBody && reqBody.length > 0) {
+              fetchOptions.body = reqBody as any;
             }
 
-            if (tenantQuota && reservationId) {
-              try {
-                await tenantQuota.commitQuota({ reservationId, actualAmount: 1 });
-              } catch {}
-            }
+            const upstreamResponse = await this.fetchFn(targetUrlStr, fetchOptions);
+            const latencyMs = Math.max(1, Date.now() - startTime);
 
-            const statusLine = `HTTP/1.1 ${upstreamResponse.status} ${upstreamResponse.statusText || 'OK'}\r\n`;
-            stream.write(statusLine);
-
-            upstreamResponse.headers.forEach((val, key) => {
-              const lk = key.toLowerCase();
-              if (lk !== 'connection' && lk !== 'keep-alive' && lk !== 'transfer-encoding') {
-                stream.write(`${key}: ${val}\r\n`);
+            if (upstreamResponse.status >= 200 && upstreamResponse.status < 300) {
+              // Success
+              if (this.modelRoutingPort) {
+                try {
+                  await this.modelRoutingPort.recordHealth({
+                    provider: candidate.provider,
+                    model: candidate.model,
+                    latencyMs,
+                    statusCode: upstreamResponse.status,
+                    success: true,
+                  });
+                } catch {}
               }
-            });
-            stream.write(`x-enkeep-model-provider: ${candidate.provider}\r\n`);
-            stream.write(`x-enkeep-model-id: ${candidate.model}\r\n`);
-            stream.write(`x-enkeep-fallback-used: ${isPrimary ? 'false' : 'true'}\r\n`);
-            stream.write('\r\n');
-            bytesWrittenToStream = true;
 
-            if (upstreamResponse.body) {
-              try {
+              if (tenantQuota && reservationId) {
+                try {
+                  await tenantQuota.commitQuota({ reservationId, actualAmount: 1 });
+                } catch {}
+              }
+
+              const statusLine = `HTTP/1.1 ${upstreamResponse.status} ${upstreamResponse.statusText || 'OK'}\r\n`;
+              stream.write(statusLine);
+
+              upstreamResponse.headers.forEach((val, key) => {
+                const lk = key.toLowerCase();
+                if (lk !== 'connection' && lk !== 'keep-alive' && lk !== 'transfer-encoding') {
+                  stream.write(`${key}: ${val}\r\n`);
+                }
+              });
+              stream.write(`x-enkeep-model-provider: ${candidate.provider}\r\n`);
+              stream.write(`x-enkeep-model-id: ${candidate.model}\r\n`);
+              stream.write(`x-enkeep-fallback-used: ${isPrimary ? 'false' : 'true'}\r\n`);
+              stream.write('\r\n');
+              bytesWrittenToStream = true;
+
+              if (upstreamResponse.body) {
+                try {
+                  for await (const chunk of upstreamResponse.body as any) {
+                    if (stream.writableEnded || stream.destroyed) break;
+                    const buf = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
+                    stream.write(buf);
+                  }
+                } catch (streamBodyErr: unknown) {
+                  // Mid-stream failure: bytes already sent to container. NEVER fallback to another model to splice streams!
+                  if (this.modelRoutingPort) {
+                    try {
+                      await this.modelRoutingPort.recordHealth({
+                        provider: candidate.provider,
+                        model: candidate.model,
+                        latencyMs: Math.max(1, Date.now() - startTime),
+                        statusCode: 500,
+                        success: false,
+                        errorType: 'STREAM_MID_FAILURE',
+                      });
+                    } catch {}
+                  }
+                  if (!stream.destroyed) {
+                    stream.destroy(streamBodyErr instanceof Error ? streamBodyErr : new Error(String(streamBodyErr)));
+                  }
+                  return;
+                }
+              }
+              stream.end();
+              return;
+            }
+
+            // 4xx Permanent/Auth failures -> Fail fast without fallback or retry!
+            if (
+              upstreamResponse.status === 400 ||
+              upstreamResponse.status === 401 ||
+              upstreamResponse.status === 403 ||
+              upstreamResponse.status === 404 ||
+              upstreamResponse.status === 422
+            ) {
+              if (this.modelRoutingPort) {
+                try {
+                  await this.modelRoutingPort.recordHealth({
+                    provider: candidate.provider,
+                    model: candidate.model,
+                    latencyMs,
+                    statusCode: upstreamResponse.status,
+                    success: false,
+                    errorType: 'AUTH_FAILURE',
+                  });
+                } catch {}
+              }
+
+              if (tenantQuota && reservationId) {
+                try {
+                  await tenantQuota.releaseQuota({ reservationId });
+                } catch {}
+              }
+
+              const statusLine = `HTTP/1.1 ${upstreamResponse.status} ${upstreamResponse.statusText || 'Error'}\r\n`;
+              stream.write(statusLine);
+              upstreamResponse.headers.forEach((val, key) => {
+                const lk = key.toLowerCase();
+                if (lk !== 'connection' && lk !== 'keep-alive' && lk !== 'transfer-encoding') {
+                  stream.write(`${key}: ${val}\r\n`);
+                }
+              });
+              stream.write('\r\n');
+              bytesWrittenToStream = true;
+              if (upstreamResponse.body) {
                 for await (const chunk of upstreamResponse.body as any) {
                   if (stream.writableEnded || stream.destroyed) break;
                   const buf = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
                   stream.write(buf);
                 }
-              } catch (streamBodyErr: unknown) {
-                // Mid-stream failure: bytes already sent to container. NEVER fallback to another model to splice streams!
-                if (this.modelRoutingPort) {
-                  try {
-                    await this.modelRoutingPort.recordHealth({
-                      provider: candidate.provider,
-                      model: candidate.model,
-                      latencyMs: Math.max(1, Date.now() - startTime),
-                      statusCode: 500,
-                      success: false,
-                      errorType: 'STREAM_MID_FAILURE',
-                    });
-                  } catch {}
-                }
-                if (!stream.destroyed) {
-                  stream.destroy(streamBodyErr instanceof Error ? streamBodyErr : new Error(String(streamBodyErr)));
-                }
-                return;
+              }
+              stream.end();
+              return;
+            }
+
+            // 5xx / 429 Transient failures -> retry with jittered backoff or proceed to next candidate
+            const isTransientStatus =
+              upstreamResponse.status === 429 ||
+              upstreamResponse.status === 502 ||
+              upstreamResponse.status === 503 ||
+              upstreamResponse.status === 504;
+
+            lastErrorStatus = upstreamResponse.status;
+            lastErrorMessage = `Upstream returned status ${upstreamResponse.status}`;
+            lastErrorCode = 'upstream_transient_error';
+
+            if (isTransientStatus && !bytesWrittenToStream && retryAttempt < MAX_TRANSIENT_RETRIES) {
+              shouldRetry = true;
+              retryDelayMs = this.computeBackoffDelay(retryAttempt, upstreamResponse.headers.get('retry-after'));
+            } else {
+              if (this.modelRoutingPort) {
+                try {
+                  await this.modelRoutingPort.recordHealth({
+                    provider: candidate.provider,
+                    model: candidate.model,
+                    latencyMs,
+                    statusCode: upstreamResponse.status,
+                    success: false,
+                    errorType: 'SERVER_ERROR',
+                  });
+                } catch {}
               }
             }
-            stream.end();
-            return;
-          }
-
-          // 4xx Permanent/Auth failures -> Fail fast without fallback!
-          if (
-            upstreamResponse.status === 400 ||
-            upstreamResponse.status === 401 ||
-            upstreamResponse.status === 403 ||
-            upstreamResponse.status === 404 ||
-            upstreamResponse.status === 422
-          ) {
-            if (this.modelRoutingPort) {
-              try {
-                await this.modelRoutingPort.recordHealth({
-                  provider: candidate.provider,
-                  model: candidate.model,
-                  latencyMs,
-                  statusCode: upstreamResponse.status,
-                  success: false,
-                  errorType: 'AUTH_FAILURE',
-                });
-              } catch {}
-            }
-
-            if (tenantQuota && reservationId) {
-              try {
-                await tenantQuota.releaseQuota({ reservationId });
-              } catch {}
-            }
-
-            const statusLine = `HTTP/1.1 ${upstreamResponse.status} ${upstreamResponse.statusText || 'Error'}\r\n`;
-            stream.write(statusLine);
-            upstreamResponse.headers.forEach((val, key) => {
-              const lk = key.toLowerCase();
-              if (lk !== 'connection' && lk !== 'keep-alive' && lk !== 'transfer-encoding') {
-                stream.write(`${key}: ${val}\r\n`);
+          } catch (fetchErr: unknown) {
+            if (bytesWrittenToStream) {
+              // If bytes were already written to stream, do NOT fallback or retry
+              if (!stream.destroyed) {
+                stream.destroy(fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr)));
               }
-            });
-            stream.write('\r\n');
-            bytesWrittenToStream = true;
-            if (upstreamResponse.body) {
-              for await (const chunk of upstreamResponse.body as any) {
-                if (stream.writableEnded || stream.destroyed) break;
-                const buf = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
-                stream.write(buf);
+              return;
+            }
+            const latencyMs = Math.max(1, Date.now() - startTime);
+            lastErrorStatus = 502;
+            lastErrorMessage = 'Upstream gateway request failed';
+            lastErrorCode = 'upstream_fetch_error';
+
+            if (retryAttempt < MAX_TRANSIENT_RETRIES) {
+              shouldRetry = true;
+              retryDelayMs = this.computeBackoffDelay(retryAttempt, null);
+            } else {
+              if (this.modelRoutingPort) {
+                try {
+                  await this.modelRoutingPort.recordHealth({
+                    provider: candidate.provider,
+                    model: candidate.model,
+                    latencyMs,
+                    statusCode: 503,
+                    success: false,
+                    errorType: 'TRANSIENT_NETWORK',
+                  });
+                } catch {}
               }
             }
-            stream.end();
-            return;
           }
 
-          // 5xx / 429 Transient failures -> record health and try next candidate in chain (if no bytes sent)!
-          if (this.modelRoutingPort) {
-            try {
-              await this.modelRoutingPort.recordHealth({
-                provider: candidate.provider,
-                model: candidate.model,
-                latencyMs,
-                statusCode: upstreamResponse.status,
-                success: false,
-                errorType: 'SERVER_ERROR',
-              });
-            } catch {}
-          }
-          lastErrorStatus = upstreamResponse.status;
-          lastErrorMessage = `Upstream returned status ${upstreamResponse.status}`;
-          lastErrorCode = 'upstream_transient_error';
-        } catch (fetchErr: unknown) {
-          if (bytesWrittenToStream) {
-            // If bytes were already written to stream, do NOT fallback
-            if (!stream.destroyed) {
-              stream.destroy(fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr)));
+          if (shouldRetry) {
+            if (retryDelayMs > 0) {
+              await this.sleep(retryDelayMs, abortController.signal);
             }
-            return;
+            continue;
+          } else {
+            break;
           }
-          const latencyMs = Math.max(1, Date.now() - startTime);
-          if (this.modelRoutingPort) {
-            try {
-              await this.modelRoutingPort.recordHealth({
-                provider: candidate.provider,
-                model: candidate.model,
-                latencyMs,
-                statusCode: 503,
-                success: false,
-                errorType: 'TRANSIENT_NETWORK',
-              });
-            } catch {}
-          }
-          lastErrorStatus = 502;
-          lastErrorMessage = 'Upstream gateway request failed';
-          lastErrorCode = 'upstream_fetch_error';
         }
       }
 
@@ -938,6 +980,54 @@ export class LlmProxyHandler implements StreamHandler {
 
     stream.write(headers + payload);
     stream.end();
+  }
+
+  /**
+   * Computes jittered exponential backoff delay, honoring Retry-After within a cap.
+   */
+  private computeBackoffDelay(retryAttempt: number, retryAfterHeader: string | null): number {
+    const RETRY_AFTER_CAP_MS = 15000;
+    const INITIAL_DELAY_MS = process.env.NODE_ENV === 'test' && !this.sleepFn ? 10 : 300;
+    const MAX_DELAY_MS = 4000;
+
+    if (retryAfterHeader) {
+      const seconds = Number(retryAfterHeader);
+      if (!isNaN(seconds) && seconds >= 0) {
+        return Math.min(Math.round(seconds * 1000), RETRY_AFTER_CAP_MS);
+      }
+      const parsedDate = Date.parse(retryAfterHeader);
+      if (!isNaN(parsedDate)) {
+        const deltaMs = parsedDate - Date.now();
+        if (deltaMs > 0) {
+          return Math.min(deltaMs, RETRY_AFTER_CAP_MS);
+        }
+      }
+    }
+
+    const base = Math.min(INITIAL_DELAY_MS * Math.pow(2, retryAttempt), MAX_DELAY_MS);
+    const jitter = 0.5 + Math.random() * 0.5;
+    return Math.max(1, Math.floor(base * jitter));
+  }
+
+  /**
+   * Pauses execution for the given duration, abortable by signal.
+   */
+  private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (this.sleepFn) {
+      return this.sleepFn(ms, signal);
+    }
+    if (signal?.aborted) return;
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      if (signal) {
+        const onAbort = () => {
+          clearTimeout(timer);
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
   }
 
   /**

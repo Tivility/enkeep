@@ -2747,5 +2747,76 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       expect(completedEvents.length).toBe(1);
       expect(completedEvents[0].executionResult.replyText).toBe(assistantMsgRow.content);
     });
+    it('maps upstream transient model error to RATE_LIMITED code and delivered assistant notice fallback text', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      const upstreamErr = Object.assign(new Error('Upstream returned status 429: rate limit exceeded'), {
+        name: 'UpstreamModelError',
+        code: 'RATE_LIMIT',
+        statusCode: 429,
+      });
+
+      const executor = {
+        execute: async () => {
+          throw upstreamErr;
+        },
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        database: db,
+        storage,
+        messageStore,
+        executor,
+        quotaMode: 'disabled',
+        profileResolver,
+      });
+
+      const completedEvents: any[] = [];
+      gateway.onTurnCompleted((event) => {
+        completedEvents.push(event);
+      });
+
+      const envelope = createSampleEnvelope();
+      const result = await gateway.dispatchInbound(envelope);
+      const turnId = result.turnId!;
+
+      await gateway.drain(1000);
+
+      // 1. turn_runs row has status 'failed' with error '模型服务暂时繁忙，请稍后重试。'
+      const turnRow = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get(turnId) as { status: string; error?: string };
+      expect(turnRow).toBeDefined();
+      expect(turnRow.status).toBe('failed');
+      expect(turnRow.error).toBe('模型服务暂时繁忙，请稍后重试。');
+
+      // 2. delivery_inbox row has status 'failed' with error '模型服务暂时繁忙，请稍后重试。'
+      const inboxRow = db.prepare('SELECT status, error FROM delivery_inbox WHERE turn_id = ?').get(turnId) as { status: string; error?: string };
+      expect(inboxRow).toBeDefined();
+      expect(inboxRow.status).toBe('failed');
+      expect(inboxRow.error).toBe('模型服务暂时繁忙，请稍后重试。');
+
+      // 3. web_messages has delivered assistant notice row with fallback text
+      const assistantMsgRow = db.prepare(`
+        SELECT role, content, status, turn_id
+        FROM web_messages
+        WHERE session_id = 'ses1' AND turn_id = ? AND role = 'assistant'
+      `).get(turnId) as { role: string; content: string; status: string; turn_id: string };
+
+      expect(assistantMsgRow).toBeDefined();
+      expect(assistantMsgRow.role).toBe('assistant');
+      expect(assistantMsgRow.status).toBe('delivered');
+      expect(assistantMsgRow.content).toBe('模型服务暂时繁忙，请稍后重试。');
+
+      // 4. web_events has turn_failed with code 'RATE_LIMITED'
+      const failEventRow = db.prepare("SELECT type, payload FROM web_events WHERE session_id = 'ses1' AND type = 'turn_failed'").get() as { type: string; payload: string };
+      expect(failEventRow).toBeDefined();
+      const payload = JSON.parse(failEventRow.payload);
+      expect(payload.code).toBe('RATE_LIMITED');
+
+      // 5. One turnCompleted listener call carrying the channel fallback text
+      expect(completedEvents.length).toBe(1);
+      expect(completedEvents[0].turnId).toBe(turnId);
+      expect(completedEvents[0].executionResult.replyText).toBe('模型服务暂时繁忙，请稍后重试。');
+    });
   });
 });

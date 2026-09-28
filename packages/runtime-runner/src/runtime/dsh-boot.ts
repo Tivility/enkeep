@@ -233,6 +233,20 @@ export class PersistedSessionResumeError extends Error {
   }
 }
 
+export class UpstreamModelError extends Error {
+  readonly code: string;
+  readonly statusCode?: number;
+  readonly originalMessage?: string;
+
+  constructor(message: string, options?: { code?: string; statusCode?: number; cause?: unknown }) {
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = 'UpstreamModelError';
+    this.code = options?.code || 'UPSTREAM_MODEL_ERROR';
+    this.statusCode = options?.statusCode;
+    this.originalMessage = message;
+  }
+}
+
 export interface DshRuntimeBootConfig {
   /** User identifier (mandatory, e.g. 'alice', 'bob') */
   readonly userId: string;
@@ -433,6 +447,11 @@ export interface DerivedTurnResult {
   actualProvider?: string;
   actualModel?: string;
   eventsCount: number;
+  upstreamError?: {
+    message: string;
+    code?: string;
+    statusCode?: number;
+  };
 }
 
 /**
@@ -449,12 +468,60 @@ export function extractTurnResultFromEvents(
   let actualUsage: { totalTokens: number } | undefined;
   let actualProvider: string | undefined;
   let actualModel: string | undefined;
+  let upstreamError: { message: string; code?: string; statusCode?: number } | undefined;
 
   for (const event of turnEvents) {
     if (event.type === 'turn/end') {
       const reason = (event.data as any)?.reason;
       if (reason?.kind === 'aborted' || reason?.kind === 'interrupted') {
         isCancelled = true;
+      } else if (reason?.kind === 'error') {
+        const errObj = reason.error || reason.failure;
+        const msg = typeof errObj?.message === 'string'
+          ? errObj.message
+          : typeof reason.message === 'string'
+          ? reason.message
+          : typeof errObj === 'string'
+          ? errObj
+          : '';
+        const code = errObj?.code || reason.code;
+        let statusCode: number | undefined;
+        const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
+        if (statusMatch) {
+          statusCode = Number(statusMatch[1]);
+        }
+        upstreamError = { message: msg, code, statusCode };
+      }
+    }
+
+    if (event.type === 'assistant/chunk') {
+      const chunkReason = (event.data as any)?.chunk?.reason;
+      if (chunkReason?.kind === 'error') {
+        const failure = chunkReason.failure;
+        const msg = typeof failure?.message === 'string' ? failure.message : '';
+        const code = failure?.code;
+        let statusCode: number | undefined;
+        const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
+        if (statusMatch) {
+          statusCode = Number(statusMatch[1]);
+        }
+        if (!upstreamError) {
+          upstreamError = { message: msg, code, statusCode };
+        }
+      }
+    }
+
+    if ((event as any).type === 'error') {
+      const errData = (event as any).data;
+      const msg = typeof errData?.message === 'string' ? errData.message : '';
+      const code = errData?.code;
+      let statusCode: number | undefined;
+      const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
+      if (statusMatch) {
+        statusCode = Number(statusMatch[1]);
+      }
+      if (!upstreamError) {
+        upstreamError = { message: msg, code, statusCode };
       }
     }
 
@@ -515,7 +582,65 @@ export function extractTurnResultFromEvents(
     actualProvider,
     actualModel,
     eventsCount: events.length,
+    upstreamError,
   };
+}
+
+/**
+ * Scans events to extract upstream transient or rate limit error if present.
+ */
+export function extractUpstreamErrorFromEvents(
+  events: readonly SessionEvent[]
+): { message: string; code?: string; statusCode?: number } | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type === 'turn/end') {
+      const reason = (event.data as any)?.reason;
+      if (reason?.kind === 'error') {
+        const errObj = reason.error || reason.failure;
+        const msg = typeof errObj?.message === 'string'
+          ? errObj.message
+          : typeof reason.message === 'string'
+          ? reason.message
+          : typeof errObj === 'string'
+          ? errObj
+          : '';
+        const code = errObj?.code || reason.code;
+        let statusCode: number | undefined;
+        const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
+        if (statusMatch) {
+          statusCode = Number(statusMatch[1]);
+        }
+        return { message: msg, code, statusCode };
+      }
+    }
+    if (event.type === 'assistant/chunk') {
+      const chunkReason = (event.data as any)?.chunk?.reason;
+      if (chunkReason?.kind === 'error') {
+        const failure = chunkReason.failure;
+        const msg = typeof failure?.message === 'string' ? failure.message : '';
+        const code = failure?.code;
+        let statusCode: number | undefined;
+        const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
+        if (statusMatch) {
+          statusCode = Number(statusMatch[1]);
+        }
+        return { message: msg, code, statusCode };
+      }
+    }
+    if ((event as any).type === 'error') {
+      const errData = (event as any).data;
+      const msg = typeof errData?.message === 'string' ? errData.message : '';
+      const code = errData?.code;
+      let statusCode: number | undefined;
+      const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
+      if (statusMatch) {
+        statusCode = Number(statusMatch[1]);
+      }
+      return { message: msg, code, statusCode };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -3213,6 +3338,16 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       if (!isCancelled) {
         if (!replyText || !replyText.trim()) {
           const sliceEvents = currentAgent.session.snapshotEvents(startIndex as any);
+          const detectedError = turnResult.upstreamError || extractUpstreamErrorFromEvents(sliceEvents);
+          if (detectedError) {
+            throw new UpstreamModelError(
+              detectedError.message || 'Upstream model request failed',
+              {
+                code: detectedError.code,
+                statusCode: detectedError.statusCode,
+              }
+            );
+          }
           throw new Error(
             `FAIL-CLOSED: Assistant completed turn but produced empty replyText. eventsCount=${currentAgent.session.seq}, startIndex=${startIndex}, newEvents=${JSON.stringify(sliceEvents.map((e: any) => ({ type: e.type, data: e.data })))}`
           );

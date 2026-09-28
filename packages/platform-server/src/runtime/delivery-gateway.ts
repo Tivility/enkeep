@@ -87,7 +87,8 @@ export type InspectedTurnErrorCode =
   | 'TURN_CANCELLED'
   | 'QUOTA_EXCEEDED'
   | 'INTERRUPTED'
-  | 'SESSION_CORRUPTED';
+  | 'SESSION_CORRUPTED'
+  | 'RATE_LIMITED';
 
 export interface InspectedTurnResult {
   readonly status: 'absent' | 'running' | 'completed' | 'failed';
@@ -2717,6 +2718,26 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       )) ||
       (typeof error === 'string' && (error === 'TURN_TIMEOUT' || error.startsWith('TURN_TIMEOUT')));
 
+    const isUpstreamTransient =
+      (error as { name?: string })?.name === 'UpstreamModelError' ||
+      (error as { code?: string })?.code === 'UPSTREAM_MODEL_ERROR' ||
+      (error as { code?: string })?.code === 'UPSTREAM_TRANSIENT_ERROR' ||
+      (error as { code?: string })?.code === 'RATE_LIMIT' ||
+      (error as { code?: string })?.code === 'RATE_LIMITED' ||
+      (error as { code?: string })?.code === 'upstream_transient_error' ||
+      (error as { code?: string })?.code === 'upstream_fetch_error' ||
+      (error instanceof Error && (
+        error.name === 'UpstreamModelError' ||
+        error.message.includes('upstream_transient_error') ||
+        error.message.includes('upstream_fetch_error') ||
+        error.message.includes('Upstream returned status 429') ||
+        error.message.includes('Upstream returned status 502') ||
+        error.message.includes('Upstream returned status 503') ||
+        error.message.includes('Upstream returned status 504') ||
+        error.message.includes('Upstream gateway request failed') ||
+        error.message.includes('Upstream model request failed')
+      ));
+
     const safeErrorMessage = params.reason || (isQuota
       ? 'Quota exceeded'
       : isSessionCorrupted
@@ -2725,6 +2746,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       ? 'Lease lost during execution'
       : isTimeout
       ? 'TURN_TIMEOUT'
+      : isUpstreamTransient
+      ? '模型服务暂时繁忙，请稍后重试。'
       : 'Turn execution failed');
 
     const safeErrorCode: PublicEventCode = params.code || (isQuota
@@ -2733,6 +2756,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       ? 'RECOVERY_REQUIRED'
       : isTimeout
       ? 'TURN_TIMEOUT'
+      : isUpstreamTransient
+      ? 'RATE_LIMITED'
       : 'EXECUTION_FAILED');
 
     let spaceId = params.spaceId;
@@ -2758,6 +2783,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         : '';
 
       noticeContent = `⏱️ 本轮处理超过 ${durationText}已被终止${stepClause}。请缩小范围或用 /new 开新一代后重试。`;
+    } else if (isUpstreamTransient) {
+      noticeContent = '模型服务暂时繁忙，请稍后重试。';
     }
 
     console.error('[delivery-gateway] turn failed', {
@@ -2799,8 +2826,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'user'
       `).run(sessionId, userId, turnId);
 
-      // 3c. If timeout, insert assistant system notice message into web_messages
-      if (isTimeout && noticeContent) {
+      // 3c. If timeout or upstream transient, insert assistant system notice message into web_messages
+      if ((isTimeout || isUpstreamTransient) && noticeContent) {
         const existingAssistantMsg = this.db.prepare(`
           SELECT id, content, status, created_at FROM web_messages
           WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
@@ -2927,7 +2954,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       inTx = false;
 
       // 6. Safely notify listeners outside the transaction
-      if (isTimeout && noticeContent) {
+      if ((isTimeout || isUpstreamTransient) && noticeContent) {
         const executionResult: TurnExecutionResult = {
           replyText: noticeContent,
           usage: { totalTokens: 0 },
@@ -3575,6 +3602,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             inspected.errorCode === 'TURN_CANCELLED' ? 'TURN_CANCELLED' :
             inspected.errorCode === 'INTERRUPTED' ? 'INTERRUPTED' :
             inspected.errorCode === 'SESSION_CORRUPTED' ? 'RECOVERY_REQUIRED' :
+            inspected.errorCode === 'RATE_LIMITED' ? 'RATE_LIMITED' :
             'EXECUTION_FAILED';
 
           await this.finalizeFailedTurn({
