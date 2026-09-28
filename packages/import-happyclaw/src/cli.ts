@@ -381,6 +381,7 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<nu
 
             console.log('\n================================================================================')
             console.log(`Totals: ${muResult.plan.summary.totalUsers} users, ${muResult.plan.summary.totalSpaces} spaces, ${muResult.plan.summary.totalSessions} sessions, ${muResult.plan.summary.totalMessages} msgs, ${muResult.plan.summary.totalMemoryFiles} mem files, ${(muResult.plan.summary.totalFileBytes / 1024).toFixed(1)} KB`)
+            console.log(`ID Collisions:        ${muResult.plan.collisions?.length ?? 0}`)
             if (muResult.passwordsFile) {
               console.log(`[Notice] Passwords safely saved in private file: ${muResult.passwordsFile}`)
             }
