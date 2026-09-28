@@ -154,8 +154,9 @@ export interface UserRuntimeHandle {
     request: RuntimeTurnRequest
   ): Promise<{
     replyText: string;
-    persisted: true;
+    persisted: boolean;
     eventsCount: number;
+    status?: 'completed' | 'cancelled';
     usage?: { totalTokens: number };
     modelInfo?: { provider: string; model: string; reasoningEffort?: string | null; source?: string; fallbackUsed?: boolean };
     routeAttempts?: Array<{ provider: string; model: string; latencyMs: number; statusCode: number; success: boolean; errorType?: string | null }>;
@@ -510,6 +511,10 @@ function createUserRuntimeHandle(
             error: (followupRes as any).error,
             persisted: followupRes.persisted,
             eventsCount: followupRes.eventsCount,
+            replyText: (followupRes as any).replyText,
+            usage: (followupRes as any).usage,
+            modelInfo: (followupRes as any).modelInfo,
+            routeAttempts: (followupRes as any).routeAttempts,
           };
         }
       } else {
@@ -526,6 +531,17 @@ function createUserRuntimeHandle(
           extensionPlan,
           extraReadableRoots: extraReadableRoots ?? undefined,
         });
+      }
+      if (res.status === 'cancelled') {
+        return {
+          replyText: typeof res.replyText === 'string' ? res.replyText : '',
+          persisted: Boolean(res.persisted),
+          eventsCount: typeof res.eventsCount === 'number' ? res.eventsCount : 0,
+          status: 'cancelled',
+          usage: res.usage,
+          modelInfo: res.modelInfo,
+          routeAttempts: res.routeAttempts,
+        };
       }
       if (res.status !== 'completed') {
         throw new Error(

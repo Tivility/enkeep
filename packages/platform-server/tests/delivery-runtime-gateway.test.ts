@@ -351,6 +351,80 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
     expect(cancelEvent).toBeDefined();
   });
 
+  it('user-initiated cancel treats cancellation as normal termination: does not persistExecutionFailure or fire turnFailedListeners when executor aborts', async () => {
+    const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+    let turnFailedCalled = false;
+    let cancelCalled = false;
+    let rejectExecution: ((err: Error) => void) | undefined;
+
+    const executor = {
+      execute: async () => {
+        return await new Promise<{ replyText: string }>((_resolve, reject) => {
+          rejectExecution = reject;
+        });
+      },
+      cancel: async () => {
+        cancelCalled = true;
+        if (rejectExecution) {
+          rejectExecution(new Error('FAIL-CLOSED: Turn execution envelope status is not completed: status=cancelled'));
+        }
+        return true;
+      },
+    };
+
+    const gateway = new DeliveryRuntimeGateway({
+      database: db,
+      storage,
+      messageStore,
+      executor,
+      quotaMode: 'disabled',
+      profileResolver,
+    });
+
+    gateway.onTurnFailed(() => {
+      turnFailedCalled = true;
+    });
+
+    const envelope = createSampleEnvelope({ id: 'cancel-aborted-turn-del' });
+    const result = await gateway.dispatchInbound(envelope);
+    const turnId = result.turnId!;
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const statusBefore = await gateway.getTurnStatus('u1', turnId);
+    expect(statusBefore.status).toBe('running');
+
+    // User cancels while running
+    const cancelled = await gateway.cancelTurn('u1', turnId);
+    expect(cancelled).toBe(true);
+    expect(cancelCalled).toBe(true);
+
+    // Drain settled tasks
+    await gateway.drain(1000);
+
+    // Turn status remains interrupted (never overwritten to failed)
+    const statusAfter = await gateway.getTurnStatus('u1', turnId);
+    expect(statusAfter.status).toBe('interrupted');
+    expect(statusAfter.error).toContain('Turn cancelled by user');
+
+    // turnFailed listener MUST NOT have been called
+    expect(turnFailedCalled).toBe(false);
+
+    // web_events MUST have turn_cancelled, and MUST NOT have turn_failed
+    const failedEvent = db.prepare("SELECT 1 FROM web_events WHERE session_id = 'ses1' AND type = 'turn_failed'").get();
+    expect(failedEvent).toBeUndefined();
+
+    const cancelEvent = db.prepare("SELECT type, payload FROM web_events WHERE session_id = 'ses1' AND type = 'turn_cancelled'").get() as { type: string; payload: string };
+    expect(cancelEvent).toBeDefined();
+    expect(cancelEvent.type).toBe('turn_cancelled');
+
+    // No assistant fallback message created
+    const history = await messageStore.listMessages('u1', 'ses1');
+    expect(history.messages.length).toBe(1);
+    expect(history.messages[0].role).toBe('user');
+  });
+
   it('cancelling queued turn atomically synchronizes turn_runs, delivery_inbox, and idempotency_records', async () => {
     const { db, storage, messageStore, profileResolver } = await setupTestEnv();
 

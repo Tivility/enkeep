@@ -2152,6 +2152,16 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             throw new ValidationError('Assistant replyText exceeds maximum allowed size (64 KiB)');
           }
         } catch (execErr) {
+          // If turn was already interrupted/cancelled by user, do not cancel again or treat as execution failure
+          const existingTurn = this.db.prepare(
+            'SELECT status FROM turn_runs WHERE turn_id = ? AND user_id = ?'
+          ).get(turnId, userId) as { status: string } | undefined;
+          if (existingTurn?.status === 'interrupted') {
+            this.turnTimeouts.delete(turnId);
+            this.notifyScheduler();
+            return;
+          }
+
           // Explicitly signal cancel to the executor for this exact turn to terminate orphaned daemon/host processes
           try {
             await Promise.race([
@@ -2164,6 +2174,16 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
               error: cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
             });
           }
+
+          const recheckTurn = this.db.prepare(
+            'SELECT status FROM turn_runs WHERE turn_id = ? AND user_id = ?'
+          ).get(turnId, userId) as { status: string } | undefined;
+          if (recheckTurn?.status === 'interrupted') {
+            this.turnTimeouts.delete(turnId);
+            this.notifyScheduler();
+            return;
+          }
+
           await this.persistExecutionFailure({
             userId,
             sessionId,
@@ -2693,6 +2713,14 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       error,
       isSessionCorrupted = isCorruptedSessionError(error),
     } = params;
+
+    // If turn was already interrupted/cancelled by user, skip failure persistence and avoid sending error fallback
+    const existingTurn = this.db.prepare(
+      'SELECT status FROM turn_runs WHERE turn_id = ? AND user_id = ?'
+    ).get(turnId, userId) as { status: string } | undefined;
+    if (existingTurn?.status === 'interrupted') {
+      return;
+    }
 
     const nowMs = Date.now();
     const userMsgRow = this.db.prepare("SELECT created_at FROM web_messages WHERE session_id = ? AND user_id = ? AND role = 'user' AND turn_id = ?").get(sessionId, userId, turnId) as { created_at: string } | undefined;
