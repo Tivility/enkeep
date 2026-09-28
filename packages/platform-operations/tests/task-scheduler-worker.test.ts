@@ -291,4 +291,140 @@ describe('Task Scheduler Worker Engine (Cron, Interval, Pause/Resume, Overlap & 
       expect(nextRunUtcExplicit).toBe('2026-06-01T04:00:00.000Z');
     });
   });
+
+  describe('6. Schedule Advancement on Claim, Overlap and Manual Run Isolation', () => {
+    it('advances migrated-style cron task strictly to next day on claim and completion keeps next_run_at', async () => {
+      const tenantOps = service.forTenant(tenantA);
+      const scheduledFor = '2026-09-20T04:00:00.000Z';
+
+      // Create a task and simulate migrated state: schedule row has cron '0 4 * * *', base task has 'once'
+      const { task } = await tenantOps.tasks.createTask({
+        title: 'Migrated Incident Cron Task',
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute daily extraction',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      // Override raw task fields in storage to simulate migrated task
+      const tenantTasksRepo = storage.forTenant(tenantA).tasks as any;
+      const rawTask = tenantTasksRepo.tasks.get(task.id);
+      rawTask.scheduleType = 'once';
+      rawTask.cronExpression = null;
+      rawTask.nextRunAt = scheduledFor;
+
+      const rawSchedule = tenantTasksRepo.schedules.get(task.id);
+      rawSchedule.nextRunAt = scheduledFor;
+      rawSchedule.scheduleType = 'cron';
+      rawSchedule.cronExpression = '0 4 * * *';
+
+      // Claim at 04:00 (use 24h lease so it stays active against current test runner clock)
+      const claimTime = new Date('2026-09-20T04:00:00.000Z');
+      const claimed = await tenantOps.tasks.claimTask({
+        claimantId: 'worker_1',
+        leaseDurationMs: 86_400_000,
+        preferredTaskId: task.id,
+        now: claimTime,
+      });
+
+      expect(claimed).not.toBeNull();
+      expect(claimed?.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+      expect(claimed?.schedule?.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+
+      // Second claim immediately after returns null
+      const secondClaim = await tenantOps.tasks.claimTask({
+        claimantId: 'worker_2',
+        leaseDurationMs: 86_400_000,
+        preferredTaskId: task.id,
+        now: new Date('2026-09-20T04:00:01.000Z'),
+      });
+      expect(secondClaim).toBeNull();
+
+      // Complete task
+      const completed = await tenantOps.tasks.completeTask(task.id, {
+        claimantId: 'worker_1',
+        result: {
+          status: 'completed',
+          completedAt: '2026-09-20T04:00:20.000Z',
+        },
+        runId: claimed?.currentRun?.id,
+      });
+
+      expect(completed.status).toBe('pending');
+      expect(completed.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+      expect(completed.schedule?.nextRunAt).toBe('2026-09-21T04:00:00.000Z');
+    });
+
+    it('advances interval schedule by interval on claim', async () => {
+      const tenantOps = service.forTenant(tenantA);
+
+      const { task } = await tenantOps.tasks.createTask({
+        title: 'Interval 5m Task',
+        scheduleType: 'interval',
+        intervalSeconds: 300,
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute interval sync',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const initialNextRun = task.nextRunAt!;
+      const claimTime = new Date(initialNextRun);
+
+      const claimed = await tenantOps.tasks.claimTask({
+        claimantId: 'worker_1',
+        leaseDurationMs: 60000,
+        preferredTaskId: task.id,
+        now: claimTime,
+      });
+
+      expect(claimed).not.toBeNull();
+      const expectedNextRun = new Date(claimTime.getTime() + 300 * 1000).toISOString();
+      expect(claimed?.nextRunAt).toBe(expectedNextRun);
+      expect(claimed?.schedule?.nextRunAt).toBe(expectedNextRun);
+    });
+
+    it('manual run does not alter next_run_at for cron schedule', async () => {
+      const tenantOps = service.forTenant(tenantA);
+
+      const { task } = await tenantOps.tasks.createTask({
+        title: 'Cron Manual Trigger Task',
+        scheduleType: 'cron',
+        cronExpression: '0 4 * * *',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute manual trigger test',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const initialNextRun = task.nextRunAt!;
+
+      // Create manual run
+      const manualRes = await tenantOps.tasks.createManualRun(task.id, 'manual_worker', 60000);
+      expect(manualRes.task.nextRunAt).toBe(initialNextRun);
+      expect(manualRes.task.schedule?.nextRunAt).toBe(initialNextRun);
+
+      // Complete manual run
+      const completed = await tenantOps.tasks.completeTask(task.id, {
+        claimantId: 'manual_worker',
+        result: {
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+        },
+        runId: manualRes.run.id,
+      });
+
+      expect(completed.status).toBe('pending');
+      expect(completed.nextRunAt).toBe(initialNextRun);
+      expect(completed.schedule?.nextRunAt).toBe(initialNextRun);
+    });
+  });
 });

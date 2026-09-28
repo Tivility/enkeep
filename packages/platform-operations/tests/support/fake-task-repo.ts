@@ -386,11 +386,14 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
 
       if (preferred.status === 'claimed' || preferred.status === 'running') {
         if (preferred.leaseExpiresAt && new Date(preferred.leaseExpiresAt).getTime() > clock.getTime()) {
+          if (schedule && isRecurring && (schedule.overlapPolicy === 'skip' || !schedule.overlapPolicy)) {
+            return null;
+          }
           throw new TaskAlreadyClaimedError(preferredTaskId, preferred.claimantId || 'unknown');
         }
       }
 
-      const due = preferred.nextRunAt ?? preferred.dueDate;
+      const due = schedule?.nextRunAt ?? preferred.nextRunAt ?? preferred.dueDate;
       if (due && new Date(due).getTime() > clock.getTime()) {
         return null;
       }
@@ -418,22 +421,33 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       this.runs.set(runId, run);
 
       let subsequentNextRunAt: string | null = null;
-      if (preferred.scheduleType === 'cron' || preferred.scheduleType === 'interval') {
-        const timezone = schedule?.timezone ?? preferred.timezone ?? 'UTC';
+      const schedType = schedule?.scheduleType ?? preferred.scheduleType;
+      const cronExpr = schedule?.cronExpression ?? preferred.cronExpression;
+      const intervalSec = schedule?.intervalSeconds ?? preferred.intervalSeconds;
+      const timezone = schedule?.timezone ?? preferred.timezone ?? 'UTC';
+
+      if (schedType === 'cron' || schedType === 'interval') {
+        const scheduledFor = schedule?.nextRunAt ?? preferred.nextRunAt ?? preferred.dueDate ?? nowIso;
+        const scheduledForTime = new Date(scheduledFor).getTime();
+        const baseClock = Number.isNaN(scheduledForTime)
+          ? clock
+          : new Date(Math.max(clock.getTime(), scheduledForTime));
+
         subsequentNextRunAt = computeNextRun(
           {
-            scheduleType: preferred.scheduleType,
-            cronExpression: preferred.cronExpression,
-            intervalSeconds: preferred.intervalSeconds,
+            scheduleType: schedType,
+            cronExpression: cronExpr,
+            intervalSeconds: intervalSec,
             enabled: true,
             timezone,
           },
-          clock
+          baseClock
         );
       }
 
+      const nextRunValue = subsequentNextRunAt ?? schedule?.nextRunAt ?? preferred.nextRunAt;
       if (schedule) {
-        schedule.nextRunAt = subsequentNextRunAt ?? schedule.nextRunAt;
+        schedule.nextRunAt = nextRunValue;
         schedule.lastRunAt = nowIso;
         schedule.updatedAt = nowIso;
       }
@@ -445,7 +459,7 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
         leaseExpiresAt,
         leaseDurationMs: input.leaseDurationMs,
         claimCount: preferred.claimCount + 1,
-        nextRunAt: subsequentNextRunAt ?? preferred.nextRunAt,
+        nextRunAt: nextRunValue,
         currentRun: run,
         schedule,
         updatedAt: nowIso,
@@ -573,7 +587,11 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       throw new TaskLeaseExpiredError(validId);
     }
 
-    const isRecurring = existing.scheduleType === 'cron' || existing.scheduleType === 'interval';
+    const isRecurring =
+      existing.scheduleType === 'cron' ||
+      existing.scheduleType === 'interval' ||
+      existing.schedule?.scheduleType === 'cron' ||
+      existing.schedule?.scheduleType === 'interval';
 
     if (runId && this.runs.has(runId)) {
       const r = this.runs.get(runId)!;
@@ -632,7 +650,11 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
       throw new TaskLeaseExpiredError(validId);
     }
 
-    const isRecurring = existing.scheduleType === 'cron' || existing.scheduleType === 'interval';
+    const isRecurring =
+      existing.scheduleType === 'cron' ||
+      existing.scheduleType === 'interval' ||
+      existing.schedule?.scheduleType === 'cron' ||
+      existing.schedule?.scheduleType === 'interval';
     const shouldFailPermanently = !isRecurring && (retryable === false || existing.claimCount >= existing.maxRetries);
 
     if (runId && this.runs.has(runId)) {
