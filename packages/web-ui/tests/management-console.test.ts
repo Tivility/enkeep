@@ -226,27 +226,25 @@ describe('Management Console UI Contract', () => {
 
       // Alice (Admin) sections per tab (max 5 per tab)
       expect(TAB_SECTIONS_ADMIN.runtime.map((s: any) => s.id)).toEqual(['runtime', 'plugins', 'tasks', 'security']);
-      expect(TAB_SECTIONS_ADMIN.workspaces.map((s: any) => s.id)).toEqual(['spaces-sessions', 'instructions', 'profiles', 'extensions', 'deliveries']);
+      expect(TAB_SECTIONS_ADMIN.workspaces.map((s: any) => s.id)).toEqual(['spaces-sessions', 'instructions', 'profiles', 'extensions', 'channels', 'deliveries']);
       expect(TAB_SECTIONS_ADMIN.storage.map((s: any) => s.id)).toEqual(['files', 'quotas', 'imports', 'reconcile']);
       expect(TAB_SECTIONS_ADMIN.users.map((s: any) => s.id)).toEqual(['users', 'audit', 'account']);
       expect(TAB_SECTIONS_ADMIN.models.map((s: any) => s.id)).toEqual(['model-config', 'model-usage']);
 
       // Bob (Member) sections per tab: only allowed sections appear, admin-only sections absent
       expect(TAB_SECTIONS_MEMBER.runtime.map((s: any) => s.id)).toEqual(['runtime', 'tasks']);
-      expect(TAB_SECTIONS_MEMBER.workspaces.map((s: any) => s.id)).toEqual(['instructions', 'profiles', 'extensions', 'deliveries']);
+      expect(TAB_SECTIONS_MEMBER.workspaces.map((s: any) => s.id)).toEqual(['instructions', 'profiles', 'extensions', 'channels', 'deliveries']);
       expect(TAB_SECTIONS_MEMBER.storage.map((s: any) => s.id)).toEqual(['files', 'quotas', 'imports']);
       expect(TAB_SECTIONS_MEMBER.users.map((s: any) => s.id)).toEqual(['audit', 'account']);
       expect(TAB_SECTIONS_MEMBER.models.map((s: any) => s.id)).toEqual(['model-config', 'model-usage']);
 
-      // No channels, no billing
+      // No billing (channels section is a real management feature since the Lark channel landing)
       Object.values(TAB_SECTIONS_ADMIN).forEach((sections: any) => {
         const ids = sections.map((s: any) => s.id);
-        expect(ids).not.toContain('channels');
         expect(ids).not.toContain('billing');
       });
       Object.values(TAB_SECTIONS_MEMBER).forEach((sections: any) => {
         const ids = sections.map((s: any) => s.id);
-        expect(ids).not.toContain('channels');
         expect(ids).not.toContain('billing');
       });
     });
@@ -302,6 +300,19 @@ describe('Management Console UI Contract', () => {
       // Session turns inspector
       expect(jsCode).toContain('/api/sessions/');
       expect(jsCode).toContain('/turns');
+    });
+
+    it('provides reasoning effort select in admin platform-default model configuration form and includes reasoningEffort in PATCH body', () => {
+      const fnStart = jsCode.indexOf('async function renderAdminModelsView');
+      const fnEnd = jsCode.indexOf('// Chat & Workspace Internationalization Helpers', fnStart);
+      expect(fnStart).toBeGreaterThan(-1);
+      const fnBody = fnEnd > -1 ? jsCode.slice(fnStart, fnEnd) : jsCode.slice(fnStart, fnStart + 4000);
+
+      expect(fnBody).toContain('select-override-effort');
+      expect(fnBody).toContain('createReasoningEffortField');
+      expect(fnBody).toContain('reasoningEffort');
+      expect(fnBody).toContain('/api/admin/model-config');
+      expect(fnBody).toContain("method: 'PATCH'");
     });
 
     it('requires confirmation dialog before role/status mutation or session revocation', () => {

@@ -106,6 +106,70 @@ describe('Web UI Execution Mode & Host Security Subsystem', () => {
       expect(fnBody).toContain('getSafeErrorMessage(err');
       expect(fnBody).toContain('showToast(');
     });
+
+    it('constructs Create Session body with space executionMode or omits it entirely when undefined', () => {
+      const fnStart = jsCode.indexOf('async function handleCreateSession');
+      const fnEnd = jsCode.indexOf('function isSafeUrl');
+      expect(fnStart).toBeGreaterThan(-1);
+      expect(fnEnd).toBeGreaterThan(fnStart);
+      const fnBody = jsCode.slice(fnStart, fnEnd);
+
+      expect(fnBody).toContain('state.spaces.find((s) => s.id === spaceId)');
+      expect(fnBody).not.toContain('executionMode: "container"');
+      expect(fnBody).toContain('...(space && space.executionMode ? { executionMode: space.executionMode } : {})');
+    });
+
+    it('+ 会话 click handler uses space executionMode and toasts on canonical session reuse', () => {
+      const handlerStart = jsCode.indexOf("newSessionBtn.addEventListener('click'");
+      expect(handlerStart).toBeGreaterThan(-1);
+      const handlerBody = jsCode.slice(handlerStart, handlerStart + 1500);
+
+      expect(handlerBody).not.toContain("executionMode: 'container'");
+      expect(handlerBody).toContain('state.spaces.find((s) => s.id === state.currentSpaceId)');
+      expect(handlerBody).toContain('...(space && space.executionMode ? { executionMode: space.executionMode } : {})');
+      expect(handlerBody).toContain('chat.canonicalSessionReused');
+      expect(handlerBody).toContain('showToast(');
+    });
+
+    it('simulates session creation body resolution across host, container, and undefined space modes', () => {
+      const spaces = [
+        { id: 'spc_host_1', name: 'Host Space', executionMode: 'host' },
+        { id: 'spc_cont_1', name: 'Docker Space', executionMode: 'container' },
+        { id: 'spc_def_1', name: 'Default Space' },
+      ];
+
+      function buildSessionBody(spaceId: string, title?: string) {
+        const space = spaces.find((s) => s.id === spaceId);
+        return {
+          spaceId,
+          ...(space && space.executionMode ? { executionMode: space.executionMode } : {}),
+          ...(title ? { title } : {}),
+        };
+      }
+
+      // Host space carries executionMode: 'host'
+      expect(buildSessionBody('spc_host_1')).toEqual({
+        spaceId: 'spc_host_1',
+        executionMode: 'host',
+      });
+
+      // Container space carries executionMode: 'container'
+      expect(buildSessionBody('spc_cont_1', 'My Session')).toEqual({
+        spaceId: 'spc_cont_1',
+        executionMode: 'container',
+        title: 'My Session',
+      });
+
+      // Undefined space executionMode omits the field entirely
+      const defBody = buildSessionBody('spc_def_1');
+      expect(defBody).toEqual({ spaceId: 'spc_def_1' });
+      expect(defBody).not.toHaveProperty('executionMode');
+
+      // Unknown space omits the field entirely
+      const unknownBody = buildSessionBody('spc_unknown');
+      expect(unknownBody).toEqual({ spaceId: 'spc_unknown' });
+      expect(unknownBody).not.toHaveProperty('executionMode');
+    });
   });
 
   describe('4. Space Badges & Mode Switch Immutability', () => {
@@ -213,6 +277,15 @@ describe('Web UI Execution Mode & Host Security Subsystem', () => {
       expect(zhCN['modal.execModeHost']).toBe('Host（高风险）');
       expect(zhCN['modal.execModeHostDesc']).toContain('运行在平台宿主机受控 Enkeep 工作区；暂不支持任意挂载；仅限管理员。');
       expect(zhCN['spaces.migrationRequired']).toBe('需要迁移');
+    });
+
+    it('contains chat.canonicalSessionReused in English and Chinese catalogs with accurate copy', () => {
+      expect(en['chat.canonicalSessionReused']).toBe(
+        'This space uses a single canonical session; switched to it. Use Fork for a branch.'
+      );
+      expect(zhCN['chat.canonicalSessionReused']).toBe(
+        '该空间使用单一主会话，已切换到主会话；如需分支请使用「派生」'
+      );
     });
   });
 

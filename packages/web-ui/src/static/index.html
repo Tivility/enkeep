@@ -100,6 +100,7 @@
     <!-- Top Application Bar -->
     <header class="app-topbar">
       <div class="topbar-left">
+        <button id="btn-toggle-sidebar" class="btn btn-secondary btn-xs sidebar-toggle-btn" title="Toggle sidebar" data-i18n-title="chat.toggleSidebarTitle" aria-label="Toggle workspace sidebar" data-i18n-aria-label="chat.toggleSidebarAria">☰</button>
         <div class="brand-badge">
           <span class="brand-glyph">⚡</span>
           <span class="brand-title" data-i18n="common.consoleTitle">Enkeep Console</span>
@@ -111,6 +112,10 @@
         </div>
       </div>
       <div class="topbar-right">
+        <a href="#management" id="nav-management" class="btn btn-secondary btn-sm nav-topbar-btn" data-view="management" title="Management" data-i18n-title="management.navLabel">
+          <span class="topbar-icon">⚙</span>
+          <span class="nav-label" data-i18n="management.navLabel">Management</span>
+        </a>
         <div class="theme-select-wrapper">
           <select id="theme-select" class="form-select theme-select-control" aria-label="Select Theme" data-i18n-aria-label="common.selectTheme">
             <option value="dark" data-i18n="theme.dark">Dark</option>
@@ -124,35 +129,46 @@
             <option value="zh-CN">简体中文</option>
           </select>
         </div>
-        <div class="user-profile-badge">
-          <span class="user-status-dot"></span>
-          <span id="user-display-name" class="user-name">User</span>
-          <span id="user-role-badge" class="badge badge-role">Member</span>
+        <div class="user-menu-container" id="user-menu-container">
+          <button type="button" class="user-profile-badge user-menu-trigger" id="user-menu-trigger" aria-haspopup="true" aria-expanded="false">
+            <span class="user-status-dot"></span>
+            <span id="user-display-name" class="user-name">User</span>
+            <span id="user-role-badge" class="badge badge-role">Member</span>
+            <span class="dropdown-caret">▾</span>
+          </button>
+          <div id="user-menu-dropdown" class="user-dropdown-menu hidden" role="menu">
+            <a href="#management/users/account" id="nav-account" class="dropdown-item" data-view="account" role="menuitem">
+              <span class="nav-label" data-i18n="account.navLabel">Account</span>
+            </a>
+            <button id="btn-logout" class="dropdown-item btn-logout-item text-danger" role="menuitem" title="Sign out of console" data-i18n-title="auth.signOutTitle" data-i18n="auth.signOut">Sign Out</button>
+            <button id="btn-nav-logout" class="hidden" tabindex="-1" aria-hidden="true" title="Sign out"></button>
+          </div>
         </div>
-        <button id="btn-logout" class="btn btn-danger btn-sm" title="Sign out of console" data-i18n-title="auth.signOutTitle" data-i18n="auth.signOut">Sign Out</button>
       </div>
     </header>
 
     <!-- Console Main Workspace & Navigation Grid -->
     <div class="app-body">
-      <!-- Left Navigation Bar -->
-      <nav id="management-nav" class="management-nav" aria-label="Console Navigation">
-        <div class="nav-group">
-          <a href="#workspace" id="nav-workspace" class="nav-item active" data-view="workspace">
-            <span class="nav-label" data-i18n="chat.navLabel">Chat</span>
-          </a>
-          <a href="#management" id="nav-management" class="nav-item" data-view="management">
-            <span class="nav-label" data-i18n="management.navLabel">Management</span>
-          </a>
-        </div>
+      <!-- Hidden compatibility management nav -->
+      <nav id="management-nav" class="hidden" aria-hidden="true"></nav>
 
-        <div class="nav-footer">
-          <a href="#management/users/account" id="nav-account" class="nav-item" data-view="account">
-            <span class="nav-label" data-i18n="account.navLabel">Account</span>
-          </a>
-          <button id="btn-nav-logout" class="btn btn-danger btn-sm btn-block" title="Sign out of console" data-i18n-title="auth.signOutTitle" data-i18n="auth.signOut">Sign Out</button>
+      <!-- Space Rail (Left Column 1) -->
+      <aside id="space-rail" class="space-rail" aria-label="Spaces Rail">
+        <div class="space-rail-header">
+          <button type="button" id="btn-toggle-space-rail" class="btn btn-secondary btn-xs space-rail-toggle-btn" title="Toggle space rail" aria-label="Toggle space rail" data-i18n-title="chat.toggleRailTitle">
+            <span class="rail-toggle-icon">◀</span>
+          </button>
+          <span class="space-rail-title" data-i18n="chat.spacesHeader">Spaces</span>
         </div>
-      </nav>
+        <div class="space-rail-search-wrapper hidden" id="space-rail-search-wrapper">
+          <input type="search" id="space-rail-search-input" class="form-input form-input-sm" placeholder="Search spaces..." data-i18n-placeholder="chat.searchSpacesPlaceholder">
+        </div>
+        <div class="space-rail-list" id="space-rail-list" role="list"></div>
+        <div class="space-rail-footer">
+          <button id="btn-new-space" class="btn btn-secondary btn-xs btn-block" title="Create a new space" data-i18n-title="chat.newSpaceTitle" data-i18n="chat.newSpace">+ Space</button>
+          <button type="button" id="btn-toggle-archived-spaces" class="btn btn-secondary btn-xs btn-block mt-xs" title="Toggle archived spaces" data-i18n="chat.showArchived">Archived</button>
+        </div>
+      </aside>
 
       <!-- View Containers -->
       <main class="management-main" id="main-content-area">
@@ -161,19 +177,21 @@
           <!-- Sidebar: Spaces and Sessions -->
           <aside id="workspace-sidebar" class="workspace-sidebar">
             <div class="sidebar-header">
-              <div class="sidebar-title-row">
-                <h2 data-i18n="chat.spacesHeader">Spaces</h2>
-                <button id="btn-new-space" class="btn btn-secondary btn-xs" title="Create a new space" data-i18n-title="chat.newSpaceTitle" data-i18n="chat.newSpace">+ Space</button>
-              </div>
-              <div class="space-select-wrapper">
-                <select id="space-select" class="form-select" aria-label="Select active workspace space" data-i18n-aria-label="chat.selectSpaceAria"></select>
-                <span id="space-mode-badge" class="badge badge-info space-mode-badge hidden">Docker</span>
-              </div>
-              <div class="space-actions-row">
-                <button id="btn-rename-space" class="btn btn-secondary btn-xs" title="Rename current space" data-i18n-title="chat.renameSpaceTitle" data-i18n="chat.renameSpace">Rename</button>
-                <button id="btn-manage-mounts" class="btn btn-secondary btn-xs hidden" title="Manage Controlled Mounts" data-i18n-title="chat.mountsTitle" data-i18n="chat.mounts">Mounts</button>
-                <button id="btn-archive-space" class="btn btn-danger btn-xs" title="Archive current space" data-i18n-title="chat.archiveSpaceTitle" data-i18n="chat.archiveSpace">Archive</button>
-                <button id="btn-restore-space" class="btn btn-success btn-xs hidden" title="Restore current space" data-i18n-title="chat.restoreSpaceTitle" data-i18n="chat.restoreSpace">Restore</button>
+              <select id="space-select" class="form-select hidden" aria-label="Select active workspace space" data-i18n-aria-label="chat.selectSpaceAria"></select>
+              <div class="space-header-row">
+                <div class="space-header-info">
+                  <h2 id="current-space-name" class="current-space-name" data-i18n="chat.spacesHeader">Spaces</h2>
+                  <span id="space-mode-badge" class="badge badge-info space-mode-badge hidden">Docker</span>
+                </div>
+                <div class="space-kebab-container">
+                  <button type="button" id="btn-space-kebab" class="btn btn-secondary btn-xs btn-icon" title="Space Actions" aria-label="Space Actions" aria-haspopup="true" aria-expanded="false" data-i18n-title="chat.spaceActions">⋯</button>
+                  <div id="space-kebab-menu" class="space-kebab-menu hidden" role="menu">
+                    <button id="btn-rename-space" class="btn btn-secondary btn-xs btn-block kebab-item" title="Rename current space" data-i18n-title="chat.renameSpaceTitle" data-i18n="chat.renameSpace">Rename</button>
+                    <button id="btn-manage-mounts" class="btn btn-secondary btn-xs btn-block kebab-item hidden" title="Manage Controlled Mounts" data-i18n-title="chat.mountsTitle" data-i18n="chat.mounts">Mounts</button>
+                    <button id="btn-archive-space" class="btn btn-danger btn-xs btn-block kebab-item" title="Archive current space" data-i18n-title="chat.archiveSpaceTitle" data-i18n="chat.archiveSpace">Archive</button>
+                    <button id="btn-restore-space" class="btn btn-success btn-xs btn-block kebab-item hidden" title="Restore current space" data-i18n-title="chat.restoreSpaceTitle" data-i18n="chat.restoreSpace">Restore</button>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -267,6 +285,11 @@
 
         <!-- 2. Management / Admin Console View Panel -->
         <div id="view-management" class="management-layout hidden">
+          <div class="management-header-bar">
+            <a href="#workspace" id="nav-workspace" class="btn btn-secondary btn-sm nav-back-btn" data-view="workspace" data-i18n="chat.backToChat">
+              ← Back to Chat
+            </a>
+          </div>
           <div id="management-content" class="management-content">
             <div id="management-tabs-bar" class="management-tabs flex-row-wrap" role="tablist" aria-label="Management Tabs">
               <button type="button" class="btn btn-secondary btn-sm" id="tab-btn-runtime" data-tab="runtime" role="tab" aria-selected="false" data-i18n="management.tabRuntime">Runtime</button>
