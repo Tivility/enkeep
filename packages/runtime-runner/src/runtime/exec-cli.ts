@@ -143,6 +143,11 @@ export interface ExecCliEnvelope {
   errorDetail?: string;
   backupPath?: string;
   backupChecksum?: string;
+  beforeTokens?: number;
+  afterTokens?: number;
+  eventsBefore?: number;
+  eventsAfter?: number;
+  summaryChars?: number;
   fileResult?: FileOperationResult;
   instructionsResult?: unknown;
   usage?: {
