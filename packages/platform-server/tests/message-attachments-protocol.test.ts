@@ -1515,6 +1515,73 @@ describe('Attachment Reference Protocol & Migration 015 Integration', () => {
       expect(r.status).toBe('copied');
     });
 
+    it('archived space recovery: copied row for archived space is aborted without inspect; active space behavior unchanged', async () => {
+      const { AttachmentSnapshotRecoveryService } = await import('../src/storage/attachment-snapshot-recovery.js');
+
+      // Clear any leftover pending rows
+      db.prepare("DELETE FROM attachment_snapshot_journal WHERE status IN ('staging', 'copied', 'cleanup_pending')").run();
+
+      const archivedSpaceId = 'spc_53989934f75b2adf2a6f95525383c2aa';
+      db.prepare(`
+        INSERT OR REPLACE INTO spaces (id, user_id, name, folder, execution_mode, status)
+        VALUES (?, ?, 'Archived Throwaway Space', 'spc_archived_folder', 'container', 'archived')
+      `).run(archivedSpaceId, aliceUserId);
+
+      const shaArchived = createHash('sha256').update('archived space throwaway snapshot').digest('hex');
+      const jArchived = 'deliv_rec_copied_archived_001';
+      db.prepare(`
+        INSERT INTO attachment_snapshot_journal (id, delivery_id, user_id, space_id, source_path, snapshot_path, content_sha256, size, status)
+        VALUES (?, 'd_archived', ?, ?, 'archived_file.txt', ?, ?, 32, 'copied')
+      `).run(jArchived, aliceUserId, archivedSpaceId, `.attachments/${shaArchived}/archived_file.txt`, shaArchived);
+
+      // Active space with inspect failure to verify unchanged fail-closed behavior
+      const shaActive = createHash('sha256').update('active space failclosed snapshot').digest('hex');
+      const jActive = 'deliv_rec_copied_active_failclosed';
+      db.prepare(`
+        INSERT INTO attachment_snapshot_journal (id, delivery_id, user_id, space_id, source_path, snapshot_path, content_sha256, size, status)
+        VALUES (?, 'd_active', ?, ?, 'active_file.txt', ?, ?, 32, 'copied')
+      `).run(jActive, aliceUserId, aliceSpaceId, `.attachments/${shaActive}/active_file.txt`, shaActive);
+
+      // Provider spy: throws if called for archived space, and simulates inspect failure for active space
+      const inspectSpy = vi.fn().mockImplementation(async (userId: string, spaceId: string, req: CanonicalFileOperationRequest) => {
+        if (spaceId === archivedSpaceId) {
+          throw new Error('inspectSnapshot must NOT be called for archived space');
+        }
+        if (spaceId === aliceSpaceId) {
+          throw new Error('Simulated inspect failure for active space container down');
+        }
+        return mockFileProvider.execute(userId, spaceId, req);
+      });
+
+      const recovery = new AttachmentSnapshotRecoveryService(db, {
+        fileProvider: { execute: inspectSpy },
+      });
+
+      const report = await recovery.recover();
+
+      // 1. Archived space: no inspect call, row aborted, counted in skippedArchived, no error for archived
+      const archivedInspectCalls = inspectSpy.mock.calls.filter((call) => call[1] === archivedSpaceId);
+      expect(archivedInspectCalls).toHaveLength(0);
+
+      const rArchived = db.prepare(`SELECT status FROM attachment_snapshot_journal WHERE id = ?`).get(jArchived) as any;
+      expect(rArchived.status).toBe('aborted');
+      expect(report.skippedArchived).toBe(1);
+
+      // 2. Active space: inspect was called, failed closed with INSPECT_FAILED, status remains copied
+      const activeInspectCalls = inspectSpy.mock.calls.filter((call) => call[1] === aliceSpaceId);
+      expect(activeInspectCalls.length).toBeGreaterThan(0);
+
+      const rActive = db.prepare(`SELECT status FROM attachment_snapshot_journal WHERE id = ?`).get(jActive) as any;
+      expect(rActive.status).toBe('copied');
+
+      expect(report.errors).toHaveLength(1);
+      expect(report.errors[0]).toEqual({
+        journalId: jActive,
+        code: 'INSPECT_FAILED',
+        stage: 'copied_inspect',
+      });
+    });
+
     it('50MB inspect: verifies snapshot existence and hash via inspectSnapshotState without buffering full content', async () => {
       const { RuntimeFileApiService } = await import('../src/files/runtime-file-api.js');
 
