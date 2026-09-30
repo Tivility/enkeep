@@ -423,6 +423,27 @@ export function extractThinkingFromText(text: string): { text: string; thinking?
 }
 
 /**
+ * Detects if a model or model configuration supports reasoning / thinking.
+ */
+export function isReasoningModelOrEffort(params: {
+  model?: string | null;
+  reasoningEffort?: string | null;
+}): boolean {
+  if (params.reasoningEffort && params.reasoningEffort.trim().length > 0) {
+    return true;
+  }
+  if (!params.model) return false;
+  const m = params.model.toLowerCase().trim();
+  return (
+    m.includes('reasoner') ||
+    m.includes('r1') ||
+    m.startsWith('o1') ||
+    m.startsWith('o3') ||
+    m.includes('qwq')
+  );
+}
+
+/**
  * Build Schema 2.0 stop reply danger button element.
  * Statically strips in final cards to prevent post-completion clicks.
  */
@@ -714,6 +735,8 @@ export class FakeLarkTransport implements LarkTransport {
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
     collapsibleThinking?: boolean;
+    expandStatusPanel?: boolean;
+    expandThinkingPanel?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
@@ -731,14 +754,16 @@ export class FakeLarkTransport implements LarkTransport {
     const messageId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
     const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+    const expandThinking = params.expandThinkingPanel ?? true;
+    const expandStatus = params.expandStatusPanel ?? true;
     const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
 
     const initialElements: Array<Record<string, unknown>> = [];
     if (withThinking) {
       initialElements.push(
         buildCollapsibleThinkingPanel({
-          content: '正在思考…',
-          expanded: true,
+          content: "<font color='grey'>尚未开始思考…</font>",
+          expanded: expandThinking,
           elementId: 'thinking_panel',
           contentElementId: 'thinking_content',
           title: '**💭 思考过程**',
@@ -749,8 +774,8 @@ export class FakeLarkTransport implements LarkTransport {
     if (withStatus) {
       initialElements.push(
         buildCollapsibleStatusPanel({
-          content: '正在准备…',
-          expanded: true,
+          content: "<font color='grey'>尚未调用工具…</font>",
+          expanded: expandStatus,
           elementId: 'tool_status_panel',
           contentElementId: 'tool_status_content',
           title: '**🔧 执行过程**',
@@ -872,16 +897,6 @@ export class FakeLarkTransport implements LarkTransport {
             buildCollapsibleStatusPanel({
               content: formattedToolStatus,
               expanded: false, // collapsed on completion
-              title: '**🔧 执行过程**',
-              backgroundColor: 'wathet-50',
-            })
-          );
-          hasProcessArea = true;
-        } else if (withStatus) {
-          bodyElements.push(
-            buildCollapsibleStatusPanel({
-              content: '暂无工具调用',
-              expanded: false,
               title: '**🔧 执行过程**',
               backgroundColor: 'wathet-50',
             })
@@ -1617,6 +1632,8 @@ export class CredentialedLarkTransport implements LarkTransport {
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
     collapsibleThinking?: boolean;
+    expandStatusPanel?: boolean;
+    expandThinkingPanel?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
@@ -1635,13 +1652,15 @@ export class CredentialedLarkTransport implements LarkTransport {
 
       const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
       const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+      const expandThinking = params.expandThinkingPanel ?? true;
+      const expandStatus = params.expandStatusPanel ?? true;
       const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
       const initialElements: Array<Record<string, unknown>> = [];
       if (withThinking) {
         initialElements.push(
           buildCollapsibleThinkingPanel({
-            content: '正在思考…',
-            expanded: true,
+            content: "<font color='grey'>尚未开始思考…</font>",
+            expanded: expandThinking,
             elementId: 'thinking_panel',
             contentElementId: 'thinking_content',
             title: '**💭 思考过程**',
@@ -1652,8 +1671,8 @@ export class CredentialedLarkTransport implements LarkTransport {
       if (withStatus) {
         initialElements.push(
           buildCollapsibleStatusPanel({
-            content: '正在准备…',
-            expanded: true,
+            content: "<font color='grey'>尚未调用工具…</font>",
+            expanded: expandStatus,
             elementId: 'tool_status_panel',
             contentElementId: 'tool_status_content',
             title: '**🔧 执行过程**',
@@ -2057,16 +2076,6 @@ export class CredentialedLarkTransport implements LarkTransport {
               buildCollapsibleStatusPanel({
                 content: formattedToolStatus,
                 expanded: false, // collapsed on completion
-                title: '**🔧 执行过程**',
-                backgroundColor: 'wathet-50',
-              })
-            );
-            hasProcessArea = true;
-          } else if (withStatus) {
-            bodyElements.push(
-              buildCollapsibleStatusPanel({
-                content: '暂无工具调用',
-                expanded: false,
                 title: '**🔧 执行过程**',
                 backgroundColor: 'wathet-50',
               })

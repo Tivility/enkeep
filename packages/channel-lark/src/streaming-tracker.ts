@@ -62,6 +62,8 @@ export interface StreamingReplyTrackerCardParams {
   collapsibleToolStatus?: boolean;
   withThinkingPanel?: boolean;
   collapsibleThinking?: boolean;
+  expandStatusPanel?: boolean;
+  expandThinkingPanel?: boolean;
   withStopButton?: boolean;
   turnId?: string;
   sessionId?: string;
@@ -86,6 +88,8 @@ export interface StreamingReplyTrackerOptions {
   collapsibleToolStatus?: boolean;
   withThinkingPanel?: boolean;
   collapsibleThinking?: boolean;
+  expandStatusPanel?: boolean;
+  expandThinkingPanel?: boolean;
   withStopButton?: boolean;
   senderId?: string;
   enableCot?: boolean;
@@ -653,8 +657,16 @@ export class StreamingReplyTracker {
         const session = this.cardSession ?? (await this.cardSessionPromise);
         if (session && !this.isStopped) {
           let thinkingToPush: string | undefined;
-          if (!this.isCotActive && this.accumulatedThinking.trim().length > 0) {
-            const formattedThinking = formatThinkingContent(this.accumulatedThinking);
+          let combinedThinking = this.accumulatedThinking;
+          const extractedInline = extractThinkingFromText(this.accumulatedText);
+          if (extractedInline.thinking) {
+            combinedThinking = combinedThinking.trim().length > 0
+              ? `${combinedThinking}\n\n${extractedInline.thinking}`
+              : extractedInline.thinking;
+          }
+
+          if (!this.isCotActive && combinedThinking.trim().length > 0) {
+            const formattedThinking = formatThinkingContent(combinedThinking);
             if (formattedThinking !== this.lastPushedThinking) {
               this.lastPushedThinking = formattedThinking;
               thinkingToPush = formattedThinking;
@@ -817,8 +829,16 @@ export class StreamingReplyTracker {
         }
 
         let thinkingToPush: string | undefined;
-        if (!this.isCotActive && this.accumulatedThinking.trim().length > 0) {
-          const formattedThinking = formatThinkingContent(this.accumulatedThinking);
+        let combinedThinking = this.accumulatedThinking;
+        const extractedInline = extractThinkingFromText(this.accumulatedText);
+        if (extractedInline.thinking) {
+          combinedThinking = combinedThinking.trim().length > 0
+            ? `${combinedThinking}\n\n${extractedInline.thinking}`
+            : extractedInline.thinking;
+        }
+
+        if (!this.isCotActive && combinedThinking.trim().length > 0) {
+          const formattedThinking = formatThinkingContent(combinedThinking);
           if (formattedThinking !== this.lastPushedThinking) {
             this.lastPushedThinking = formattedThinking;
             thinkingToPush = formattedThinking;
@@ -876,8 +896,10 @@ export class StreamingReplyTracker {
 
     const extracted = extractThinkingFromText(textToFinalize);
     textToFinalize = extracted.text;
-    if (!this.isCotActive && !finalThinking && extracted.thinking) {
-      finalThinking = extracted.thinking;
+    if (!this.isCotActive && extracted.thinking) {
+      finalThinking = finalThinking
+        ? `${finalThinking}\n\n${extracted.thinking}`
+        : extracted.thinking;
     }
 
     // If turn completed or stopped, settle any remaining running tool entries
@@ -925,7 +947,13 @@ export class StreamingReplyTracker {
       if (textToFinalize && textToFinalize.trim().length > 0) {
         try {
           const guardedText = applyStreamingLengthGuard(textToFinalize, this.maxStreamingLength);
-          await session.pushText(guardedText);
+          const fallbackStatus = this.toolStatusEntries.length > 0
+            ? formatToolStatusMarkdown(this.toolStatusEntries)
+            : (this.withStatusPanel ? "<font color='grey'>无工具调用</font>" : undefined);
+          const fallbackThinking = finalThinking
+            ? formatThinkingContent(finalThinking)
+            : (this.withThinkingPanel ? "<font color='grey'>无思考过程</font>" : undefined);
+          await session.pushText(guardedText, fallbackStatus ?? undefined, fallbackThinking ?? undefined);
         } catch (pushErr) {
           console.warn('[lark-stream] pushText fallback error', {
             code: (pushErr as any)?.code,

@@ -258,6 +258,8 @@ export interface LarkTransport {
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
     collapsibleThinking?: boolean;
+    expandStatusPanel?: boolean;
+    expandThinkingPanel?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
