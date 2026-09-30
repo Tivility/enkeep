@@ -1198,6 +1198,7 @@ export class LarkChannelGateway {
           senderId: parsed.senderId,
           withStatusPanel: true,
           withThinkingPanel: hasThinking,
+          withStatusBar: true,
           cardParams: {
             chatId: parsed.chatId,
             replyToMessageId: parsed.messageId,
@@ -1207,6 +1208,7 @@ export class LarkChannelGateway {
             sessionId: route.id,
             withStatusPanel: true,
             withThinkingPanel: hasThinking,
+            withStatusBar: true,
             expandStatusPanel: false,
           },
         });
