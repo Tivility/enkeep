@@ -1330,14 +1330,28 @@ export class AgentPromptTaskWorker {
               let replyText = extractedReplyText;
               if (!replyText && this.db) {
                 try {
-                  const stmt = this.db.prepare(`
-                    SELECT content FROM web_messages
-                    WHERE user_id = ? AND session_id = ? AND role = 'assistant'
-                    ORDER BY created_at DESC, id DESC LIMIT 1
-                  `);
-                  const row = stmt.get(tenantId, payload.sessionId) as { content?: string } | undefined;
-                  if (row && typeof row.content === 'string') {
-                    replyText = row.content;
+                  const currentTurnId = task.currentRun?.turnId;
+                  if (currentTurnId) {
+                    const stmt = this.db.prepare(`
+                      SELECT content FROM web_messages
+                      WHERE user_id = ? AND session_id = ? AND role = 'assistant' AND turn_id = ?
+                      LIMIT 1
+                    `);
+                    const row = stmt.get(tenantId, payload.sessionId, currentTurnId) as { content?: string } | undefined;
+                    if (row && typeof row.content === 'string') {
+                      replyText = row.content;
+                    }
+                  }
+                  if (!replyText) {
+                    const stmt = this.db.prepare(`
+                      SELECT content FROM web_messages
+                      WHERE user_id = ? AND session_id = ? AND role = 'assistant'
+                      ORDER BY created_at DESC, id DESC LIMIT 1
+                    `);
+                    const row = stmt.get(tenantId, payload.sessionId) as { content?: string } | undefined;
+                    if (row && typeof row.content === 'string') {
+                      replyText = row.content;
+                    }
                   }
                 } catch (dbErr) {
                   console.warn(`[${deliveryChannel}-task] Failed to read assistant message from web_messages:`, dbErr);
@@ -1411,6 +1425,39 @@ export class AgentPromptTaskWorker {
                 const deliveryText = replyText ?? `Task "${task.title}" completed successfully.`;
                 const stableRunId = task.currentRun?.id || task.id;
                 const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
+
+                // Defensive idempotency: check if an outbox row already exists for this task run or turn
+                if (this.db) {
+                  try {
+                    const currentTurnId = task.currentRun?.turnId || '';
+                    const existingOutbox = this.db.prepare(`
+                      SELECT id, status FROM channel_outbox
+                      WHERE (
+                        id = ?
+                        OR (id = ? AND ? != '')
+                        OR json_extract(payload_json, '$.runId') = ?
+                        OR (json_extract(payload_json, '$.turnId') IS NOT NULL AND ? != '' AND json_extract(payload_json, '$.turnId') = ?)
+                      )
+                      LIMIT 1
+                    `).get(
+                      outboxId,
+                      currentTurnId ? `out_task_${currentTurnId}` : '',
+                      currentTurnId,
+                      stableRunId,
+                      currentTurnId,
+                      currentTurnId
+                    ) as { id: string; status: string } | undefined;
+                    if (existingOutbox && (existingOutbox.status === 'delivered' || existingOutbox.status === 'sending')) {
+                      return {
+                        taskId: task.id,
+                        tenantId,
+                        status: 'completed',
+                        result: validatedResult,
+                      };
+                    }
+                  } catch {}
+                }
+
                 await gateway.sendProactiveMessage({
                   chatId,
                   text: deliveryText,
@@ -1935,6 +1982,25 @@ export class AgentPromptTaskWorker {
             : `任务 "${task.title}" 脚本执行完成 (退出码 ${validatedResult.exitCode})。`;
           const stableRunId = task.currentRun?.id || task.id;
           const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
+
+          if (this.db) {
+            try {
+              const existingOutbox = this.db.prepare(`
+                SELECT id, status FROM channel_outbox
+                WHERE id = ? OR json_extract(payload_json, '$.runId') = ?
+                LIMIT 1
+              `).get(outboxId, stableRunId) as { id: string; status: string } | undefined;
+              if (existingOutbox && (existingOutbox.status === 'delivered' || existingOutbox.status === 'sending')) {
+                return {
+                  taskId: task.id,
+                  tenantId,
+                  status: 'completed',
+                  result: validatedResult,
+                };
+              }
+            } catch {}
+          }
+
           await gateway.sendProactiveMessage({
             chatId,
             text: deliveryText,

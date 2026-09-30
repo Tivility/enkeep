@@ -436,6 +436,7 @@ export class ChannelRuntimeManager {
     // 3. Proactive scheduled deliveries / task-originated turns (no nativeEventId)
     let taskInfo: {
       taskId: string;
+      runId?: string;
       title?: string;
       payload?: any;
     } | undefined;
@@ -449,13 +450,14 @@ export class ChannelRuntimeManager {
     if (this.db) {
       try {
         const taskRow = this.db.prepare(`
-          SELECT tr.task_id, pt.title, pt.payload
+          SELECT tr.task_id, tr.id as run_id, pt.title, pt.payload
           FROM task_runs tr
           JOIN platform_tasks pt ON pt.id = tr.task_id
           WHERE (tr.turn_id = ? OR tr.delivery_id = ?) AND tr.user_id = ?
           LIMIT 1
         `).get(turnId, event.deliveryId || turnId, userId) as {
           task_id: string;
+          run_id?: string;
           title?: string;
           payload?: string;
         } | undefined;
@@ -469,6 +471,7 @@ export class ChannelRuntimeManager {
           }
           taskInfo = {
             taskId: taskRow.task_id,
+            runId: taskRow.run_id,
             title: taskRow.title,
             payload: parsedPayload,
           };
@@ -564,15 +567,20 @@ export class ChannelRuntimeManager {
       return;
     }
 
-    const outboxId = `out_task_${turnId}`;
+    const stableRunId = taskInfo.runId || taskInfo.taskId || turnId;
+    const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
     if (this.db) {
       try {
         const existingOutbox = this.db.prepare(`
           SELECT id, status FROM channel_outbox
-          WHERE session_id = ? AND account_id = ?
-            AND (id = ? OR json_extract(payload_json, '$.turnId') = ?)
+          WHERE (
+            id = ?
+            OR id = ?
+            OR json_extract(payload_json, '$.runId') = ?
+            OR json_extract(payload_json, '$.turnId') = ?
+          )
           LIMIT 1
-        `).get(sessionId, targetAccountId, outboxId, turnId) as { id: string; status: string } | undefined;
+        `).get(outboxId, `out_task_${turnId}`, stableRunId, turnId) as { id: string; status: string } | undefined;
         if (existingOutbox && (existingOutbox.status === 'delivered' || existingOutbox.status === 'sending')) {
           return;
         }
@@ -755,12 +763,17 @@ export class ChannelRuntimeManager {
       try {
         const unOutboxedTaskRows = this.db.prepare(`
           SELECT wm.id as message_id, wm.session_id, wm.user_id, wm.turn_id, wm.content as reply_text,
-                 sr.space_id, tr.task_id
+                 sr.space_id, tr.task_id, tr.id as run_id
           FROM web_messages wm
           JOIN session_routes sr ON sr.id = wm.session_id
           JOIN task_runs tr ON tr.turn_id = wm.turn_id AND tr.user_id = wm.user_id
           LEFT JOIN channel_outbox co ON co.session_id = wm.session_id
-               AND (co.id = 'out_task_' || wm.turn_id OR json_extract(co.payload_json, '$.turnId') = wm.turn_id)
+               AND (
+                 co.id = 'out_task_' || tr.id
+                 OR co.id = 'out_task_' || wm.turn_id
+                 OR json_extract(co.payload_json, '$.runId') = tr.id
+                 OR json_extract(co.payload_json, '$.turnId') = wm.turn_id
+               )
           WHERE wm.role = 'assistant' AND wm.status = 'delivered'
             AND wm.created_at < datetime('now', '-15 seconds')
             AND co.id IS NULL
@@ -772,6 +785,7 @@ export class ChannelRuntimeManager {
           reply_text: string;
           space_id: string;
           task_id: string;
+          run_id?: string;
         }>;
 
         for (const row of unOutboxedTaskRows) {
