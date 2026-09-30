@@ -264,16 +264,16 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
     const result = await dispatchPromise;
 
     expect(result.status).toBe('completed');
-    // DeliveryExecutionRequest timeoutMs defaults to ordinary 1800s
+    // DeliveryExecutionRequest timeoutMs defaults to ordinary 3600s
     expect(capturedExecutionRequest).not.toBeNull();
-    expect(capturedExecutionRequest?.timeoutMs).toBe(1_800_000);
-    // Adapter sendTurn receives 1800s default
+    expect(capturedExecutionRequest?.timeoutMs).toBe(3_600_000);
+    // Adapter sendTurn receives 3600s default
     expect(capturedAdapterTurnRequest).not.toBeNull();
-    expect(capturedAdapterTurnRequest?.timeoutMs).toBe(1_800_000);
+    expect(capturedAdapterTurnRequest?.timeoutMs).toBe(3_600_000);
   });
 
-  // Test 3: Invalid registry budget (> 1800000) rejected pre-dispatch
-  it('3. invalid registry/context budget > 1800000 fails closed and rejects pre-dispatch without invoking executor', async () => {
+  // Test 3: Invalid registry budget (> 3600000) rejected pre-dispatch
+  it('3. invalid registry/context budget > 3600000 fails closed and rejects pre-dispatch without invoking executor', async () => {
     const invalidTask = {
       id: trustedTaskId,
       userId: tenantAlice,
@@ -296,11 +296,11 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
       signal: new AbortController().signal,
       workerId: 'worker_inv_1',
       tenantId: tenantAlice,
-      executionBudget: { maxWaitMs: 1_800_001 },
+      executionBudget: { maxWaitMs: 3_600_001 },
     };
 
     await expect(dispatcher.dispatch(invalidContext)).rejects.toThrow(
-      /Execution budget maxWaitMs must be a finite integer between 1 and 1800000/
+      /Execution budget maxWaitMs must be a finite integer between 1 and 3600000/
     );
 
     // Executor was never reached
@@ -320,23 +320,23 @@ describe('Trusted Runtime Timeout Forwarding E2E: Registry -> Dispatcher -> Gate
 
     // Unrecognized option key rejected
     await expect(
-      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 1_800_000, extraOption: true } as any)
+      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 3_600_000, extraOption: true } as any)
     ).rejects.toThrow(/Unrecognized dispatch option/);
 
     // Non-integer timeoutMs rejected
     await expect(
       deliveryGateway.dispatchInbound(envelope, { timeoutMs: 500.5 } as any)
-    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
+    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 3600000/);
 
     // Negative timeoutMs rejected
     await expect(
       deliveryGateway.dispatchInbound(envelope, { timeoutMs: -100 })
-    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
+    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 3600000/);
 
-    // > 1_800_000 rejected
+    // > 3_600_000 rejected
     await expect(
-      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 1_800_001 })
-    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
+      deliveryGateway.dispatchInbound(envelope, { timeoutMs: 3_600_001 })
+    ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 3600000/);
   });
 
   // Test 5: Outer timeout / cancellation cleanly forwarded to executor.cancel

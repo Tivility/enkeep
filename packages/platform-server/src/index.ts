@@ -137,6 +137,7 @@ export {
   computeTurnReservationTokens,
   extractActualUsage,
   DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
+  DEFAULT_QUOTA_RESERVATION_GRACE_SECONDS,
 } from './runtime/delivery-gateway.js';
 
 // Handler and HTTP Server

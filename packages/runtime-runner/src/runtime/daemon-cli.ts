@@ -96,7 +96,7 @@ export function resolveDaemonBootConfig(): {
   const maxAgents = process.env.DSH_MAX_AGENTS ? parseInt(process.env.DSH_MAX_AGENTS, 10) : undefined;
   const idleAgentTimeoutMs = process.env.DSH_IDLE_AGENT_TIMEOUT_MS
     ? parseInt(process.env.DSH_IDLE_AGENT_TIMEOUT_MS, 10)
-    : 1_800_000; // 30 minutes default
+    : 3_600_000; // 60 minutes default
   const maxConcurrentSessions = process.env.DSH_MAX_CONCURRENT_SESSIONS
     ? parseInt(process.env.DSH_MAX_CONCURRENT_SESSIONS, 10)
     : undefined;

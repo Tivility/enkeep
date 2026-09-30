@@ -268,11 +268,11 @@ export class RuntimeDaemon extends EventEmitter {
     this.maxAgents =
       options.maxAgents ?? (!isNaN(envMaxAgents) && envMaxAgents > 0 ? envMaxAgents : 16);
 
-    const envIdleTimeout = process.env.DSH_IDLE_AGENT_TIMEOUT_MS
-      ? parseInt(process.env.DSH_IDLE_AGENT_TIMEOUT_MS, 10)
+    const envIdleTimeout = process.env.DSH_IDLE_AGENT_TIMEOUT_MS || process.env.ENKEEP_EXECUTION_BUDGET_MS || process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS
+      ? parseInt(process.env.DSH_IDLE_AGENT_TIMEOUT_MS || process.env.ENKEEP_EXECUTION_BUDGET_MS || process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS || '', 10)
       : NaN;
     this.idleAgentTimeoutMs =
-      options.idleAgentTimeoutMs ?? (!isNaN(envIdleTimeout) && envIdleTimeout > 0 ? envIdleTimeout : 1_800_000);
+      options.idleAgentTimeoutMs ?? (!isNaN(envIdleTimeout) && envIdleTimeout > 0 ? envIdleTimeout : 3_600_000);
 
     const envMaxConcurrent = process.env.DSH_MAX_CONCURRENT_SESSIONS
       ? parseInt(process.env.DSH_MAX_CONCURRENT_SESSIONS, 10)

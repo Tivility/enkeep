@@ -151,7 +151,7 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
       browserService: options.browserService,
       platformUserId: options.platformUserId,
       maxAgents: options.maxAgents ?? 16,
-      idleAgentTimeoutMs: options.idleAgentTimeoutMs ?? 1_800_000,
+      idleAgentTimeoutMs: options.idleAgentTimeoutMs ?? 3_600_000,
       maxConcurrentSessions: options.maxConcurrentSessions ?? 4,
       mounts: options.mounts,
       environment: options.extraEnv || {},

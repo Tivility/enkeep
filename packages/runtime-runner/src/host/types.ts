@@ -63,7 +63,7 @@ export interface HostRuntimeSpec {
   readonly llmProviders?: string | Record<string, unknown>;
   /** Max agents kept warm in daemon (default: 16) */
   readonly maxAgents?: number;
-  /** Idle agent timeout in ms (default: 1,800,000 / 30m) */
+  /** Idle agent timeout in ms (default: 3,600,000 / 60m) */
   readonly idleAgentTimeoutMs?: number;
   /** Max concurrent session turns (default: 4) */
   readonly maxConcurrentSessions?: number;

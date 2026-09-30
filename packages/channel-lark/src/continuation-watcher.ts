@@ -37,6 +37,14 @@ export interface ContinuationWatcherOptions {
   onStopped?: () => void;
 }
 
+const envBudget =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.ENKEEP_INTERACTIVE_TURN_TIMEOUT_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedBudget = envBudget ? parseInt(envBudget, 10) : NaN;
+export const DEFAULT_CONTINUATION_INACTIVITY_TIMEOUT_MS =
+  Number.isSafeInteger(parsedBudget) && parsedBudget > 0 ? parsedBudget : 3_600_000;
+
 export class ContinuationWatcher {
   private readonly sessionRouteId: string;
   private readonly accountId: string;
@@ -72,7 +80,7 @@ export class ContinuationWatcher {
     this.hasActiveInboundTracker = options.hasActiveInboundTracker;
     this.deriveOutboxId = options.deriveOutboxId;
     this.pollIntervalMs = options.pollIntervalMs ?? 500;
-    this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60 * 1000;
+    this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? DEFAULT_CONTINUATION_INACTIVITY_TIMEOUT_MS;
     this.onStopped = options.onStopped;
     this.lastActivityTime = Date.now();
 

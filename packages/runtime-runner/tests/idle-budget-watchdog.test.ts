@@ -180,11 +180,11 @@ describe('G13 Transport Deadline & Idle Watchdog', () => {
 
   describe('Budget & Idle Calculation Invariants', () => {
     it('defaults idle timeout to effective execution budget and never clamps to arbitrary 300s', () => {
-      // Case 1: unconfigured default uses baseline 600s
+      // Case 1: unconfigured default uses baseline 3600s
       const b1 = calculateTurnBudgets({}, {});
-      expect(b1.rawBudgetMs).toBe(DEFAULT_FOLLOWUP_TIMEOUT_MS); // 600_000
-      expect(b1.idleTimeoutMs).toBe(600_000); // Equal to rawBudgetMs, NOT 300_000!
-      expect(b1.clientWaitTimeoutMs).toBe(660_000); // 600s + 60s grace
+      expect(b1.rawBudgetMs).toBe(DEFAULT_FOLLOWUP_TIMEOUT_MS); // 3_600_000
+      expect(b1.idleTimeoutMs).toBe(3_600_000); // Equal to rawBudgetMs, NOT 300_000!
+      expect(b1.clientWaitTimeoutMs).toBe(3_660_000); // 3600s + 60s grace
 
       // Case 2: caller specifies explicit 900s timeoutMs
       const b2 = calculateTurnBudgets({ timeoutMs: 900_000 }, {});
@@ -192,7 +192,7 @@ describe('G13 Transport Deadline & Idle Watchdog', () => {
       expect(b2.idleTimeoutMs).toBe(900_000); // Default idle matches 900s!
       expect(b2.clientWaitTimeoutMs).toBe(960_000);
 
-      // Case 3: configured options with HC defaults (1800s)
+      // Case 3: configured options with HC defaults (3600s)
       const b3 = calculateTurnBudgets(
         {},
         {
@@ -200,9 +200,9 @@ describe('G13 Transport Deadline & Idle Watchdog', () => {
           defaultIdleTimeoutMs: HC_DEFAULT_IDLE_TIMEOUT_MS,
         }
       );
-      expect(b3.rawBudgetMs).toBe(1_800_000);
-      expect(b3.idleTimeoutMs).toBe(1_800_000);
-      expect(b3.clientWaitTimeoutMs).toBe(1_860_000);
+      expect(b3.rawBudgetMs).toBe(3_600_000);
+      expect(b3.idleTimeoutMs).toBe(3_600_000);
+      expect(b3.clientWaitTimeoutMs).toBe(3_660_000);
 
       // Case 4: explicit caller idle override is respected
       const b4 = calculateTurnBudgets({ timeoutMs: 900_000, idleTimeoutMs: 120_000 }, {});
@@ -808,15 +808,15 @@ describe('G13 Transport Deadline & Idle Watchdog', () => {
     it('supports generic defaultExecutionBudgetMs and defaultIdleTimeoutMs options', () => {
       const transport = new HostDaemonTransport({
         socketPath: '/tmp/test.sock',
-        defaultExecutionBudgetMs: 1_800_000,
-        defaultIdleTimeoutMs: 1_800_000,
+        defaultExecutionBudgetMs: 3_600_000,
+        defaultIdleTimeoutMs: 3_600_000,
       });
 
-      expect((transport as any).options.defaultExecutionBudgetMs).toBe(1_800_000);
-      expect((transport as any).options.defaultIdleTimeoutMs).toBe(1_800_000);
-      expect(HC_DEFAULT_EXECUTION_BUDGET_MS).toBe(1_800_000);
-      expect(HC_DEFAULT_IDLE_TIMEOUT_MS).toBe(1_800_000);
-      expect(DEFAULT_FOLLOWUP_TIMEOUT_MS).toBe(600_000);
+      expect((transport as any).options.defaultExecutionBudgetMs).toBe(3_600_000);
+      expect((transport as any).options.defaultIdleTimeoutMs).toBe(3_600_000);
+      expect(HC_DEFAULT_EXECUTION_BUDGET_MS).toBe(3_600_000);
+      expect(HC_DEFAULT_IDLE_TIMEOUT_MS).toBe(3_600_000);
+      expect(DEFAULT_FOLLOWUP_TIMEOUT_MS).toBe(3_600_000);
     });
   });
 });

@@ -24,6 +24,14 @@ export const STREAMING_MAX_CONTENT_LENGTH = 3800;
 export const STREAMING_MAX_LENGTH = STREAMING_MAX_CONTENT_LENGTH;
 export const STREAMING_TRUNCATION_NOTICE = '... (内容超长，流式阶段仅展示最新部分，完整内容将在生成完毕后呈现)\n\n';
 
+const envBudget =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.ENKEEP_INTERACTIVE_TURN_TIMEOUT_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedBudget = envBudget ? parseInt(envBudget, 10) : NaN;
+export const DEFAULT_STREAMING_MAX_DURATION_MS =
+  Number.isSafeInteger(parsedBudget) && parsedBudget > 0 ? parsedBudget : 3_600_000;
+
 /**
  * Guard streaming text to safe maximum length (default 3800 characters) for Feishu CardKit.
  * When text exceeds maxLength, slides a window to display the latest content with a truncation notice,
@@ -330,7 +338,7 @@ export class StreamingReplyTracker {
     this.sessionRouteId = options.sessionRouteId;
     this.cardParams = options.cardParams;
     this.pollIntervalMs = options.pollIntervalMs ?? 500;
-    this.maxDurationMs = options.maxDurationMs ?? 600_000;
+    this.maxDurationMs = options.maxDurationMs ?? DEFAULT_STREAMING_MAX_DURATION_MS;
     this.detached = options.detached ?? false;
     this.onFinalized = options.onFinalized;
     this.turnId = options.turnId;

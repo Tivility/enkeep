@@ -153,14 +153,24 @@ export interface RuntimeHealthStatus {
   mountGeneration?: number;
 }
 
-/** Default execution timeout for followup turns (600 seconds / 10 minutes to accommodate large context LLM calls) */
-export const DEFAULT_FOLLOWUP_TIMEOUT_MS = 600_000;
+const envExecBudget =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedExecBudget = envExecBudget ? parseInt(envExecBudget, 10) : NaN;
 
-/** HappyClaw source canonical default execution timeout (1,800,000 ms / 30 minutes) */
-export const HC_DEFAULT_EXECUTION_BUDGET_MS = 1_800_000;
+export const DEFAULT_EXECUTION_BUDGET_MS =
+  Number.isSafeInteger(parsedExecBudget) && parsedExecBudget > 0
+    ? parsedExecBudget
+    : 3_600_000;
 
-/** HappyClaw source canonical default idle activity timeout (1,800,000 ms / 30 minutes) */
-export const HC_DEFAULT_IDLE_TIMEOUT_MS = 1_800_000;
+/** Default execution timeout for followup turns (3,600 seconds / 60 minutes to accommodate large context LLM calls) */
+export const DEFAULT_FOLLOWUP_TIMEOUT_MS = DEFAULT_EXECUTION_BUDGET_MS;
+
+/** HappyClaw source canonical default execution timeout (3,600,000 ms / 60 minutes) */
+export const HC_DEFAULT_EXECUTION_BUDGET_MS = DEFAULT_EXECUTION_BUDGET_MS;
+
+/** HappyClaw source canonical default idle activity timeout (3,600,000 ms / 60 minutes) */
+export const HC_DEFAULT_IDLE_TIMEOUT_MS = DEFAULT_EXECUTION_BUDGET_MS;
 
 export {
   calculateTurnBudgets,

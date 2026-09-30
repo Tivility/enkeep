@@ -35,7 +35,16 @@ import {
 
 export type TaskWorkerStatus = 'idle' | 'running' | 'stopping' | 'stopped';
 
-export const DEFAULT_TASK_EXECUTION_BUDGET_MS = 1_800_000; // 30 minutes default
+const envTaskBudget =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.ENKEEP_TASK_EXECUTION_BUDGET_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedTaskBudget = envTaskBudget ? parseInt(envTaskBudget, 10) : NaN;
+
+export const DEFAULT_TASK_EXECUTION_BUDGET_MS =
+  Number.isSafeInteger(parsedTaskBudget) && parsedTaskBudget > 0
+    ? parsedTaskBudget
+    : 3_600_000; // 60 minutes default
 
 export interface TaskExecutionBudget {
   readonly maxWaitMs?: number;
@@ -1607,7 +1616,7 @@ export class AgentPromptTaskWorker {
     const configuredTimeout = Number.isSafeInteger(envTimeout) && envTimeout > 0 ? envTimeout : 300000;
     const timeoutMs = Math.min(
       Math.max(payload.timeoutMs ?? configuredTimeout, 1000),
-      1800000
+      DEFAULT_TASK_EXECUTION_BUDGET_MS
     );
 
     let scriptResult: {

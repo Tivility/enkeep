@@ -78,6 +78,11 @@ export interface DeliveryExecutionRequest {
   readonly timeoutMs?: number;
 }
 
+const envGrace = process.env.ENKEEP_QUOTA_RESERVATION_GRACE_SECONDS;
+const parsedGrace = envGrace ? parseInt(envGrace, 10) : NaN;
+export const DEFAULT_QUOTA_RESERVATION_GRACE_SECONDS =
+  Number.isSafeInteger(parsedGrace) && parsedGrace >= 0 ? parsedGrace : 300;
+
 export { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS };
 export type { DeliveryDispatchOptions };
 
@@ -1901,7 +1906,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           });
 
           const effectiveTimeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
-          const reservationTtlSeconds = Math.ceil(effectiveTimeoutMs / 1000) + 300;
+          const reservationTtlSeconds = Math.ceil(effectiveTimeoutMs / 1000) + DEFAULT_QUOTA_RESERVATION_GRACE_SECONDS;
 
           const quotaRequest: QuotaReservationRequest = {
             userId,

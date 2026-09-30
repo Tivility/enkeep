@@ -1,5 +1,6 @@
 export {
   AgentPromptTaskWorker,
+  DEFAULT_TASK_EXECUTION_BUDGET_MS,
   type AgentPromptDispatcher,
   type AgentPromptDispatchFn,
   type AgentPromptDispatchContext,

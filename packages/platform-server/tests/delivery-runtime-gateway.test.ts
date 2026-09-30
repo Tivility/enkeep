@@ -2628,8 +2628,8 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
   });
 
   describe('Interactive Turn Timeout & Failure Notice Delivery', () => {
-    it('verifies default timeout constant is 1800000 and is passed in executionRequest', async () => {
-      expect(DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS).toBe(1_800_000);
+    it('verifies default timeout constant is 3600000 and is passed in executionRequest', async () => {
+      expect(DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS).toBe(3_600_000);
 
       const { db, storage, messageStore, profileResolver } = await setupTestEnv();
       let capturedRequest: any = null;
@@ -2661,7 +2661,7 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       await gateway.drain(1000);
 
       expect(capturedRequest).not.toBeNull();
-      expect(capturedRequest.timeoutMs).toBe(1_800_000);
+      expect(capturedRequest.timeoutMs).toBe(3_600_000);
       expect(capturedRequest.timeoutMs).toBe(DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS);
     });
 
@@ -2699,7 +2699,7 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       expect(capturedRequest.timeoutMs).toBe(5000);
     });
 
-    it('rejects dispatch timeoutMs exceeding 1800000 cap', async () => {
+    it('rejects dispatch timeoutMs exceeding 3600000 cap', async () => {
       const { db, storage, messageStore, profileResolver } = await setupTestEnv();
       const gateway = new DeliveryRuntimeGateway({
         database: db,
@@ -2715,8 +2715,8 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
 
       const envelope = createSampleEnvelope();
       await expect(
-        gateway.dispatchInbound(envelope, { timeoutMs: 1_800_001 })
-      ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 1800000/);
+        gateway.dispatchInbound(envelope, { timeoutMs: 3_600_001 })
+      ).rejects.toThrow(/Dispatch timeoutMs must be a finite integer between 1 and 3600000/);
     });
 
     it('a stubbed executor that rejects with TURN_TIMEOUT results in a failed turn_runs row AND a delivered assistant notice web_messages row AND one turnCompleted listener call carrying the notice text', async () => {
@@ -2771,7 +2771,7 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       expect(assistantMsgRow.role).toBe('assistant');
       expect(assistantMsgRow.status).toBe('delivered');
       expect(assistantMsgRow.turn_id).toBe(turnId);
-      expect(assistantMsgRow.content).toBe('⏱️ 本轮处理超过 30 分钟已被终止（已执行 7 步）。请缩小范围或用 /new 开新一代后重试。');
+      expect(assistantMsgRow.content).toBe('⏱️ 本轮处理超过 60 分钟已被终止（已执行 7 步）。请缩小范围或用 /new 开新一代后重试。');
 
       // 3. Exactly one turnCompleted listener call carrying the notice text
       expect(completedEvents.length).toBe(1);
@@ -2817,7 +2817,7 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       `).get(turnId) as { role: string; content: string; status: string; turn_id: string };
 
       expect(assistantMsgRow).toBeDefined();
-      expect(assistantMsgRow.content).toBe('⏱️ 本轮处理超过 30 分钟已被终止。请缩小范围或用 /new 开新一代后重试。');
+      expect(assistantMsgRow.content).toBe('⏱️ 本轮处理超过 60 分钟已被终止。请缩小范围或用 /new 开新一代后重试。');
       expect(completedEvents.length).toBe(1);
       expect(completedEvents[0].executionResult.replyText).toBe(assistantMsgRow.content);
     });
