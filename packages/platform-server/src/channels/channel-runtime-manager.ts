@@ -588,13 +588,33 @@ export class ChannelRuntimeManager {
     }
 
     if (typeof proactiveGateway.sendProactiveMessage === 'function') {
-      await proactiveGateway.sendProactiveMessage({
+      const sendResult = await proactiveGateway.sendProactiveMessage({
         chatId: targetChatId,
         text: executionResult.replyText,
         title: taskInfo.title,
         sessionId,
         outboxId,
       });
+
+      if (!sendResult || sendResult.success !== false) {
+        if (this.db) {
+          try {
+            this.db.prepare(`
+              INSERT OR REPLACE INTO channel_turn_origins (
+                turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id, reply_to_message_id
+              ) VALUES (?, ?, ?, ?, 'lark', ?, ?, ?)
+            `).run(turnId, userId, sessionId, targetAccountId, targetChatId, targetChatId, sendResult?.messageId ?? null);
+          } catch (err) {
+            console.warn('[channel-runtime-manager] failed to record channel_turn_origins', {
+              turnId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        if (typeof proactiveGateway.startOrExtendContinuationWatcher === 'function') {
+          await proactiveGateway.startOrExtendContinuationWatcher(sessionId);
+        }
+      }
     }
   }
 

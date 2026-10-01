@@ -296,12 +296,29 @@ export class ContinuationWatcher {
           return;
         }
 
+        const causeChildId = (runningEvt as any).causeChildId;
+        const outboxId = runningEvt.originTurnId
+          ? `cont_${runningEvt.originTurnId}_${causeChildId || runningEvt.turnId}`
+          : (this.deriveOutboxId?.(`cont_row_${runningEvt.rowId}`) ?? `cont_${runningEvt.turnId || `row_${runningEvt.rowId}`}`);
+
+        if (typeof this.channelRepo.findOutboxById === 'function') {
+          const existing = await this.channelRepo.findOutboxById(outboxId).catch(() => null);
+          if (this.isStopped) return;
+          if (existing) {
+            console.info('[lark-cont] duplicate continuation skipped', { outboxId, routeId: this.sessionRouteId });
+            const term = events.find((e) => (runningEvt.turnId ? e.turnId === runningEvt.turnId : e.rowId >= runningEvt.rowId) &&
+              e.type === 'turn_status' && (e.status === 'completed' || e.status === 'failed'));
+            const skipTo = term ? term.rowId : runningEvt.rowId;
+            if (skipTo > this.cursor) this.cursor = skipTo;
+            return;
+          }
+        }
+
         console.info('[lark-cont] running detected -> tracker created', {
           routeId: this.sessionRouteId,
           rowId: runningEvt.rowId,
           originTurnId: runningEvt.originTurnId,
         });
-        const runningRowId = runningEvt.rowId;
         const tracker = new StreamingReplyTracker({
           transport: this.transport,
           streamEventSource: this.streamEventSource,
@@ -316,7 +333,7 @@ export class ContinuationWatcher {
               status,
               messageId,
             });
-            await this.recordOutboxDelivery(finalText, status, messageId, runningRowId, targetCardParams);
+            await this.recordOutboxDelivery(finalText, status, messageId, outboxId, targetCardParams);
             if (!this.isStopped) {
               void this.pollTick();
             }
@@ -345,26 +362,12 @@ export class ContinuationWatcher {
   private async recordOutboxDelivery(
     finalText: string,
     status: 'completed' | 'failed',
-    messageId?: string,
-    eventRowId?: number,
+    messageId: string | undefined,
+    outboxId: string,
     targetOverride?: ContinuationTarget
   ): Promise<void> {
     try {
       const target = targetOverride ?? this.replyTarget;
-      const turnKey = eventRowId
-        ? `cont_row_${eventRowId}`
-        : `cont_${messageId || randomUUID().replace(/-/g, '').slice(0, 16)}`;
-      let outboxId: string;
-      if (this.deriveOutboxId) {
-        outboxId = this.deriveOutboxId(turnKey);
-      } else {
-        const hash = createHash('sha256')
-          .update(`${this.userId}:${this.accountId}:${turnKey}`)
-          .digest('hex')
-          .slice(0, 24);
-        outboxId = `out_${hash}`;
-      }
-
       const payload: OutboundReplyPayload = {
         text: finalText,
         format: 'markdown',
@@ -372,7 +375,7 @@ export class ContinuationWatcher {
         rootId: target.rootId,
         threadId: target.threadId,
         replyToMessageId: target.replyToMessageId,
-        turnId: turnKey,
+        turnId: outboxId,
         messageId,
       };
 

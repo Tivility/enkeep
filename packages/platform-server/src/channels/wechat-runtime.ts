@@ -19,10 +19,13 @@ import {
   type TurnExecutionResult,
 } from '../runtime/delivery-gateway.js';
 import { TenantScopedLarkImageIngestor } from './lark-image-ingestor.js';
+import type { AutonomousTurnCompletedPayload } from './sqlite-stream-event-source.js';
 import {
   WeChatChannelGateway,
   ContextTokenStore,
   CredentialedWeChatTransport,
+  extractFinalAnswerText,
+  markdownToPlainText,
   type WeChatConnectionState,
   type WeChatTransport,
   type WeChatTransportConfig,
@@ -839,6 +842,47 @@ export class WeChatRuntimeManager {
       nativeContextId: route?.nativeContextId || '',
       nativeEventId,
     });
+  }
+
+  /**
+   * Handles autonomous turn completion notification for WeChat channel (Item E).
+   * Verifies origin, deduplicates outbox ID per Rule C, extracts answer text, and delivers proactively.
+   */
+  async handleAutonomousTurnCompleted(event: AutonomousTurnCompletedPayload): Promise<void> {
+    const { sessionRouteId, turnId, originTurnId, causeChildId } = event;
+    if (!this.db || !this.isRunning || this.isDisposing) return;
+
+    const orig = this.db.prepare(
+      'SELECT account_id, channel, native_context_id, user_id FROM channel_turn_origins WHERE turn_id = ? LIMIT 1'
+    ).get(originTurnId) as any;
+    if (!orig || orig.channel !== 'wechat' || !orig.account_id || !orig.user_id) return;
+
+    const outboxId = causeChildId ? `cont_${originTurnId}_${causeChildId}` : `cont_${originTurnId}_${turnId}`;
+    if (this.db.prepare('SELECT 1 FROM channel_outbox WHERE id = ? LIMIT 1').get(outboxId)) return;
+
+    const toUserId = (orig.native_context_id || '').replace(/^wechat:/, '').split(':')[0].trim();
+    if (!toUserId) return;
+    const contextToken = await this.contextTokenStore.get(toUserId);
+    if (!contextToken) {
+      console.warn('[wechat-runtime] skipping continuation: missing context_token', { toUserId, turnId, originTurnId });
+      return;
+    }
+
+    const rows = this.db.prepare(
+      `SELECT payload FROM web_events WHERE session_id = ? AND type = 'assistant_delta' AND json_extract(payload, '$.turnId') = ? ORDER BY rowid ASC`
+    ).all(sessionRouteId, turnId) as Array<{ payload: string }>;
+    const rawReply = rows.map((r) => {
+      try { const p = JSON.parse(r.payload); return typeof p.delta === 'string' ? p.delta : ''; } catch { return ''; }
+    }).join('');
+    if (!rawReply.trim()) return;
+
+    const replyText = markdownToPlainText(extractFinalAnswerText(rawReply));
+    if (!replyText.trim()) return;
+
+    await this.sendProactiveMessage({
+      userId: orig.user_id, accountId: orig.account_id, chatId: orig.native_context_id || toUserId,
+      text: replyText, sessionId: sessionRouteId, outboxId,
+    }).catch((err) => console.warn('[wechat-runtime] continuation delivery failed', { outboxId, err }));
   }
 
   /**
