@@ -16,10 +16,10 @@
 import * as path from 'node:path';
 import { Transform, type TransformCallback } from 'node:stream';
 import { createHash } from 'node:crypto';
-import { ValidationError, PlatformError } from '@enkeep/platform-core';
+import { ValidationError, PlatformError, MAX_INBOUND_FILE_BYTES, resolveMaxInboundFileBytes } from '@enkeep/platform-core';
 
-export const MAX_UPLOAD_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MiB single file max
-export const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024; // 50 MiB total request max
+export const MAX_UPLOAD_FILE_SIZE_BYTES = resolveMaxInboundFileBytes(); // 500 MiB single file max
+export const MAX_UPLOAD_TOTAL_BYTES = resolveMaxInboundFileBytes(); // 500 MiB total request max
 export const MAX_UPLOAD_FILES_COUNT = 1; // Strict single-file atomic upload per request
 
 export const EXTENSION_MIME_MAP: Record<string, string> = {
@@ -284,6 +284,25 @@ export class ByteLimitTransform extends Transform {
     this.push(chunk);
     callback();
   }
+}
+
+/**
+ * Checks that the storage volume has sufficient free space,
+ * requiring at least the file size plus a 1GB safety headroom per Issue FF / F-diagnosis.zh.md.
+ */
+export async function checkDiskFreeSpace(targetPath: string, requiredBytes: number = 0): Promise<boolean> {
+  try {
+    const fs = await import('node:fs');
+    if (typeof fs.promises?.statfs === 'function') {
+      const stats = await fs.promises.statfs(targetPath);
+      const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+      const minRequired = requiredBytes + 1024 * 1024 * 1024; // 1 GB safety floor
+      return freeBytes >= minRequired;
+    }
+  } catch {
+    // Fail-open if statfs is not supported on mounted filesystem
+  }
+  return true;
 }
 
 /**

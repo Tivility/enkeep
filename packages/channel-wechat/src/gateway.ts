@@ -385,7 +385,18 @@ export class WeChatChannelGateway {
                 });
               }
             }
-          } catch {
+          } catch (err: any) {
+            const isSizeError = Boolean(
+              err?.message &&
+              (err.message.includes('exceeds maximum allowed size') || err.message.includes('exceeds max'))
+            );
+            if (isSizeError && msg.senderId && msg.contextToken) {
+              await this.transport.sendReply(
+                msg.senderId,
+                msg.contextToken,
+                '⚠️ 微信平台限制单文件最大 20MB。您发送的文件已超出微信接口上限，请登录 Enkeep Web 控制台上传大文件（支持最大 500MB）。'
+              ).catch(() => {});
+            }
             // Keep text fallback on failure (download/decrypt/size/ingest)
           }
         }

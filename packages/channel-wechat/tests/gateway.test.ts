@@ -1216,5 +1216,53 @@ I should prepare a table with Gateway and Database.
       // Did NOT create a fallback binding to default space
       expect(mockChannelRepo.createBinding).not.toHaveBeenCalled();
     });
+
+    it('replies with user-facing platform limit error when file attachment exceeds 20MB', async () => {
+      const mockIngestor = {
+        ingestImage: vi.fn(),
+        ingestFile: vi.fn(),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: (async () => {
+          return new Response(new Uint8Array(10), {
+            status: 200,
+            headers: { 'content-length': String(21 * 1024 * 1024) },
+          });
+        }) as any,
+      });
+
+      const oversizeFileMessage: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_oversize_001',
+        senderId: 'wx_user_oversize',
+        contextToken: 'ctx_oversize_token',
+        mediaItems: [
+          {
+            type: 'file',
+            name: 'large_data.zip',
+            encryptQueryParam: 'novac2c_param_oversize',
+            aesKey: Buffer.alloc(16).toString('base64'),
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(oversizeFileMessage);
+      expect(result.handled).toBe(true);
+
+      const limitReply = fakeTransport.sentReplies.find((r) =>
+        r.text.includes('⚠️ 微信平台限制单文件最大 20MB。您发送的文件已超出微信接口上限')
+      );
+      expect(limitReply).toBeDefined();
+      expect(limitReply?.toUserId).toBe('wx_user_oversize');
+    });
   });
 });

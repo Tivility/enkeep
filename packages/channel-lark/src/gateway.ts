@@ -943,7 +943,7 @@ export class LarkChannelGateway {
 
           const isPdfClaim = targetFile.name && targetFile.name.toLowerCase().endsWith('.pdf');
           const failureReply = failureError && failureError.includes('exceeds maximum allowed size')
-            ? '文件大小超出限制（单文件最大 20MB）'
+            ? '⚠️ 飞书消息附件接口限制单文件最大 100MB。您发送的文件已超出飞书接口上限，请通过 Enkeep Web 界面（支持最大 500MB）直接上传，或在飞书中发送飞书云文档/云盘分享链接。'
             : (failureError && (failureError.includes('Unsupported file format') || failureError.includes('magic bytes'))
               ? (isPdfClaim ? '文件格式错误或非有效 PDF 文件' : '文件格式错误或非有效文件')
               : '文件接收失败，请稍后重试');

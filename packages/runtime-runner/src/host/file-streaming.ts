@@ -21,8 +21,9 @@ import {
 } from '../runtime/file-ops.js';
 import { isPathContained } from './security.js';
 import { HostOwnershipError } from '../spec/provider.js';
+import { resolveMaxInboundFileBytes } from '@enkeep/platform-core';
 
-export const DEFAULT_MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB
+export const DEFAULT_MAX_FILE_SIZE_BYTES = resolveMaxInboundFileBytes(); // 500 MiB (524,288,000 bytes)
 
 function computeBufferSha256(buf: Buffer): string {
   return crypto.createHash('sha256').update(buf).digest('hex');

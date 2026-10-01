@@ -31,10 +31,12 @@ import {
 } from './markdown-card.js';
 
 export const SAFE_RESOURCE_ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
-export const MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-image cap
-export const IMAGE_DOWNLOAD_TIMEOUT_MS = 15000; // 15 seconds
-export const MAX_FILE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-file cap
-export const FILE_DOWNLOAD_TIMEOUT_MS = 15000; // 15 seconds
+export const LARK_PLATFORM_MAX_FILE_BYTES = 100 * 1024 * 1024; // 100 MiB Feishu IM resource limit
+export const MAX_IMAGE_DOWNLOAD_BYTES = 30 * 1024 * 1024; // 30 MiB per-image cap (Feishu IM limit)
+export const IMAGE_DOWNLOAD_TIMEOUT_MS = 60000; // 60 seconds
+export const MAX_FILE_DOWNLOAD_BYTES = 100 * 1024 * 1024; // 100 MiB per-file cap (Feishu IM resource limit)
+export const FILE_DOWNLOAD_TIMEOUT_MS = 600000; // 10 minutes total lifecycle budget
+export const FILE_ACTIVITY_TIMEOUT_MS = 30000; // 30 seconds idle heartbeat timeout
 
 /**
  * Validates strict PDF byte signature (%PDF-).
@@ -1705,16 +1707,31 @@ export class CredentialedLarkTransport implements LarkTransport {
         const chunks: Buffer[] = [];
         let totalBytes = 0;
 
-        const remainingMs = Math.max(500, overallDeadline - Date.now());
+        const activityTimeoutMs = FILE_ACTIVITY_TIMEOUT_MS;
 
         await new Promise<void>((resolve, reject) => {
-          streamTimer = setTimeout(() => {
-            const timeoutErr = new Error(`${type === 'image' ? 'Image' : 'File'} resource download body stream timed out`);
-            if (typeof stream.destroy === 'function') {
-              stream.destroy(timeoutErr);
+          const resetActivityTimer = () => {
+            if (streamTimer) clearTimeout(streamTimer);
+            const timeLeft = overallDeadline - Date.now();
+            if (timeLeft <= 0) {
+              const timeoutErr = new Error(`${type === 'image' ? 'Image' : 'File'} resource download body stream timed out`);
+              if (typeof stream.destroy === 'function') {
+                stream.destroy(timeoutErr);
+              }
+              reject(timeoutErr);
+              return;
             }
-            reject(timeoutErr);
-          }, remainingMs);
+            const delay = Math.min(activityTimeoutMs, timeLeft);
+            streamTimer = setTimeout(() => {
+              const timeoutErr = new Error(`${type === 'image' ? 'Image' : 'File'} resource download body stream timed out`);
+              if (typeof stream.destroy === 'function') {
+                stream.destroy(timeoutErr);
+              }
+              reject(timeoutErr);
+            }, delay);
+          };
+
+          resetActivityTimer();
 
           const onData = (chunk: any) => {
             const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -1729,6 +1746,7 @@ export class CredentialedLarkTransport implements LarkTransport {
               return;
             }
             chunks.push(buf);
+            resetActivityTimer();
           };
 
           const onError = (err: any) => {
