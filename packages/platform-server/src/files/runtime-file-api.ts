@@ -23,6 +23,8 @@ import {
   NotFoundError,
   ValidationError,
   ForbiddenError,
+  MAX_INBOUND_FILE_BYTES,
+  resolveMaxInboundFileBytes,
 } from '@enkeep/platform-core';
 import type { PlatformWebApi } from '@enkeep/web-channel';
 
@@ -1639,7 +1641,7 @@ export class RuntimeFileApiService {
       cleanEtag = validateEtag(request.expectedEtag);
     }
 
-    let maxBytes = request.maxSizeBytes ?? (50 * 1024 * 1024); // 50 MiB
+    let maxBytes = request.maxSizeBytes ?? resolveMaxInboundFileBytes(); // 500 MiB default
 
     // Storage quota management
     let oldSize = 0;
@@ -1819,7 +1821,7 @@ export class RuntimeFileApiService {
     await this.requireActiveSpace(cleanUserId, cleanSpaceId);
 
     const { normalizedPath } = validateRelativeFilePath(request.path, { allowRoot: false });
-    const maxBytes = request.maxSizeBytes ?? (50 * 1024 * 1024);
+    const maxBytes = request.maxSizeBytes ?? resolveMaxInboundFileBytes();
 
     try {
       if (typeof this.fileProvider.stageBinaryStream === 'function') {

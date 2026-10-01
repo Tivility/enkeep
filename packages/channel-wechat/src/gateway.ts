@@ -34,7 +34,7 @@ import type {
 } from './gateway-types.js';
 
 export const MAX_WECHAT_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB per image
-export const MAX_WECHAT_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024; // 20 MiB per file
+export const MAX_WECHAT_ATTACHMENT_FILE_BYTES = 500 * 1024 * 1024; // 500 MiB per file (aligned with platform cap)
 
 /**
  * Media attachment ingestor interface compatible with Lark's TenantScopedLarkImageIngestor.
@@ -385,7 +385,17 @@ export class WeChatChannelGateway {
                 });
               }
             }
-          } catch {
+          } catch (err: any) {
+            const isSizeError = Boolean(
+              err?.message &&
+              (err.message.includes('exceeds maximum allowed size') || err.message.includes('exceeds max'))
+            );
+            if (msg.senderId && msg.contextToken) {
+              const replyText = isSizeError
+                ? '文件大小超出限制（单文件最大 500MB）'
+                : '文件下载失败，请稍后重试';
+              await this.transport.sendReply(msg.senderId, msg.contextToken, replyText).catch(() => {});
+            }
             // Keep text fallback on failure (download/decrypt/size/ingest)
           }
         }

@@ -7,6 +7,11 @@
  */
 
 import * as lark from '@larksuiteoapi/node-sdk';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { resolveMaxInboundFileBytes } from '@enkeep/platform-core';
 import {
   REAL_LARK_CREDENTIAL_ACCEPTANCE,
   REAL_LARK_CREDENTIAL_SKIP_REASON,
@@ -31,10 +36,58 @@ import {
 } from './markdown-card.js';
 
 export const SAFE_RESOURCE_ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
-export const MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-image cap
-export const IMAGE_DOWNLOAD_TIMEOUT_MS = 15000; // 15 seconds
-export const MAX_FILE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB per-file cap
-export const FILE_DOWNLOAD_TIMEOUT_MS = 15000; // 15 seconds
+export const LARK_PLATFORM_MAX_FILE_BYTES = 100 * 1024 * 1024; // 100 MiB Feishu IM resource limit
+export const LARK_NON_RANGE_MAX_FILE_BYTES = 100 * 1024 * 1024; // 100 MiB Feishu IM non-range download limit
+export const LARK_DOWNLOAD_CHUNK_SIZE_BYTES = 32 * 1024 * 1024; // 32 MiB Feishu IM ranged chunk size
+export const MAX_IMAGE_DOWNLOAD_BYTES = 30 * 1024 * 1024; // 30 MiB per-image cap (Feishu IM limit)
+export const IMAGE_DOWNLOAD_TIMEOUT_MS = 60000; // 60 seconds
+export const MAX_FILE_DOWNLOAD_BYTES = 500 * 1024 * 1024; // 500 MiB Enkeep inbound cap
+export const FILE_DOWNLOAD_TIMEOUT_MS = 600000; // 10 minutes total lifecycle budget
+export const FILE_ACTIVITY_TIMEOUT_MS = 30000; // 30 seconds idle heartbeat timeout
+export const LARK_CHUNK_RETRY_COUNT = 3;
+export const LARK_CHUNK_INITIAL_BACKOFF_MS = 200;
+
+export async function isFeishuSizeLimitError(err: any): Promise<boolean> {
+  if (!err) return false;
+  const msg = String(err?.message || err?.msg || '').toLowerCase();
+  const code = String(err?.code || err?.response?.data?.code || err?.status || '');
+  if (
+    code === '234037' ||
+    msg.includes('234037') ||
+    msg.includes('downloaded file size exceeds limit') ||
+    msg.includes('size exceeds limit')
+  ) {
+    return true;
+  }
+  if (err?.response?.data) {
+    try {
+      let bodyText = '';
+      if (Buffer.isBuffer(err.response.data)) {
+        bodyText = err.response.data.toString('utf8');
+      } else if (
+        typeof err.response.data.read === 'function' ||
+        typeof err.response.data[Symbol.asyncIterator] === 'function'
+      ) {
+        const stream = err.response.data;
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        bodyText = Buffer.concat(chunks).toString('utf8');
+      } else if (typeof err.response.data === 'string') {
+        bodyText = err.response.data;
+      }
+      if (
+        bodyText.includes('234037') ||
+        bodyText.toLowerCase().includes('downloaded file size exceeds limit') ||
+        bodyText.toLowerCase().includes('size exceeds limit')
+      ) {
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
 
 /**
  * Validates strict PDF byte signature (%PDF-).
@@ -292,13 +345,137 @@ export function buildStreamingStatusLine(params: {
   return `<font color='grey'>⏳ 已用 ${formatDuration(elapsedBucket)} · 更新 ${timeSec}${idleNotice}</font>`;
 }
 
+export function truncate(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return text.slice(0, limit - 1) + '…';
+}
+
+export interface ToolCallView {
+  name: string;
+  status: 'running' | 'complete' | 'completed' | 'error' | 'failed' | 'started';
+  durationMs: number;
+  summary?: string;
+  /** When the tool invocation is wrapping a Skill, display this instead of name. */
+  skillName?: string;
+  /** Sub-agent tool calls get visual indentation. */
+  isNested?: boolean;
+}
+
+/** Map a tool name + summary to a labeled parameter (mirrors HappyClaw parseToolParam). */
+export function parseToolParam(
+  toolName: string,
+  summary: string | undefined
+): { label: string; value: string } | null {
+  if (!summary) return null;
+  let text = summary.trim();
+  if (!text) return null;
+
+  // Try parsing JSON if it looks like a JSON object
+  if (text.startsWith('{') && text.endsWith('}')) {
+    try {
+      const obj = JSON.parse(text);
+      if (obj && typeof obj === 'object') {
+        const val =
+          obj.path ??
+          obj.file_path ??
+          obj.cmd ??
+          obj.command ??
+          obj.pattern ??
+          obj.query ??
+          obj.url ??
+          obj.task ??
+          obj.prompt ??
+          obj.input ??
+          obj.name;
+        if (val !== undefined && typeof val === 'string') {
+          text = val;
+        } else if (val !== undefined) {
+          text = String(val);
+        }
+      }
+    } catch {}
+  }
+
+  const lower = toolName.toLowerCase();
+  if (['read', 'write', 'edit', 'glob', 'read_file', 'write_file', 'edit_file'].includes(lower)) {
+    return { label: 'path', value: text };
+  }
+  if (['bash', 'sh', 'shell', 'exec', 'command'].includes(lower)) {
+    return { label: 'cmd', value: text };
+  }
+  if (['grep', 'search', 'ripgrep'].includes(lower)) {
+    return { label: 'pattern', value: text };
+  }
+  if (['agent', 'task', 'subagent', 'subagent_fork', 'create_task'].includes(lower)) {
+    return { label: 'task', value: text };
+  }
+  if (['web_fetch', 'fetch'].includes(lower)) {
+    return { label: 'url', value: text };
+  }
+  return { label: 'input', value: text };
+}
+
+/** Tool timeline with status tags, elapsed time, labeled params, skill + nested hints (HappyClaw parity). */
+export function buildToolsTimelineText(
+  tools: ToolCallView[],
+  opts: { maxVisible?: number } = {}
+): string {
+  // Filter out AskUserQuestion
+  const filtered = tools.filter((t) => {
+    const lower = t.name?.toLowerCase() || '';
+    return lower !== 'askuserquestion' && lower !== 'ask_user_question';
+  });
+  if (filtered.length === 0) return "<font color='grey'>尚未调用任何工具</font>";
+
+  const maxVisible = opts.maxVisible ?? 8;
+  const running = filtered.filter((t) => t.status === 'running' || t.status === 'started');
+  const recent = filtered.filter((t) => t.status !== 'running' && t.status !== 'started').slice(-maxVisible);
+  const picked = [...running, ...recent].slice(0, maxVisible);
+
+  const lines = picked.map((t) => {
+    const tagColor =
+      t.status === 'running' || t.status === 'started'
+        ? 'blue'
+        : t.status === 'error' || t.status === 'failed'
+          ? 'red'
+          : 'green';
+    const tagText =
+      t.status === 'running' || t.status === 'started'
+        ? '运行'
+        : t.status === 'error' || t.status === 'failed'
+          ? '失败'
+          : '完成';
+    const elapsed =
+      t.durationMs > 0
+        ? ` <font color='grey'>(${formatDuration(t.durationMs)})</font>`
+        : '';
+    const isSkill = t.name === 'Skill' || t.name === 'skill' || t.name?.toLowerCase() === 'skill';
+    const displayName = isSkill && t.skillName ? t.skillName : t.name;
+    const param = parseToolParam(t.name, t.summary);
+    const paramLine =
+      param && !(isSkill && param.value === displayName)
+        ? `\n  <font color='grey'>${param.label}: ${truncate(param.value, 90)}</font>`
+        : '';
+    const indent = t.isNested ? '    ' : '';
+    return `${indent}<text_tag color='${tagColor}'>${tagText}</text_tag> \`${displayName}\`${elapsed}${paramLine}`;
+  });
+
+  const hidden = filtered.length - picked.length;
+  const more =
+    hidden > 0
+      ? `\n<font color='grey'>… 另有 ${hidden} 条工具记录已收起</font>`
+      : '';
+  return `${lines.join('\n')}${more}`;
+}
+
 /**
  * Format tool status entries into Lark Schema 2.0 markdown content.
- * Displays tool name and short status. Subagents are rendered with status tags, duration, and optional description.
+ * Displays tool name, Schema 2.0 status badges, elapsed duration, and param summary.
  */
 export function formatToolStatusMarkdown(
   toolStatus?: string | readonly CardToolStatusEntry[],
-  nowMs?: number
+  nowMs?: number,
+  opts?: { maxVisible?: number; useSchemaTags?: boolean }
 ): string | null {
   if (!toolStatus) return null;
   if (typeof toolStatus === 'string') {
@@ -309,13 +486,32 @@ export function formatToolStatusMarkdown(
     return null;
   }
 
-  const subagentEntries = toolStatus.filter(isSubagentTool);
-  const normalToolEntries = toolStatus.filter((e) => !isSubagentTool(e));
+  // D10: Filter out AskUserQuestion from tools timeline
+  const filtered = toolStatus.filter((e) => {
+    const lower = e.toolName?.toLowerCase() || '';
+    return lower !== 'askuserquestion' && lower !== 'ask_user_question';
+  });
+  if (filtered.length === 0) {
+    return null;
+  }
+
+  const subagentEntries = filtered.filter(isSubagentTool);
+  const normalToolEntries = filtered.filter((e) => !isSubagentTool(e));
 
   const sections: string[] = [];
 
   if (subagentEntries.length > 0) {
-    const subagentLines = subagentEntries.map((entry) => {
+    const maxSub = opts?.maxVisible ?? 8;
+    const runningSub = subagentEntries.filter(
+      (e) => e.status === 'started' || e.status === 'running'
+    );
+    const recentSub = subagentEntries
+      .filter((e) => e.status !== 'started' && e.status !== 'running')
+      .slice(-maxSub);
+    const pickedSub = [...runningSub, ...recentSub].slice(0, maxSub);
+    const hiddenSub = subagentEntries.length - pickedSub.length;
+
+    const subagentLines = pickedSub.map((entry) => {
       const tagColor =
         entry.status === 'started' || entry.status === 'running'
           ? 'blue'
@@ -340,7 +536,7 @@ export function formatToolStatusMarkdown(
       }
 
       const desc = entry.description
-        ? `\n  <font color='grey'>${entry.description.slice(0, 180)}</font>`
+        ? `\n  <font color='grey'>${truncate(entry.description, 180)}</font>`
         : '';
 
       const statusDesc =
@@ -350,28 +546,108 @@ export function formatToolStatusMarkdown(
             ? '已完成'
             : '执行失败';
 
-      return `<text_tag color='${tagColor}'>${tagText}</text_tag> 🤖 **${entry.toolName}**: ${statusDesc}${elapsedPart}${desc}`;
+      const indent = entry.isNested ? '    ' : '';
+      return `${indent}<text_tag color='${tagColor}'>${tagText}</text_tag> 🤖 **${entry.toolName}**: ${statusDesc}${elapsedPart}${desc}`;
     });
+
+    if (hiddenSub > 0) {
+      subagentLines.push(`<font color='grey'>… 另有 ${hiddenSub} 项子任务已收起</font>`);
+    }
 
     sections.push(`🤖 **子任务 / Subagents**\n${subagentLines.join('\n')}`);
   }
 
   if (normalToolEntries.length > 0) {
-    const normalToolLines = normalToolEntries.map((entry) => {
-      if (entry.status === 'started' || entry.status === 'running') {
-        return `🔨 **${entry.toolName}**: 正在执行…`;
-      } else if (entry.status === 'completed') {
-        return `✅ **${entry.toolName}**: 已完成`;
-      } else if (entry.status === 'failed') {
-        return `❌ **${entry.toolName}**: 执行失败`;
-      }
-      return `• **${entry.toolName}**: ${entry.status}`;
-    });
+    const hasRichInfo = normalToolEntries.some(
+      (e) =>
+        Boolean(e.description) ||
+        Boolean(e.skillName) ||
+        Boolean(e.isNested)
+    );
+    const useTags = opts?.useSchemaTags === true || hasRichInfo;
 
-    if (subagentEntries.length > 0) {
-      sections.push(`🔨 **工具调用**\n${normalToolLines.join('\n')}`);
+    if (useTags) {
+      const maxNormal = opts?.maxVisible ?? 8;
+      const runningNormal = normalToolEntries.filter(
+        (e) => e.status === 'started' || e.status === 'running'
+      );
+      const recentNormal = normalToolEntries
+        .filter((e) => e.status !== 'started' && e.status !== 'running')
+        .slice(-maxNormal);
+      const pickedNormal = [...runningNormal, ...recentNormal].slice(0, maxNormal);
+      const hiddenNormal = normalToolEntries.length - pickedNormal.length;
+
+      const normalToolLines = pickedNormal.map((entry) => {
+        const tagColor =
+          entry.status === 'started' || entry.status === 'running'
+            ? 'blue'
+            : entry.status === 'completed'
+              ? 'green'
+              : 'red';
+        const tagText =
+          entry.status === 'started' || entry.status === 'running'
+            ? '运行'
+            : entry.status === 'completed'
+              ? '完成'
+              : '失败';
+
+        let elapsedPart = '';
+        if (typeof entry.startTime === 'number' && entry.startTime > 0) {
+          const end =
+            typeof entry.endTime === 'number' && entry.endTime > 0
+              ? entry.endTime
+              : (nowMs ?? Date.now());
+          const durationMs = Math.max(0, end - entry.startTime);
+          if (durationMs > 0) {
+            elapsedPart = ` <font color='grey'>(${formatDuration(durationMs)})</font>`;
+          }
+        }
+
+        const isSkill =
+          entry.toolName === 'Skill' ||
+          entry.toolName === 'skill' ||
+          entry.toolName?.toLowerCase() === 'skill';
+        const displayName = isSkill && entry.skillName ? entry.skillName : entry.toolName;
+
+        const summary = entry.description || entry.detail;
+        const param = parseToolParam(entry.toolName, summary);
+        let paramLine = '';
+        if (param && !(isSkill && param.value === displayName)) {
+          paramLine = `\n  <font color='grey'>${param.label}: ${truncate(param.value, 90)}</font>`;
+        }
+        const indent = entry.isNested ? '    ' : '';
+        return `${indent}<text_tag color='${tagColor}'>${tagText}</text_tag> \`${displayName}\`${elapsedPart}${paramLine}`;
+      });
+
+      if (hiddenNormal > 0) {
+        normalToolLines.push(
+          `<font color='grey'>… 另有 ${hiddenNormal} 条工具记录已收起</font>`
+        );
+      }
+
+      if (subagentEntries.length > 0) {
+        sections.push(`🔨 **工具调用**\n${normalToolLines.join('\n')}`);
+      } else {
+        sections.push(normalToolLines.join('\n'));
+      }
     } else {
-      sections.push(normalToolLines.join('\n'));
+      // Legacy fallback for bare test entries without start/end times or descriptions
+      const normalToolLines = normalToolEntries.map((entry) => {
+        if (entry.status === 'started' || entry.status === 'running') {
+          return `🔨 **${entry.toolName}**: 正在执行…`;
+        } else if (entry.status === 'completed') {
+          return `✅ **${entry.toolName}**: 已完成`;
+        } else if (entry.status === 'failed') {
+          return `❌ **${entry.toolName}**: 执行失败`;
+        }
+        return `• **${entry.toolName}**: ${entry.status}`;
+      });
+
+      if (subagentEntries.length > 0) {
+        sections.push(`🔨 **工具调用**\n${normalToolLines.join('\n')}`);
+      } else {
+        sections.push(normalToolLines.join('\n'));
+      }
     }
   }
 
@@ -735,9 +1011,19 @@ export class FakeLarkTransport implements LarkTransport {
     this._mockFiles.clear();
   }
 
+  public maxFileDownloadBytes: number = MAX_FILE_DOWNLOAD_BYTES;
+
   async downloadFileResource(
     messageId: string,
-    fileKey: string
+    fileKey: string,
+    options?: {
+      declaredSize?: number;
+      chunkSizeBytes?: number;
+      nonRangeLimitBytes?: number;
+      maxBytes?: number;
+      timeoutMs?: number;
+      activityTimeoutMs?: number;
+    }
   ): Promise<{ buffer: Buffer; mimeType: string } | null> {
     if (!this._connected) {
       throw new Error('FakeLarkTransport is not connected');
@@ -748,12 +1034,16 @@ export class FakeLarkTransport implements LarkTransport {
     if (!SAFE_RESOURCE_ID_REGEX.test(messageId) || !SAFE_RESOURCE_ID_REGEX.test(fileKey)) {
       throw new Error('Invalid resource identifier format or path traversal detected');
     }
+    const effectiveMaxBytes = options?.maxBytes ?? this.maxFileDownloadBytes ?? MAX_FILE_DOWNLOAD_BYTES;
+    if (typeof options?.declaredSize === 'number' && options.declaredSize > effectiveMaxBytes) {
+      throw new Error(`File exceeds maximum allowed size of ${effectiveMaxBytes} bytes`);
+    }
     const found = this._mockFiles.get(`${messageId}:${fileKey}`) || this._mockFiles.get(fileKey);
     if (!found) {
       return null;
     }
-    if (found.buffer.length > MAX_FILE_DOWNLOAD_BYTES) {
-      throw new Error(`File exceeds maximum allowed size of ${MAX_FILE_DOWNLOAD_BYTES} bytes`);
+    if (found.buffer.length > effectiveMaxBytes) {
+      throw new Error(`File exceeds maximum allowed size of ${effectiveMaxBytes} bytes`);
     }
     return { buffer: found.buffer, mimeType: found.mimeType || 'application/octet-stream' };
   }
@@ -832,6 +1122,7 @@ export class FakeLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    statusPanelTitle?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
@@ -881,7 +1172,7 @@ export class FakeLarkTransport implements LarkTransport {
           expanded: expandStatus,
           elementId: 'tool_status_panel',
           contentElementId: 'tool_status_content',
-          title: '**🔧 执行过程**',
+          title: params.statusPanelTitle ?? '**🔧 执行过程**',
           backgroundColor: 'wathet-50',
         })
       );
@@ -1018,7 +1309,7 @@ export class FakeLarkTransport implements LarkTransport {
             buildCollapsibleStatusPanel({
               content: formattedToolStatus,
               expanded: false, // collapsed on completion
-              title: '**🔧 执行过程**',
+              title: params.statusPanelTitle ?? '**🔧 执行过程**',
               backgroundColor: 'wathet-50',
             })
           );
@@ -1123,6 +1414,7 @@ export interface CredentialedLarkTransportOptions {
   credentialResolver?: LarkCredentialResolver;
   clientFactory?: LarkSdkClientFactory;
   autoConnect?: boolean;
+  apiClient?: any;
 }
 
 /**
@@ -1148,6 +1440,10 @@ export class CredentialedLarkTransport implements LarkTransport {
       this.account = options.account;
       this.credentialResolver = options.credentialResolver;
       this.clientFactory = options.clientFactory;
+      if (options.apiClient) {
+        this.apiClient = options.apiClient;
+        this._connected = true;
+      }
     } else {
       this.account = options;
     }
@@ -1182,6 +1478,10 @@ export class CredentialedLarkTransport implements LarkTransport {
   }
 
   async start(): Promise<void> {
+    if (this.apiClient) {
+      this._connected = true;
+      return;
+    }
     // 1. Resolve credentials
     let appId = this.account.appId;
     let appSecret = this.account.appSecret;
@@ -1481,16 +1781,31 @@ export class CredentialedLarkTransport implements LarkTransport {
         const chunks: Buffer[] = [];
         let totalBytes = 0;
 
-        const remainingMs = Math.max(500, overallDeadline - Date.now());
+        const activityTimeoutMs = FILE_ACTIVITY_TIMEOUT_MS;
 
         await new Promise<void>((resolve, reject) => {
-          streamTimer = setTimeout(() => {
-            const timeoutErr = new Error(`${type === 'image' ? 'Image' : 'File'} resource download body stream timed out`);
-            if (typeof stream.destroy === 'function') {
-              stream.destroy(timeoutErr);
+          const resetActivityTimer = () => {
+            if (streamTimer) clearTimeout(streamTimer);
+            const timeLeft = overallDeadline - Date.now();
+            if (timeLeft <= 0) {
+              const timeoutErr = new Error(`${type === 'image' ? 'Image' : 'File'} resource download body stream timed out`);
+              if (typeof stream.destroy === 'function') {
+                stream.destroy(timeoutErr);
+              }
+              reject(timeoutErr);
+              return;
             }
-            reject(timeoutErr);
-          }, remainingMs);
+            const delay = Math.min(activityTimeoutMs, timeLeft);
+            streamTimer = setTimeout(() => {
+              const timeoutErr = new Error(`${type === 'image' ? 'Image' : 'File'} resource download body stream timed out`);
+              if (typeof stream.destroy === 'function') {
+                stream.destroy(timeoutErr);
+              }
+              reject(timeoutErr);
+            }, delay);
+          };
+
+          resetActivityTimer();
 
           const onData = (chunk: any) => {
             const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -1505,6 +1820,7 @@ export class CredentialedLarkTransport implements LarkTransport {
               return;
             }
             chunks.push(buf);
+            resetActivityTimer();
           };
 
           const onError = (err: any) => {
@@ -1593,7 +1909,15 @@ export class CredentialedLarkTransport implements LarkTransport {
 
   async downloadFileResource(
     messageId: string,
-    fileKey: string
+    fileKey: string,
+    options?: {
+      declaredSize?: number;
+      chunkSizeBytes?: number;
+      nonRangeLimitBytes?: number;
+      maxBytes?: number;
+      timeoutMs?: number;
+      activityTimeoutMs?: number;
+    }
   ): Promise<{ buffer: Buffer; mimeType: string } | null> {
     if (!this.apiClient) {
       return null;
@@ -1608,20 +1932,402 @@ export class CredentialedLarkTransport implements LarkTransport {
       throw new Error('Feishu/Lark SDK im.messageResource API not available');
     }
 
-    const buffer = await this.downloadBoundedResourceStream(
-      resourceApi,
-      messageId,
-      fileKey,
-      'file',
-      FILE_DOWNLOAD_TIMEOUT_MS,
-      MAX_FILE_DOWNLOAD_BYTES
-    );
-    if (!buffer) {
-      return null;
+    const effectiveMaxBytes = options?.maxBytes ?? resolveMaxInboundFileBytes();
+    const effectiveTimeoutMs = options?.timeoutMs ?? FILE_DOWNLOAD_TIMEOUT_MS;
+    const effectiveActivityTimeoutMs = options?.activityTimeoutMs ?? FILE_ACTIVITY_TIMEOUT_MS;
+    const effectiveNonRangeLimit = options?.nonRangeLimitBytes ??
+      (process.env.ENKEEP_LARK_NON_RANGE_MAX_BYTES
+        ? parseInt(process.env.ENKEEP_LARK_NON_RANGE_MAX_BYTES, 10)
+        : LARK_NON_RANGE_MAX_FILE_BYTES);
+    const effectiveChunkSize = options?.chunkSizeBytes ??
+      (process.env.ENKEEP_LARK_DOWNLOAD_CHUNK_BYTES
+        ? parseInt(process.env.ENKEEP_LARK_DOWNLOAD_CHUNK_BYTES, 10)
+        : LARK_DOWNLOAD_CHUNK_SIZE_BYTES);
+
+    const overallDeadline = Date.now() + effectiveTimeoutMs;
+
+    if (typeof options?.declaredSize === 'number' && options.declaredSize > effectiveMaxBytes) {
+      throw new Error(`File exceeds maximum allowed size of ${effectiveMaxBytes} bytes`);
     }
 
-    const mimeType = isPdfBuffer(buffer) ? 'application/pdf' : 'application/octet-stream';
-    return { buffer, mimeType };
+    const tempFilePath = path.join(
+      os.tmpdir(),
+      `enkeep_lark_${messageId}_${fileKey}_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.tmp`
+    );
+
+    const knownLarge = typeof options?.declaredSize === 'number' && options.declaredSize >= effectiveNonRangeLimit;
+
+    try {
+      if (knownLarge) {
+        await this.downloadFileRangedChunksToTempFile({
+          resourceApi,
+          messageId,
+          fileKey,
+          tempFilePath,
+          chunkSize: effectiveChunkSize,
+          maxBytes: effectiveMaxBytes,
+          activityTimeoutMs: effectiveActivityTimeoutMs,
+          overallDeadline,
+        });
+      } else {
+        let mustFallbackToRanged = false;
+        try {
+          await this.downloadFileNonRangeToTempFile({
+            resourceApi,
+            messageId,
+            fileKey,
+            tempFilePath,
+            maxBytes: effectiveMaxBytes,
+            activityTimeoutMs: effectiveActivityTimeoutMs,
+            overallDeadline,
+          });
+        } catch (err: any) {
+          if (await isFeishuSizeLimitError(err)) {
+            mustFallbackToRanged = true;
+            try { await fs.promises.unlink(tempFilePath); } catch {}
+          } else {
+            throw err;
+          }
+        }
+
+        if (mustFallbackToRanged) {
+          await this.downloadFileRangedChunksToTempFile({
+            resourceApi,
+            messageId,
+            fileKey,
+            tempFilePath,
+            chunkSize: effectiveChunkSize,
+            maxBytes: effectiveMaxBytes,
+            activityTimeoutMs: effectiveActivityTimeoutMs,
+            overallDeadline,
+          });
+        }
+      }
+
+      const stat = await fs.promises.stat(tempFilePath);
+      if (stat.size > effectiveMaxBytes) {
+        throw new Error(`File exceeds maximum allowed size of ${effectiveMaxBytes} bytes`);
+      }
+
+      const buffer = await fs.promises.readFile(tempFilePath);
+      const mimeType = isPdfBuffer(buffer) ? 'application/pdf' : 'application/octet-stream';
+      return { buffer, mimeType };
+    } finally {
+      try {
+        await fs.promises.unlink(tempFilePath);
+      } catch {}
+    }
+  }
+
+  private async downloadFileNonRangeToTempFile(params: {
+    resourceApi: any;
+    messageId: string;
+    fileKey: string;
+    tempFilePath: string;
+    maxBytes: number;
+    activityTimeoutMs: number;
+    overallDeadline: number;
+  }): Promise<void> {
+    const { resourceApi, messageId, fileKey, tempFilePath, maxBytes, activityTimeoutMs, overallDeadline } = params;
+    const timeLeft = overallDeadline - Date.now();
+    if (timeLeft <= 0) {
+      throw new Error('File resource download timed out before request');
+    }
+
+    let preHeadersTimer: NodeJS.Timeout | undefined;
+    const preHeadersPromise = resourceApi.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type: 'file' },
+    });
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      preHeadersTimer = setTimeout(() => {
+        reject(new Error('File resource download timed out waiting for headers'));
+      }, Math.min(60000, timeLeft));
+    });
+
+    let res: any;
+    try {
+      res = await Promise.race([preHeadersPromise, timeoutPromise]);
+    } finally {
+      if (preHeadersTimer) clearTimeout(preHeadersTimer);
+    }
+
+    if (!res) {
+      throw new Error(`Resource not found for key ${fileKey}`);
+    }
+
+    const contentType = res.headers?.['content-type'] || res.headers?.['Content-Type'] || '';
+    if (contentType.includes('application/json')) {
+      if (typeof res.getReadableStream === 'function') {
+        const stream = res.getReadableStream();
+        const jsonChunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          jsonChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const text = Buffer.concat(jsonChunks).toString('utf8');
+        try {
+          const parsedJson = JSON.parse(text);
+          if (parsedJson.code === 234037 || String(parsedJson.msg).toLowerCase().includes('size exceeds limit')) {
+            const sizeErr: any = new Error(parsedJson.msg || 'Downloaded file size exceeds limit');
+            sizeErr.code = 234037;
+            throw sizeErr;
+          }
+          if (parsedJson.code !== 0) {
+            throw new Error(`Feishu API error ${parsedJson.code}: ${parsedJson.msg}`);
+          }
+        } catch (e: any) {
+          if (e.code === 234037) throw e;
+        }
+      }
+    }
+
+    if (typeof res.getReadableStream === 'function') {
+      const stream = res.getReadableStream();
+      await this.pipeStreamToTempFile({
+        stream,
+        tempFilePath,
+        maxBytes,
+        activityTimeoutMs,
+        overallDeadline,
+        flags: 'w',
+      });
+    } else if (Buffer.isBuffer(res)) {
+      if (res.length > maxBytes) {
+        throw new Error(`File exceeds maximum allowed size of ${maxBytes} bytes`);
+      }
+      await fs.promises.writeFile(tempFilePath, res);
+    } else if (Buffer.isBuffer((res as any).data)) {
+      if ((res as any).data.length > maxBytes) {
+        throw new Error(`File exceeds maximum allowed size of ${maxBytes} bytes`);
+      }
+      await fs.promises.writeFile(tempFilePath, (res as any).data);
+    } else {
+      throw new Error('Unsupported response format from messageResource.get');
+    }
+  }
+
+  private async downloadFileRangedChunksToTempFile(params: {
+    resourceApi: any;
+    messageId: string;
+    fileKey: string;
+    tempFilePath: string;
+    chunkSize: number;
+    maxBytes: number;
+    activityTimeoutMs: number;
+    overallDeadline: number;
+  }): Promise<void> {
+    const { resourceApi, messageId, fileKey, tempFilePath, chunkSize, maxBytes, activityTimeoutMs, overallDeadline } = params;
+
+    let offset = 0;
+    let totalFileSize: number | null = null;
+    let accumulatedTotalBytes = 0;
+
+    while (true) {
+      if (Date.now() >= overallDeadline) {
+        throw new Error('File resource download body stream timed out');
+      }
+
+      let end = offset + chunkSize - 1;
+      if (totalFileSize !== null && end >= totalFileSize) {
+        end = totalFileSize - 1;
+      }
+      if (totalFileSize !== null && offset >= totalFileSize) {
+        break;
+      }
+
+      const rangeHeader = `bytes=${offset}-${end}`;
+
+      let chunkRes: any = null;
+      let lastErr: any = null;
+
+      for (let attempt = 1; attempt <= LARK_CHUNK_RETRY_COUNT; attempt++) {
+        const timeLeft = overallDeadline - Date.now();
+        if (timeLeft <= 0) {
+          throw new Error('File resource download body stream timed out');
+        }
+
+        try {
+          let preHeadersTimer: NodeJS.Timeout | undefined;
+          const preHeadersPromise = resourceApi.get(
+            {
+              path: { message_id: messageId, file_key: fileKey },
+              params: { type: 'file' },
+            },
+            {
+              headers: {
+                Range: rangeHeader,
+              },
+            }
+          );
+
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            preHeadersTimer = setTimeout(() => {
+              reject(new Error('File resource chunk download timed out waiting for headers'));
+            }, Math.min(30000, timeLeft));
+          });
+
+          try {
+            chunkRes = await Promise.race([preHeadersPromise, timeoutPromise]);
+          } finally {
+            if (preHeadersTimer) clearTimeout(preHeadersTimer);
+          }
+
+          if (!chunkRes) {
+            throw new Error(`Resource chunk not found for key ${fileKey} at ${rangeHeader}`);
+          }
+          break;
+        } catch (err: any) {
+          lastErr = err;
+          if (attempt >= LARK_CHUNK_RETRY_COUNT || Date.now() >= overallDeadline) {
+            throw lastErr;
+          }
+          const backoffMs = LARK_CHUNK_INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        }
+      }
+
+      const contentRangeHeader =
+        chunkRes.headers?.['content-range'] || chunkRes.headers?.['Content-Range'] || '';
+      if (contentRangeHeader) {
+        const match = String(contentRangeHeader).match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+        if (match) {
+          const totalStr = match[3];
+          if (totalStr !== '*') {
+            totalFileSize = parseInt(totalStr, 10);
+            if (totalFileSize > maxBytes) {
+              throw new Error(`File exceeds maximum allowed size of ${maxBytes} bytes`);
+            }
+          }
+        }
+      }
+
+      let bytesInChunk = 0;
+      if (typeof chunkRes.getReadableStream === 'function') {
+        const stream = chunkRes.getReadableStream();
+        bytesInChunk = await this.pipeStreamToTempFile({
+          stream,
+          tempFilePath,
+          maxBytes: maxBytes - accumulatedTotalBytes,
+          activityTimeoutMs,
+          overallDeadline,
+          flags: 'a',
+        });
+      } else if (Buffer.isBuffer(chunkRes)) {
+        bytesInChunk = chunkRes.length;
+        if (accumulatedTotalBytes + bytesInChunk > maxBytes) {
+          throw new Error(`File exceeds maximum allowed size of ${maxBytes} bytes`);
+        }
+        await fs.promises.appendFile(tempFilePath, chunkRes);
+      } else if (Buffer.isBuffer((chunkRes as any).data)) {
+        const buf = (chunkRes as any).data;
+        bytesInChunk = buf.length;
+        if (accumulatedTotalBytes + bytesInChunk > maxBytes) {
+          throw new Error(`File exceeds maximum allowed size of ${maxBytes} bytes`);
+        }
+        await fs.promises.appendFile(tempFilePath, buf);
+      } else {
+        throw new Error('Unsupported chunk response format from messageResource.get');
+      }
+
+      accumulatedTotalBytes += bytesInChunk;
+      offset += bytesInChunk;
+
+      if (accumulatedTotalBytes > maxBytes) {
+        throw new Error(`File exceeds maximum allowed size of ${maxBytes} bytes`);
+      }
+
+      if (bytesInChunk === 0) {
+        break;
+      }
+
+      if (totalFileSize !== null && offset >= totalFileSize) {
+        break;
+      }
+
+      const requestedRangeLength = end - (offset - bytesInChunk) + 1;
+      if (bytesInChunk < requestedRangeLength) {
+        break;
+      }
+    }
+  }
+
+  private async pipeStreamToTempFile(params: {
+    stream: any;
+    tempFilePath: string;
+    maxBytes: number;
+    activityTimeoutMs: number;
+    overallDeadline: number;
+    flags: 'w' | 'a';
+  }): Promise<number> {
+    const { stream, tempFilePath, maxBytes, activityTimeoutMs, overallDeadline, flags } = params;
+    let streamTimer: NodeJS.Timeout | undefined;
+    let bytesWritten = 0;
+    const writeStream = fs.createWriteStream(tempFilePath, { flags });
+
+    return await new Promise<number>((resolve, reject) => {
+      const resetActivityTimer = () => {
+        if (streamTimer) clearTimeout(streamTimer);
+        const timeLeft = overallDeadline - Date.now();
+        if (timeLeft <= 0) {
+          const timeoutErr = new Error('File resource download body stream timed out');
+          cleanup();
+          try { stream.destroy(timeoutErr); } catch {}
+          try { writeStream.destroy(timeoutErr); } catch {}
+          reject(timeoutErr);
+          return;
+        }
+        const delay = Math.min(activityTimeoutMs, timeLeft);
+        streamTimer = setTimeout(() => {
+          const timeoutErr = new Error('File resource download body stream timed out');
+          cleanup();
+          try { stream.destroy(timeoutErr); } catch {}
+          try { writeStream.destroy(timeoutErr); } catch {}
+          reject(timeoutErr);
+        }, delay);
+      };
+
+      resetActivityTimer();
+
+      const onData = (chunk: any) => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytesWritten += buf.length;
+        if (bytesWritten > maxBytes) {
+          cleanup();
+          const sizeErr = new Error(`File exceeds maximum allowed size of ${maxBytes} bytes`);
+          try { stream.destroy(sizeErr); } catch {}
+          try { writeStream.destroy(sizeErr); } catch {}
+          reject(sizeErr);
+          return;
+        }
+        writeStream.write(buf);
+        resetActivityTimer();
+      };
+
+      const onError = (err: any) => {
+        cleanup();
+        try { writeStream.destroy(err); } catch {}
+        reject(err);
+      };
+
+      const onEnd = () => {
+        cleanup();
+        writeStream.end(() => {
+          resolve(bytesWritten);
+        });
+      };
+
+      const cleanup = () => {
+        if (streamTimer) clearTimeout(streamTimer);
+        stream.removeListener('data', onData);
+        stream.removeListener('error', onError);
+        stream.removeListener('end', onEnd);
+      };
+
+      stream.on('data', onData);
+      stream.on('error', onError);
+      stream.on('end', onEnd);
+    });
   }
 
   /**
@@ -1749,6 +2455,7 @@ export class CredentialedLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    statusPanelTitle?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
@@ -2245,7 +2952,7 @@ export class CredentialedLarkTransport implements LarkTransport {
               buildCollapsibleStatusPanel({
                 content: formattedToolStatus,
                 expanded: false, // collapsed on completion
-                title: '**🔧 执行过程**',
+                title: params.statusPanelTitle ?? '**🔧 执行过程**',
                 backgroundColor: 'wathet-50',
               })
             );
