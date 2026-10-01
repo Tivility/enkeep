@@ -175,6 +175,9 @@ export interface StreamAssistantEvent {
   description?: string;
   detail?: string;
   isSubagent?: boolean;
+  skillName?: string;
+  isNested?: boolean;
+  args?: any;
 }
 
 export interface CardToolStatusEntry {
@@ -186,6 +189,8 @@ export interface CardToolStatusEntry {
   readonly endTime?: number;
   readonly description?: string;
   readonly isSubagent?: boolean;
+  readonly skillName?: string;
+  readonly isNested?: boolean;
 }
 
 export interface CardFinalMetadata {
@@ -262,6 +267,7 @@ export interface LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    statusPanelTitle?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;

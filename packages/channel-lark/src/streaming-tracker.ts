@@ -571,6 +571,12 @@ export class StreamingReplyTracker {
         }
       } else if (evt.type === 'tool_status') {
         const name = evt.toolName || 'subagent';
+        const lowerName = name.toLowerCase();
+        // D10: Filter out AskUserQuestion from tools timeline
+        if (lowerName === 'askuserquestion' || lowerName === 'ask_user_question') {
+          continue;
+        }
+
         const current = this.runningTools.get(name) ?? 0;
         const isSubagent = Boolean(
           evt.isSubagent ||
@@ -578,6 +584,40 @@ export class StreamingReplyTracker {
           name === 'subagent_fork' ||
           name === 'create_task'
         );
+
+        let description = evt.description || (evt as any).detail;
+        if (!description && (evt as any).args) {
+          const rawArgs = (evt as any).args;
+          if (typeof rawArgs === 'string') {
+            description = rawArgs;
+          } else if (typeof rawArgs === 'object' && rawArgs !== null) {
+            description =
+              rawArgs.cmd ||
+              rawArgs.command ||
+              rawArgs.path ||
+              rawArgs.file_path ||
+              rawArgs.pattern ||
+              rawArgs.query ||
+              rawArgs.url ||
+              rawArgs.task ||
+              rawArgs.prompt ||
+              rawArgs.input ||
+              rawArgs.name ||
+              JSON.stringify(rawArgs);
+          }
+        }
+
+        const skillName =
+          (evt as any).skillName ||
+          (evt as any).skill_name ||
+          (lowerName === 'skill' && description ? description : undefined);
+        const isNested = Boolean(
+          (evt as any).isNested ||
+          (evt as any).is_nested ||
+          (evt as any).originTurnId ||
+          (evt as any).parent_turn_id
+        );
+
         const now = Date.now();
         if (evt.status === 'started') {
           this.runningTools.set(name, current + 1);
@@ -586,8 +626,10 @@ export class StreamingReplyTracker {
             status: 'running',
             timestamp: new Date().toISOString(),
             startTime: now,
-            description: evt.description || (evt as any).detail,
+            description,
             isSubagent,
+            skillName,
+            isNested,
           });
         } else if (evt.status === 'completed' || evt.status === 'failed') {
           this.runningTools.set(name, Math.max(0, current - 1));
@@ -600,7 +642,8 @@ export class StreamingReplyTracker {
               ...this.toolStatusEntries[actualIdx],
               status: evt.status as 'completed' | 'failed',
               endTime: now,
-              ...(evt.description ? { description: evt.description } : {}),
+              ...(description ? { description } : {}),
+              ...(skillName ? { skillName } : {}),
             };
           } else {
             this.toolStatusEntries.push({
@@ -609,14 +652,34 @@ export class StreamingReplyTracker {
               timestamp: new Date().toISOString(),
               startTime: now,
               endTime: now,
-              description: evt.description || (evt as any).detail,
+              description,
               isSubagent,
+              skillName,
+              isNested,
             });
           }
         }
       } else if (evt.type === 'turn_status') {
-        if (evt.status === 'completed' || evt.status === 'failed') {
-          terminalStatus = evt.status;
+        if (
+          evt.status === 'completed' ||
+          evt.status === 'failed' ||
+          evt.status === 'interrupted' ||
+          evt.status === 'stopped'
+        ) {
+          terminalStatus = evt.status === 'completed' ? 'completed' : 'failed';
+          const now = Date.now();
+          for (let i = 0; i < this.toolStatusEntries.length; i++) {
+            if (
+              this.toolStatusEntries[i].status === 'running' ||
+              this.toolStatusEntries[i].status === 'started'
+            ) {
+              this.toolStatusEntries[i] = {
+                ...this.toolStatusEntries[i],
+                status: evt.status === 'completed' ? 'completed' : 'failed',
+                endTime: now,
+              };
+            }
+          }
           break;
         }
       }
@@ -988,13 +1051,18 @@ export class StreamingReplyTracker {
     }
 
     // If turn completed or stopped, settle any remaining running tool entries
-    if (status === 'completed' || status === 'stopped' || status === 'failed') {
+    const isTerminal =
+      status === 'completed' ||
+      status === 'stopped' ||
+      status === 'failed' ||
+      (status as string) === 'interrupted';
+    if (isTerminal) {
       const now = Date.now();
       for (let i = 0; i < this.toolStatusEntries.length; i++) {
         if (this.toolStatusEntries[i].status === 'running' || this.toolStatusEntries[i].status === 'started') {
           this.toolStatusEntries[i] = {
             ...this.toolStatusEntries[i],
-            status: status === 'stopped' || status === 'failed' ? 'failed' : 'completed',
+            status: status === 'stopped' || status === 'failed' || (status as string) === 'interrupted' ? 'failed' : 'completed',
             endTime: now,
           };
         }

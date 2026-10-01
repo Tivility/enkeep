@@ -292,13 +292,137 @@ export function buildStreamingStatusLine(params: {
   return `<font color='grey'>⏳ 已用 ${formatDuration(elapsedBucket)} · 更新 ${timeSec}${idleNotice}</font>`;
 }
 
+export function truncate(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return text.slice(0, limit - 1) + '…';
+}
+
+export interface ToolCallView {
+  name: string;
+  status: 'running' | 'complete' | 'completed' | 'error' | 'failed' | 'started';
+  durationMs: number;
+  summary?: string;
+  /** When the tool invocation is wrapping a Skill, display this instead of name. */
+  skillName?: string;
+  /** Sub-agent tool calls get visual indentation. */
+  isNested?: boolean;
+}
+
+/** Map a tool name + summary to a labeled parameter (mirrors HappyClaw parseToolParam). */
+export function parseToolParam(
+  toolName: string,
+  summary: string | undefined
+): { label: string; value: string } | null {
+  if (!summary) return null;
+  let text = summary.trim();
+  if (!text) return null;
+
+  // Try parsing JSON if it looks like a JSON object
+  if (text.startsWith('{') && text.endsWith('}')) {
+    try {
+      const obj = JSON.parse(text);
+      if (obj && typeof obj === 'object') {
+        const val =
+          obj.path ??
+          obj.file_path ??
+          obj.cmd ??
+          obj.command ??
+          obj.pattern ??
+          obj.query ??
+          obj.url ??
+          obj.task ??
+          obj.prompt ??
+          obj.input ??
+          obj.name;
+        if (val !== undefined && typeof val === 'string') {
+          text = val;
+        } else if (val !== undefined) {
+          text = String(val);
+        }
+      }
+    } catch {}
+  }
+
+  const lower = toolName.toLowerCase();
+  if (['read', 'write', 'edit', 'glob', 'read_file', 'write_file', 'edit_file'].includes(lower)) {
+    return { label: 'path', value: text };
+  }
+  if (['bash', 'sh', 'shell', 'exec', 'command'].includes(lower)) {
+    return { label: 'cmd', value: text };
+  }
+  if (['grep', 'search', 'ripgrep'].includes(lower)) {
+    return { label: 'pattern', value: text };
+  }
+  if (['agent', 'task', 'subagent', 'subagent_fork', 'create_task'].includes(lower)) {
+    return { label: 'task', value: text };
+  }
+  if (['web_fetch', 'fetch'].includes(lower)) {
+    return { label: 'url', value: text };
+  }
+  return { label: 'input', value: text };
+}
+
+/** Tool timeline with status tags, elapsed time, labeled params, skill + nested hints (HappyClaw parity). */
+export function buildToolsTimelineText(
+  tools: ToolCallView[],
+  opts: { maxVisible?: number } = {}
+): string {
+  // Filter out AskUserQuestion
+  const filtered = tools.filter((t) => {
+    const lower = t.name?.toLowerCase() || '';
+    return lower !== 'askuserquestion' && lower !== 'ask_user_question';
+  });
+  if (filtered.length === 0) return "<font color='grey'>尚未调用任何工具</font>";
+
+  const maxVisible = opts.maxVisible ?? 8;
+  const running = filtered.filter((t) => t.status === 'running' || t.status === 'started');
+  const recent = filtered.filter((t) => t.status !== 'running' && t.status !== 'started').slice(-maxVisible);
+  const picked = [...running, ...recent].slice(0, maxVisible);
+
+  const lines = picked.map((t) => {
+    const tagColor =
+      t.status === 'running' || t.status === 'started'
+        ? 'blue'
+        : t.status === 'error' || t.status === 'failed'
+          ? 'red'
+          : 'green';
+    const tagText =
+      t.status === 'running' || t.status === 'started'
+        ? '运行'
+        : t.status === 'error' || t.status === 'failed'
+          ? '失败'
+          : '完成';
+    const elapsed =
+      t.durationMs > 0
+        ? ` <font color='grey'>(${formatDuration(t.durationMs)})</font>`
+        : '';
+    const isSkill = t.name === 'Skill' || t.name === 'skill' || t.name?.toLowerCase() === 'skill';
+    const displayName = isSkill && t.skillName ? t.skillName : t.name;
+    const param = parseToolParam(t.name, t.summary);
+    const paramLine =
+      param && !(isSkill && param.value === displayName)
+        ? `\n  <font color='grey'>${param.label}: ${truncate(param.value, 90)}</font>`
+        : '';
+    const indent = t.isNested ? '    ' : '';
+    return `${indent}<text_tag color='${tagColor}'>${tagText}</text_tag> \`${displayName}\`${elapsed}${paramLine}`;
+  });
+
+  const hidden = filtered.length - picked.length;
+  const more =
+    hidden > 0
+      ? `\n<font color='grey'>… 另有 ${hidden} 条工具记录已收起</font>`
+      : '';
+  return `${lines.join('\n')}${more}`;
+}
+
 /**
  * Format tool status entries into Lark Schema 2.0 markdown content.
- * Displays tool name and short status. Subagents are rendered with status tags, duration, and optional description.
+ * Displays tool name, Schema 2.0 status badges, elapsed duration, and param summary.
  */
 export function formatToolStatusMarkdown(
   toolStatus?: string | readonly CardToolStatusEntry[],
-  nowMs?: number
+  nowMs?: number,
+  opts?: { maxVisible?: number; useSchemaTags?: boolean }
 ): string | null {
   if (!toolStatus) return null;
   if (typeof toolStatus === 'string') {
@@ -309,13 +433,32 @@ export function formatToolStatusMarkdown(
     return null;
   }
 
-  const subagentEntries = toolStatus.filter(isSubagentTool);
-  const normalToolEntries = toolStatus.filter((e) => !isSubagentTool(e));
+  // D10: Filter out AskUserQuestion from tools timeline
+  const filtered = toolStatus.filter((e) => {
+    const lower = e.toolName?.toLowerCase() || '';
+    return lower !== 'askuserquestion' && lower !== 'ask_user_question';
+  });
+  if (filtered.length === 0) {
+    return null;
+  }
+
+  const subagentEntries = filtered.filter(isSubagentTool);
+  const normalToolEntries = filtered.filter((e) => !isSubagentTool(e));
 
   const sections: string[] = [];
 
   if (subagentEntries.length > 0) {
-    const subagentLines = subagentEntries.map((entry) => {
+    const maxSub = opts?.maxVisible ?? 8;
+    const runningSub = subagentEntries.filter(
+      (e) => e.status === 'started' || e.status === 'running'
+    );
+    const recentSub = subagentEntries
+      .filter((e) => e.status !== 'started' && e.status !== 'running')
+      .slice(-maxSub);
+    const pickedSub = [...runningSub, ...recentSub].slice(0, maxSub);
+    const hiddenSub = subagentEntries.length - pickedSub.length;
+
+    const subagentLines = pickedSub.map((entry) => {
       const tagColor =
         entry.status === 'started' || entry.status === 'running'
           ? 'blue'
@@ -340,7 +483,7 @@ export function formatToolStatusMarkdown(
       }
 
       const desc = entry.description
-        ? `\n  <font color='grey'>${entry.description.slice(0, 180)}</font>`
+        ? `\n  <font color='grey'>${truncate(entry.description, 180)}</font>`
         : '';
 
       const statusDesc =
@@ -350,28 +493,108 @@ export function formatToolStatusMarkdown(
             ? '已完成'
             : '执行失败';
 
-      return `<text_tag color='${tagColor}'>${tagText}</text_tag> 🤖 **${entry.toolName}**: ${statusDesc}${elapsedPart}${desc}`;
+      const indent = entry.isNested ? '    ' : '';
+      return `${indent}<text_tag color='${tagColor}'>${tagText}</text_tag> 🤖 **${entry.toolName}**: ${statusDesc}${elapsedPart}${desc}`;
     });
+
+    if (hiddenSub > 0) {
+      subagentLines.push(`<font color='grey'>… 另有 ${hiddenSub} 项子任务已收起</font>`);
+    }
 
     sections.push(`🤖 **子任务 / Subagents**\n${subagentLines.join('\n')}`);
   }
 
   if (normalToolEntries.length > 0) {
-    const normalToolLines = normalToolEntries.map((entry) => {
-      if (entry.status === 'started' || entry.status === 'running') {
-        return `🔨 **${entry.toolName}**: 正在执行…`;
-      } else if (entry.status === 'completed') {
-        return `✅ **${entry.toolName}**: 已完成`;
-      } else if (entry.status === 'failed') {
-        return `❌ **${entry.toolName}**: 执行失败`;
-      }
-      return `• **${entry.toolName}**: ${entry.status}`;
-    });
+    const hasRichInfo = normalToolEntries.some(
+      (e) =>
+        Boolean(e.description) ||
+        Boolean(e.skillName) ||
+        Boolean(e.isNested)
+    );
+    const useTags = opts?.useSchemaTags === true || hasRichInfo;
 
-    if (subagentEntries.length > 0) {
-      sections.push(`🔨 **工具调用**\n${normalToolLines.join('\n')}`);
+    if (useTags) {
+      const maxNormal = opts?.maxVisible ?? 8;
+      const runningNormal = normalToolEntries.filter(
+        (e) => e.status === 'started' || e.status === 'running'
+      );
+      const recentNormal = normalToolEntries
+        .filter((e) => e.status !== 'started' && e.status !== 'running')
+        .slice(-maxNormal);
+      const pickedNormal = [...runningNormal, ...recentNormal].slice(0, maxNormal);
+      const hiddenNormal = normalToolEntries.length - pickedNormal.length;
+
+      const normalToolLines = pickedNormal.map((entry) => {
+        const tagColor =
+          entry.status === 'started' || entry.status === 'running'
+            ? 'blue'
+            : entry.status === 'completed'
+              ? 'green'
+              : 'red';
+        const tagText =
+          entry.status === 'started' || entry.status === 'running'
+            ? '运行'
+            : entry.status === 'completed'
+              ? '完成'
+              : '失败';
+
+        let elapsedPart = '';
+        if (typeof entry.startTime === 'number' && entry.startTime > 0) {
+          const end =
+            typeof entry.endTime === 'number' && entry.endTime > 0
+              ? entry.endTime
+              : (nowMs ?? Date.now());
+          const durationMs = Math.max(0, end - entry.startTime);
+          if (durationMs > 0) {
+            elapsedPart = ` <font color='grey'>(${formatDuration(durationMs)})</font>`;
+          }
+        }
+
+        const isSkill =
+          entry.toolName === 'Skill' ||
+          entry.toolName === 'skill' ||
+          entry.toolName?.toLowerCase() === 'skill';
+        const displayName = isSkill && entry.skillName ? entry.skillName : entry.toolName;
+
+        const summary = entry.description || entry.detail;
+        const param = parseToolParam(entry.toolName, summary);
+        let paramLine = '';
+        if (param && !(isSkill && param.value === displayName)) {
+          paramLine = `\n  <font color='grey'>${param.label}: ${truncate(param.value, 90)}</font>`;
+        }
+        const indent = entry.isNested ? '    ' : '';
+        return `${indent}<text_tag color='${tagColor}'>${tagText}</text_tag> \`${displayName}\`${elapsedPart}${paramLine}`;
+      });
+
+      if (hiddenNormal > 0) {
+        normalToolLines.push(
+          `<font color='grey'>… 另有 ${hiddenNormal} 条工具记录已收起</font>`
+        );
+      }
+
+      if (subagentEntries.length > 0) {
+        sections.push(`🔨 **工具调用**\n${normalToolLines.join('\n')}`);
+      } else {
+        sections.push(normalToolLines.join('\n'));
+      }
     } else {
-      sections.push(normalToolLines.join('\n'));
+      // Legacy fallback for bare test entries without start/end times or descriptions
+      const normalToolLines = normalToolEntries.map((entry) => {
+        if (entry.status === 'started' || entry.status === 'running') {
+          return `🔨 **${entry.toolName}**: 正在执行…`;
+        } else if (entry.status === 'completed') {
+          return `✅ **${entry.toolName}**: 已完成`;
+        } else if (entry.status === 'failed') {
+          return `❌ **${entry.toolName}**: 执行失败`;
+        }
+        return `• **${entry.toolName}**: ${entry.status}`;
+      });
+
+      if (subagentEntries.length > 0) {
+        sections.push(`🔨 **工具调用**\n${normalToolLines.join('\n')}`);
+      } else {
+        sections.push(normalToolLines.join('\n'));
+      }
     }
   }
 
@@ -832,6 +1055,7 @@ export class FakeLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    statusPanelTitle?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
@@ -881,7 +1105,7 @@ export class FakeLarkTransport implements LarkTransport {
           expanded: expandStatus,
           elementId: 'tool_status_panel',
           contentElementId: 'tool_status_content',
-          title: '**🔧 执行过程**',
+          title: params.statusPanelTitle ?? '**🔧 执行过程**',
           backgroundColor: 'wathet-50',
         })
       );
@@ -1018,7 +1242,7 @@ export class FakeLarkTransport implements LarkTransport {
             buildCollapsibleStatusPanel({
               content: formattedToolStatus,
               expanded: false, // collapsed on completion
-              title: '**🔧 执行过程**',
+              title: params.statusPanelTitle ?? '**🔧 执行过程**',
               backgroundColor: 'wathet-50',
             })
           );
@@ -1749,6 +1973,7 @@ export class CredentialedLarkTransport implements LarkTransport {
     rootId?: string;
     threadId?: string;
     title?: string;
+    statusPanelTitle?: string;
     withStatusPanel?: boolean;
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
@@ -2245,7 +2470,7 @@ export class CredentialedLarkTransport implements LarkTransport {
               buildCollapsibleStatusPanel({
                 content: formattedToolStatus,
                 expanded: false, // collapsed on completion
-                title: '**🔧 执行过程**',
+                title: params.statusPanelTitle ?? '**🔧 执行过程**',
                 backgroundColor: 'wathet-50',
               })
             );
