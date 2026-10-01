@@ -25,7 +25,7 @@ export const DEFAULT_CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c';
 export const DEFAULT_ILINK_BASE = 'https://ilinkai.weixin.qq.com';
 export const ILINK_APP_ID = 'bot';
 export const ILINK_APP_CLIENT_VERSION = '131329';
-export const MAX_MEDIA_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+export const MAX_MEDIA_FILE_SIZE = 50 * 1024 * 1024; // 50MB default
 
 /**
  * Encrypt buffer with AES-128-ECB and PKCS7 padding.

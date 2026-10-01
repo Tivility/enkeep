@@ -130,6 +130,7 @@ export interface LarkMessageResource {
   type: 'image' | 'file';
   key: string;
   name: string;
+  size?: number;
   messageId?: string;
   unsupported?: boolean;
 }
@@ -289,7 +290,15 @@ export interface LarkTransport {
   ): Promise<{ buffer: Buffer; mimeType: string } | null>;
   downloadFileResource?(
     messageId: string,
-    fileKey: string
+    fileKey: string,
+    options?: {
+      declaredSize?: number;
+      chunkSizeBytes?: number;
+      nonRangeLimitBytes?: number;
+      maxBytes?: number;
+      timeoutMs?: number;
+      activityTimeoutMs?: number;
+    }
   ): Promise<{ buffer: Buffer; mimeType: string } | null>;
 }
 

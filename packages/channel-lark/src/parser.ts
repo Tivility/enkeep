@@ -350,10 +350,15 @@ export function extractTextAndResources(
         const rawName = typeof parsed.file_name === 'string' ? parsed.file_name : undefined;
         const sanitizedName = rawName ? sanitizeClaimedFileName(rawName) : undefined;
         const displayName = sanitizedName || parsed.file_key;
+        const rawSize =
+          typeof parsed.file_size === 'number' && parsed.file_size > 0
+            ? parsed.file_size
+            : (typeof parsed.size === 'number' && parsed.size > 0 ? parsed.size : undefined);
         resources.push({
           type: 'file',
           key: parsed.file_key,
           name: displayName,
+          ...(rawSize !== undefined ? { size: rawSize } : {}),
         });
         return { text: `[文件: ${displayName}]`, resources };
       }

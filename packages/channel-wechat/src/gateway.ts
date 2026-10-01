@@ -34,7 +34,7 @@ import type {
 } from './gateway-types.js';
 
 export const MAX_WECHAT_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB per image
-export const MAX_WECHAT_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024; // 20 MiB per file
+export const MAX_WECHAT_ATTACHMENT_FILE_BYTES = 500 * 1024 * 1024; // 500 MiB per file (aligned with platform cap)
 
 /**
  * Media attachment ingestor interface compatible with Lark's TenantScopedLarkImageIngestor.
@@ -390,12 +390,11 @@ export class WeChatChannelGateway {
               err?.message &&
               (err.message.includes('exceeds maximum allowed size') || err.message.includes('exceeds max'))
             );
-            if (isSizeError && msg.senderId && msg.contextToken) {
-              await this.transport.sendReply(
-                msg.senderId,
-                msg.contextToken,
-                '⚠️ 微信平台限制单文件最大 20MB。您发送的文件已超出微信接口上限，请登录 Enkeep Web 控制台上传大文件（支持最大 500MB）。'
-              ).catch(() => {});
+            if (msg.senderId && msg.contextToken) {
+              const replyText = isSizeError
+                ? '文件大小超出限制（单文件最大 500MB）'
+                : '文件下载失败，请稍后重试';
+              await this.transport.sendReply(msg.senderId, msg.contextToken, replyText).catch(() => {});
             }
             // Keep text fallback on failure (download/decrypt/size/ingest)
           }

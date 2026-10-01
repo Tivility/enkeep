@@ -434,12 +434,12 @@ describe('Lark Generic & PDF Attachment Intake', () => {
     expect(saved.equals(largeBuffer)).toBe(true);
   });
 
-  it('5. rejects file exceeding 100 MiB cap (fail-closed)', async () => {
-    const over100MiB = Buffer.alloc(100 * 1024 * 1024 + 1024);
+  it('5. rejects file exceeding 500 MiB cap (fail-closed)', async () => {
+    const over500MiB = Buffer.alloc(500 * 1024 * 1024 + 1024);
     const fileKey = 'file_v3_oversize';
     const messageId = 'om_msg_oversize';
 
-    transport.registerMockFile(fileKey, over100MiB, 'application/octet-stream', messageId);
+    transport.registerMockFile(fileKey, over500MiB, 'application/octet-stream', messageId);
 
     const event = makeFileEvent({
       eventId: 'evt_oversize_001',
@@ -455,7 +455,7 @@ describe('Lark Generic & PDF Attachment Intake', () => {
 
     const replies = transport.sentReplies;
     expect(replies).toHaveLength(1);
-    expect(replies[0].content).toContain('⚠️ 飞书消息附件接口限制单文件最大 100MB。您发送的文件已超出飞书接口上限，请通过 Enkeep Web 界面（支持最大 500MB）直接上传，或在飞书中发送飞书云文档/云盘分享链接。');
+    expect(replies[0].content).toContain('文件大小超出限制（单文件最大 500MB）');
 
     const inboxRows = db.prepare('SELECT status, payload_json FROM channel_inbox WHERE native_event_id = ?').all(
       'evt_oversize_001'

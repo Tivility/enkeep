@@ -1217,7 +1217,67 @@ I should prepare a table with Gateway and Database.
       expect(mockChannelRepo.createBinding).not.toHaveBeenCalled();
     });
 
-    it('replies with user-facing platform limit error when file attachment exceeds 20MB', async () => {
+    it('accepts large synthetic payload up to 500MB cap (FF2)', async () => {
+      const mockIngestor = {
+        ingestImage: vi.fn(),
+        ingestFile: vi.fn().mockResolvedValue({
+          path: '.attachments/incoming/fake_50mb.zip',
+          etag: '"sha256_fake_50mb"',
+          mediaType: 'application/zip',
+          displayName: 'large_data.zip',
+        }),
+      };
+
+      const syntheticKey = Buffer.alloc(16, 0x5a);
+      const plaintext = Buffer.alloc(32, 0x42);
+      // Ciphertext must be valid AES-128-ECB multiple of 16 bytes
+      const cipher = await import('node:crypto').then((c) => {
+        const cp = c.createCipheriv('aes-128-ecb', syntheticKey, null);
+        return Buffer.concat([cp.update(plaintext), cp.final()]);
+      });
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: (async () => {
+          return new Response(cipher, {
+            status: 200,
+            headers: { 'content-length': String(50 * 1024 * 1024) }, // Declares 50MB > 20MB
+          });
+        }) as any,
+      });
+
+      const largeFileMessage: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_large_50mb_001',
+        senderId: 'wx_user_large',
+        contextToken: 'ctx_large_token',
+        mediaItems: [
+          {
+            type: 'file',
+            name: 'large_data.zip',
+            encryptQueryParam: 'novac2c_param_50mb',
+            aesKey: syntheticKey.toString('base64'),
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(largeFileMessage);
+      expect(result.handled).toBe(true);
+      expect(mockIngestor.ingestFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileName: 'large_data.zip',
+        })
+      );
+    });
+
+    it('replies with user-facing error when file attachment exceeds 500MB cap', async () => {
       const mockIngestor = {
         ingestImage: vi.fn(),
         ingestFile: vi.fn(),
@@ -1235,7 +1295,7 @@ I should prepare a table with Gateway and Database.
         fetchFn: (async () => {
           return new Response(new Uint8Array(10), {
             status: 200,
-            headers: { 'content-length': String(21 * 1024 * 1024) },
+            headers: { 'content-length': String(501 * 1024 * 1024) },
           });
         }) as any,
       });
@@ -1248,7 +1308,7 @@ I should prepare a table with Gateway and Database.
         mediaItems: [
           {
             type: 'file',
-            name: 'large_data.zip',
+            name: 'massive_archive.zip',
             encryptQueryParam: 'novac2c_param_oversize',
             aesKey: Buffer.alloc(16).toString('base64'),
           },
@@ -1259,10 +1319,58 @@ I should prepare a table with Gateway and Database.
       expect(result.handled).toBe(true);
 
       const limitReply = fakeTransport.sentReplies.find((r) =>
-        r.text.includes('⚠️ 微信平台限制单文件最大 20MB。您发送的文件已超出微信接口上限')
+        r.text.includes('文件大小超出限制（单文件最大 500MB）')
       );
       expect(limitReply).toBeDefined();
       expect(limitReply?.toUserId).toBe('wx_user_oversize');
+    });
+
+    it('replies with generic download failure error when CDN download fails', async () => {
+      const mockIngestor = {
+        ingestImage: vi.fn(),
+        ingestFile: vi.fn(),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: mockRuntimeGateway,
+        contextTokenStore,
+        mediaAttachmentIngestor: mockIngestor,
+        fetchFn: (async () => {
+          return new Response('CDN 500 Internal Error', {
+            status: 500,
+            statusText: 'Internal Server Error',
+          });
+        }) as any,
+      });
+
+      const failedFileMessage: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_cdn_failed_001',
+        senderId: 'wx_user_cdn_fail',
+        contextToken: 'ctx_cdn_fail_token',
+        mediaItems: [
+          {
+            type: 'file',
+            name: 'report.pdf',
+            encryptQueryParam: 'novac2c_param_cdn_fail',
+            aesKey: Buffer.alloc(16).toString('base64'),
+          },
+        ],
+      };
+
+      const result = await gateway.handleInboundMessage(failedFileMessage);
+      expect(result.handled).toBe(true);
+
+      const failReply = fakeTransport.sentReplies.find((r) =>
+        r.text.includes('文件下载失败，请稍后重试')
+      );
+      expect(failReply).toBeDefined();
+      expect(failReply?.toUserId).toBe('wx_user_cdn_fail');
     });
   });
 });
