@@ -68,6 +68,11 @@ export class EventRelayService implements IEventRelayService {
   private readonly platformPostStatusCounts: Record<string, number> = {};
   private lastFrameTimeMs = 0;
 
+  private readonly flushTimeoutMs: number;
+  private readonly flushBackoffMs: number;
+  private flushStartedAt = 0;
+  private nextFlushAllowedAt = 0;
+
   constructor(ctx: Context, config?: EventRelayConfig) {
     this.ctx = ctx;
     this.consumer = config?.consumer ?? 'default';
@@ -75,6 +80,8 @@ export class EventRelayService implements IEventRelayService {
     this.batchIntervalMs = Math.min(Math.max(config?.batchIntervalMs ?? 30, 20), 50);
     this.maxBatchSizeBytes = config?.maxBatchSizeBytes ?? 32768; // 32KB
     this.maxPendingBytes = config?.maxPendingBytes ?? 262144; // 256KB
+    this.flushTimeoutMs = config?.flushTimeoutMs ?? 15000;
+    this.flushBackoffMs = config?.flushBackoffMs ?? 1000;
 
     this.startBatchTimer();
   }
@@ -574,34 +581,95 @@ export class EventRelayService implements IEventRelayService {
     }
   }
 
-  private async flushOutbound(): Promise<void> {
-    if (this.isFlushing || this.pendingOutboundFrames.length === 0) {
+  private async flushOutbound(force = false): Promise<void> {
+    if (this.isFlushing) {
+      if (Date.now() - this.flushStartedAt > this.flushTimeoutMs + 5000) {
+        this.isFlushing = false;
+      } else {
+        return;
+      }
+    }
+    if ((!force && Date.now() < this.nextFlushAllowedAt) || this.pendingOutboundFrames.length === 0) {
       return;
     }
     this.isFlushing = true;
+    this.flushStartedAt = Date.now();
 
     try {
       while (this.pendingOutboundFrames.length > 0) {
-        const batch = this.pendingOutboundFrames.splice(0, 100);
         let batchBytes = 0;
-        for (const f of batch) {
-          batchBytes += JSON.stringify(f).length;
+        let count = 0;
+        while (count < this.pendingOutboundFrames.length && count < 100) {
+          const frameBytes = JSON.stringify(this.pendingOutboundFrames[count]).length;
+          if (count > 0 && batchBytes + frameBytes > this.maxBatchSizeBytes) {
+            break;
+          }
+          batchBytes += frameBytes;
+          count++;
         }
+        const batch = this.pendingOutboundFrames.splice(0, count);
         this.pendingOutboundBytes = Math.max(0, this.pendingOutboundBytes - batchBytes);
 
         const client = this.platformClient;
         if (client && typeof client.request === 'function') {
+          let timer: NodeJS.Timeout | undefined;
           try {
-            const res = await client.request('/api/events', {
+            const reqPromise = client.request('/api/events', {
               method: 'POST',
               body: { events: batch },
+              timeoutMs: this.flushTimeoutMs,
             });
+            const timeoutPromise = new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`Event relay flush request timed out after ${this.flushTimeoutMs}ms`)),
+                this.flushTimeoutMs
+              );
+            });
+            const res = await Promise.race([reqPromise, timeoutPromise]);
             const statusKey = String((res && typeof res === 'object' && 'status' in res) ? res.status : 200);
             this.platformPostStatusCounts[statusKey] = (this.platformPostStatusCounts[statusKey] || 0) + 1;
             this.flushCount++;
           } catch (reqErr: unknown) {
             this.platformPostStatusCounts['network_error'] = (this.platformPostStatusCounts['network_error'] || 0) + 1;
             this.recordFlushFailure(reqErr);
+
+            const toRequeue = batch.filter((f) => !(f as any).__retried);
+            for (const f of toRequeue) {
+              (f as any).__retried = true;
+            }
+            if (toRequeue.length > 0) {
+              this.pendingOutboundFrames.unshift(...toRequeue);
+              let requeueBytes = 0;
+              for (const f of toRequeue) {
+                requeueBytes += JSON.stringify(f).length;
+              }
+              this.pendingOutboundBytes += requeueBytes;
+
+              while (this.pendingOutboundBytes > this.maxPendingBytes && this.pendingOutboundFrames.length > 0) {
+                const deltaIdx = this.pendingOutboundFrames.findIndex((f) => f.type === 'assistant_delta' || f.type === 'reasoning_delta');
+                if (deltaIdx >= 0) {
+                  const dropped = this.pendingOutboundFrames.splice(deltaIdx, 1)[0];
+                  this.pendingOutboundBytes -= JSON.stringify(dropped).length;
+                  this.droppedDeltaCount++;
+                } else {
+                  const dropped = this.pendingOutboundFrames.pop()!;
+                  this.pendingOutboundBytes -= JSON.stringify(dropped).length;
+                  this.droppedDeltaCount++;
+                }
+              }
+            }
+
+            this.nextFlushAllowedAt = Date.now() + this.flushBackoffMs;
+            console.warn('[dsh-event-relay] Outbound flush failed, re-queued batch:', {
+              batchCount: batch.length,
+              requeuedCount: toRequeue.length,
+              pendingFramesCount: this.pendingOutboundFrames.length,
+              pendingBytes: this.pendingOutboundBytes,
+              error: reqErr instanceof Error ? reqErr.message : String(reqErr),
+            });
+            break;
+          } finally {
+            if (timer) clearTimeout(timer);
           }
         }
       }
@@ -611,7 +679,7 @@ export class EventRelayService implements IEventRelayService {
   }
 
   async flush(): Promise<void> {
-    await this.flushOutbound();
+    await this.flushOutbound(true);
   }
 
   feedHistoricalEvents(session: Session, events: readonly SessionEvent[]): number {
