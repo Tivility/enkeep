@@ -368,10 +368,19 @@ export interface InternalRuntimeDispatchResult {
   readonly executionMode?: 'runtime' | 'command';
 }
 
+const envTurnTimeout =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.ENKEEP_INTERACTIVE_TURN_TIMEOUT_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedTurnTimeout = envTurnTimeout ? parseInt(envTurnTimeout, 10) : NaN;
+
 /**
- * Default execution timeout for interactive turns (1,800 seconds / 30 minutes).
+ * Default execution timeout for interactive turns (3,600 seconds / 60 minutes).
  */
-export const DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS = 1_800_000;
+export const DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS =
+  Number.isSafeInteger(parsedTurnTimeout) && parsedTurnTimeout > 0
+    ? parsedTurnTimeout
+    : 3_600_000;
 
 /**
  * Server-owned options passed to runtime gateway dispatch.

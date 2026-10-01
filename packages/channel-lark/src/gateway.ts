@@ -47,6 +47,7 @@ import type {
 import { StreamingReplyTracker } from './streaming-tracker.js';
 import { ContinuationWatcher, type ContinuationTarget } from './continuation-watcher.js';
 import { LarkCotManager, type LarkCotApiClient, type CotEntry } from './cot.js';
+import { isReasoningModelOrEffort } from './transport.js';
 
 export interface LarkChannelGatewayOptions {
   account: ChannelAccount | LarkAccountConfig;
@@ -62,6 +63,7 @@ export interface LarkChannelGatewayOptions {
   enableCot?: boolean;
   cotApiClient?: LarkCotApiClient;
   noCotChats?: string[];
+  withThinkingPanel?: boolean;
   isOperatorAllowed?: (params: {
     operatorId: string;
     chatId?: string;
@@ -116,6 +118,7 @@ export class LarkChannelGateway {
   private readonly turnSenders = new Map<string, string>();
   private readonly stoppedTurns = new Set<string>();
   readonly cotManager: LarkCotManager;
+  private readonly configuredWithThinkingPanel?: boolean;
   private readonly isOperatorAllowedCallback?: (params: {
     operatorId: string;
     chatId?: string;
@@ -135,6 +138,7 @@ export class LarkChannelGateway {
     this.defaultSpaceId = options.defaultSpaceId;
     this.groupActivationMode = options.groupActivationMode;
     this.streamEventSource = options.streamEventSource;
+    this.configuredWithThinkingPanel = options.withThinkingPanel;
     this.isOperatorAllowedCallback = options.isOperatorAllowed;
     this.cotManager = new LarkCotManager({
       enabled: options.enableCot ?? false,
@@ -1184,6 +1188,7 @@ export class LarkChannelGateway {
             initialCursor = await this.streamEventSource.getLatestRowId(route.id);
           } catch {}
         }
+        const hasThinking = this.isThinkingSupportedForRoute(route.id, route.spaceId, this.account.userId);
         const tracker = new StreamingReplyTracker({
           transport: this.transport,
           streamEventSource: this.streamEventSource,
@@ -1192,7 +1197,8 @@ export class LarkChannelGateway {
           turnId: dispatchResult.turnId,
           senderId: parsed.senderId,
           withStatusPanel: true,
-          withThinkingPanel: true,
+          withThinkingPanel: hasThinking,
+          withStatusBar: true,
           cardParams: {
             chatId: parsed.chatId,
             replyToMessageId: parsed.messageId,
@@ -1201,7 +1207,9 @@ export class LarkChannelGateway {
             turnId: dispatchResult.turnId,
             sessionId: route.id,
             withStatusPanel: true,
-            withThinkingPanel: true,
+            withThinkingPanel: hasThinking,
+            withStatusBar: true,
+            expandStatusPanel: false,
           },
         });
         tracker.start();
@@ -1218,6 +1226,61 @@ export class LarkChannelGateway {
       sessionRouteId: route.id,
       turnId,
     };
+  }
+
+  private isThinkingSupportedForRoute(sessionId: string, spaceId?: string, userId?: string): boolean {
+    if (this.configuredWithThinkingPanel !== undefined) {
+      return this.configuredWithThinkingPanel;
+    }
+
+    const db = (this.streamEventSource as any)?.db;
+    if (!db || typeof db.prepare !== 'function') {
+      return true;
+    }
+
+    try {
+      let row: { model?: string; reasoning_effort?: string | null } | undefined;
+      try {
+        row = db
+          .prepare(
+            `SELECT model, reasoning_effort FROM model_selection_overrides
+             WHERE (owner_type = 'session' AND owner_id = ?)
+                OR (owner_type = 'space' AND owner_id = ?)
+                OR (owner_type = 'user' AND owner_id = ?)
+                OR (owner_type = 'platform' AND owner_id = 'default')
+             ORDER BY CASE owner_type
+               WHEN 'session' THEN 1
+               WHEN 'space' THEN 2
+               WHEN 'user' THEN 3
+               WHEN 'platform' THEN 4
+             END LIMIT 1`
+          )
+          .get(sessionId, spaceId ?? '', userId ?? '') as any;
+      } catch {}
+
+      if (!row) {
+        try {
+          row = db
+            .prepare(
+              `SELECT model, reasoning_effort FROM model_config_overrides
+               WHERE user_id = ? OR user_id IS NULL
+               ORDER BY user_id DESC LIMIT 1`
+            )
+            .get(userId ?? '') as any;
+        } catch {}
+      }
+
+      if (row) {
+        return isReasoningModelOrEffort({
+          model: row.model,
+          reasoningEffort: row.reasoning_effort,
+        });
+      }
+
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   private recordTurnSender(key: string, senderId: string): void {

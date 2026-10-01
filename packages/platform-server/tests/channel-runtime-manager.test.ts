@@ -337,4 +337,70 @@ describe('ChannelRuntimeManager - Proactive Scheduled Deliveries & Web Isolation
     expect(outboxRows.length).toBe(1);
     expect(outboxRows[0].status).toBe('delivered');
   });
+
+  it('7. aligns outboxId with runId and prevents duplicate outbound when outbox already exists', async () => {
+    const tenant = storage.forTenant(userId);
+    const sessionRoute = await tenant.sessionRoutes.create({
+      id: 'ses_dedup_007',
+      spaceId,
+      channel: 'lark',
+      accountId,
+      nativeContextId: chatId,
+      peerId: chatId,
+      dshSessionId: 'dsh_dedup_007',
+    });
+
+    const taskId = 'task_dedup_007';
+    const runId = 'run_dedup_007';
+    const turnId = 'turn_dedup_007';
+    const payload = {
+      type: 'agent_prompt',
+      prompt: 'Check metrics report',
+      silent: false,
+    };
+
+    db.prepare(`
+      INSERT INTO platform_tasks (id, user_id, title, status, payload)
+      VALUES (?, ?, 'Metrics Report', 'running', ?)
+    `).run(taskId, userId, JSON.stringify(payload));
+
+    db.prepare(`
+      INSERT INTO task_runs (id, task_id, user_id, status, turn_id, session_id)
+      VALUES (?, ?, ?, 'running', ?, ?)
+    `).run(runId, taskId, userId, turnId, sessionRoute.id);
+
+    // First completion call creates outbox item with out_task_${runId}
+    await runtimeManager.handleTurnCompleted({
+      userId,
+      sessionId: sessionRoute.id,
+      spaceId,
+      turnId,
+      deliveryId: 'deliv_task_007',
+      idempotencyKey: 'deliv_task_007',
+      executionResult: { replyText: 'Metrics summary text.' },
+      tokenUsage: { tokens: 20 },
+      taskId,
+    });
+
+    const outboxRows = db.prepare('SELECT * FROM channel_outbox WHERE account_id = ?').all(accountId) as any[];
+    expect(outboxRows.length).toBe(1);
+    expect(outboxRows[0].id).toBe(`out_task_${runId}`);
+    expect(outboxRows[0].status).toBe('delivered');
+
+    // Second completion call (simulating race or TaskWorker replay) deduplicates via runId outboxId
+    await runtimeManager.handleTurnCompleted({
+      userId,
+      sessionId: sessionRoute.id,
+      spaceId,
+      turnId,
+      deliveryId: 'deliv_task_007_repeat',
+      idempotencyKey: 'deliv_task_007_repeat',
+      executionResult: { replyText: 'Metrics summary text.' },
+      tokenUsage: { tokens: 20 },
+      taskId,
+    });
+
+    const outboxRowsAfter = db.prepare('SELECT * FROM channel_outbox WHERE account_id = ?').all(accountId) as any[];
+    expect(outboxRowsAfter.length).toBe(1);
+  });
 });

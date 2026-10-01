@@ -93,8 +93,8 @@ describe('D1 Quota Commit Protection & Dynamic TTL in DeliveryRuntimeGateway', (
     await gateway.drain(1000);
 
     expect(capturedRequest).toBeDefined();
-    // Default interactive turn timeout is 1800000ms (1800s). TTL = 1800 + 300 = 2100s.
-    expect(capturedRequest!.ttlSeconds).toBe(2100);
+    // Default interactive turn timeout is 3600000ms (3600s). TTL = 3600 + 300 = 3900s.
+    expect(capturedRequest!.ttlSeconds).toBe(3900);
   });
 
   it('dynamically computes ttlSeconds for custom turn timeout (e.g. 600s + 300s = 900s)', async () => {

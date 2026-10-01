@@ -19,6 +19,7 @@ import {
   type TaskPayload,
   type TaskDispatchResult,
   type TaskExecutionBudget,
+  DEFAULT_TASK_EXECUTION_BUDGET_MS,
 } from '@enkeep/platform-operations';
 import {
   SqlitePlatformOperationsStorage,
@@ -56,6 +57,7 @@ export interface PlatformServerTaskWorkerOptions {
   pollIntervalMs?: number;
   leaseDurationMs?: number;
   heartbeatIntervalMs?: number;
+  defaultExecutionBudgetMs?: number;
   operationsStorage?: SqlitePlatformOperationsStorage;
   taskNotificationService?: TaskNotificationService;
   channelRuntimeManager?: any;
@@ -247,6 +249,7 @@ export function createPlatformServerTaskWorker(
     pollIntervalMs: options.pollIntervalMs,
     leaseDurationMs: options.leaseDurationMs,
     heartbeatIntervalMs: options.heartbeatIntervalMs,
+    defaultExecutionBudgetMs: options.defaultExecutionBudgetMs ?? DEFAULT_TASK_EXECUTION_BUDGET_MS,
     systemRecovery: () => operationsStorage.recoverAfterRestart(),
     channelRuntimeManager: options.channelRuntimeManager,
     wechatRuntimeManager: options.wechatRuntimeManager,

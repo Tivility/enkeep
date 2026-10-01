@@ -231,12 +231,13 @@ export interface FakeRemovedReactionRecord {
 }
 
 export interface FakeStreamingCallRecord {
-  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'finalize';
+  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'push_status_line' | 'finalize';
   readonly cardId?: string;
   readonly messageId?: string;
   readonly content?: string;
   readonly toolStatus?: string | readonly CardToolStatusEntry[];
   readonly thinkingText?: string;
+  readonly statusLine?: string;
   readonly status?: 'completed' | 'failed' | 'stopped';
   readonly metadata?: CardFinalMetadata;
   readonly card?: any;
@@ -245,11 +246,59 @@ export interface FakeStreamingCallRecord {
 }
 
 /**
+ * Check if a tool entry represents a subagent task.
+ */
+export function isSubagentTool(entry: CardToolStatusEntry): boolean {
+  if (entry.isSubagent) return true;
+  const name = entry.toolName?.toLowerCase() || '';
+  return name === 'subagent' || name === 'subagent_fork' || name === 'create_task';
+}
+
+/**
+ * Format duration in milliseconds into a concise readable string.
+ */
+export function formatDuration(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return '-';
+  if (ms === 0) return '0s';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${Number.isInteger(sec) ? sec : sec.toFixed(1)}s`;
+  const min = Math.floor(sec / 60);
+  const restSec = Math.floor(sec % 60);
+  return restSec === 0 ? `${min}m` : `${min}m ${restSec}s`;
+}
+
+/**
+ * Build Schema 2.0 streaming status line with 5s-bucketed elapsed time and liveness indicators.
+ */
+export function buildStreamingStatusLine(params: {
+  elapsedMs: number;
+  nowMs?: number;
+  lastActivityAt?: number;
+  staleThresholdMs?: number;
+}): string {
+  const elapsedBucket = Math.max(0, Math.floor(params.elapsedMs / 5000) * 5000);
+  const now = params.nowMs ?? Date.now();
+  const nowBucket = Math.floor(now / 5000) * 5000;
+  const timeSec = `<local_datetime millisecond='${nowBucket}' format_type='time_sec'></local_datetime>`;
+
+  let idleNotice = '';
+  const staleThreshold = params.staleThresholdMs ?? 120_000;
+  if (params.lastActivityAt && now - params.lastActivityAt >= staleThreshold) {
+    const silenceMs = now - params.lastActivityAt;
+    idleNotice = ` · ${formatDuration(silenceMs)} 无新事件，仍在运行`;
+  }
+
+  return `<font color='grey'>⏳ 已用 ${formatDuration(elapsedBucket)} · 更新 ${timeSec}${idleNotice}</font>`;
+}
+
+/**
  * Format tool status entries into Lark Schema 2.0 markdown content.
- * Displays tool name and short status, e.g. 🔨 web_search: 正在执行… / ✅ web_search: 已完成.
+ * Displays tool name and short status. Subagents are rendered with status tags, duration, and optional description.
  */
 export function formatToolStatusMarkdown(
-  toolStatus?: string | readonly CardToolStatusEntry[]
+  toolStatus?: string | readonly CardToolStatusEntry[],
+  nowMs?: number
 ): string | null {
   if (!toolStatus) return null;
   if (typeof toolStatus === 'string') {
@@ -260,21 +309,73 @@ export function formatToolStatusMarkdown(
     return null;
   }
 
-  return toolStatus
-    .map((entry) => {
-      const isSubagent = entry.toolName === 'subagent';
+  const subagentEntries = toolStatus.filter(isSubagentTool);
+  const normalToolEntries = toolStatus.filter((e) => !isSubagentTool(e));
+
+  const sections: string[] = [];
+
+  if (subagentEntries.length > 0) {
+    const subagentLines = subagentEntries.map((entry) => {
+      const tagColor =
+        entry.status === 'started' || entry.status === 'running'
+          ? 'blue'
+          : entry.status === 'completed'
+            ? 'green'
+            : 'red';
+      const tagText =
+        entry.status === 'started' || entry.status === 'running'
+          ? '运行'
+          : entry.status === 'completed'
+            ? '完成'
+            : '失败';
+
+      let elapsedPart = '';
+      if (typeof entry.startTime === 'number' && entry.startTime > 0) {
+        const end =
+          typeof entry.endTime === 'number' && entry.endTime > 0
+            ? entry.endTime
+            : (nowMs ?? Date.now());
+        const durationMs = Math.max(0, end - entry.startTime);
+        elapsedPart = ` <font color='grey'>· ${formatDuration(durationMs)}</font>`;
+      }
+
+      const desc = entry.description
+        ? `\n  <font color='grey'>${entry.description.slice(0, 180)}</font>`
+        : '';
+
+      const statusDesc =
+        entry.status === 'started' || entry.status === 'running'
+          ? '正在执行…'
+          : entry.status === 'completed'
+            ? '已完成'
+            : '执行失败';
+
+      return `<text_tag color='${tagColor}'>${tagText}</text_tag> 🤖 **${entry.toolName}**: ${statusDesc}${elapsedPart}${desc}`;
+    });
+
+    sections.push(`🤖 **子任务 / Subagents**\n${subagentLines.join('\n')}`);
+  }
+
+  if (normalToolEntries.length > 0) {
+    const normalToolLines = normalToolEntries.map((entry) => {
       if (entry.status === 'started' || entry.status === 'running') {
-        const icon = isSubagent ? '🤖' : '🔨';
-        return `${icon} **${entry.toolName}**: 正在执行…`;
+        return `🔨 **${entry.toolName}**: 正在执行…`;
       } else if (entry.status === 'completed') {
-        const icon = isSubagent ? '🤖' : '✅';
-        return `${icon} **${entry.toolName}**: 已完成`;
+        return `✅ **${entry.toolName}**: 已完成`;
       } else if (entry.status === 'failed') {
         return `❌ **${entry.toolName}**: 执行失败`;
       }
       return `• **${entry.toolName}**: ${entry.status}`;
-    })
-    .join('\n');
+    });
+
+    if (subagentEntries.length > 0) {
+      sections.push(`🔨 **工具调用**\n${normalToolLines.join('\n')}`);
+    } else {
+      sections.push(normalToolLines.join('\n'));
+    }
+  }
+
+  return sections.join('\n\n');
 }
 
 /**
@@ -420,6 +521,27 @@ export function extractThinkingFromText(text: string): { text: string; thinking?
     text: cleaned.trim(),
     thinking,
   };
+}
+
+/**
+ * Detects if a model or model configuration supports reasoning / thinking.
+ */
+export function isReasoningModelOrEffort(params: {
+  model?: string | null;
+  reasoningEffort?: string | null;
+}): boolean {
+  if (params.reasoningEffort && params.reasoningEffort.trim().length > 0) {
+    return true;
+  }
+  if (!params.model) return false;
+  const m = params.model.toLowerCase().trim();
+  return (
+    m.includes('reasoner') ||
+    m.includes('r1') ||
+    m.startsWith('o1') ||
+    m.startsWith('o3') ||
+    m.includes('qwq')
+  );
 }
 
 /**
@@ -714,6 +836,9 @@ export class FakeLarkTransport implements LarkTransport {
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
     collapsibleThinking?: boolean;
+    expandStatusPanel?: boolean;
+    expandThinkingPanel?: boolean;
+    withStatusBar?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
@@ -731,14 +856,17 @@ export class FakeLarkTransport implements LarkTransport {
     const messageId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
     const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+    const withStatusBar = Boolean(params.withStatusBar);
+    const expandThinking = params.expandThinkingPanel ?? true;
+    const expandStatus = params.expandStatusPanel ?? true;
     const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
 
     const initialElements: Array<Record<string, unknown>> = [];
     if (withThinking) {
       initialElements.push(
         buildCollapsibleThinkingPanel({
-          content: '正在思考…',
-          expanded: true,
+          content: "<font color='grey'>尚未开始思考…</font>",
+          expanded: expandThinking,
           elementId: 'thinking_panel',
           contentElementId: 'thinking_content',
           title: '**💭 思考过程**',
@@ -749,8 +877,8 @@ export class FakeLarkTransport implements LarkTransport {
     if (withStatus) {
       initialElements.push(
         buildCollapsibleStatusPanel({
-          content: '正在准备…',
-          expanded: true,
+          content: "<font color='grey'>尚未调用工具…</font>",
+          expanded: expandStatus,
           elementId: 'tool_status_panel',
           contentElementId: 'tool_status_content',
           title: '**🔧 执行过程**',
@@ -763,6 +891,14 @@ export class FakeLarkTransport implements LarkTransport {
       element_id: 'main_content',
       content: '正在思考…',
     });
+    if (withStatusBar) {
+      initialElements.push({
+        tag: 'markdown',
+        element_id: 'streaming_status_bar',
+        text_size: 'notation',
+        content: buildStreamingStatusLine({ elapsedMs: 0, nowMs: Date.now() }),
+      });
+    }
     if (withStop) {
       initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
     }
@@ -798,7 +934,7 @@ export class FakeLarkTransport implements LarkTransport {
     const session: LarkStreamingCardSession = {
       cardId,
       messageId,
-      pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void> => {
+      pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string, statusLine?: string): Promise<void> => {
         this._streamingCalls.push({
           type: 'push',
           cardId,
@@ -806,6 +942,7 @@ export class FakeLarkTransport implements LarkTransport {
           content: accumulatedText,
           toolStatus,
           thinkingText,
+          statusLine,
           timestamp: new Date().toISOString(),
         });
       },
@@ -824,6 +961,15 @@ export class FakeLarkTransport implements LarkTransport {
           cardId,
           messageId,
           content: thinkingText,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      pushStatusLine: async (statusText: string): Promise<void> => {
+        this._streamingCalls.push({
+          type: 'push_status_line',
+          cardId,
+          messageId,
+          content: statusText,
           timestamp: new Date().toISOString(),
         });
       },
@@ -872,16 +1018,6 @@ export class FakeLarkTransport implements LarkTransport {
             buildCollapsibleStatusPanel({
               content: formattedToolStatus,
               expanded: false, // collapsed on completion
-              title: '**🔧 执行过程**',
-              backgroundColor: 'wathet-50',
-            })
-          );
-          hasProcessArea = true;
-        } else if (withStatus) {
-          bodyElements.push(
-            buildCollapsibleStatusPanel({
-              content: '暂无工具调用',
-              expanded: false,
               title: '**🔧 执行过程**',
               backgroundColor: 'wathet-50',
             })
@@ -1617,6 +1753,9 @@ export class CredentialedLarkTransport implements LarkTransport {
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
     collapsibleThinking?: boolean;
+    expandStatusPanel?: boolean;
+    expandThinkingPanel?: boolean;
+    withStatusBar?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;
@@ -1635,13 +1774,16 @@ export class CredentialedLarkTransport implements LarkTransport {
 
       const withThinking = Boolean(params.withThinkingPanel ?? params.collapsibleThinking);
       const withStatus = Boolean(params.withStatusPanel ?? params.collapsibleToolStatus);
+      const withStatusBar = Boolean(params.withStatusBar);
+      const expandThinking = params.expandThinkingPanel ?? true;
+      const expandStatus = params.expandStatusPanel ?? true;
       const withStop = params.withStopButton ?? Boolean(params.turnId || params.sessionId);
       const initialElements: Array<Record<string, unknown>> = [];
       if (withThinking) {
         initialElements.push(
           buildCollapsibleThinkingPanel({
-            content: '正在思考…',
-            expanded: true,
+            content: "<font color='grey'>尚未开始思考…</font>",
+            expanded: expandThinking,
             elementId: 'thinking_panel',
             contentElementId: 'thinking_content',
             title: '**💭 思考过程**',
@@ -1652,8 +1794,8 @@ export class CredentialedLarkTransport implements LarkTransport {
       if (withStatus) {
         initialElements.push(
           buildCollapsibleStatusPanel({
-            content: '正在准备…',
-            expanded: true,
+            content: "<font color='grey'>尚未调用工具…</font>",
+            expanded: expandStatus,
             elementId: 'tool_status_panel',
             contentElementId: 'tool_status_content',
             title: '**🔧 执行过程**',
@@ -1666,6 +1808,14 @@ export class CredentialedLarkTransport implements LarkTransport {
         element_id: 'main_content',
         content: '正在思考…',
       });
+      if (withStatusBar) {
+        initialElements.push({
+          tag: 'markdown',
+          element_id: 'streaming_status_bar',
+          text_size: 'notation',
+          content: buildStreamingStatusLine({ elapsedMs: 0, nowMs: Date.now() }),
+        });
+      }
       if (withStop) {
         initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
       }
@@ -1822,7 +1972,7 @@ export class CredentialedLarkTransport implements LarkTransport {
       const session: LarkStreamingCardSession = {
         cardId,
         messageId: boundMessageId,
-        pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void> => {
+        pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string, statusLine?: string): Promise<void> => {
           try {
             const contentFn = client.cardkit?.v1?.cardElement?.content;
             if (typeof contentFn !== 'function') return;
@@ -1942,6 +2092,20 @@ export class CredentialedLarkTransport implements LarkTransport {
                 },
               });
             }
+
+            if (withStatusBar && statusLine) {
+              seq += 1;
+              await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: 'streaming_status_bar',
+                },
+                data: {
+                  content: statusLine,
+                  sequence: seq,
+                },
+              });
+            }
           } catch (err) {
             logger.warn('[lark-stream] pushText error', {
               code: (err as any)?.code,
@@ -1990,6 +2154,30 @@ export class CredentialedLarkTransport implements LarkTransport {
             });
           } catch (err) {
             logger.warn('[lark-stream] pushThinking error', {
+              code: (err as any)?.code,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        },
+        pushStatusLine: async (statusText: string): Promise<void> => {
+          if (!withStatusBar) return;
+          try {
+            const contentFn = client.cardkit?.v1?.cardElement?.content;
+            if (typeof contentFn !== 'function') return;
+
+            seq += 1;
+            await contentFn({
+              path: {
+                card_id: cardId,
+                element_id: 'streaming_status_bar',
+              },
+              data: {
+                content: statusText,
+                sequence: seq,
+              },
+            });
+          } catch (err) {
+            logger.warn('[lark-stream] pushStatusLine error', {
               code: (err as any)?.code,
               message: err instanceof Error ? err.message : String(err),
             });
@@ -2057,16 +2245,6 @@ export class CredentialedLarkTransport implements LarkTransport {
               buildCollapsibleStatusPanel({
                 content: formattedToolStatus,
                 expanded: false, // collapsed on completion
-                title: '**🔧 执行过程**',
-                backgroundColor: 'wathet-50',
-              })
-            );
-            hasProcessArea = true;
-          } else if (withStatus) {
-            bodyElements.push(
-              buildCollapsibleStatusPanel({
-                content: '暂无工具调用',
-                expanded: false,
                 title: '**🔧 执行过程**',
                 backgroundColor: 'wathet-50',
               })

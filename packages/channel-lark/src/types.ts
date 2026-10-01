@@ -172,6 +172,9 @@ export interface StreamAssistantEvent {
   toolName?: string;
   turnId?: string;
   originTurnId?: string;
+  description?: string;
+  detail?: string;
+  isSubagent?: boolean;
 }
 
 export interface CardToolStatusEntry {
@@ -179,6 +182,10 @@ export interface CardToolStatusEntry {
   readonly status: 'started' | 'running' | 'completed' | 'failed';
   readonly timestamp?: string;
   readonly detail?: string;
+  readonly startTime?: number;
+  readonly endTime?: number;
+  readonly description?: string;
+  readonly isSubagent?: boolean;
 }
 
 export interface CardFinalMetadata {
@@ -219,9 +226,10 @@ export interface OutboundReplyResult {
 export interface LarkStreamingCardSession {
   readonly cardId: string;
   readonly messageId: string;
-  pushText(accumulatedText: string, toolStatus?: string, thinkingText?: string): Promise<void>;
+  pushText(accumulatedText: string, toolStatus?: string, thinkingText?: string, statusLine?: string): Promise<void>;
   pushToolStatus?(statusText: string): Promise<void>;
   pushThinking?(thinkingText: string): Promise<void>;
+  pushStatusLine?(statusText: string): Promise<void>;
   finalize(
     finalText: string,
     status: 'completed' | 'failed' | 'stopped',
@@ -258,6 +266,9 @@ export interface LarkTransport {
     collapsibleToolStatus?: boolean;
     withThinkingPanel?: boolean;
     collapsibleThinking?: boolean;
+    expandStatusPanel?: boolean;
+    expandThinkingPanel?: boolean;
+    withStatusBar?: boolean;
     withStopButton?: boolean;
     turnId?: string;
     sessionId?: string;

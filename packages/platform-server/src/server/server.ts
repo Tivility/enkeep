@@ -340,6 +340,8 @@ export interface PlatformServerOptions {
   workerId?: string;
   /** Optional run ID used to derive worker ID */
   runId?: string;
+  /** Optional default task execution budget in ms */
+  defaultExecutionBudgetMs?: number;
   /** Optional tenant runtime file provider */
   fileProvider?: TenantRuntimeFileProvider;
   /** Optional runtime file API service */
@@ -1024,6 +1026,7 @@ export class PlatformServer {
           operationsStorage: this.operationsStorage,
           runId: options.runId,
           workerId: options.workerId,
+          defaultExecutionBudgetMs: options.defaultExecutionBudgetMs,
           channelRuntimeManager: options.channelRuntimeManager ?? this.channelRuntimeManager,
           wechatRuntimeManager: options.wechatRuntimeManager ?? this.wechatRuntimeManager,
           prepareTaskInput: taskPreparerHook,

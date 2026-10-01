@@ -35,7 +35,16 @@ import {
 
 export type TaskWorkerStatus = 'idle' | 'running' | 'stopping' | 'stopped';
 
-export const DEFAULT_TASK_EXECUTION_BUDGET_MS = 1_800_000; // 30 minutes default
+const envTaskBudget =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.ENKEEP_TASK_EXECUTION_BUDGET_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedTaskBudget = envTaskBudget ? parseInt(envTaskBudget, 10) : NaN;
+
+export const DEFAULT_TASK_EXECUTION_BUDGET_MS =
+  Number.isSafeInteger(parsedTaskBudget) && parsedTaskBudget > 0
+    ? parsedTaskBudget
+    : 3_600_000; // 60 minutes default
 
 export interface TaskExecutionBudget {
   readonly maxWaitMs?: number;
@@ -1321,14 +1330,28 @@ export class AgentPromptTaskWorker {
               let replyText = extractedReplyText;
               if (!replyText && this.db) {
                 try {
-                  const stmt = this.db.prepare(`
-                    SELECT content FROM web_messages
-                    WHERE user_id = ? AND session_id = ? AND role = 'assistant'
-                    ORDER BY created_at DESC, id DESC LIMIT 1
-                  `);
-                  const row = stmt.get(tenantId, payload.sessionId) as { content?: string } | undefined;
-                  if (row && typeof row.content === 'string') {
-                    replyText = row.content;
+                  const currentTurnId = task.currentRun?.turnId;
+                  if (currentTurnId) {
+                    const stmt = this.db.prepare(`
+                      SELECT content FROM web_messages
+                      WHERE user_id = ? AND session_id = ? AND role = 'assistant' AND turn_id = ?
+                      LIMIT 1
+                    `);
+                    const row = stmt.get(tenantId, payload.sessionId, currentTurnId) as { content?: string } | undefined;
+                    if (row && typeof row.content === 'string') {
+                      replyText = row.content;
+                    }
+                  }
+                  if (!replyText) {
+                    const stmt = this.db.prepare(`
+                      SELECT content FROM web_messages
+                      WHERE user_id = ? AND session_id = ? AND role = 'assistant'
+                      ORDER BY created_at DESC, id DESC LIMIT 1
+                    `);
+                    const row = stmt.get(tenantId, payload.sessionId) as { content?: string } | undefined;
+                    if (row && typeof row.content === 'string') {
+                      replyText = row.content;
+                    }
                   }
                 } catch (dbErr) {
                   console.warn(`[${deliveryChannel}-task] Failed to read assistant message from web_messages:`, dbErr);
@@ -1402,6 +1425,39 @@ export class AgentPromptTaskWorker {
                 const deliveryText = replyText ?? `Task "${task.title}" completed successfully.`;
                 const stableRunId = task.currentRun?.id || task.id;
                 const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
+
+                // Defensive idempotency: check if an outbox row already exists for this task run or turn
+                if (this.db) {
+                  try {
+                    const currentTurnId = task.currentRun?.turnId || '';
+                    const existingOutbox = this.db.prepare(`
+                      SELECT id, status FROM channel_outbox
+                      WHERE (
+                        id = ?
+                        OR (id = ? AND ? != '')
+                        OR json_extract(payload_json, '$.runId') = ?
+                        OR (json_extract(payload_json, '$.turnId') IS NOT NULL AND ? != '' AND json_extract(payload_json, '$.turnId') = ?)
+                      )
+                      LIMIT 1
+                    `).get(
+                      outboxId,
+                      currentTurnId ? `out_task_${currentTurnId}` : '',
+                      currentTurnId,
+                      stableRunId,
+                      currentTurnId,
+                      currentTurnId
+                    ) as { id: string; status: string } | undefined;
+                    if (existingOutbox && (existingOutbox.status === 'delivered' || existingOutbox.status === 'sending')) {
+                      return {
+                        taskId: task.id,
+                        tenantId,
+                        status: 'completed',
+                        result: validatedResult,
+                      };
+                    }
+                  } catch {}
+                }
+
                 await gateway.sendProactiveMessage({
                   chatId,
                   text: deliveryText,
@@ -1607,7 +1663,7 @@ export class AgentPromptTaskWorker {
     const configuredTimeout = Number.isSafeInteger(envTimeout) && envTimeout > 0 ? envTimeout : 300000;
     const timeoutMs = Math.min(
       Math.max(payload.timeoutMs ?? configuredTimeout, 1000),
-      1800000
+      DEFAULT_TASK_EXECUTION_BUDGET_MS
     );
 
     let scriptResult: {
@@ -1926,6 +1982,25 @@ export class AgentPromptTaskWorker {
             : `任务 "${task.title}" 脚本执行完成 (退出码 ${validatedResult.exitCode})。`;
           const stableRunId = task.currentRun?.id || task.id;
           const outboxId = `out_task_${stableRunId.replace(/[^a-zA-Z0-9_]/g, '')}`;
+
+          if (this.db) {
+            try {
+              const existingOutbox = this.db.prepare(`
+                SELECT id, status FROM channel_outbox
+                WHERE id = ? OR json_extract(payload_json, '$.runId') = ?
+                LIMIT 1
+              `).get(outboxId, stableRunId) as { id: string; status: string } | undefined;
+              if (existingOutbox && (existingOutbox.status === 'delivered' || existingOutbox.status === 'sending')) {
+                return {
+                  taskId: task.id,
+                  tenantId,
+                  status: 'completed',
+                  result: validatedResult,
+                };
+              }
+            } catch {}
+          }
+
           await gateway.sendProactiveMessage({
             chatId,
             text: deliveryText,

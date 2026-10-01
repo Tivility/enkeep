@@ -42,6 +42,17 @@ export type TaskScheduleMisfirePolicy = typeof TASK_SCHEDULE_MISFIRE_POLICIES[nu
 export const TASK_SCHEDULE_OVERLAP_POLICIES = ['skip'] as const;
 export type TaskScheduleOverlapPolicy = typeof TASK_SCHEDULE_OVERLAP_POLICIES[number];
 
+const envTaskBudget =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.ENKEEP_TASK_EXECUTION_BUDGET_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedTaskBudget = envTaskBudget ? parseInt(envTaskBudget, 10) : NaN;
+
+export const MAX_TASK_TIMEOUT_MS =
+  Number.isSafeInteger(parsedTaskBudget) && parsedTaskBudget > 0
+    ? parsedTaskBudget
+    : 3_600_000;
+
 export const TASK_RUN_STATUSES = [
   'pending',
   'claimed',
@@ -439,9 +450,9 @@ export function validateScriptTaskPayload(payload: unknown): ScriptTaskPayload {
       typeof obj.timeoutMs !== 'number' ||
       !Number.isSafeInteger(obj.timeoutMs) ||
       obj.timeoutMs <= 0 ||
-      obj.timeoutMs > 1_800_000
+      obj.timeoutMs > MAX_TASK_TIMEOUT_MS
     ) {
-      throw new ValidationError('Invalid timeoutMs: must be a positive integer <= 1800000');
+      throw new ValidationError(`Invalid timeoutMs: must be a positive integer <= ${MAX_TASK_TIMEOUT_MS}`);
     }
     timeoutMs = obj.timeoutMs;
   }
@@ -834,9 +845,9 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
       typeof obj.timeoutMs !== 'number' ||
       !Number.isSafeInteger(obj.timeoutMs) ||
       obj.timeoutMs <= 0 ||
-      obj.timeoutMs > 1_800_000
+      obj.timeoutMs > MAX_TASK_TIMEOUT_MS
     ) {
-      throw new ValidationError('Invalid timeoutMs: must be a positive integer <= 1800000');
+      throw new ValidationError(`Invalid timeoutMs: must be a positive integer <= ${MAX_TASK_TIMEOUT_MS}`);
     }
     timeoutMs = obj.timeoutMs;
     hasEditableField = true;
@@ -907,9 +918,9 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
         typeof payloadObj.timeoutMs !== 'number' ||
         !Number.isSafeInteger(payloadObj.timeoutMs) ||
         payloadObj.timeoutMs <= 0 ||
-        payloadObj.timeoutMs > 1_800_000
+        payloadObj.timeoutMs > MAX_TASK_TIMEOUT_MS
       ) {
-        throw new ValidationError('Invalid timeoutMs: must be a positive integer <= 1800000');
+        throw new ValidationError(`Invalid timeoutMs: must be a positive integer <= ${MAX_TASK_TIMEOUT_MS}`);
       }
       if (timeoutMs !== undefined && timeoutMs !== payloadObj.timeoutMs) {
         throw new ValidationError('Conflicting timeoutMs values provided in root and payload');

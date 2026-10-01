@@ -11,6 +11,7 @@ import type {
   CardToolStatusEntry,
   LarkStreamingCardSession,
   LarkTransport,
+  StreamAssistantEvent,
   StreamEventSource,
 } from './types.js';
 import {
@@ -18,11 +19,20 @@ import {
   formatThinkingContent,
   stripThinkingTags,
   extractThinkingFromText,
+  buildStreamingStatusLine,
 } from './transport.js';
 
 export const STREAMING_MAX_CONTENT_LENGTH = 3800;
 export const STREAMING_MAX_LENGTH = STREAMING_MAX_CONTENT_LENGTH;
 export const STREAMING_TRUNCATION_NOTICE = '... (内容超长，流式阶段仅展示最新部分，完整内容将在生成完毕后呈现)\n\n';
+
+const envBudget =
+  process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+  process.env.ENKEEP_INTERACTIVE_TURN_TIMEOUT_MS ||
+  process.env.DSH_DEFAULT_EXECUTION_BUDGET_MS;
+const parsedBudget = envBudget ? parseInt(envBudget, 10) : NaN;
+export const DEFAULT_STREAMING_MAX_DURATION_MS =
+  Number.isSafeInteger(parsedBudget) && parsedBudget > 0 ? parsedBudget : 3_600_000;
 
 /**
  * Guard streaming text to safe maximum length (default 3800 characters) for Feishu CardKit.
@@ -54,6 +64,9 @@ export interface StreamingReplyTrackerCardParams {
   collapsibleToolStatus?: boolean;
   withThinkingPanel?: boolean;
   collapsibleThinking?: boolean;
+  expandStatusPanel?: boolean;
+  expandThinkingPanel?: boolean;
+  withStatusBar?: boolean;
   withStopButton?: boolean;
   turnId?: string;
   sessionId?: string;
@@ -78,6 +91,9 @@ export interface StreamingReplyTrackerOptions {
   collapsibleToolStatus?: boolean;
   withThinkingPanel?: boolean;
   collapsibleThinking?: boolean;
+  expandStatusPanel?: boolean;
+  expandThinkingPanel?: boolean;
+  withStatusBar?: boolean;
   withStopButton?: boolean;
   senderId?: string;
   enableCot?: boolean;
@@ -314,12 +330,16 @@ export class StreamingReplyTracker {
   private readonly runningTools = new Map<string, number>();
   private readonly withStatusPanel: boolean;
   private readonly withThinkingPanel: boolean;
+  private readonly withStatusBar: boolean;
   private readonly isCotActive: boolean;
   private readonly toolStatusEntries: CardToolStatusEntry[] = [];
   private lastPushedToolStatus = '';
   private currentStreamId: string | null = null;
   private streamEnded = false;
   private startTime = 0;
+  private lastActivityAt = 0;
+  private lastPushedStatusBucket = 0;
+  private lastPushedStatusLine?: string;
   private inFlightTick: Promise<void> | null = null;
   private finalizedResult: { handled: boolean; messageId?: string; degraded?: boolean } | null = null;
   private seenOwnRunning = false;
@@ -330,7 +350,7 @@ export class StreamingReplyTracker {
     this.sessionRouteId = options.sessionRouteId;
     this.cardParams = options.cardParams;
     this.pollIntervalMs = options.pollIntervalMs ?? 500;
-    this.maxDurationMs = options.maxDurationMs ?? 600_000;
+    this.maxDurationMs = options.maxDurationMs ?? DEFAULT_STREAMING_MAX_DURATION_MS;
     this.detached = options.detached ?? false;
     this.onFinalized = options.onFinalized;
     this.turnId = options.turnId;
@@ -338,6 +358,9 @@ export class StreamingReplyTracker {
     this.initialMetadata = options.metadata;
     this.withStopButton = options.withStopButton ?? options.cardParams?.withStopButton;
     this.senderId = options.senderId;
+    this.startTime = Date.now();
+    this.lastActivityAt = this.startTime;
+    this.lastPushedStatusBucket = Math.floor(this.startTime / 5000);
 
     const chatId = options.cardParams?.chatId;
     const cotOption =
@@ -370,6 +393,10 @@ export class StreamingReplyTracker {
       options.collapsibleToolStatus ??
       options.cardParams?.withStatusPanel ??
       options.cardParams?.collapsibleToolStatus
+    );
+    this.withStatusBar = Boolean(
+      options.withStatusBar ??
+      options.cardParams?.withStatusBar
     );
     this.isWaiting = !this.detached && Boolean(this.turnId && typeof this.streamEventSource.getPlatformTurnState === 'function');
     if (this.isWaiting) {
@@ -436,6 +463,7 @@ export class StreamingReplyTracker {
         ...this.cardParams,
         ...(this.withStatusPanel ? { withStatusPanel: true } : {}),
         ...(this.withThinkingPanel ? { withThinkingPanel: true } : {}),
+        withStatusBar: this.withStatusBar,
         withStopButton: this.withStopButton ?? this.cardParams?.withStopButton,
         turnId: this.turnId ?? this.cardParams?.turnId,
         sessionId: this.sessionRouteId ?? this.cardParams?.sessionId,
@@ -460,6 +488,8 @@ export class StreamingReplyTracker {
   start(): void {
     if (this.isStopped) return;
     this.startTime = Date.now();
+    this.lastActivityAt = this.startTime;
+    this.lastPushedStatusBucket = 0;
 
     if (!this.isWaiting) {
       this.initStreamingCard();
@@ -479,13 +509,16 @@ export class StreamingReplyTracker {
   }
 
   private processEvents(
-    events: Array<{
+    events: StreamAssistantEvent[] | Array<{
       rowId: number;
       type: 'assistant_delta' | 'assistant_stream_end' | 'turn_status' | 'tool_status' | 'reasoning_delta' | 'thinking';
       delta?: string;
       streamId?: string;
       status?: string;
       toolName?: string;
+      description?: string;
+      detail?: string;
+      isSubagent?: boolean;
     }>
   ): { terminalStatus?: 'completed' | 'failed' } {
     let terminalStatus: 'completed' | 'failed' | undefined;
@@ -501,6 +534,15 @@ export class StreamingReplyTracker {
 
       if (evt.rowId > this.cursor) {
         this.cursor = evt.rowId;
+      }
+
+      if (
+        evt.type === 'assistant_delta' ||
+        evt.type === 'reasoning_delta' ||
+        (evt as any).type === 'thinking' ||
+        evt.type === 'tool_status'
+      ) {
+        this.lastActivityAt = Date.now();
       }
 
       if ((evt.type === 'reasoning_delta' || (evt as any).type === 'thinking') && typeof evt.delta === 'string') {
@@ -530,12 +572,22 @@ export class StreamingReplyTracker {
       } else if (evt.type === 'tool_status') {
         const name = evt.toolName || 'subagent';
         const current = this.runningTools.get(name) ?? 0;
+        const isSubagent = Boolean(
+          evt.isSubagent ||
+          name === 'subagent' ||
+          name === 'subagent_fork' ||
+          name === 'create_task'
+        );
+        const now = Date.now();
         if (evt.status === 'started') {
           this.runningTools.set(name, current + 1);
           this.toolStatusEntries.push({
             toolName: name,
             status: 'running',
             timestamp: new Date().toISOString(),
+            startTime: now,
+            description: evt.description || (evt as any).detail,
+            isSubagent,
           });
         } else if (evt.status === 'completed' || evt.status === 'failed') {
           this.runningTools.set(name, Math.max(0, current - 1));
@@ -547,12 +599,18 @@ export class StreamingReplyTracker {
             this.toolStatusEntries[actualIdx] = {
               ...this.toolStatusEntries[actualIdx],
               status: evt.status as 'completed' | 'failed',
+              endTime: now,
+              ...(evt.description ? { description: evt.description } : {}),
             };
           } else {
             this.toolStatusEntries.push({
               toolName: name,
               status: evt.status as 'completed' | 'failed',
               timestamp: new Date().toISOString(),
+              startTime: now,
+              endTime: now,
+              description: evt.description || (evt as any).detail,
+              isSubagent,
             });
           }
         }
@@ -644,9 +702,19 @@ export class StreamingReplyTracker {
         // Wait for card session to be available if still pending
         const session = this.cardSession ?? (await this.cardSessionPromise);
         if (session && !this.isStopped) {
+          const now = Date.now();
+          const currentBucket = Math.floor((now - this.startTime) / 5000);
           let thinkingToPush: string | undefined;
-          if (!this.isCotActive && this.accumulatedThinking.trim().length > 0) {
-            const formattedThinking = formatThinkingContent(this.accumulatedThinking);
+          let combinedThinking = this.accumulatedThinking;
+          const extractedInline = extractThinkingFromText(this.accumulatedText);
+          if (extractedInline.thinking) {
+            combinedThinking = combinedThinking.trim().length > 0
+              ? `${combinedThinking}\n\n${extractedInline.thinking}`
+              : extractedInline.thinking;
+          }
+
+          if (!this.isCotActive && combinedThinking.trim().length > 0) {
+            const formattedThinking = formatThinkingContent(combinedThinking);
             if (formattedThinking !== this.lastPushedThinking) {
               this.lastPushedThinking = formattedThinking;
               thinkingToPush = formattedThinking;
@@ -656,8 +724,23 @@ export class StreamingReplyTracker {
             }
           }
 
+          const currentStatusLine = this.withStatusBar
+            ? buildStreamingStatusLine({
+                elapsedMs: now - this.startTime,
+                nowMs: now,
+                lastActivityAt: this.lastActivityAt,
+              })
+            : undefined;
+
+          let statusLineToPush: string | undefined;
+          if (currentStatusLine && currentStatusLine !== this.lastPushedStatusLine) {
+            statusLineToPush = currentStatusLine;
+          }
+
+          let didPushText = false;
+
           if (this.withStatusPanel) {
-            const statusMarkdown = formatToolStatusMarkdown(this.toolStatusEntries);
+            const statusMarkdown = formatToolStatusMarkdown(this.toolStatusEntries, now);
             if (statusMarkdown && statusMarkdown !== this.lastPushedToolStatus) {
               this.lastPushedToolStatus = statusMarkdown;
               if (typeof session.pushToolStatus === 'function') {
@@ -669,7 +752,12 @@ export class StreamingReplyTracker {
             const textToPush = applyStreamingLengthGuard(cleanText, this.maxStreamingLength);
             if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
               this.lastPushedText = textToPush;
-              await session.pushText(textToPush, statusMarkdown ?? undefined, thinkingToPush);
+              if (statusLineToPush) {
+                this.lastPushedStatusLine = statusLineToPush;
+                this.lastPushedStatusBucket = currentBucket;
+              }
+              await session.pushText(textToPush, statusMarkdown ?? undefined, thinkingToPush, statusLineToPush);
+              didPushText = true;
             }
           } else {
             const subagentCount = this.runningTools.get('subagent') ?? 0;
@@ -681,7 +769,24 @@ export class StreamingReplyTracker {
             const textToPush = applyStreamingLengthGuard(rawTextToPush, this.maxStreamingLength);
             if (textToPush && textToPush.trim().length > 0 && textToPush !== this.lastPushedText) {
               this.lastPushedText = textToPush;
-              await session.pushText(textToPush, undefined, thinkingToPush);
+              if (statusLineToPush) {
+                this.lastPushedStatusLine = statusLineToPush;
+                this.lastPushedStatusBucket = currentBucket;
+              }
+              await session.pushText(textToPush, undefined, thinkingToPush, statusLineToPush);
+              didPushText = true;
+            }
+          }
+
+          // Idle heartbeat: if text wasn't pushed, but a new 5-second bucket is reached,
+          // push status line update to keep card alive and show accurate elapsed/silence.
+          if (!didPushText && this.withStatusBar && currentStatusLine) {
+            if (currentBucket > this.lastPushedStatusBucket && currentStatusLine !== this.lastPushedStatusLine) {
+              this.lastPushedStatusBucket = currentBucket;
+              this.lastPushedStatusLine = currentStatusLine;
+              if (typeof session.pushStatusLine === 'function') {
+                await session.pushStatusLine(currentStatusLine);
+              }
             }
           }
         }
@@ -809,8 +914,16 @@ export class StreamingReplyTracker {
         }
 
         let thinkingToPush: string | undefined;
-        if (!this.isCotActive && this.accumulatedThinking.trim().length > 0) {
-          const formattedThinking = formatThinkingContent(this.accumulatedThinking);
+        let combinedThinking = this.accumulatedThinking;
+        const extractedInline = extractThinkingFromText(this.accumulatedText);
+        if (extractedInline.thinking) {
+          combinedThinking = combinedThinking.trim().length > 0
+            ? `${combinedThinking}\n\n${extractedInline.thinking}`
+            : extractedInline.thinking;
+        }
+
+        if (!this.isCotActive && combinedThinking.trim().length > 0) {
+          const formattedThinking = formatThinkingContent(combinedThinking);
           if (formattedThinking !== this.lastPushedThinking) {
             this.lastPushedThinking = formattedThinking;
             thinkingToPush = formattedThinking;
@@ -868,17 +981,21 @@ export class StreamingReplyTracker {
 
     const extracted = extractThinkingFromText(textToFinalize);
     textToFinalize = extracted.text;
-    if (!this.isCotActive && !finalThinking && extracted.thinking) {
-      finalThinking = extracted.thinking;
+    if (!this.isCotActive && extracted.thinking) {
+      finalThinking = finalThinking
+        ? `${finalThinking}\n\n${extracted.thinking}`
+        : extracted.thinking;
     }
 
     // If turn completed or stopped, settle any remaining running tool entries
-    if (status === 'completed' || status === 'stopped') {
+    if (status === 'completed' || status === 'stopped' || status === 'failed') {
+      const now = Date.now();
       for (let i = 0; i < this.toolStatusEntries.length; i++) {
         if (this.toolStatusEntries[i].status === 'running' || this.toolStatusEntries[i].status === 'started') {
           this.toolStatusEntries[i] = {
             ...this.toolStatusEntries[i],
-            status: status === 'stopped' ? 'failed' : 'completed',
+            status: status === 'stopped' || status === 'failed' ? 'failed' : 'completed',
+            endTime: now,
           };
         }
       }
@@ -917,7 +1034,13 @@ export class StreamingReplyTracker {
       if (textToFinalize && textToFinalize.trim().length > 0) {
         try {
           const guardedText = applyStreamingLengthGuard(textToFinalize, this.maxStreamingLength);
-          await session.pushText(guardedText);
+          const fallbackStatus = this.toolStatusEntries.length > 0
+            ? formatToolStatusMarkdown(this.toolStatusEntries)
+            : (this.withStatusPanel ? "<font color='grey'>无工具调用</font>" : undefined);
+          const fallbackThinking = finalThinking
+            ? formatThinkingContent(finalThinking)
+            : (this.withThinkingPanel ? "<font color='grey'>无思考过程</font>" : undefined);
+          await session.pushText(guardedText, fallbackStatus ?? undefined, fallbackThinking ?? undefined);
         } catch (pushErr) {
           console.warn('[lark-stream] pushText fallback error', {
             code: (pushErr as any)?.code,

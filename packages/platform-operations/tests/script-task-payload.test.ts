@@ -102,7 +102,7 @@ describe('Script Task Payload & Result Contract (D6 / F-16)', () => {
       ).toThrow(ValidationError);
     });
 
-    it('validates timeoutMs bounds (positive, <= 1800000)', () => {
+    it('validates timeoutMs bounds (positive, <= 3600000)', () => {
       expect(() =>
         validateScriptTaskPayload({
           type: 'script',
@@ -126,7 +126,7 @@ describe('Script Task Payload & Result Contract (D6 / F-16)', () => {
           type: 'script',
           command: 'echo 1',
           spaceId: validSpaceId,
-          timeoutMs: 1_800_001,
+          timeoutMs: 3_600_001,
         })
       ).toThrow(ValidationError);
 

@@ -74,7 +74,7 @@ import type {
   OperationsReadinessStatus,
 } from "../management/types.js";
 import type { PlatformOperationsService, AgentPromptTaskWorker, QuotaMetric, TaskPriority, UpdateTaskInput, AgentPromptSessionPolicy, AgentPromptContextMode, ScriptTaskPayload, TaskPayload } from "@enkeep/platform-operations";
-import { QuotaExceededError, validateTimezone, validateUpdateTaskInput } from "@enkeep/platform-operations";
+import { QuotaExceededError, validateTimezone, validateUpdateTaskInput, MAX_TASK_TIMEOUT_MS } from "@enkeep/platform-operations";
 import Busboy from "busboy";
 import {
   RuntimeFileApiService,
@@ -3696,9 +3696,9 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                     typeof body.timeoutMs !== "number" ||
                     !Number.isSafeInteger(body.timeoutMs) ||
                     body.timeoutMs <= 0 ||
-                    body.timeoutMs > 1_800_000
+                    body.timeoutMs > MAX_TASK_TIMEOUT_MS
                   ) {
-                    throw new ValidationError("Invalid timeoutMs: must be a positive integer <= 1800000");
+                    throw new ValidationError(`Invalid timeoutMs: must be a positive integer <= ${MAX_TASK_TIMEOUT_MS}`);
                   }
                   timeoutMs = body.timeoutMs;
                 }
