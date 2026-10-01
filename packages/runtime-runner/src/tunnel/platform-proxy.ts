@@ -429,6 +429,11 @@ export class PlatformProxyHandler implements StreamHandler {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: 'Internal platform proxy error' } }));
       }
+      try {
+        duplex.destroy();
+      } catch (_destroyErr: unknown) {
+        // Safe destroy
+      }
     }
   }
 
@@ -2080,23 +2085,24 @@ export class PlatformProxyHandler implements StreamHandler {
 
     let insertedCount = 0;
 
-    if (this.db) {
-      const nowIso = new Date().toISOString();
-      const insertStmt = this.db.prepare(`
-        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          session_id = excluded.session_id,
-          user_id = excluded.user_id,
-          type = excluded.type,
-          payload = excluded.payload,
-          created_at = excluded.created_at
-      `);
+    try {
+      if (this.db) {
+        const nowIso = new Date().toISOString();
+        const insertStmt = this.db.prepare(`
+          INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            session_id = excluded.session_id,
+            user_id = excluded.user_id,
+            type = excluded.type,
+            payload = excluded.payload,
+            created_at = excluded.created_at
+        `);
 
-      let lastTimeMs = 0;
-      try {
+        let lastTimeMs = 0;
         for (const raw of rawEvents) {
-          if (!isRecord(raw)) continue;
+          try {
+            if (!isRecord(raw)) continue;
 
           const rawSessionId = typeof raw['sessionId'] === 'string' ? raw['sessionId'] : (typeof raw['session_id'] === 'string' ? raw['session_id'] : undefined);
           if (!rawSessionId || !rawSessionId.trim()) continue;
@@ -2340,16 +2346,22 @@ export class PlatformProxyHandler implements StreamHandler {
               }
             }
           }
+        } catch (frameErr: unknown) {
+          console.warn('[platform-proxy] Failed to process event frame:', frameErr);
         }
-      } catch (err: unknown) {
-        throw err;
       }
     }
 
-    this.writeJsonResponse(stream, 200, {
-      success: true,
-      count: insertedCount,
-    });
+      this.writeJsonResponse(stream, 200, {
+        success: true,
+        count: insertedCount,
+      });
+    } catch (err: unknown) {
+      console.error('[platform-proxy] Failed to persist events batch:', err);
+      this.writeJsonResponse(stream, 500, {
+        error: { code: 'DATABASE_ERROR', message: 'Failed to persist events batch' },
+      });
+    }
   }
 
   /**

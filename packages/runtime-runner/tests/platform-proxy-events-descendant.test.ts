@@ -334,4 +334,53 @@ describe('Item A: PlatformProxyHandler Unmapped and Descendant Events Dropping',
     const countRow = db.prepare('SELECT COUNT(*) as cnt FROM web_events WHERE user_id = ?').get(BOB_PLATFORM_ID) as any;
     expect(countRow.cnt).toBe(0);
   });
+
+  it('converts thrown database error into 5xx response and never leaves request open', async () => {
+    db.exec('DROP TABLE web_events;');
+
+    const res = await sendEventsRequest(handler, [
+      {
+        id: 'evt_test_db_error',
+        sessionId: 'sr_alice_root',
+        type: 'turn_started',
+        payload: { status: 'running' },
+      },
+    ]);
+
+    expect(res.status).toBe(500);
+    expect(res.body.error.code).toBe('DATABASE_ERROR');
+  });
+
+  it('does not abort remaining frames when a single bad frame throws', async () => {
+    db.exec(`
+      CREATE TRIGGER fail_bad_frame BEFORE INSERT ON web_events WHEN NEW.id = 'evt_bad_frame'
+      BEGIN
+        SELECT RAISE(FAIL, 'Simulated bad frame database error');
+      END;
+    `);
+
+    const res = await sendEventsRequest(handler, [
+      {
+        id: 'evt_bad_frame',
+        sessionId: 'sr_alice_root',
+        type: 'turn_started',
+        payload: { status: 'running' },
+      },
+      {
+        id: 'evt_good_frame_001',
+        sessionId: 'sr_alice_root',
+        type: 'turn_started',
+        payload: { status: 'running' },
+      },
+    ]);
+
+    expect(res.status).toBe(200);
+    expect(res.body.count).toBe(1);
+
+    const goodRow = db.prepare('SELECT * FROM web_events WHERE id = ?').get('evt_good_frame_001');
+    expect(goodRow).toBeDefined();
+
+    const badRow = db.prepare('SELECT * FROM web_events WHERE id = ?').get('evt_bad_frame');
+    expect(badRow).toBeUndefined();
+  });
 });
