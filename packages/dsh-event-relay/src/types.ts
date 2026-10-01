@@ -59,6 +59,16 @@ export interface EventRelayConfig {
    * Maximum pending bytes before dropping intermediate deltas (default: 262144, 256KB).
    */
   readonly maxPendingBytes?: number;
+
+  /**
+   * Timeout in ms for outbound platform flush requests (default: 15000, 15s).
+   */
+  readonly flushTimeoutMs?: number;
+
+  /**
+   * Delay in ms to back off outbound flushing after a failure or timeout (default: 1000, 1s).
+   */
+  readonly flushBackoffMs?: number;
 }
 
 /**

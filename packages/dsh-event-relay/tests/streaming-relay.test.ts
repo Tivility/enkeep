@@ -288,4 +288,61 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
 
     service.clear();
   });
+
+  it('re-queues batch and delivers subsequent frames when fake client first request never resolves', async () => {
+    let callCount = 0;
+    const requestCalls: any[] = [];
+    mockPlatformClient.request = vi.fn().mockImplementation(async (_path: string, options: any) => {
+      callCount++;
+      requestCalls.push(options);
+      if (callCount === 1) {
+        // First request never resolves (simulating hang / stall)
+        return new Promise(() => {});
+      }
+      return { status: 200, data: { success: true } };
+    });
+
+    const service = new EventRelayService(ctx, {
+      flushTimeoutMs: 50,
+      flushBackoffMs: 20,
+      batchIntervalMs: 20,
+    });
+    const session = { id: 'ses_00000000000000000000000000000001' } as Session;
+
+    // 1. Ingest first event
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 1,
+      time: Date.now(),
+      data: { turn: 1 },
+    });
+
+    // Manually trigger flush; first request hangs and will time out in 50ms
+    const flushPromise = service.flush();
+
+    // 2. Ingest second event while first flush is in-flight / timed out
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 2,
+      time: Date.now(),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    await flushPromise;
+
+    // Wait for backoff (20ms) and next flush
+    await new Promise((r) => setTimeout(r, 60));
+    await service.flush();
+
+    // Assert that the first request was called (and timed out)
+    expect(callCount).toBeGreaterThanOrEqual(2);
+
+    // Later frames (and re-queued frames) are delivered
+    const secondCallEvents = requestCalls[1].body.events;
+    const types = secondCallEvents.map((e: any) => e.type);
+    expect(types).toContain('turn_started');
+    expect(types).toContain('turn_completed');
+
+    service.clear();
+  });
 });
