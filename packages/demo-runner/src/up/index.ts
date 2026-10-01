@@ -1820,6 +1820,8 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     externalInteractionService: options.externalInteractionService as any,
   });
 
+  let platformServer: PlatformServer | undefined;
+
   // 6d. Helper to bind full platform proxy & events stream handlers to runtime tunnel
   async function bindRuntimeServices(handle: UserRuntimeHandle, platformUserId: string): Promise<void> {
     const rawHandle = handle.rawHandle;
@@ -1830,6 +1832,13 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       await rawHandle.startTransport();
     }
 
+    const onAutonomousTurnCompleted = (payload: import('@enkeep/runtime-runner').AutonomousTurnCompletedPayload) => {
+      const mgr = options.wechatRuntimeManager ?? platformServer?.wechatRuntimeManager;
+      if (mgr) {
+        void mgr.handleAutonomousTurnCompleted(payload);
+      }
+    };
+
     const platformHandler = createPlatformProxyHandler({
       platformUserId,
       runtimeIdentity: handle.userId,
@@ -1839,6 +1848,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       browserService,
       mcpService: mcpManager,
       fileProvider: demoFileProvider as any,
+      onAutonomousTurnCompleted,
     });
     const eventsHandler = createEventsStreamHandler({
       platformUserId,
@@ -1846,6 +1856,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       db: db!,
       storage: storage!,
       operations: operationsService,
+      onAutonomousTurnCompleted,
     });
     const dshDeploymentConfig = loadDshDeploymentConfig();
     const isLlmEnabled = Boolean(
@@ -2582,7 +2593,6 @@ fs.appendFileSync(p, corruptData);
   };
 
   // 8. Start Platform Server
-  let platformServer: PlatformServer | undefined;
   let platformUrl = '';
   let platformActualPort = 0;
 

@@ -132,6 +132,17 @@ interface StoredTaskRow {
   readonly created_at: string;
 }
 
+export interface AutonomousTurnCompletedPayload {
+  sessionRouteId: string;
+  turnId: string;
+  originTurnId: string;
+  causeChildId?: string;
+}
+
+export type AutonomousTurnCompletedCallback = (
+  payload: AutonomousTurnCompletedPayload
+) => void | Promise<void>;
+
 export interface PlatformProxyBaseOptions {
   /** Expected container runtime alias (e.g. 'alice') */
   runtimeIdentity?: string;
@@ -141,6 +152,8 @@ export interface PlatformProxyBaseOptions {
   maxFileSizeBytes?: number;
   /** Optional custom descendant resolver instance */
   descendantResolver?: DescendantResolver;
+  /** Optional callback invoked when an autonomous terminal turn completes */
+  onAutonomousTurnCompleted?: AutonomousTurnCompletedCallback;
 }
 
 export interface PlatformProxyBoundOptions extends PlatformProxyBaseOptions {
@@ -211,10 +224,12 @@ export class PlatformProxyHandler implements StreamHandler {
   private readonly mcpService?: PlatformProxyMcpService;
   private readonly descendantResolver: DescendantResolver;
   private readonly unmappedSessionWarnMap = new Map<string, number>();
+  private readonly onAutonomousTurnCompleted?: AutonomousTurnCompletedCallback;
   private readonly maxBodyBytes: number;
   private readonly maxFileSizeBytes: number;
 
   constructor(options: PlatformProxyOptions = {}) {
+    this.onAutonomousTurnCompleted = options.onAutonomousTurnCompleted;
     if (options.db || options.storage || options.operations || options.browserService || options.fileProvider || options.mcpService) {
       if (
         options.platformUserId === undefined ||
@@ -2271,12 +2286,22 @@ export class PlatformProxyHandler implements StreamHandler {
           const rawOriginTurnId = typeof raw['originTurnId'] === 'string' && raw['originTurnId'].trim().length > 0
             ? raw['originTurnId'].trim()
             : (typeof p['originTurnId'] === 'string' && p['originTurnId'].trim().length > 0 ? p['originTurnId'].trim() : undefined);
+          const rawCauseChildId = typeof raw['causeChildId'] === 'string' && raw['causeChildId'].trim().length > 0
+            ? raw['causeChildId'].trim()
+            : (typeof p['causeChildId'] === 'string' && p['causeChildId'].trim().length > 0
+              ? p['causeChildId'].trim()
+              : (isRecord(p['metadata']) && typeof p['metadata']['causeChildId'] === 'string' && p['metadata']['causeChildId'].trim().length > 0
+                ? p['metadata']['causeChildId'].trim()
+                : undefined));
 
           if (rawTurnId && !sanitizedPayload['turnId']) {
             sanitizedPayload['turnId'] = rawTurnId;
           }
           if (rawOriginTurnId && !sanitizedPayload['originTurnId']) {
             sanitizedPayload['originTurnId'] = rawOriginTurnId;
+          }
+          if (rawCauseChildId && !sanitizedPayload['causeChildId']) {
+            sanitizedPayload['causeChildId'] = rawCauseChildId;
           }
 
           insertStmt.run(
@@ -2288,6 +2313,33 @@ export class PlatformProxyHandler implements StreamHandler {
             createdAt
           );
           insertedCount++;
+
+          if (
+            eventType === 'turn_status' &&
+            sanitizedPayload['status'] === 'completed' &&
+            typeof sanitizedPayload['originTurnId'] === 'string' &&
+            sanitizedPayload['originTurnId'].trim().length > 0 &&
+            typeof sanitizedPayload['turnId'] === 'string' &&
+            sanitizedPayload['turnId'].trim().length > 0
+          ) {
+            if (typeof this.onAutonomousTurnCompleted === 'function') {
+              try {
+                const res = this.onAutonomousTurnCompleted({
+                  sessionRouteId: targetSessionId,
+                  turnId: sanitizedPayload['turnId'] as string,
+                  originTurnId: sanitizedPayload['originTurnId'] as string,
+                  causeChildId: typeof sanitizedPayload['causeChildId'] === 'string' ? sanitizedPayload['causeChildId'] : undefined,
+                });
+                if (res && typeof (res as any).catch === 'function') {
+                  (res as any).catch((cbErr: unknown) => {
+                    console.warn('[platform-proxy] onAutonomousTurnCompleted async rejection', cbErr);
+                  });
+                }
+              } catch (cbErr: unknown) {
+                console.warn('[platform-proxy] onAutonomousTurnCompleted throw', cbErr);
+              }
+            }
+          }
         }
       } catch (err: unknown) {
         throw err;

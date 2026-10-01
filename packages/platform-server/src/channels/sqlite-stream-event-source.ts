@@ -16,6 +16,17 @@ declare module '@enkeep/channel-lark' {
   }
 }
 
+export interface AutonomousTurnCompletedPayload {
+  sessionRouteId: string;
+  turnId: string;
+  originTurnId: string;
+  causeChildId?: string;
+}
+
+export type AutonomousTurnCompletedCallback = (
+  payload: AutonomousTurnCompletedPayload
+) => void | Promise<void>;
+
 interface WebEventRow {
   rowid: number | bigint;
   type: string;
