@@ -10,6 +10,12 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { StreamEventSource, StreamAssistantEvent } from '@enkeep/channel-lark';
 import type { ChannelTurnOrigin } from '@enkeep/platform-core';
 
+declare module '@enkeep/channel-lark' {
+  interface StreamAssistantEvent {
+    causeChildId?: string;
+  }
+}
+
 interface WebEventRow {
   rowid: number | bigint;
   type: string;
@@ -47,6 +53,7 @@ export class SqliteStreamEventSource implements StreamEventSource {
       let toolName: string | undefined;
       let turnId: string | undefined;
       let originTurnId: string | undefined;
+      let causeChildId: string | undefined;
 
       try {
         const parsed = JSON.parse(row.payload);
@@ -55,6 +62,10 @@ export class SqliteStreamEventSource implements StreamEventSource {
         }
         if (typeof parsed.originTurnId === 'string' && parsed.originTurnId.trim().length > 0) {
           originTurnId = parsed.originTurnId.trim();
+        }
+        const rawCauseChildId = parsed.causeChildId ?? parsed.cause_child_id ?? parsed.metadata?.causeChildId ?? parsed.metadata?.cause_child_id;
+        if (typeof rawCauseChildId === 'string' && rawCauseChildId.trim().length > 0) {
+          causeChildId = rawCauseChildId.trim();
         }
 
         if (row.type === 'assistant_delta') {
@@ -91,6 +102,7 @@ export class SqliteStreamEventSource implements StreamEventSource {
         toolName,
         turnId,
         originTurnId,
+        causeChildId,
       };
     }) as unknown as StreamAssistantEvent[];
   }
