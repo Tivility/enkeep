@@ -210,6 +210,7 @@ export class PlatformProxyHandler implements StreamHandler {
   private readonly fileProvider?: PlatformProxyFileProvider;
   private readonly mcpService?: PlatformProxyMcpService;
   private readonly descendantResolver: DescendantResolver;
+  private readonly unmappedSessionWarnMap = new Map<string, number>();
   private readonly maxBodyBytes: number;
   private readonly maxFileSizeBytes: number;
 
@@ -2088,8 +2089,9 @@ export class PlatformProxyHandler implements StreamHandler {
           // Resolve canonical user ID and session ID for tenant
           let targetSessionId = rawSessionId.trim();
           let targetUserId = this.platformUserId;
+          let routeRow: { id: string; user_id?: string } | undefined;
           try {
-            const routeRow = this.db.prepare(
+            routeRow = this.db.prepare(
               'SELECT id, user_id FROM session_routes WHERE (id = ? OR dsh_session_id = ?) AND user_id = ? LIMIT 1'
             ).get(targetSessionId, targetSessionId, this.platformUserId) as { id: string; user_id?: string } | undefined;
             if (routeRow) {
@@ -2099,7 +2101,25 @@ export class PlatformProxyHandler implements StreamHandler {
               }
             }
           } catch (_lookupErr: unknown) {
-            // Retain raw targetSessionId on query error
+            // Retain undefined routeRow on query error
+          }
+
+          if (!routeRow) {
+            const now = Date.now();
+            const lastWarn = this.unmappedSessionWarnMap.get(targetSessionId) ?? 0;
+            if (now - lastWarn >= 60_000) {
+              this.unmappedSessionWarnMap.set(targetSessionId, now);
+              console.warn('[platform-proxy] Dropping event frame for unmapped session', {
+                sessionId: targetSessionId,
+                type: raw['type'],
+              });
+              if (this.unmappedSessionWarnMap.size > 500) {
+                for (const [id, ts] of this.unmappedSessionWarnMap) {
+                  if (now - ts >= 60_000) this.unmappedSessionWarnMap.delete(id);
+                }
+              }
+            }
+            continue;
           }
 
           const rawCreatedAt = typeof raw['createdAt'] === 'string' && raw['createdAt'].length > 0 ? raw['createdAt'] : nowIso;
