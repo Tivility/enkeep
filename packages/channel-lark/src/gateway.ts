@@ -205,10 +205,14 @@ export class LarkChannelGateway {
    * Starts or extends a continuation watcher for the given session route.
    * Bound to at most 50 watchers per gateway, evicting the oldest.
    */
-  async startOrExtendContinuationWatcher(routeId: string, cursor?: number): Promise<void> {
+  async startOrExtendContinuationWatcher(routeId: string, cursor?: number, fallbackTarget?: ContinuationTarget): Promise<void> {
     if (this.isDisposed || !this.streamEventSource) return;
 
-    const target = this.lastInboundTargets.get(routeId);
+    let target = this.lastInboundTargets.get(routeId);
+    if (!target && fallbackTarget) {
+      target = fallbackTarget;
+      this.lastInboundTargets.set(routeId, target);
+    }
     if (!target) return;
 
     const existing = this.continuationWatchers.get(routeId);
@@ -1911,6 +1915,14 @@ export class LarkChannelGateway {
 
       if (this.channelRepo && claimedItem) {
         await this.channelRepo.updateOutboxStatus(claimedItem.id, 'delivered', false);
+      }
+
+      if (sessionId) {
+        this.lastInboundTargets.set(sessionId, {
+          chatId,
+          replyToMessageId: messageId,
+          nativeContextId: chatId,
+        });
       }
 
       return { success: true, messageId };
