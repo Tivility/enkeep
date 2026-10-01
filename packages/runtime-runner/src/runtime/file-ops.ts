@@ -10,16 +10,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { resolveMaxInboundFileBytes } from '@enkeep/platform-core';
 
 export const SPACE_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 export const ETAG_REGEX = /^"[0-9a-f]{64}"$/;
 export const MAX_FILE_OP_BYTES = 1024 * 1024; // 1 MiB (1,048,576 bytes)
-export const MAX_STREAMING_FILE_BYTES = 50 * 1024 * 1024; // 50 MiB (52,428,800 bytes)
+export const MAX_STREAMING_FILE_BYTES = resolveMaxInboundFileBytes(); // 500 MiB (524,288,000 bytes)
 export const MAX_GLOBAL_INSTRUCTIONS_BYTES = 20 * 1024; // 20 KiB (20,480 bytes)
 export const MAX_SPACE_INSTRUCTIONS_BYTES = 64 * 1024; // 64 KiB (65,536 bytes)
 export const MAX_DIR_ENTRIES = 500; // Maximum directory listing entries
 export const MAX_LOCK_OWNER_BYTES = 4096; // Maximum lock owner metadata payload size
-export const MAX_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB (20,971,520 bytes) attachment cap
+export const MAX_ATTACHMENT_IMAGE_BYTES = 30 * 1024 * 1024; // 30 MiB (31,457,280 bytes) attachment cap
 
 /**
  * Strict canonical request keys permitted at container runtime.
@@ -2940,8 +2941,8 @@ export function executeFileOperation(
         throw new FileOpError('PAYLOAD_TOO_LARGE');
       }
 
-      // Cumulative attachment limit strictly enforced to 20 MiB
-      if (offset + payloadBuffer.length > MAX_ATTACHMENT_IMAGE_BYTES) {
+      // Cumulative attachment limit strictly enforced to streaming file bytes (500 MiB)
+      if (offset + payloadBuffer.length > MAX_STREAMING_FILE_BYTES) {
         throw new FileOpError('PAYLOAD_TOO_LARGE');
       }
 
@@ -3054,7 +3055,7 @@ export function executeFileOperation(
           throw new FileOpError('INVALID_REQUEST');
         }
 
-        if (tempStat.size > MAX_ATTACHMENT_IMAGE_BYTES) {
+        if (tempStat.size > MAX_STREAMING_FILE_BYTES) {
           try { filesystem.unlinkSync(tempPath); } catch {}
           throw new FileOpError('PAYLOAD_TOO_LARGE');
         }
@@ -3197,7 +3198,7 @@ export function executeFileOperation(
           payloadBuffer = Buffer.from(reqObj.content, 'utf8');
         }
 
-        if (payloadBuffer.length > MAX_ATTACHMENT_IMAGE_BYTES) {
+        if (payloadBuffer.length > MAX_STREAMING_FILE_BYTES) {
           throw new FileOpError('PAYLOAD_TOO_LARGE');
         }
 

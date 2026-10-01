@@ -1,13 +1,13 @@
 import { createHash } from 'node:crypto';
 import type { LarkImageAttachmentIngestor } from '@enkeep/channel-lark';
-import { PlatformError, ValidationError } from '@enkeep/platform-core';
+import { PlatformError, ValidationError, resolveMaxInboundFileBytes } from '@enkeep/platform-core';
 import type { TenantRuntimeFileProvider } from '../files/runtime-file-api.js';
 import { validateUserId, validateSpaceId } from '../files/runtime-file-api.js';
-import { sniffMimeType } from '../files/file-transport-utils.js';
+import { sniffMimeType, checkDiskFreeSpace } from '../files/file-transport-utils.js';
 
 export const SAFE_RESOURCE_ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
-export const MAX_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB per image
-export const MAX_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024; // 20 MiB per file
+export const MAX_ATTACHMENT_IMAGE_BYTES = 30 * 1024 * 1024; // 30 MiB per image (Feishu IM limit)
+export const MAX_ATTACHMENT_FILE_BYTES = resolveMaxInboundFileBytes(); // 500 MiB per file default
 
 function isStrictPdfBuffer(buffer: Buffer): boolean {
   return (
@@ -210,9 +210,10 @@ export class TenantScopedLarkImageIngestor implements LarkImageAttachmentIngesto
     if (!Buffer.isBuffer(params.buffer) || params.buffer.length === 0) {
       throw new ValidationError('File buffer must be a non-empty Buffer');
     }
-    if (params.buffer.length > MAX_ATTACHMENT_FILE_BYTES) {
+    const effectiveMaxBytes = resolveMaxInboundFileBytes();
+    if (params.buffer.length > effectiveMaxBytes) {
       throw new PlatformError(
-        `File size ${params.buffer.length} exceeds maximum limit of ${MAX_ATTACHMENT_FILE_BYTES} bytes`,
+        `File size ${params.buffer.length} exceeds maximum limit of ${effectiveMaxBytes} bytes`,
         'PAYLOAD_TOO_LARGE',
         413
       );
@@ -297,7 +298,7 @@ export class TenantScopedLarkImageIngestor implements LarkImageAttachmentIngesto
               op: 'write',
               path: targetRelativePath,
               requireAbsent: true,
-              maxSizeBytes: MAX_ATTACHMENT_FILE_BYTES,
+              maxSizeBytes: effectiveMaxBytes,
             },
             Readable.from(params.buffer)
           );

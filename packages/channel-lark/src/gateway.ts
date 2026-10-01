@@ -922,7 +922,11 @@ export class LarkChannelGateway {
         let failureError: string | undefined;
 
         try {
-          downloadedFile = await this.transport.downloadFileResource(parsed.messageId, targetFile.key);
+          downloadedFile = await this.transport.downloadFileResource(
+            parsed.messageId,
+            targetFile.key,
+            targetFile.size !== undefined ? { declaredSize: targetFile.size } : undefined
+          );
           if (!downloadedFile) {
             failureError = `Resource not found for key ${targetFile.key}`;
           }
@@ -943,7 +947,7 @@ export class LarkChannelGateway {
 
           const isPdfClaim = targetFile.name && targetFile.name.toLowerCase().endsWith('.pdf');
           const failureReply = failureError && failureError.includes('exceeds maximum allowed size')
-            ? '文件大小超出限制（单文件最大 20MB）'
+            ? '文件大小超出限制（单文件最大 500MB）'
             : (failureError && (failureError.includes('Unsupported file format') || failureError.includes('magic bytes'))
               ? (isPdfClaim ? '文件格式错误或非有效 PDF 文件' : '文件格式错误或非有效文件')
               : '文件接收失败，请稍后重试');
