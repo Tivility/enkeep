@@ -48,6 +48,7 @@ export class EventRelayService implements IEventRelayService {
   private readonly activeTurnContexts = new Map<string, { platformTurnId: string; originTurnId?: string; causeChildId?: string; dshIntTurn?: number }>();
   private readonly dshIntTurnMap = new Map<string, { platformTurnId: string; originTurnId?: string; causeChildId?: string }>();
   private readonly pendingAutonomousOrigins = new Map<string, { originTurnId: string; causeChildId: string }>();
+  private readonly activeTurnSessions = new Set<string>();
   private readonly childOriginMap = new Map<string, string>();
   private pendingOutboundFrames: ContainerStreamingEventFrame[] = [];
   private pendingOutboundBytes = 0;
@@ -171,6 +172,7 @@ export class EventRelayService implements IEventRelayService {
 
   bindTurnContext(sessionId: string, context: { turnId: string; originTurnId?: string; causeChildId?: string; dshIntTurn?: number }): () => void {
     if (!sessionId) return () => {};
+    this.pendingAutonomousOrigins.delete(sessionId);
     this.activeTurnContexts.set(sessionId, {
       platformTurnId: context.turnId,
       originTurnId: context.originTurnId,
@@ -321,18 +323,20 @@ export class EventRelayService implements IEventRelayService {
     }
 
     // 2. Identify child settlement or message from structured source in agent/inbox/spliced or user/message
-    const eventType = event.type as string;
-    if (eventType === 'agent/inbox/spliced') {
-      const inserted = (event.data as any)?.inserted;
-      if (Array.isArray(inserted)) {
-        for (const item of inserted) {
-          const childId = this.extractChildIdFromStructuredSource(item?.source);
-          if (childId) this.recordPendingAutonomousOrigin(sessionId, childId);
+    if (!this.activeTurnSessions.has(sessionId)) {
+      const eventType = event.type as string;
+      if (eventType === 'agent/inbox/spliced') {
+        const inserted = (event.data as any)?.inserted;
+        if (Array.isArray(inserted)) {
+          for (const item of inserted) {
+            const childId = this.extractChildIdFromStructuredSource(item?.source);
+            if (childId) this.recordPendingAutonomousOrigin(sessionId, childId);
+          }
         }
+      } else if (eventType === 'user/message') {
+        const childId = this.extractChildIdFromStructuredSource((event.data as any)?.source);
+        if (childId) this.recordPendingAutonomousOrigin(sessionId, childId);
       }
-    } else if (eventType === 'user/message') {
-      const childId = this.extractChildIdFromStructuredSource((event.data as any)?.source);
-      if (childId) this.recordPendingAutonomousOrigin(sessionId, childId);
     }
 
     // 3. Autonomous turn start
@@ -362,6 +366,7 @@ export class EventRelayService implements IEventRelayService {
 
     switch (event.type) {
       case 'turn/start': {
+        this.activeTurnSessions.add(sessionId);
         const streamState = {
           streamId: `msgstream_${randomBytes(16).toString('hex')}`,
           accumulatedLength: 0,
@@ -507,6 +512,7 @@ export class EventRelayService implements IEventRelayService {
         }
 
         this.sessionStreams.delete(sessionId);
+        this.activeTurnSessions.delete(sessionId);
         if (scopedCtx?.platformTurnId && this.activeTurnContexts.get(sessionId)?.platformTurnId === scopedCtx.platformTurnId) {
           this.activeTurnContexts.delete(sessionId);
         }
@@ -704,6 +710,7 @@ export class EventRelayService implements IEventRelayService {
     this.pendingOutboundFrames = [];
     this.pendingOutboundBytes = 0;
     this.sessionStreams.clear();
+    this.activeTurnSessions.clear();
     this.buffer.clear();
     this.subscribers.clear();
   }
