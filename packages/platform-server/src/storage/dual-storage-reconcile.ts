@@ -768,13 +768,19 @@ export class DualStorageReconcileService {
       if (fs.existsSync(root)) {
         knownRootExists = true;
         for (const pKey of projectKeys) {
+          candidatePaths.push(path.join(root, pKey, encId, 'session.v4.jsonl'));
           candidatePaths.push(path.join(root, pKey, encId, 'session.jsonl'));
+          candidatePaths.push(path.join(root, pKey, dshSessionId, 'session.v4.jsonl'));
           candidatePaths.push(path.join(root, pKey, dshSessionId, 'session.jsonl'));
         }
         // Flat candidates within this existing root
+        candidatePaths.push(path.join(root, dshSessionId, 'session.v4.jsonl'));
         candidatePaths.push(path.join(root, dshSessionId, 'session.jsonl'));
+        candidatePaths.push(path.join(root, encId, 'session.v4.jsonl'));
         candidatePaths.push(path.join(root, encId, 'session.jsonl'));
+        candidatePaths.push(path.join(root, `${dshSessionId}.v4.jsonl`));
         candidatePaths.push(path.join(root, `${dshSessionId}.jsonl`));
+        candidatePaths.push(path.join(root, `${encId}.v4.jsonl`));
         candidatePaths.push(path.join(root, `${encId}.jsonl`));
 
         // Search subdirectories inside this existing root
@@ -782,7 +788,9 @@ export class DualStorageReconcileService {
           const entries = fs.readdirSync(root, { withFileTypes: true });
           for (const ent of entries) {
             if (ent.isDirectory()) {
+              candidatePaths.push(path.join(root, ent.name, encId, 'session.v4.jsonl'));
               candidatePaths.push(path.join(root, ent.name, encId, 'session.jsonl'));
+              candidatePaths.push(path.join(root, ent.name, dshSessionId, 'session.v4.jsonl'));
               candidatePaths.push(path.join(root, ent.name, dshSessionId, 'session.jsonl'));
             }
           }
@@ -1039,6 +1047,9 @@ export class DualStorageReconcileService {
     if (dshRead.executionMode) {
       details.executionMode = dshRead.executionMode;
     }
+    if (dshRead.resolvedPath) {
+      details.resolvedPath = dshRead.resolvedPath;
+    }
     if (resolved.currentGeneration > 1) {
       details.generation = resolved.currentGeneration;
     }
@@ -1200,9 +1211,12 @@ export class DualStorageReconcileService {
 
       let jsonlPath: string | undefined = undefined;
       if (dshSessionsDir && fs.existsSync(dshSessionsDir)) {
-        const candidatePath = path.join(dshSessionsDir, r.dsh_session_id, 'session.jsonl');
-        if (fs.existsSync(candidatePath)) {
-          jsonlPath = candidatePath;
+        const v4Candidate = path.join(dshSessionsDir, r.dsh_session_id, 'session.v4.jsonl');
+        const legacyCandidate = path.join(dshSessionsDir, r.dsh_session_id, 'session.jsonl');
+        if (fs.existsSync(v4Candidate)) {
+          jsonlPath = v4Candidate;
+        } else if (fs.existsSync(legacyCandidate)) {
+          jsonlPath = legacyCandidate;
         }
       }
 

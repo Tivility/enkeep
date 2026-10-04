@@ -92,8 +92,9 @@ export async function materializeSessions(
           })
           isOk = Boolean(check.exists && check.valid)
         } else if (options.runtimeSessionsDir) {
-          const sessionFile = join(options.runtimeSessionsDir, item.folder || 'default', item.sessionId, 'session.jsonl')
-          isOk = existsSync(sessionFile)
+          const v4File = join(options.runtimeSessionsDir, item.folder || 'default', item.sessionId, 'session.v4.jsonl')
+          const legacyFile = join(options.runtimeSessionsDir, item.folder || 'default', item.sessionId, 'session.jsonl')
+          isOk = existsSync(v4File) || existsSync(legacyFile)
         }
       }
 
@@ -111,8 +112,18 @@ export async function materializeSessions(
         } else if (options.runtimeSessionsDir) {
           const dir = join(options.runtimeSessionsDir, item.folder || 'default', item.sessionId)
           mkdirSync(dir, { recursive: true })
-          const header = { type: 'session', version: 0, id: item.sessionId, createdAt: item.seed[0]?.time ?? Date.now(), cwd: `/home/dsh/spaces/${item.folder || 'default'}`, delegationDepth: 0, seedLength: item.seed.length }
-          writeFileSync(join(dir, 'session.jsonl'), [JSON.stringify(header), ...item.seed.map((e) => JSON.stringify(e))].join('\n') + '\n', 'utf8')
+          const header = {
+            type: 'session',
+            version: 4,
+            id: item.sessionId,
+            createdAt: item.seed[0]?.time ?? Date.now(),
+            cwd: `/home/dsh/spaces/${item.folder || 'default'}`,
+            delegationDepth: 0,
+            isSeeded: true,
+          }
+          const content = [JSON.stringify(header), ...item.seed.map((e) => JSON.stringify(e))].join('\n') + '\n'
+          writeFileSync(join(dir, 'session.v4.jsonl'), content, 'utf8')
+          writeFileSync(join(dir, 'session.jsonl'), content, 'utf8')
         }
         results.push({ sessionId: item.sessionId, folder: item.folder, chatJid: item.chatJid, status: 'MATERIALIZED' })
       }
@@ -232,7 +243,7 @@ export async function repairMaterializeSeeds(options: RepairMaterializeOptions):
           attachments: null,
         }))
         const compiled = compileSeed(r.native_context_id || r.id, msgRows)
-        const seed = compiled.seed.length > 0 ? compiled.seed : [{ type: 'session/end-seed', seq: 0, time: Date.now(), data: {} }]
+        const seed = compiled.seed.length > 0 ? compiled.seed : [{ type: 'session/end-seed', seq: 0, time: Date.now(), data: { inherited: true } }]
         items.push({
           sessionId: r.dsh_session_id || r.id,
           folder: spaceMap.get(r.space_id) || 'default',

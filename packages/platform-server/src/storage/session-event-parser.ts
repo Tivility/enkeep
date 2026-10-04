@@ -16,6 +16,7 @@ export interface DshSessionHeader {
   readonly cwd?: string;
   readonly parentSession?: string;
   readonly seedLength?: number;
+  readonly isSeeded?: boolean;
   readonly origin?: 'subagent';
   readonly delegationDepth: number;
   readonly agentPreset?: string;
@@ -99,36 +100,40 @@ export interface ParsedDshSession {
 }
 
 // ============================================================================
-// Official DSH Session Library Loader Helper
+// Official DSH Session Format Catalog Loader Helper
 // ============================================================================
 
-interface DshOfficialSessionModule {
-  readonly Session?: unknown;
-  readonly decodeStorageRecord?: (record: unknown) => DshSessionEvent[];
-  readonly SESSION_FORMAT_VERSION?: number;
+export interface DshSessionFormatCatalogModule {
+  readonly createSessionFormatCatalogWithChildren?: (children: unknown[]) => {
+    readonly currentVersion: number;
+    readonly createRestore: (header: unknown, options?: unknown) => {
+      decodeRow(row: unknown): void;
+      finish(): { header: unknown; events: unknown[]; inheritedEventCount?: number };
+    };
+  };
 }
 
-let cachedOfficialSessionModule: DshOfficialSessionModule | null | undefined = undefined;
+let cachedSessionFormatCatalogModule: DshSessionFormatCatalogModule | null | undefined = undefined;
 
 /**
- * Dynamically resolves and loads the official @deepseek-ai/dsh-session library if available.
+ * Dynamically resolves and loads the official @deepseek-ai/dsh-session-format-catalog library if available.
  */
-export function resolveOfficialDshSessionModule(): DshOfficialSessionModule | null {
-  if (cachedOfficialSessionModule !== undefined) {
-    return cachedOfficialSessionModule;
+export function resolveSessionFormatCatalogModule(): DshSessionFormatCatalogModule | null {
+  if (cachedSessionFormatCatalogModule !== undefined) {
+    return cachedSessionFormatCatalogModule;
   }
 
   const startDir = path.dirname(fileURLToPath(import.meta.url));
   let dir = startDir;
 
   for (let i = 0; i < 10; i++) {
-    const directPath = path.join(dir, 'node_modules', '@deepseek-ai', 'dsh-session', 'lib', 'index.js');
+    const directPath = path.join(dir, 'node_modules', '@deepseek-ai', 'dsh-session-format-catalog', 'lib', 'index.js');
     if (fs.existsSync(directPath)) {
       try {
         const mod = importFreshModule(directPath);
         if (mod) {
-          cachedOfficialSessionModule = mod;
-          return mod;
+          cachedSessionFormatCatalogModule = mod as unknown as DshSessionFormatCatalogModule;
+          return cachedSessionFormatCatalogModule;
         }
       } catch {}
     }
@@ -138,13 +143,13 @@ export function resolveOfficialDshSessionModule(): DshOfficialSessionModule | nu
       try {
         const entries = fs.readdirSync(pnpmDir);
         for (const entry of entries) {
-          if (entry.startsWith('@deepseek-ai+dsh-session@')) {
-            const candidate = path.join(pnpmDir, entry, 'node_modules', '@deepseek-ai', 'dsh-session', 'lib', 'index.js');
+          if (entry.startsWith('@deepseek-ai+dsh-session-format-catalog@')) {
+            const candidate = path.join(pnpmDir, entry, 'node_modules', '@deepseek-ai', 'dsh-session-format-catalog', 'lib', 'index.js');
             if (fs.existsSync(candidate)) {
               const mod = importFreshModule(candidate);
               if (mod) {
-                cachedOfficialSessionModule = mod;
-                return mod;
+                cachedSessionFormatCatalogModule = mod as unknown as DshSessionFormatCatalogModule;
+                return cachedSessionFormatCatalogModule;
               }
             }
           }
@@ -157,17 +162,17 @@ export function resolveOfficialDshSessionModule(): DshOfficialSessionModule | nu
     dir = parent;
   }
 
-  cachedOfficialSessionModule = null;
+  cachedSessionFormatCatalogModule = null;
   return null;
 }
 
-function importFreshModule(modulePath: string): DshOfficialSessionModule | null {
+function importFreshModule<T = unknown>(modulePath: string): T | null {
   try {
     // Dynamic synchronous require or ESM path
     const url = pathToFileURL(modulePath).href;
     // In node we can require or inspect
     const resolved = require(modulePath);
-    return resolved as DshOfficialSessionModule;
+    return resolved as T;
   } catch {
     return null;
   }
@@ -391,6 +396,7 @@ export function validateSessionHeader(record: unknown): DshSessionHeader {
     cwd: typeof h.cwd === 'string' ? h.cwd : undefined,
     parentSession: typeof h.parentSession === 'string' ? h.parentSession : undefined,
     seedLength: typeof h.seedLength === 'number' ? h.seedLength : undefined,
+    isSeeded: typeof h.isSeeded === 'boolean' ? h.isSeeded : undefined,
     origin: h.origin === 'subagent' ? 'subagent' : undefined,
     delegationDepth: typeof h.delegationDepth === 'number' ? h.delegationDepth : 0,
     agentPreset: typeof h.agentPreset === 'string' ? h.agentPreset : undefined,
@@ -478,6 +484,11 @@ export function projectCanonicalWebMessages(
       continue;
     }
 
+    if (event.type === 'system/message' || event.type === 'developer/message') {
+      // System and developer prompts are platform context, not user-facing messages
+      continue;
+    }
+
     if (event.type === 'turn/start') {
       const turnData = event.data as { turn?: number } | undefined;
       if (typeof turnData?.turn === 'number') {
@@ -490,8 +501,11 @@ export function projectCanonicalWebMessages(
       const data = event.data as DshUserMessageData | undefined;
       if (!data) continue;
 
-      // Filter out internal context/plugin/synthetic messages from becoming public user messages
+      // Filter out internal context/plugin/synthetic messages or tool results
       if (data.source && data.source.kind !== 'user') {
+        continue;
+      }
+      if ((data as any).role && (data as any).role !== 'user') {
         continue;
       }
 
@@ -526,6 +540,9 @@ export function projectCanonicalWebMessages(
     if (event.type === 'assistant/message') {
       const data = event.data as DshAssistantMessageData | undefined;
       if (!data || !data.message) continue;
+      if (data.message.role && data.message.role !== 'assistant') {
+        continue;
+      }
 
       const text = extractVisibleTextFromContentBlocks(data.message.content);
       const rawId = data.message.id || (data as unknown as { id?: string }).id;
@@ -614,7 +631,6 @@ export function parseDshSessionJsonl(
   const header = validateSessionHeader(parsedHeaderJson);
 
   // 2. Parse & validate event lines
-  const officialMod = resolveOfficialDshSessionModule();
   const events: DshSessionEvent[] = [];
   let expectedSeq = 0;
 
@@ -627,16 +643,7 @@ export function parseDshSessionJsonl(
       throw new ValidationError(`Malformed JSON on line ${item.lineNumber}: ${(err as Error).message}`);
     }
 
-    let decodedEvents: DshSessionEnvelope[];
-    if (officialMod?.decodeStorageRecord) {
-      try {
-        decodedEvents = officialMod.decodeStorageRecord(parsedJson) as DshSessionEnvelope[];
-      } catch (err) {
-        throw new ValidationError(`Official decoder rejected line ${item.lineNumber}: ${(err as Error).message}`);
-      }
-    } else {
-      decodedEvents = decodeStorageRecordFallback(parsedJson);
-    }
+    const decodedEvents = decodeStorageRecordFallback(parsedJson);
 
     for (const rawEv of decodedEvents) {
       const validatedEv = validateSessionEnvelope(rawEv, expectedSeq);
@@ -693,4 +700,46 @@ export async function readAndParseDshSessionFile(
       rawSha256: computeSha256(rawBytes),
     },
   };
+}
+
+/**
+ * Normalizes legacy session records to canonical V4 format using DSH session format catalog when available.
+ */
+export function normalizeSessionEventsToV4(
+  header: DshSessionHeader,
+  events: readonly DshSessionEvent[]
+): { header: DshSessionHeader; events: DshSessionEvent[] } {
+  if (header.version >= 4) {
+    return { header, events: [...events] };
+  }
+
+  const catalogMod = resolveSessionFormatCatalogModule();
+  if (!catalogMod?.createSessionFormatCatalogWithChildren) {
+    return { header, events: [...events] };
+  }
+
+  try {
+    const catalog = catalogMod.createSessionFormatCatalogWithChildren([]);
+    const sourceHeader = {
+      type: 'session',
+      version: header.version,
+      id: header.id,
+      createdAt: header.createdAt,
+      delegationDepth: header.delegationDepth ?? 0,
+      seedLength: header.seedLength ?? events.length,
+    };
+    const restore = catalog.createRestore(sourceHeader, { recovery: 'recoverable', validation: 'current' });
+    for (const row of events) {
+      restore.decodeRow(row);
+    }
+    const artifact = restore.finish();
+    const rawHeader = artifact.header as Record<string, unknown>;
+    const v4Header = validateSessionHeader({ type: 'session', ...rawHeader });
+    return {
+      header: v4Header,
+      events: artifact.events as DshSessionEvent[],
+    };
+  } catch {
+    return { header, events: [...events] };
+  }
 }
