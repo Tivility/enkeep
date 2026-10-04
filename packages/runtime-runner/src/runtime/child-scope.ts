@@ -51,6 +51,7 @@ export function bindSubagentScopeIfEligible(
   childCtx: Context,
   meta: Record<string, unknown> | undefined,
   runtimeCtx: Context,
+  childAgent?: Agent,
 ): (() => void) | undefined {
   // 1. Verify trusted subagent origin - non-subagents pass through untouched
   if (!meta || meta.origin !== 'subagent') {
@@ -75,7 +76,7 @@ export function bindSubagentScopeIfEligible(
   }
 
   // 4. Match space and parent actual scope - prevent cross-space tool escalation
-  const childCwd = (meta.cwd as string | undefined) ?? (childCtx.agent as Agent)?.session?.header?.cwd;
+  const childCwd = (meta.cwd as string | undefined) ?? childAgent?.session?.header?.cwd;
   const parentCwd = parentAgent.session?.header?.cwd;
   if (childCwd !== parentCwd) {
     return undefined;
@@ -163,9 +164,9 @@ export function installSubagentScopeDecorator(
 
     const effectiveOptions: CreateAgentOptions = {
       ...options,
-      setup: async (childCtx: Context) => {
+      setup: async (childCtx: Context, childAgent: Agent) => {
         // 1. Synchronous scope & tool inheritance BEFORE origSetup
-        const unbindInheritance = bindSubagentScopeIfEligible(childCtx, meta, ctx);
+        const unbindInheritance = bindSubagentScopeIfEligible(childCtx, meta, ctx, childAgent);
 
         let origCommit: AgentSetupCommit | void = undefined;
         let registeredChildId: string | undefined = undefined;
@@ -173,7 +174,7 @@ export function installSubagentScopeDecorator(
         try {
           // 2. Await original setup callback
           if (origSetup) {
-            origCommit = await origSetup(childCtx);
+            origCommit = await origSetup(childCtx, childAgent);
           }
 
           // 3. Await asynchronous descendant route registration safely before publication / first model request
@@ -251,12 +252,12 @@ export function installSubagentScopeDecorator(
 
     const effectiveOptions: ResumeAgentOptions = {
       ...options,
-      setup: async (childCtx: Context) => {
+      setup: async (childCtx: Context, childAgent: Agent) => {
         // Read server-owned persisted session header
-        const header = (childCtx.agent as Agent)?.session?.header as unknown as Record<string, unknown> | undefined;
+        const header = childAgent?.session?.header as unknown as Record<string, unknown> | undefined;
 
         // 1. Synchronous scope & tool inheritance BEFORE origSetup
-        const unbindInheritance = bindSubagentScopeIfEligible(childCtx, header, ctx);
+        const unbindInheritance = bindSubagentScopeIfEligible(childCtx, header, ctx, childAgent);
 
         let origCommit: AgentSetupCommit | void = undefined;
         let registeredChildId: string | undefined = undefined;
@@ -264,7 +265,7 @@ export function installSubagentScopeDecorator(
         try {
           // 2. Await original setup callback
           if (origSetup) {
-            origCommit = await origSetup(childCtx);
+            origCommit = await origSetup(childCtx, childAgent);
           }
 
           // 3. Cold resume re-register using trusted header + known parent route
