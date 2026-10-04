@@ -113,7 +113,6 @@ describe('DSH Approvals, Permission Presets & Subagent Control E2E', () => {
         // In the next turn, we request writing a new file
         // With read-only mode, writing triggers an approval question
         const sid = SessionId(sessionId);
-        const inspection = await (runtime as any).context.sessionPersistence.inspect(sid);
         const agentHandle = runtime.agentHandles?.get(sessionId);
         if (agentHandle) {
           setSandboxMode(agentHandle.agent.session, 'read-only');
@@ -161,8 +160,14 @@ describe('DSH Approvals, Permission Presets & Subagent Control E2E', () => {
         expect(writtenContent).toBe(fileContent);
 
         // Verify SessionEvent audit trail has approval/asked and approval/decided
-        const finalInspection = await (runtime as any).context.sessionPersistence.inspect(sid);
-        const events = finalInspection.events as SessionEvent[];
+        const handle = await (runtime as any).context.sessionPersistence.open(sid, 'read');
+        let events: SessionEvent[];
+        try {
+          const res = await handle.read();
+          events = res.events;
+        } finally {
+          await handle.close();
+        }
         const askedEvent = events.find((e) => e.type === 'approval/asked');
         const decidedEvent = events.find((e) => e.type === 'approval/decided');
         expect(askedEvent).toBeDefined();
@@ -236,8 +241,14 @@ describe('DSH Approvals, Permission Presets & Subagent Control E2E', () => {
 
         // Verify SessionEvent audit trail has approval/decided with outcome 'rejected'
         const sid = SessionId(sessionId);
-        const inspection = await (runtime as any).context.sessionPersistence.inspect(sid);
-        const events = inspection.events as SessionEvent[];
+        const handle = await (runtime as any).context.sessionPersistence.open(sid, 'read');
+        let events: SessionEvent[];
+        try {
+          const res = await handle.read();
+          events = res.events;
+        } finally {
+          await handle.close();
+        }
         const decidedEvent = events.find((e) => e.type === 'approval/decided');
         expect(decidedEvent).toBeDefined();
         expect((decidedEvent?.data as any)?.outcome).toBe('rejected');

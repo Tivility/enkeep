@@ -20,7 +20,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { SessionId, decodeStorageRecord, type SessionEvent as DshSessionEvent } from '@deepseek-ai/dsh-session';
+import { SessionId, type SessionEvent as DshSessionEvent } from '@deepseek-ai/dsh-session';
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy';
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import {
@@ -880,7 +880,7 @@ describe('Production Runtime Runner Daemon E2E Deterministic Tests', () => {
         let expectedSeq = 0;
         for (let i = 1; i < lines.length; i++) {
           const parsed = JSON.parse(lines[i]);
-          const decoded = decodeStorageRecord(parsed);
+          const decoded = Array.isArray(parsed) ? parsed : [parsed];
           for (const ev of decoded) {
             expect(ev).toBeDefined();
             expect(ev.seq).toBe(expectedSeq);

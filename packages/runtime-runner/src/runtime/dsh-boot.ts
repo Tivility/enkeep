@@ -599,6 +599,20 @@ export function extractUpstreamErrorFromEvents(
         return { message: msg, code, statusCode };
       }
     }
+    if ((event as any).type === 'assistant/chunk') {
+      const chunkReason = (event.data as any)?.chunk?.reason;
+      if (chunkReason?.kind === 'error') {
+        const failure = chunkReason.failure;
+        const msg = typeof failure?.message === 'string' ? failure.message : '';
+        const code = failure?.code;
+        let statusCode: number | undefined;
+        const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
+        if (statusMatch) {
+          statusCode = Number(statusMatch[1]);
+        }
+        return { message: msg, code, statusCode };
+      }
+    }
     if ((event as any).type === 'error') {
       const errData = (event as any).data;
       const msg = typeof errData?.message === 'string' ? errData.message : '';
@@ -1965,6 +1979,10 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         });
       } catch (err: unknown) {
         await disposeSessionWorkspace(sessionIdStr);
+        const isAlreadyExists = (err as any)?.name === 'SessionAlreadyExistsError' || String(err).includes('already exists');
+        if (isAlreadyExists) {
+          throw new PersistedSessionResumeError(sessionIdStr, sessionsDir, err);
+        }
         throw err;
       }
     }

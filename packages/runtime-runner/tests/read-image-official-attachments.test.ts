@@ -24,7 +24,7 @@ import { createHash } from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
 import { bootDshRuntime } from '../src/runtime/dsh-boot.js';
 import { WorkspaceAttachmentStore } from '../src/runtime/workspace-attachments.js';
-import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm';
+import { createUserMessage, createToolResultMessage, type ContentBlock } from '@deepseek-ai/dsh-llm';
 
 // Minimal valid 1x1 JPEG fixture (43 bytes base64)
 const JPEG_1X1_BYTES = Buffer.from(
@@ -218,19 +218,10 @@ describe('read_image & Official Attachments Capability', () => {
       const renderedBlocks: ContentBlock[] = readImageTool.output.render({ file_path: filePath }, result);
 
       // Append tool-result user message carrying the ImageBlock to the agent's session
-      const toolResultMessage = createUserMessage({
-        content: [
-          {
-            type: 'tool-result',
-            id: 'call_read_img_002' as any,
-            name: 'read_image',
-            content: renderedBlocks,
-          },
-        ],
-        source: {
-          kind: 'tool',
-          callId: 'call_read_img_002' as any,
-        },
+      const toolResultMessage = createToolResultMessage({
+        callId: 'call_read_img_002' as any,
+        content: renderedBlocks,
+        isError: false,
       });
 
       // Followup to trigger provider serialization

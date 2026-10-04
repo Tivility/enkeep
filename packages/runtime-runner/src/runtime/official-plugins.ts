@@ -577,7 +577,7 @@ export class InstructionsFileSystem extends LocalFileSystem {
     if (!isAllowed) {
       throw new FsError(
         `Access denied: path "${filePath}" resolves outside instructions boundary`,
-        'FS_SANDBOX_DENIED'
+        'FS_NOT_FOUND'
       );
     }
     return target;
@@ -656,7 +656,7 @@ export class InstructionsFileSystem extends LocalFileSystem {
           if (!allowedMissing) {
             throw new FsError(
               `Access denied: lstat path "${filePath}" is outside space boundary "${cwd}"`,
-              'FS_SANDBOX_DENIED'
+              'FS_NOT_FOUND'
             );
           }
         }
@@ -693,7 +693,7 @@ export class InstructionsFileSystem extends LocalFileSystem {
     if (!isCandidateAllowed) {
       throw new FsError(
         `Access denied: lstat path "${filePath}" resolves outside space boundary "${cwd}"`,
-        'FS_SANDBOX_DENIED'
+        'FS_NOT_FOUND'
       );
     }
 
