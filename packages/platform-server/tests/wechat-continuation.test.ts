@@ -518,4 +518,85 @@ describe('Item E: WeChat Continuation Delivery', () => {
       await manager.stop();
     }
   });
+
+  it('delivers autonomous turn continuation when originTurnId is an intermediate autonomous turn (platform -> auto1 -> auto2)', async () => {
+    const { db, manager, proxyHandler } = await setupTestEnv();
+
+    try {
+      const sessionRouteId = 'ses_route_synthetic_001';
+      const platTurnId = 'turn_plat_chain_001';
+      const auto1TurnId = 'turn_auto_chain_001';
+      const auto2TurnId = 'turn_auto_chain_002';
+      const causeChildId = 'ses_subagent_chain_002';
+      const peerId = 'test-peer-chain@im.wechat';
+
+      // 1. Root platform turn in channel_turn_origins
+      db.prepare(`
+        INSERT INTO channel_turn_origins (
+          turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id
+        ) VALUES (?, ?, ?, ?, 'wechat', ?, ?)
+      `).run(platTurnId, userId, sessionRouteId, accountId, peerId, `wechat:${peerId}`);
+
+      // 2. Cache context token for peer
+      await manager.contextTokenStore.set(peerId, 'ctx_token_synthetic_chain');
+
+      // 3. Drive auto1 turn events through PlatformProxyHandler (origin is platTurnId)
+      await sendEvents(
+        proxyHandler,
+        [
+          {
+            type: 'assistant_delta',
+            sessionId: sessionRouteId,
+            turnId: auto1TurnId,
+            payload: { delta: 'Auto 1 intermediate reply' },
+          },
+          {
+            type: 'turn_status',
+            sessionId: sessionRouteId,
+            turnId: auto1TurnId,
+            originTurnId: platTurnId,
+            payload: { status: 'completed' },
+          },
+        ]
+      );
+
+      // 4. Drive auto2 turn events through PlatformProxyHandler (origin is auto1TurnId)
+      await sendEvents(
+        proxyHandler,
+        [
+          {
+            type: 'assistant_delta',
+            sessionId: sessionRouteId,
+            turnId: auto2TurnId,
+            payload: { delta: 'Auto 2 final reply from nested background subagent' },
+          },
+          {
+            type: 'turn_status',
+            sessionId: sessionRouteId,
+            turnId: auto2TurnId,
+            originTurnId: auto1TurnId,
+            causeChildId,
+            payload: { status: 'completed' },
+          },
+        ]
+      );
+
+      await new Promise((r) => setTimeout(r, 150));
+
+      // 5. Verify fakeServer received proactive message delivered for auto2
+      const auto2Message = fakeServer.sendMessages.find(
+        (m) => m.body?.msg?.item_list?.[0]?.text_item?.text === 'Auto 2 final reply from nested background subagent'
+      );
+      expect(auto2Message).toBeDefined();
+
+      // 6. Verify dedupe outbox key uses immediate originTurnId: cont_<originTurnId>_<causeChildId>
+      const expectedOutboxId = `cont_${auto1TurnId}_${causeChildId}`;
+      const outboxRow = db.prepare('SELECT id, status FROM channel_outbox WHERE id = ?').get(expectedOutboxId) as any;
+      expect(outboxRow).toBeDefined();
+      expect(outboxRow.id).toBe(expectedOutboxId);
+      expect(outboxRow.status).toBe('delivered');
+    } finally {
+      await manager.stop();
+    }
+  });
 });

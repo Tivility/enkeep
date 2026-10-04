@@ -19,7 +19,10 @@ import {
   type TurnExecutionResult,
 } from '../runtime/delivery-gateway.js';
 import { TenantScopedLarkImageIngestor } from './lark-image-ingestor.js';
-import type { AutonomousTurnCompletedPayload } from './sqlite-stream-event-source.js';
+import {
+  SqliteStreamEventSource,
+  type AutonomousTurnCompletedPayload,
+} from './sqlite-stream-event-source.js';
 import {
   WeChatChannelGateway,
   ContextTokenStore,
@@ -68,6 +71,7 @@ export interface WeChatRuntimeManagerOptions {
   readonly autoStart?: boolean;
   readonly mediaAttachmentIngestor?: WeChatMediaAttachmentIngestor;
   readonly imageAttachmentIngestor?: WeChatMediaAttachmentIngestor;
+  readonly streamEventSource?: SqliteStreamEventSource;
 }
 
 export class WeChatRuntimeManager {
@@ -80,6 +84,7 @@ export class WeChatRuntimeManager {
   private readonly masterKey?: Buffer;
   private readonly workerIntervalMs: number;
   private readonly mediaAttachmentIngestor?: WeChatMediaAttachmentIngestor;
+  private readonly streamEventSource?: SqliteStreamEventSource;
 
   private isRunning = false;
   private isDisposing = false;
@@ -155,6 +160,8 @@ export class WeChatRuntimeManager {
     }
 
     this.contextTokenStore = new ContextTokenStore({ db: this.db });
+    this.streamEventSource =
+      options.streamEventSource ?? (this.db ? new SqliteStreamEventSource(this.db) : undefined);
 
     if (this.db) {
       this.initDatabaseTables();
@@ -852,15 +859,15 @@ export class WeChatRuntimeManager {
     const { sessionRouteId, turnId, originTurnId, causeChildId } = event;
     if (!this.db || !this.isRunning || this.isDisposing) return;
 
-    const orig = this.db.prepare(
-      'SELECT account_id, channel, native_context_id, user_id FROM channel_turn_origins WHERE turn_id = ? LIMIT 1'
-    ).get(originTurnId) as any;
-    if (!orig || orig.channel !== 'wechat' || !orig.account_id || !orig.user_id) return;
+    const orig = await (this.streamEventSource
+      ? this.streamEventSource.resolveTurnOrigin(originTurnId, sessionRouteId)
+      : null);
+    if (!orig || orig.channel !== 'wechat' || !orig.accountId || !orig.userId) return;
 
     const outboxId = causeChildId ? `cont_${originTurnId}_${causeChildId}` : `cont_${originTurnId}_${turnId}`;
     if (this.db.prepare('SELECT 1 FROM channel_outbox WHERE id = ? LIMIT 1').get(outboxId)) return;
 
-    const toUserId = (orig.native_context_id || '').replace(/^wechat:/, '').split(':')[0].trim();
+    const toUserId = (orig.nativeContextId || '').replace(/^wechat:/, '').split(':')[0].trim();
     if (!toUserId) return;
     const contextToken = await this.contextTokenStore.get(toUserId);
     if (!contextToken) {
@@ -880,7 +887,7 @@ export class WeChatRuntimeManager {
     if (!replyText.trim()) return;
 
     await this.sendProactiveMessage({
-      userId: orig.user_id, accountId: orig.account_id, chatId: orig.native_context_id || toUserId,
+      userId: orig.userId, accountId: orig.accountId, chatId: orig.nativeContextId || toUserId,
       text: replyText, sessionId: sessionRouteId, outboxId,
     }).catch((err) => console.warn('[wechat-runtime] continuation delivery failed', { outboxId, err }));
   }
