@@ -624,7 +624,7 @@ export async function executeMultiUserMigration(
           const srcHasMsgs = (srcDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'").get()) !== undefined
           const msgs = srcHasMsgs
             ? ((srcDb
-                .prepare('SELECT id, content, is_from_me, timestamp, attachments FROM messages WHERE chat_jid = ?')
+                .prepare('SELECT id, content, is_from_me, timestamp, attachments FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC, id ASC')
                 .all(ses.chatJid) as unknown[]) as Array<{
                 id: string
                 content?: string | null
@@ -640,8 +640,9 @@ export async function executeMultiUserMigration(
             const targetMsgId = deterministicMessageId(ses.chatJid, m.id)
             const eventId = `ev_${sha256Hex(`${targetUserId}:${ses.targetSessionId}:${targetMsgId}`).slice(0, 24)}`
             const provId = `prov_${sha256Hex(`${targetUserId}:${ses.chatJid}:${m.id}`).slice(0, 24)}`
+            const msgCreatedAt = m.timestamp || createdAt
 
-            msgStmt?.run(targetMsgId, ses.targetSessionId, targetUserId, role, content, ses.targetRouteKey, createdAt)
+            msgStmt?.run(targetMsgId, ses.targetSessionId, targetUserId, role, content, ses.targetRouteKey, msgCreatedAt)
 
             eventStmt?.run(
               eventId,
@@ -654,7 +655,7 @@ export async function executeMultiUserMigration(
                 content,
                 routeKey: ses.targetRouteKey,
               }),
-              createdAt
+              msgCreatedAt
             )
 
             provStmt?.run(

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { executeMultiUserMigration } from '../src/multi-user/orchestrator.js'
-import { repairMaterializeSeeds } from '../src/multi-user/materialize.js'
+import { repairFixTimestamps, repairMaterializeSeeds } from '../src/multi-user/materialize.js'
 import { runCli } from '../src/cli.js'
 
 describe('Importer Seed Materialization & Repair Mode (S1)', () => {
@@ -466,5 +466,232 @@ describe('Importer Seed Materialization & Repair Mode (S1)', () => {
       dryRun: true,
     })
     expect(rerun[0]!.sessions[0]!.status).toBe('OK')
+  })
+
+  it('scrambled ids still produce chronological seed', async () => {
+    const platformDb = join(tempDir, 'platform-scrambled.db')
+    const db = new DatabaseSync(platformDb)
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT);
+      CREATE TABLE spaces (id TEXT PRIMARY KEY, user_id TEXT, folder TEXT);
+      CREATE TABLE session_routes (id TEXT PRIMARY KEY, space_id TEXT, user_id TEXT, native_context_id TEXT, dsh_session_id TEXT);
+      CREATE TABLE web_messages (id TEXT PRIMARY KEY, session_id TEXT, user_id TEXT, role TEXT, content TEXT, created_at TEXT);
+      CREATE TABLE fixed_import_provenance (id TEXT PRIMARY KEY, user_id TEXT, source_chat_jid TEXT, source_message_id TEXT, target_message_id TEXT, target_event_id TEXT, created_at TEXT);
+
+      INSERT INTO users VALUES ('user-synth-01', 'synth-user');
+      INSERT INTO spaces VALUES ('spc_0000000000000001', 'user-synth-01', 'space-scrambled');
+      INSERT INTO session_routes VALUES ('import-ses-scrambled', 'spc_0000000000000001', 'user-synth-01', 'web:synth-chat', 'import-ses-scrambled');
+
+      -- Insert with scrambled hashed IDs
+      -- msg1 & msg2 have identical timestamps. If sorted by hashed ID, 'msg_hpc_aaa' comes before 'msg_hpc_zzz'.
+      -- But msg1 is user turn (provenance rowid 1), msg2 is assistant turn (provenance rowid 2).
+      INSERT INTO web_messages VALUES
+        ('msg_hpc_zzz', 'import-ses-scrambled', 'user-synth-01', 'user', 'Turn 1 user', '2026-09-01T10:00:00.000Z'),
+        ('msg_hpc_aaa', 'import-ses-scrambled', 'user-synth-01', 'assistant', 'Turn 1 assistant', '2026-09-01T10:00:00.000Z'),
+        ('msg_hpc_mmm', 'import-ses-scrambled', 'user-synth-01', 'user', 'Turn 2 user', '2026-09-01T10:01:00.000Z'),
+        ('msg_post_01', 'import-ses-scrambled', 'user-synth-01', 'assistant', 'Turn 2 assistant post-import', '2026-09-01T10:02:00.000Z');
+
+      INSERT INTO fixed_import_provenance (id, user_id, source_chat_jid, source_message_id, target_message_id) VALUES
+        ('prov-1', 'user-synth-01', 'web:synth-chat', 'm1', 'msg_hpc_zzz'),
+        ('prov-2', 'user-synth-01', 'web:synth-chat', 'm2', 'msg_hpc_aaa'),
+        ('prov-3', 'user-synth-01', 'web:synth-chat', 'm3', 'msg_hpc_mmm');
+      -- Note: msg_post_01 has no provenance (created after import)
+    `)
+    db.close()
+
+    const sessionsDir = join(tempDir, 'sessions-scrambled')
+    mkdirSync(sessionsDir, { recursive: true })
+
+    await repairMaterializeSeeds({
+      targetDbPath: platformDb,
+      user: 'synth-user',
+      runtimeSessionsDir: sessionsDir,
+      dryRun: false,
+    })
+
+    const sessionFile = join(sessionsDir, 'space-scrambled', 'import-ses-scrambled', 'session.jsonl')
+    expect(existsSync(sessionFile)).toBe(true)
+
+    const lines = readFileSync(sessionFile, 'utf8').trim().split('\n')
+    const events = lines.slice(1).map((l) => JSON.parse(l)) // skip header
+
+    const textMessages = events
+      .filter((e) => e.type === 'user/message' || e.type === 'assistant/message')
+      .map((e) => {
+        if (e.type === 'user/message') return { role: 'user', text: e.data.content[0].text }
+        return { role: 'assistant', text: e.data.message.content[0].text }
+      })
+
+    expect(textMessages).toEqual([
+      { role: 'user', text: 'Turn 1 user' },
+      { role: 'assistant', text: 'Turn 1 assistant' },
+      { role: 'user', text: 'Turn 2 user' },
+      { role: 'assistant', text: 'Turn 2 assistant post-import' },
+    ])
+  })
+
+  it('fix-timestamps idempotent', async () => {
+    const srcDbPath = join(tempDir, 'src-messages.db')
+    const srcDb = new DatabaseSync(srcDbPath)
+    srcDb.exec(`
+      CREATE TABLE messages (id TEXT PRIMARY KEY, chat_jid TEXT, timestamp TEXT);
+      INSERT INTO messages VALUES
+        ('m1', 'web:synth-chat-01', '2026-08-01T12:00:00.000Z'),
+        ('m2', 'web:synth-chat-01', '2026-08-01T12:01:00.000Z');
+    `)
+    srcDb.close()
+
+    const targetDbPath = join(tempDir, 'target-platform.db')
+    const targetDb = new DatabaseSync(targetDbPath)
+    targetDb.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT);
+      CREATE TABLE web_messages (id TEXT PRIMARY KEY, created_at TEXT);
+      CREATE TABLE web_events (id TEXT PRIMARY KEY, created_at TEXT);
+      CREATE TABLE fixed_import_provenance (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        source_chat_jid TEXT,
+        source_message_id TEXT,
+        target_message_id TEXT,
+        target_event_id TEXT
+      );
+
+      INSERT INTO users VALUES ('user-synth-01', 'synth-user');
+      -- Initially with batch time
+      INSERT INTO web_messages VALUES
+        ('target_msg_1', '2026-09-24T22:29:45.291Z'),
+        ('target_msg_2', '2026-09-24T22:29:45.291Z');
+      INSERT INTO web_events VALUES
+        ('target_ev_1', '2026-09-24T22:29:45.291Z'),
+        ('target_ev_2', '2026-09-24T22:29:45.291Z');
+      INSERT INTO fixed_import_provenance VALUES
+        ('prov-1', 'user-synth-01', 'web:synth-chat-01', 'm1', 'target_msg_1', 'target_ev_1'),
+        ('prov-2', 'user-synth-01', 'web:synth-chat-01', 'm2', 'target_msg_2', 'target_ev_2');
+    `)
+    targetDb.close()
+
+    // 1. Dry run prints counts and does not mutate
+    const dryRunRes = await repairFixTimestamps({
+      targetDbPath,
+      sourcePath: srcDbPath,
+      user: 'synth-user',
+      dryRun: true,
+    })
+    expect(dryRunRes.messagesUpdated).toBe(2)
+    expect(dryRunRes.eventsUpdated).toBe(2)
+    expect(dryRunRes.dryRun).toBe(true)
+
+    const checkDb1 = new DatabaseSync(targetDbPath, { readOnly: true })
+    const msg1Before = checkDb1.prepare("SELECT created_at FROM web_messages WHERE id = 'target_msg_1'").get() as any
+    expect(msg1Before.created_at).toBe('2026-09-24T22:29:45.291Z')
+    checkDb1.close()
+
+    // 2. Live run updates timestamps
+    const liveRunRes = await repairFixTimestamps({
+      targetDbPath,
+      sourcePath: srcDbPath,
+      user: 'synth-user',
+      dryRun: false,
+    })
+    expect(liveRunRes.messagesUpdated).toBe(2)
+    expect(liveRunRes.eventsUpdated).toBe(2)
+
+    const checkDb2 = new DatabaseSync(targetDbPath, { readOnly: true })
+    const msg1After = checkDb2.prepare("SELECT created_at FROM web_messages WHERE id = 'target_msg_1'").get() as any
+    const ev1After = checkDb2.prepare("SELECT created_at FROM web_events WHERE id = 'target_ev_1'").get() as any
+    expect(msg1After.created_at).toBe('2026-08-01T12:00:00.000Z')
+    expect(ev1After.created_at).toBe('2026-08-01T12:00:00.000Z')
+    checkDb2.close()
+
+    // 3. Subsequent run reports 0 updates (idempotent)
+    const dryRunAgain = await repairFixTimestamps({
+      targetDbPath,
+      sourcePath: srcDbPath,
+      user: 'synth-user',
+      dryRun: true,
+    })
+    expect(dryRunAgain.messagesUpdated).toBe(0)
+    expect(dryRunAgain.eventsUpdated).toBe(0)
+
+    const liveRunAgain = await repairFixTimestamps({
+      targetDbPath,
+      sourcePath: srcDbPath,
+      user: 'synth-user',
+      dryRun: false,
+    })
+    expect(liveRunAgain.messagesUpdated).toBe(0)
+    expect(liveRunAgain.eventsUpdated).toBe(0)
+  })
+
+  it('rebuild refuses with active turn', async () => {
+    const platformDb = join(tempDir, 'platform-active-turn.db')
+    const db = new DatabaseSync(platformDb)
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT);
+      CREATE TABLE spaces (id TEXT PRIMARY KEY, user_id TEXT, folder TEXT);
+      CREATE TABLE session_routes (id TEXT PRIMARY KEY, space_id TEXT, user_id TEXT, native_context_id TEXT, dsh_session_id TEXT);
+      CREATE TABLE web_messages (id TEXT PRIMARY KEY, session_id TEXT, user_id TEXT, role TEXT, content TEXT, created_at TEXT);
+      CREATE TABLE turn_runs (id TEXT PRIMARY KEY, route_id TEXT, status TEXT);
+
+      INSERT INTO users VALUES ('user-synth-01', 'synth-user');
+      INSERT INTO spaces VALUES ('spc_0000000000000001', 'user-synth-01', 'space-turn');
+      INSERT INTO session_routes VALUES ('import-ses-turn', 'spc_0000000000000001', 'user-synth-01', 'web:synth-chat', 'import-ses-turn');
+      INSERT INTO web_messages VALUES ('m-1', 'import-ses-turn', 'user-synth-01', 'user', 'Hello', '2026-09-01T10:00:00.000Z');
+      INSERT INTO turn_runs VALUES ('tr-1', 'import-ses-turn', 'running');
+    `)
+    db.close()
+
+    const sessionsDir = join(tempDir, 'sessions-active-turn')
+    mkdirSync(sessionsDir, { recursive: true })
+
+    // Refuses when turn is running
+    await expect(
+      repairMaterializeSeeds({
+        targetDbPath: platformDb,
+        user: 'synth-user',
+        runtimeSessionsDir: sessionsDir,
+        rebuildSeeds: true,
+      })
+    ).rejects.toThrow(/active or queued turn/)
+
+    // Update to queued - still refuses
+    const db2 = new DatabaseSync(platformDb)
+    db2.prepare("UPDATE turn_runs SET status = 'queued' WHERE id = 'tr-1'").run()
+    db2.close()
+
+    await expect(
+      repairMaterializeSeeds({
+        targetDbPath: platformDb,
+        user: 'synth-user',
+        runtimeSessionsDir: sessionsDir,
+        rebuildSeeds: true,
+      })
+    ).rejects.toThrow(/active or queued turn/)
+
+    // Update to completed - successfully rebuilds
+    const db3 = new DatabaseSync(platformDb)
+    db3.prepare("UPDATE turn_runs SET status = 'completed' WHERE id = 'tr-1'").run()
+    db3.close()
+
+    const results = await repairMaterializeSeeds({
+      targetDbPath: platformDb,
+      user: 'synth-user',
+      runtimeSessionsDir: sessionsDir,
+      rebuildSeeds: true,
+    })
+    expect(results).toHaveLength(1)
+    expect(results[0]!.sessions[0]!.status).toBe('MATERIALIZED')
+
+    const sessionFile = join(sessionsDir, 'space-turn', 'import-ses-turn', 'session.jsonl')
+    expect(existsSync(sessionFile)).toBe(true)
+
+    // Running rebuild again forces re-materialization even if session file exists
+    const resultsAgain = await repairMaterializeSeeds({
+      targetDbPath: platformDb,
+      user: 'synth-user',
+      runtimeSessionsDir: sessionsDir,
+      rebuildSeeds: true,
+    })
+    expect(resultsAgain[0]!.sessions[0]!.status).toBe('MATERIALIZED')
   })
 })

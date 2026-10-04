@@ -284,6 +284,9 @@ export function compareMessages(a: MessageRow, b: MessageRow): number {
   const at = a.timestamp ?? ''
   const bt = b.timestamp ?? ''
   if (at !== bt) return at < bt ? -1 : 1
+  if (a.id.startsWith('msg_hpc_') || b.id.startsWith('msg_hpc_')) {
+    return 0
+  }
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }
 

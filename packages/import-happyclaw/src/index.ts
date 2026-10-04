@@ -209,10 +209,13 @@ export {
   RuntimeDaemonClient,
   materializeSessions,
   repairMaterializeSeeds,
+  repairFixTimestamps,
   type SessionMaterializeItem,
   type SessionMaterializeResult,
   type RepairMaterializeOptions,
   type RepairUserResult,
+  type RepairFixTimestampsOptions,
+  type FixTimestampsResult,
 } from './multi-user/materialize.js'
 
 export type {

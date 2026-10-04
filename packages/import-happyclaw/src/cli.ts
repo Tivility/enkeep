@@ -12,7 +12,7 @@
 import { formatInspectSummary, inspectSource } from './inspect.js'
 import { createMigrationPlan, executeGenericMigration } from './migrate.js'
 import { executeMultiUserMigration } from './multi-user/orchestrator.js'
-import { repairMaterializeSeeds } from './multi-user/materialize.js'
+import { repairFixTimestamps, repairMaterializeSeeds } from './multi-user/materialize.js'
 
 function printHelp(): void {
   console.log(`
@@ -47,6 +47,9 @@ Options:
   --dry-run                  Output the migration plan without mutating disk or DB
   --target-dir <path>        Directory to output DSH seeds, spaces, and manifest files
   --demo-root <path>         Enforce target directory containment inside this root
+  --materialize-seeds        Materialize seeds for selected users
+  --fix-timestamps           Update created_at of imported web_messages and web_events from provenance
+  --rebuild-seeds            Force re-materialize selected users' imported sessions in correct order
   --json                     Output result in structured JSON format
   --help, -h                 Show this help message
 
@@ -90,6 +93,8 @@ export interface ParsedArgs {
   readonly json: boolean
   readonly help: boolean
   readonly materializeSeeds: boolean
+  readonly fixTimestamps: boolean
+  readonly rebuildSeeds: boolean
   readonly runtimeSocket?: string
   readonly runtimeSessionsDir?: string
 }
@@ -120,6 +125,8 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs {
   let json = false
   let help = false
   let materializeSeeds = false
+  let fixTimestamps = false
+  let rebuildSeeds = false
   let runtimeSocket: string | undefined
   let runtimeSessionsDir: string | undefined
 
@@ -247,6 +254,16 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs {
       i += 1
       continue
     }
+    if (arg === '--fix-timestamps') {
+      fixTimestamps = true
+      i += 1
+      continue
+    }
+    if (arg === '--rebuild-seeds') {
+      rebuildSeeds = true
+      i += 1
+      continue
+    }
     if (arg === '--runtime-socket') {
       runtimeSocket = args[i + 1]
       i += 2
@@ -292,6 +309,8 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs {
     json,
     help,
     materializeSeeds,
+    fixTimestamps,
+    rebuildSeeds,
     runtimeSocket,
     runtimeSessionsDir,
   }
@@ -305,15 +324,61 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<nu
     return 0
   }
 
-  if (parsed.materializeSeeds) {
+  if (parsed.fixTimestamps) {
     const targetDbPath = parsed.targetDb || parsed.sourcePath
     if (!targetDbPath) {
-      console.error('Error: --target-db <path> is required for --materialize-seeds.')
+      console.error('Error: --target-db <path> is required for --fix-timestamps.')
+      return 1
+    }
+    if (!parsed.sourcePath) {
+      console.error('Error: --source <path> is required for --fix-timestamps.')
+      return 1
+    }
+    try {
+      const targetUsers = parsed.users.length > 0 ? parsed.users : parsed.user ? [parsed.user] : []
+      const result = await repairFixTimestamps({
+        targetDbPath,
+        sourcePath: parsed.sourcePath,
+        users: targetUsers,
+        dryRun: parsed.dryRun,
+      })
+
+      if (parsed.json) {
+        console.log(JSON.stringify({ success: true, ...result }, null, 2))
+      } else {
+        console.log('================================================================================')
+        console.log(
+          parsed.dryRun
+            ? '          Enkeep Fix Timestamps Repair (DRY RUN)                                '
+            : '          Enkeep Fix Timestamps Repair Execution Completed                      '
+        )
+        console.log('================================================================================')
+        console.log(`Target Platform DB:  ${targetDbPath}`)
+        console.log(`Source DB:           ${parsed.sourcePath}`)
+        console.log(`Messages ${parsed.dryRun ? 'to update' : 'updated'}: ${result.messagesUpdated}`)
+        console.log(`Events ${parsed.dryRun ? 'to update' : 'updated'}:   ${result.eventsUpdated}`)
+        console.log('================================================================================')
+      }
+      return 0
+    } catch (err: any) {
+      if (parsed.json) {
+        console.error(JSON.stringify({ error: err?.message ?? String(err) }))
+      } else {
+        console.error(`Error: ${err?.message ?? String(err)}`)
+      }
+      return 1
+    }
+  }
+
+  if (parsed.materializeSeeds || parsed.rebuildSeeds) {
+    const targetDbPath = parsed.targetDb || parsed.sourcePath
+    if (!targetDbPath) {
+      console.error(`Error: --target-db <path> is required for ${parsed.rebuildSeeds ? '--rebuild-seeds' : '--materialize-seeds'}.`)
       return 1
     }
     const targetUsers = parsed.users.length > 0 ? parsed.users : parsed.user ? [parsed.user] : []
     if (targetUsers.length === 0) {
-      console.error('Error: --user <name> is required for --materialize-seeds.')
+      console.error(`Error: --user <name> is required for ${parsed.rebuildSeeds ? '--rebuild-seeds' : '--materialize-seeds'}.`)
       return 1
     }
     try {
@@ -323,6 +388,7 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<nu
         runtimeSocketPath: parsed.runtimeSocket,
         runtimeSessionsDir: parsed.runtimeSessionsDir,
         dryRun: parsed.dryRun,
+        rebuildSeeds: parsed.rebuildSeeds,
       })
 
       if (parsed.json) {
@@ -331,8 +397,8 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<nu
         console.log('================================================================================')
         console.log(
           parsed.dryRun
-            ? '          Enkeep Seed Materialization Repair (DRY RUN)                          '
-            : '          Enkeep Seed Materialization Repair Execution Completed                '
+            ? `          Enkeep Seed ${parsed.rebuildSeeds ? 'Rebuild' : 'Materialization'} Repair (DRY RUN)                          `
+            : `          Enkeep Seed ${parsed.rebuildSeeds ? 'Rebuild' : 'Materialization'} Repair Execution Completed                `
         )
         console.log('================================================================================')
         console.log(`Target Platform DB:  ${targetDbPath}`)
