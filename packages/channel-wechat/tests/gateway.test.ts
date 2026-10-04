@@ -1372,5 +1372,40 @@ I should prepare a table with Gateway and Database.
       expect(failReply).toBeDefined();
       expect(failReply?.toUserId).toBe('wx_user_cdn_fail');
     });
+
+    it('sends fallback failure reply via transport.sendReply when dispatchInbound fails', async () => {
+      const rejectingRuntimeGateway: any = {
+        dispatchInbound: vi.fn().mockRejectedValue(
+          Object.assign(new Error('Session is corrupted: recovery required'), {
+            code: 'RECOVERY_REQUIRED',
+            status: 409,
+          })
+        ),
+      };
+
+      const gateway = new WeChatChannelGateway({
+        account: testAccount,
+        transport: fakeTransport,
+        channelRepo: mockChannelRepo,
+        sessionRouteRepo: mockSessionRouteRepo,
+        spaceRepo: mockSpaceRepo,
+        runtimeGateway: rejectingRuntimeGateway,
+        contextTokenStore,
+      });
+
+      const inboundMsg: WeChatParsedMessage = {
+        ...sampleParsedMessage,
+        messageId: 'msg_fail_synth_001',
+        senderId: 'wx_user_synth_fail',
+        contextToken: 'ctx_synth_fail_token',
+      };
+
+      await expect(gateway.handleInboundMessage(inboundMsg)).rejects.toThrow('Session is corrupted');
+
+      const failureReply = fakeTransport.sentReplies.find(
+        (r) => r.toUserId === 'wx_user_synth_fail' && r.text.includes('抱歉，当前处理遇到问题，请稍后重试。')
+      );
+      expect(failureReply).toBeDefined();
+    });
   });
 });

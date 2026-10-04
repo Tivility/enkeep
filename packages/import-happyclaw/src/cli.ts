@@ -12,6 +12,7 @@
 import { formatInspectSummary, inspectSource } from './inspect.js'
 import { createMigrationPlan, executeGenericMigration } from './migrate.js'
 import { executeMultiUserMigration } from './multi-user/orchestrator.js'
+import { repairMaterializeSeeds } from './multi-user/materialize.js'
 
 function printHelp(): void {
   console.log(`
@@ -88,6 +89,9 @@ export interface ParsedArgs {
   readonly demoRoot?: string
   readonly json: boolean
   readonly help: boolean
+  readonly materializeSeeds: boolean
+  readonly runtimeSocket?: string
+  readonly runtimeSessionsDir?: string
 }
 
 export function parseCliArgs(argv: readonly string[]): ParsedArgs {
@@ -115,6 +119,9 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs {
   let demoRoot: string | undefined
   let json = false
   let help = false
+  let materializeSeeds = false
+  let runtimeSocket: string | undefined
+  let runtimeSessionsDir: string | undefined
 
   let i = 0
   while (i < args.length) {
@@ -235,6 +242,21 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs {
       i += 2
       continue
     }
+    if (arg === '--materialize-seeds') {
+      materializeSeeds = true
+      i += 1
+      continue
+    }
+    if (arg === '--runtime-socket') {
+      runtimeSocket = args[i + 1]
+      i += 2
+      continue
+    }
+    if (arg === '--runtime-sessions-dir') {
+      runtimeSessionsDir = args[i + 1]
+      i += 2
+      continue
+    }
 
     if (!command && !arg.startsWith('-')) {
       command = arg
@@ -269,13 +291,78 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs {
     demoRoot,
     json,
     help,
+    materializeSeeds,
+    runtimeSocket,
+    runtimeSessionsDir,
   }
 }
 
 export async function runCli(argv: readonly string[] = process.argv): Promise<number> {
   const parsed = parseCliArgs(argv)
 
-  if (parsed.help || !parsed.command) {
+  if (parsed.help) {
+    printHelp()
+    return 0
+  }
+
+  if (parsed.materializeSeeds) {
+    const targetDbPath = parsed.targetDb || parsed.sourcePath
+    if (!targetDbPath) {
+      console.error('Error: --target-db <path> is required for --materialize-seeds.')
+      return 1
+    }
+    const targetUsers = parsed.users.length > 0 ? parsed.users : parsed.user ? [parsed.user] : []
+    if (targetUsers.length === 0) {
+      console.error('Error: --user <name> is required for --materialize-seeds.')
+      return 1
+    }
+    try {
+      const results = await repairMaterializeSeeds({
+        targetDbPath,
+        users: targetUsers,
+        runtimeSocketPath: parsed.runtimeSocket,
+        runtimeSessionsDir: parsed.runtimeSessionsDir,
+        dryRun: parsed.dryRun,
+      })
+
+      if (parsed.json) {
+        console.log(JSON.stringify({ success: true, dryRun: parsed.dryRun, results }, null, 2))
+      } else {
+        console.log('================================================================================')
+        console.log(
+          parsed.dryRun
+            ? '          Enkeep Seed Materialization Repair (DRY RUN)                          '
+            : '          Enkeep Seed Materialization Repair Execution Completed                '
+        )
+        console.log('================================================================================')
+        console.log(`Target Platform DB:  ${targetDbPath}`)
+        for (const u of results) {
+          console.log(`\n[User: ${u.username}] (${u.userId})`)
+          console.log(`  Sessions (${u.sessions.length}):`)
+          for (const s of u.sessions) {
+            console.log(`    - [${s.sessionId}] (${s.chatJid}): ${s.status}`)
+          }
+        }
+        const allSessions = results.flatMap((r) => r.sessions)
+        const okCount = allSessions.filter((s) => s.status === 'OK').length
+        const missingCount = allSessions.filter((s) => s.status === 'MISSING').length
+        const matCount = allSessions.filter((s) => s.status === 'MATERIALIZED').length
+        console.log('\n================================================================================')
+        console.log(`Totals: ${okCount} OK, ${missingCount} MISSING${matCount ? `, ${matCount} MATERIALIZED` : ''}`)
+        console.log('================================================================================')
+      }
+      return 0
+    } catch (err: any) {
+      if (parsed.json) {
+        console.error(JSON.stringify({ error: err?.message ?? String(err) }))
+      } else {
+        console.error(`Error: ${err?.message ?? String(err)}`)
+      }
+      return 1
+    }
+  }
+
+  if (!parsed.command) {
     printHelp()
     return 0
   }
@@ -325,6 +412,8 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<nu
             dryRun: parsed.dryRun,
             passwordFile: parsed.passwordFile,
             masterKey: parsed.vaultKey,
+            runtimeSocketPath: parsed.runtimeSocket,
+            runtimeSessionsDir: parsed.runtimeSessionsDir,
           })
 
           if (parsed.json) {

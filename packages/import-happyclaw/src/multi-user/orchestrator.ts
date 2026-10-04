@@ -6,7 +6,7 @@ import { assertNotProductionData, validateSourceFile } from '../guard.js'
 import { channelFromJid, deterministicMessageId, deterministicSessionId, deterministicSpaceId } from '../ids.js'
 import { computeSourceFingerprint } from '../manifest.js'
 import { introspectSource } from '../introspection.js'
-import { compileChats } from '../seed.js'
+import { compileChats, compileSeed } from '../seed.js'
 import { detectIdCollisions } from './collision.js'
 import {
   prepareChannelAccountCredential,
@@ -18,6 +18,7 @@ import {
   discoverMemoryFiles,
   scanSpaceFiles,
 } from './file-transfer.js'
+import { materializeSessions, type SessionMaterializeItem } from './materialize.js'
 import {
   generateSecureTempPassword,
   getDefaultPasswordFilePath,
@@ -420,6 +421,8 @@ export async function executeMultiUserMigration(
         }
       }
 
+      const userMaterializeItems: SessionMaterializeItem[] = []
+
       // Begin atomic transaction per user
       targetDb.exec('BEGIN IMMEDIATE')
       try {
@@ -668,6 +671,23 @@ export async function executeMultiUserMigration(
               createdAt
             )
           }
+
+          const msgRows = msgs.map((m) => ({
+            id: m.id,
+            chat_jid: ses.chatJid,
+            content: m.content || '',
+            timestamp: m.timestamp || null,
+            is_from_me: m.is_from_me ? 1 : 0,
+            attachments: m.attachments || null,
+          }))
+          const compiled = compileSeed(ses.chatJid, msgRows)
+          const seed = compiled.seed.length > 0 ? compiled.seed : [{ type: 'session/end-seed', seq: 0, time: Date.now(), data: {} }]
+          userMaterializeItems.push({
+            sessionId: ses.targetSessionId,
+            folder: ses.targetFolder,
+            seed,
+            chatJid: ses.chatJid,
+          })
         }
 
         // 6. Channel accounts & credentials (DISABLED + encrypted/placeholder)
@@ -814,6 +834,20 @@ export async function executeMultiUserMigration(
           }
         }
         copyMemoryFilesSafely(uPlan.memoryFiles, options.targetSpacesDir)
+      }
+
+      // 7. Materialize seeds in target runtime daemon if socket or session path available
+      const socketPath =
+        options.runtimeSocketPath ||
+        process.env.ENKEEP_RUNTIME_SOCKET ||
+        process.env.DSH_DAEMON_SOCKET_PATH ||
+        (existsSync('/tmp/enkeep-runtime.sock') ? '/tmp/enkeep-runtime.sock' : undefined)
+      if (socketPath || options.runtimeSessionsDir) {
+        await materializeSessions(userMaterializeItems, {
+          runtimeSocketPath: socketPath,
+          runtimeSessionsDir: options.runtimeSessionsDir,
+          dryRun: options.dryRun,
+        })
       }
     }
 

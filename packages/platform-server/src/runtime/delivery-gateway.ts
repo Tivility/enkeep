@@ -1019,6 +1019,19 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       });
     }
 
+    // Fail fast if route is in recovery_required or holds a blocked RECOVERY_REQUIRED lease
+    if (this.hasRecoveryTable() || this.hasLeasesTable()) {
+      const isRecoveryRequired = this.hasRecoveryTable() && Boolean(
+        this.db.prepare("SELECT 1 FROM session_recovery_state WHERE user_id = ? AND route_id = ? AND generation = ? AND status = 'recovery_required' LIMIT 1").get(userId, sessionId, currentGen)
+      );
+      const hasBlockedLease = this.hasLeasesTable() && Boolean(
+        this.db.prepare("SELECT 1 FROM session_execution_leases WHERE user_id = ? AND route_id = ? AND status = 'blocked' AND (blocked_code = 'RECOVERY_REQUIRED' OR blocked_code IS NULL) LIMIT 1").get(userId, sessionId)
+      );
+      if (isRecoveryRequired || hasBlockedLease) {
+        throw new PlatformError('Session is corrupted: recovery required', 'RECOVERY_REQUIRED', 409);
+      }
+    }
+
     // Profile resolution pre-check: fail closed if profile snapshot is tampered/corrupted
     await this.profileResolver.resolve(userId, sessionId, currentGen);
 
@@ -1620,7 +1633,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           AND (
             NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_execution_leases')
             OR tr.route_id NOT IN (
-              SELECT route_id FROM session_execution_leases WHERE user_id = tr.user_id AND status = 'active'
+              SELECT route_id FROM session_execution_leases WHERE user_id = tr.user_id AND status IN ('active', 'blocked')
             )
           )
           AND (
@@ -3815,6 +3828,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           WHERE tr.status IN ('queued', 'running')
             AND tr.route_id NOT IN (
               SELECT route_id FROM session_recovery_state WHERE status = 'recovery_required' AND generation = COALESCE(sr.current_generation, 1)
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_execution_leases')
+              OR tr.route_id NOT IN (
+                SELECT route_id FROM session_execution_leases WHERE status = 'blocked' AND (blocked_code = 'RECOVERY_REQUIRED' OR blocked_code IS NULL)
+              )
             )
         `).get() as { cnt?: number } | undefined;
         queuedOrRunningCount = row?.cnt ?? 0;

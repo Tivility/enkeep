@@ -260,6 +260,61 @@ describe('SqliteWebMessageStore Dedicated Unit Tests', () => {
         })
       ).rejects.toThrow(ValidationError);
     });
+
+    it('rejects ingest with RECOVERY_REQUIRED if session is in recovery_required or has blocked lease', async () => {
+      const validTimestamp = new Date().toISOString();
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS session_recovery_state (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          route_id TEXT NOT NULL,
+          generation INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL,
+          failure_code TEXT NOT NULL
+        )
+      `).run();
+      db.prepare(`
+        INSERT INTO session_recovery_state (id, user_id, route_id, generation, status, failure_code)
+        VALUES ('rec_fail_01', ?, ?, 1, 'recovery_required', 'CORRUPTED_SESSION_ARTIFACT')
+      `).run(userId, sessionId);
+
+      await expect(
+        store.ingestWebDelivery({
+          userId,
+          sessionId,
+          spaceId,
+          dshSessionId,
+          idempotencyKey: 'idem_rec_check',
+          content: 'Should fail fast',
+          timestamp: validTimestamp,
+        })
+      ).rejects.toMatchObject({
+        code: 'RECOVERY_REQUIRED',
+        status: 409,
+      });
+
+      // Clear recovery state but insert blocked lease
+      db.prepare("UPDATE session_recovery_state SET status = 'resolved' WHERE id = 'rec_fail_01'").run();
+      db.prepare(`
+        INSERT INTO session_execution_leases (id, user_id, route_id, turn_id, status, blocked_code, worker_id, expires_at)
+        VALUES ('lease_b_01', ?, ?, 'turn_synth_01', 'blocked', 'RECOVERY_REQUIRED', 'w1', '2099-01-01')
+      `).run(userId, sessionId);
+
+      await expect(
+        store.ingestWebDelivery({
+          userId,
+          sessionId,
+          spaceId,
+          dshSessionId,
+          idempotencyKey: 'idem_rec_check_2',
+          content: 'Should fail fast on blocked lease',
+          timestamp: validTimestamp,
+        })
+      ).rejects.toMatchObject({
+        code: 'RECOVERY_REQUIRED',
+        status: 409,
+      });
+    });
   });
 
   describe('CAS State Machine: claimHeldDelivery', () => {
