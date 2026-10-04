@@ -456,6 +456,9 @@ export class WeChatChannelGateway {
         'failed',
         JSON.stringify({ parsed: msg, error: err?.message || String(err) })
       );
+      if (msg.senderId && msg.contextToken) {
+        await this.transport.sendReply(msg.senderId, msg.contextToken, '抱歉，当前处理遇到问题，请稍后重试。').catch(() => {});
+      }
       throw err;
     }
   }

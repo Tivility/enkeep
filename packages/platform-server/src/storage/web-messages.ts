@@ -801,7 +801,7 @@ export class SqliteWebMessageStore {
       // 0. Strict session route and parent space authoritative active verification
       const routeCheckStmt = this.db.prepare(`
         SELECT sr.id as route_id, sr.user_id, sr.space_id, sr.status as route_status, sr.execution_mode as route_mode,
-               sr.dsh_session_id, s.id as space_pk, s.status as space_status, s.execution_mode as space_mode
+               sr.dsh_session_id, sr.current_generation, s.id as space_pk, s.status as space_status, s.execution_mode as space_mode
         FROM session_routes sr
         LEFT JOIN spaces s ON sr.space_id = s.id AND s.user_id = sr.user_id
         WHERE sr.id = ? AND sr.user_id = ?
@@ -814,6 +814,7 @@ export class SqliteWebMessageStore {
         route_status: unknown;
         route_mode: unknown;
         dsh_session_id: unknown;
+        current_generation: unknown;
         space_pk: unknown;
         space_status: unknown;
         space_mode: unknown;
@@ -847,6 +848,20 @@ export class SqliteWebMessageStore {
         this.rollbackSafe();
         inTransaction = false;
         throw new PlatformError('Space is not active and cannot accept new turns', 'SPACE_ARCHIVED', 409);
+      }
+
+      const curGen = typeof routeRow.current_generation === 'number' ? routeRow.current_generation : 1;
+      const recCheck = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_recovery_state'").get();
+      if (recCheck && this.db.prepare("SELECT 1 FROM session_recovery_state WHERE user_id = ? AND route_id = ? AND generation = ? AND status = 'recovery_required' LIMIT 1").get(userId, sessionId, curGen)) {
+        this.rollbackSafe();
+        inTransaction = false;
+        throw new PlatformError('Session is corrupted: recovery required', 'RECOVERY_REQUIRED', 409);
+      }
+      const leaseCheck = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_execution_leases'").get();
+      if (leaseCheck && this.db.prepare("SELECT 1 FROM session_execution_leases WHERE user_id = ? AND route_id = ? AND status = 'blocked' AND (blocked_code = 'RECOVERY_REQUIRED' OR blocked_code IS NULL) LIMIT 1").get(userId, sessionId)) {
+        this.rollbackSafe();
+        inTransaction = false;
+        throw new PlatformError('Session is corrupted: recovery required', 'RECOVERY_REQUIRED', 409);
       }
 
       // 1. Check idempotency record under strict lock

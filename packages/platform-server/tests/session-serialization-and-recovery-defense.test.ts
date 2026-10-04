@@ -879,4 +879,139 @@ describe('Full Defense-in-Depth Session Serialization & Recovery (E1 - E8)', () 
     expect(row.raw_backup_path).toBe('backup.jsonl.bak');
     expect(row.raw_backup_path).not.toContain('/Users/admin');
   });
+
+  // E13: Fail fast for recovery-required sessions: rejects new turns with RECOVERY_REQUIRED
+  it('E13. Fail fast for recovery-required sessions: immediately rejects new turns when session_recovery_state is recovery_required or holds blocked lease', async () => {
+    const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+    const executedTurns: string[] = [];
+    const executor = {
+      execute: async (req: DeliveryExecutionRequest): Promise<TurnExecutionResult> => {
+        executedTurns.push(req.content);
+        return { replyText: `OK: ${req.content}`, usage: { totalTokens: 10 } };
+      },
+      cancel: async () => true,
+    };
+
+    const gateway = new DeliveryRuntimeGateway({
+      database: db,
+      storage,
+      messageStore,
+      executor,
+      quotaMode: 'disabled',
+      profileResolver,
+    });
+
+    // 1. Mark session in recovery_required
+    db.prepare(`
+      INSERT INTO session_recovery_state (id, user_id, route_id, generation, status, failure_code)
+      VALUES ('rec_synth_01', 'u1', 'ses1', 1, 'recovery_required', 'CORRUPTED_SESSION_ARTIFACT')
+    `).run();
+
+    // Inbound dispatch must be rejected immediately with 409 RECOVERY_REQUIRED
+    await expect(
+      gateway.dispatchInbound({
+        id: createValidDeliveryId(),
+        sessionId: 'ses1',
+        userId: 'u1',
+        content: 'Turn rejected during recovery_required',
+        timestamp: new Date().toISOString(),
+      })
+    ).rejects.toMatchObject({
+      code: 'RECOVERY_REQUIRED',
+      status: 409,
+    });
+
+    // Verify turn was NOT enqueued in turn_runs
+    const queuedTurnRuns = db.prepare(
+      "SELECT id FROM turn_runs WHERE route_id = 'ses1' AND status = 'queued'"
+    ).all();
+    expect(queuedTurnRuns.length).toBe(0);
+
+    // 2. Resolve recovery_state but hold blocked lease
+    db.prepare("UPDATE session_recovery_state SET status = 'resolved' WHERE id = 'rec_synth_01'").run();
+    db.prepare(`
+      INSERT INTO session_execution_leases (id, user_id, route_id, turn_id, generation, phase, status, blocked_code, worker_id, expires_at)
+      VALUES ('lease_blocked_01', 'u1', 'ses1', 'turn_prev_01', 1, 'claimed', 'blocked', 'RECOVERY_REQUIRED', 'w1', '2099-01-01')
+    `).run();
+
+    // Must still reject immediately due to blocked lease
+    await expect(
+      gateway.dispatchInbound({
+        id: createValidDeliveryId(),
+        sessionId: 'ses1',
+        userId: 'u1',
+        content: 'Turn rejected during blocked lease',
+        timestamp: new Date().toISOString(),
+      })
+    ).rejects.toMatchObject({
+      code: 'RECOVERY_REQUIRED',
+      status: 409,
+    });
+
+    expect(executedTurns.length).toBe(0);
+  });
+
+  // E14: Dispatch queued turns after recovery resolution and blocked lease release
+  it('E14. Dispatches queued turns once recovery_state is resolved and blocked lease is released through recovery path', async () => {
+    const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+    const executedTurns: string[] = [];
+    const executor = {
+      execute: async (req: DeliveryExecutionRequest): Promise<TurnExecutionResult> => {
+        executedTurns.push(req.content);
+        return { replyText: `Recovered turn OK: ${req.content}`, usage: { totalTokens: 15 } };
+      },
+      cancel: async () => true,
+    };
+
+    const gateway = new DeliveryRuntimeGateway({
+      database: db,
+      storage,
+      messageStore,
+      executor,
+      quotaMode: 'disabled',
+      profileResolver,
+    });
+
+    // Setup session with recovery_required and blocked lease
+    db.prepare(`
+      INSERT INTO session_recovery_state (id, user_id, route_id, generation, status, failure_code)
+      VALUES ('rec_synth_02', 'u1', 'ses1', 1, 'recovery_required', 'CORRUPTED_SESSION_ARTIFACT')
+    `).run();
+    db.prepare(`
+      INSERT INTO session_execution_leases (id, user_id, route_id, turn_id, generation, phase, status, blocked_code, worker_id, expires_at)
+      VALUES ('lease_blocked_02', 'u1', 'ses1', 'turn_prev_02', 1, 'claimed', 'blocked', 'RECOVERY_REQUIRED', 'w1', '2099-01-01')
+    `).run();
+
+    // Inject a queued turn that was enqueued prior to crash/corruption
+    const queuedTurnId = 'turn_synth_queued_01';
+    const deliveryId = createValidDeliveryId();
+    const nowIso = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+      VALUES ('inbox_q_01', 'u1', 'ses1', 'msg_q_01', ?, ?, 'held', ?, ?, ?)
+    `).run(deliveryId, JSON.stringify({ content: 'Queued turn before recovery' }), queuedTurnId, nowIso, nowIso);
+    db.prepare(`
+      INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, created_at)
+      VALUES ('msg_q_01', 'ses1', 'u1', 'user', 'Queued turn before recovery', 'delivered', 'u1:web:sp1:ses1', ?, ?)
+    `).run(queuedTurnId, nowIso);
+    db.prepare(`
+      INSERT INTO turn_runs (id, user_id, space_id, route_id, turn_id, status, created_at, updated_at)
+      VALUES ('run_q_01', 'u1', 'sp1', 'ses1', ?, 'queued', ?, ?)
+    `).run(queuedTurnId, nowIso, nowIso);
+
+    // Drain while blocked: turn must NOT be executed
+    await gateway.drain(100);
+    expect(executedTurns.length).toBe(0);
+
+    // Supported recovery path: resolve recovery_state and release blocked lease
+    db.prepare("UPDATE session_recovery_state SET status = 'resolved' WHERE id = 'rec_synth_02'").run();
+    db.prepare("UPDATE session_execution_leases SET status = 'released', released_at = CURRENT_TIMESTAMP WHERE id = 'lease_blocked_02'").run();
+
+    // Trigger scheduler drain: queued turn must now be claimed and executed
+    await gateway.drain(1000);
+
+    expect(executedTurns).toEqual(['Queued turn before recovery']);
+    const turnStatus = db.prepare("SELECT status FROM turn_runs WHERE turn_id = ?").get(queuedTurnId) as any;
+    expect(turnStatus?.status).toBe('completed');
+  });
 });

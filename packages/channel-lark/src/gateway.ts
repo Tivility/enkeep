@@ -1224,7 +1224,13 @@ export class LarkChannelGateway {
         this.registerTracker(platformIdempotencyKey, tracker);
       }
     } catch (err) {
+      const pending = this.pendingReactions.get(platformIdempotencyKey);
+      if (pending) {
+        this.pendingReactions.delete(platformIdempotencyKey);
+        pending.reactionIdPromise.then((rxId) => { if (rxId) this.transport.removeReaction(pending.messageId, rxId).catch(() => {}); }).catch(() => {});
+      }
       await this.channelRepo.updateInboxStatus(inboxItem.id, 'failed');
+      await this.notifyInboundErrorOnce({ route, parsed, nativeEventId, nativeContextId, errorReplyText: '处理失败，请稍后重试。' });
       throw err;
     }
 

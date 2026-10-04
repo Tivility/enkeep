@@ -606,6 +606,9 @@ describe('Lark Channel Pre-Live Offline Verification', () => {
         await expect(gateway.handleInboundEvent(rawEvent)).rejects.toThrow('Transient queue timeout');
         const inboxAfterFail = await tenant.channels.findInboxByEvent(account.id, 'evt_retry_001');
         expect(inboxAfterFail?.status).toBe('failed');
+        const errOutbox = await tenant.channels.findOutboxById(gateway.deriveOutboxId('err_evt_retry_001'));
+        expect(errOutbox?.status).toBe('delivered');
+        expect(JSON.parse(errOutbox!.payloadJson).text).toBe('处理失败，请稍后重试。');
 
         // 2. Re-dispatch succeeds via CAS claim from 'failed' -> 'processing' -> 'delivered'
         shouldFailDispatch = false;
