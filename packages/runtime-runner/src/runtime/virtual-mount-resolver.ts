@@ -64,11 +64,15 @@ export class VirtualMountResolver {
   private readonly deniedRoots: readonly string[];
 
   constructor(
-    spacePath: string,
+    spacePath: string | { get?: () => unknown },
     mounts?: readonly ResolvedRuntimeMount[],
     options?: VirtualMountResolverOptions
   ) {
-    this.spacePath = path.resolve(spacePath);
+    const rawSpacePath =
+      typeof spacePath === 'object' && spacePath !== null && 'get' in spacePath && typeof (spacePath as any).get === 'function'
+        ? (spacePath as any).get()
+        : spacePath;
+    this.spacePath = path.resolve(String(rawSpacePath ?? process.cwd()));
     this.mounts = mounts ?? [];
 
     const resolveRoots = (roots: readonly string[]): string[] => {
