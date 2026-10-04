@@ -205,6 +205,16 @@ export {
   type ChannelCredentialInfo,
 } from './multi-user/credentials.js'
 
+export {
+  RuntimeDaemonClient,
+  materializeSessions,
+  repairMaterializeSeeds,
+  type SessionMaterializeItem,
+  type SessionMaterializeResult,
+  type RepairMaterializeOptions,
+  type RepairUserResult,
+} from './multi-user/materialize.js'
+
 export type {
   MultiUserSelectOptions,
   MultiUserMigrateOptions,

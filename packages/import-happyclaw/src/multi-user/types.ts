@@ -160,6 +160,10 @@ export interface MultiUserMigrateOptions {
   readonly deterministicCreatedAt?: string
   /** Whether to throw immediately when collisions are detected (defaults to false in plan, true in execute) */
   readonly throwOnCollision?: boolean
+  /** Runtime daemon socket path for seed materialization */
+  readonly runtimeSocketPath?: string
+  /** Runtime sessions directory on disk (alternative seed path) */
+  readonly runtimeSessionsDir?: string
 }
 
 export interface MultiUserMigrationResult {
