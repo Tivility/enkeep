@@ -12,6 +12,7 @@ import { randomBytes } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type {
+  AssistantStreamFrame,
   ContainerStreamingEventFrame,
   EventRelayConfig,
   EventRelayDiagnostics,
@@ -30,6 +31,10 @@ interface SessionStreamState {
   accumulatedLength: number;
   accumulatedReasoningLength?: number;
   activeToolName?: string;
+  turn?: number;
+  step?: number;
+  ended?: boolean;
+  outcome?: unknown;
 }
 
 export class EventRelayService implements IEventRelayService {
@@ -164,6 +169,15 @@ export class EventRelayService implements IEventRelayService {
     });
     if (typeof unsubEvent === 'function') disposers.push(unsubEvent);
 
+    const unsubStream = agentCtx.on('agent/assistant-stream', (payload: any) => {
+      const session = payload?.agent?.session ?? payload?.session;
+      const frame = payload?.frame;
+      if (session && frame) {
+        this.ingestAssistantStream(session, frame);
+      }
+    });
+    if (typeof unsubStream === 'function') disposers.push(unsubStream);
+
     const unsubFlush = agentCtx.on('session/flush', async (_s: Session) => {
       await this.flush();
     });
@@ -217,16 +231,31 @@ export class EventRelayService implements IEventRelayService {
       const msg = (event.data as any)?.message;
       if (!msg) return undefined;
       const content = msg.content;
-      if (!Array.isArray(content)) return undefined;
-      for (const block of content) {
-        if (!block || typeof block !== 'object') continue;
-        const nested = Array.isArray(block.content) ? block.content : [block];
-        for (const item of nested) {
-          const txt = typeof item?.text === 'string' ? item.text : '';
-          const subMatch = txt.match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
-          if (subMatch) return subMatch[1];
-          const jobMatch = txt.match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
-          if (jobMatch) return jobMatch[1];
+      if (typeof content === 'string') {
+        const subMatch = content.match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
+        if (subMatch) return subMatch[1];
+        const jobMatch = content.match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+        if (jobMatch) return jobMatch[1];
+      }
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (!block) continue;
+          if (typeof block === 'string') {
+            const subMatch = (block as string).match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
+            if (subMatch) return subMatch[1];
+            const jobMatch = (block as string).match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+            if (jobMatch) return jobMatch[1];
+            continue;
+          }
+          if (typeof block !== 'object') continue;
+          const nested = Array.isArray(block.content) ? block.content : [block];
+          for (const item of nested) {
+            const txt = typeof item === 'string' ? item : (typeof item?.text === 'string' ? item.text : '');
+            const subMatch = txt.match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
+            if (subMatch) return subMatch[1];
+            const jobMatch = txt.match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+            if (jobMatch) return jobMatch[1];
+          }
         }
       }
     } catch {}
@@ -239,7 +268,10 @@ export class EventRelayService implements IEventRelayService {
     if ((s.kind === 'subagent-settled' || s.kind === 'agent-message') && typeof s.senderSessionId === 'string' && s.senderSessionId.trim().length > 0) {
       return s.senderSessionId.trim();
     }
-    if (s.kind === 'plugin' && s.plugin === 'tool-jobs') {
+    if (s.kind === 'tool-jobs' || (s.kind === 'plugin' && s.plugin === 'tool-jobs')) {
+      if (typeof s.jobId === 'string' && s.jobId.trim().length > 0) {
+        return s.jobId.trim();
+      }
       const summary = typeof s.summary === 'string' ? s.summary : '';
       const match = summary.match(/(?:job\s+)?([a-zA-Z0-9_\-]+-\d+)/i);
       if (match) return match[1];
@@ -309,6 +341,113 @@ export class EventRelayService implements IEventRelayService {
     const now = Date.now();
     this.lastFrameTimeMs = Math.max(now, this.lastFrameTimeMs + 1);
     return new Date(this.lastFrameTimeMs).toISOString();
+  }
+
+  private stampAndEnqueueFrames(sessionId: string, frames: ContainerStreamingEventFrame[], currentTurn?: number): void {
+    if (frames.length === 0) return;
+    const scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+    const turnId = scopedCtx?.platformTurnId ?? (scopedCtx as any)?.turnId;
+    const originTurnId = scopedCtx?.originTurnId;
+    const causeChildId = scopedCtx?.causeChildId;
+
+    for (const f of frames) {
+      if (turnId && !f.turnId) (f as any).turnId = turnId;
+      if (originTurnId && !f.originTurnId) (f as any).originTurnId = originTurnId;
+      if (causeChildId) {
+        if (!(f as any).causeChildId) (f as any).causeChildId = causeChildId;
+        if (f.payload && !(f.payload as any).causeChildId) (f.payload as any).causeChildId = causeChildId;
+      }
+      this.mappedFrameCounts[f.type] = (this.mappedFrameCounts[f.type] || 0) + 1;
+    }
+    this.enqueueOutboundFrames(frames);
+  }
+
+  ingestAssistantStream(session: Session, frame: AssistantStreamFrame): void {
+    if (!session || !frame) return;
+    const sessionId = session.id as string;
+    if (!sessionId) return;
+
+    if (frame.type === 'start') {
+      const streamState: SessionStreamState = {
+        streamId: `msgstream_${randomBytes(16).toString('hex')}`,
+        accumulatedLength: 0,
+        accumulatedReasoningLength: 0,
+        turn: frame.turn,
+        step: frame.step,
+        ended: false,
+      };
+      this.sessionStreams.set(sessionId, streamState);
+      return;
+    }
+
+    if (frame.type === 'chunk') {
+      const chunk = frame.chunk;
+      if (!chunk) return;
+      const streamState = this.getOrCreateStreamState(sessionId);
+      if (streamState.turn === undefined && typeof (frame as any).turn === 'number') {
+        streamState.turn = (frame as any).turn;
+      }
+      const frames: ContainerStreamingEventFrame[] = [];
+
+      if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text.length > 0) {
+        streamState.accumulatedLength += chunk.text.length;
+        frames.push({
+          sessionId,
+          type: 'assistant_delta',
+          payload: {
+            streamId: streamState.streamId,
+            delta: chunk.text,
+            accumulatedLength: streamState.accumulatedLength,
+          },
+          createdAt: this.getMonotonicIsoTimestamp(),
+        });
+      } else if (chunk.type === 'reasoning-delta') {
+        const deltaText = typeof chunk.text === 'string'
+          ? chunk.text
+          : (typeof (chunk as any).delta === 'string' ? (chunk as any).delta : '');
+        streamState.accumulatedReasoningLength = (streamState.accumulatedReasoningLength || 0) + deltaText.length;
+        frames.push({
+          sessionId,
+          type: 'reasoning_delta',
+          payload: {
+            streamId: streamState.streamId,
+            delta: deltaText,
+            accumulatedLength: streamState.accumulatedReasoningLength,
+            status: 'thinking',
+          },
+          createdAt: this.getMonotonicIsoTimestamp(),
+        });
+      }
+
+      if (frames.length > 0) {
+        this.stampAndEnqueueFrames(sessionId, frames, streamState.turn);
+      }
+      return;
+    }
+
+    if (frame.type === 'end') {
+      const streamState = this.sessionStreams.get(sessionId);
+      if (streamState) {
+        if (!streamState.ended) {
+          streamState.ended = true;
+          const frames: ContainerStreamingEventFrame[] = [
+            {
+              sessionId,
+              type: 'assistant_stream_end',
+              payload: {
+                streamId: streamState.streamId,
+              },
+              createdAt: this.getMonotonicIsoTimestamp(),
+            },
+          ];
+          this.stampAndEnqueueFrames(sessionId, frames, streamState.turn);
+        }
+        if (frame.outcome) {
+          streamState.outcome = frame.outcome;
+        }
+      }
+      return;
+    }
   }
 
   private mapAndQueueStreamingFrames(sessionId: string, event: SessionEvent): void {
@@ -388,44 +527,6 @@ export class EventRelayService implements IEventRelayService {
         break;
       }
 
-      case 'assistant/chunk': {
-        const chunk = event.data.chunk;
-        if (!chunk) break;
-
-        const streamState = this.getOrCreateStreamState(sessionId);
-
-        if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text.length > 0) {
-          streamState.accumulatedLength += chunk.text.length;
-          frames.push({
-            sessionId,
-            type: 'assistant_delta',
-            payload: {
-              streamId: streamState.streamId,
-              delta: chunk.text,
-              accumulatedLength: streamState.accumulatedLength,
-            },
-            createdAt: this.getMonotonicIsoTimestamp(),
-          });
-        } else if (chunk.type === 'reasoning-delta') {
-          const deltaText = typeof chunk.text === 'string'
-            ? chunk.text
-            : (typeof (chunk as any).delta === 'string' ? (chunk as any).delta : '');
-          streamState.accumulatedReasoningLength = (streamState.accumulatedReasoningLength || 0) + deltaText.length;
-          frames.push({
-            sessionId,
-            type: 'reasoning_delta',
-            payload: {
-              streamId: streamState.streamId,
-              delta: deltaText,
-              accumulatedLength: streamState.accumulatedReasoningLength,
-              status: 'thinking',
-            },
-            createdAt: this.getMonotonicIsoTimestamp(),
-          });
-        }
-        break;
-      }
-
       case 'tool/call': {
         const streamState = this.getOrCreateStreamState(sessionId);
         const toolName = typeof event.data.name === 'string' ? event.data.name : 'tool';
@@ -461,14 +562,17 @@ export class EventRelayService implements IEventRelayService {
 
       case 'assistant/message': {
         const streamState = this.getOrCreateStreamState(sessionId);
-        frames.push({
-          sessionId,
-          type: 'assistant_stream_end',
-          payload: {
-            streamId: streamState.streamId,
-          },
-          createdAt: this.getMonotonicIsoTimestamp(),
-        });
+        if (!streamState.ended) {
+          streamState.ended = true;
+          frames.push({
+            sessionId,
+            type: 'assistant_stream_end',
+            payload: {
+              streamId: streamState.streamId,
+            },
+            createdAt: this.getMonotonicIsoTimestamp(),
+          });
+        }
         break;
       }
 
@@ -476,7 +580,8 @@ export class EventRelayService implements IEventRelayService {
         const reasonKind = event.data.reason?.kind;
         const streamState = this.sessionStreams.get(sessionId);
 
-        if (streamState) {
+        if (streamState && !streamState.ended) {
+          streamState.ended = true;
           frames.push({
             sessionId,
             type: 'assistant_stream_end',
@@ -528,16 +633,7 @@ export class EventRelayService implements IEventRelayService {
     }
 
     if (frames.length > 0) {
-      for (const f of frames) {
-        if (turnId && !f.turnId) (f as any).turnId = turnId;
-        if (originTurnId && !f.originTurnId) (f as any).originTurnId = originTurnId;
-        if (causeChildId) {
-          if (!(f as any).causeChildId) (f as any).causeChildId = causeChildId;
-          if (f.payload && !(f.payload as any).causeChildId) (f.payload as any).causeChildId = causeChildId;
-        }
-        this.mappedFrameCounts[f.type] = (this.mappedFrameCounts[f.type] || 0) + 1;
-      }
-      this.enqueueOutboundFrames(frames);
+      this.stampAndEnqueueFrames(sessionId, frames, currentTurn);
     }
   }
 

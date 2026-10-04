@@ -820,4 +820,237 @@ describe('Item B: Structured Subagent Cause Child ID Contract', () => {
       expect(frame.turnId).toBe(betaTurnId);
     }
   });
+
+  it('identifies childId from V4 role: tool tool/result message and attributes autonomous turn via agent/assistant-stream', async () => {
+    const service = new EventRelayService(ctx);
+    const session = { id: 'ses_parent_0000000000000030' } as Session;
+    const parentPlatformTurnId = 'turn_platform_000000000030';
+    const childId = 'ses_child_0000000000000031';
+    const agentCtx = new Context();
+    service.attachAgent(agentCtx);
+
+    // 1. Initial turn launches subagent with V4 tool-role message
+    service.bindTurnContext(session.id, {
+      turnId: parentPlatformTurnId,
+      dshIntTurn: 1,
+    });
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 1,
+      time: 300,
+      data: { turn: 1 },
+    });
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 2,
+      time: 301,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'tool',
+          content: [{ type: 'text', text: `started subagent ${childId}` }],
+        } as any,
+      },
+    });
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 3,
+      time: 302,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    // 2. Child finishes: notice arrives with subagent-settled structured source
+    service.ingest(session, {
+      type: 'agent/inbox/spliced' as any,
+      seq: 4,
+      time: 303,
+      data: {
+        target: 'next-turn',
+        inserted: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'Subagent finished work.' }],
+            source: {
+              kind: 'subagent-settled',
+              form: 'notice',
+              senderSessionId: childId,
+            },
+          },
+        ],
+      },
+    });
+
+    // 3. Autonomous turn 2 starts and streams via agent/assistant-stream
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 5,
+      time: 304,
+      data: { turn: 2 },
+    });
+
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'start',
+        turn: 2,
+        step: 1,
+      },
+    });
+
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'chunk',
+        chunk: {
+          type: 'text-delta',
+          text: 'V4 autonomous streaming delta.',
+        },
+      },
+    });
+
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'end',
+        outcome: {
+          kind: 'committed',
+          eventType: 'assistant/message',
+          seq: 6,
+        },
+      },
+    });
+
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 7,
+      time: 305,
+      data: { turn: 2, reason: { kind: 'completed' } },
+    });
+
+    await service.flush();
+
+    const autoFrames = dispatchedFrames.filter((f) => f.originTurnId === parentPlatformTurnId);
+    expect(autoFrames.length).toBeGreaterThan(0);
+    const deltaFrame = autoFrames.find((f) => f.type === 'assistant_delta');
+    expect(deltaFrame).toBeDefined();
+    expect(deltaFrame.payload.delta).toBe('V4 autonomous streaming delta.');
+    expect(deltaFrame.causeChildId).toBe(childId);
+    expect(deltaFrame.payload.causeChildId).toBe(childId);
+    expect(deltaFrame.originTurnId).toBe(parentPlatformTurnId);
+  });
+
+  it('identifies childId from V4 { kind: "tool-jobs" } structured source and attributes autonomous turn', async () => {
+    const service = new EventRelayService(ctx);
+    const session = { id: 'ses_parent_0000000000000040' } as Session;
+    const parentPlatformTurnId = 'turn_platform_000000000040';
+    const jobId = 'job-v4-synthetic-42';
+    const agentCtx = new Context();
+    service.attachAgent(agentCtx);
+
+    // 1. Initial turn launches background job with V4 tool-role message
+    service.bindTurnContext(session.id, {
+      turnId: parentPlatformTurnId,
+      dshIntTurn: 1,
+    });
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 1,
+      time: 400,
+      data: { turn: 1 },
+    });
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 2,
+      time: 401,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'tool',
+          content: [{ type: 'text', text: `started background job ${jobId}` }],
+        } as any,
+      },
+    });
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 3,
+      time: 402,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    // 2. V4 tool-jobs source arrives in inbox with native { kind: 'tool-jobs' }
+    service.ingest(session, {
+      type: 'agent/inbox/spliced' as any,
+      seq: 4,
+      time: 403,
+      data: {
+        target: 'next-turn',
+        inserted: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'Job finished.' }],
+            source: {
+              kind: 'tool-jobs',
+              form: 'notice',
+              summary: `job ${jobId} finished`,
+            },
+          },
+        ],
+      },
+    });
+
+    // 3. Autonomous turn starts in DSH
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 5,
+      time: 404,
+      data: { turn: 2 },
+    });
+
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'start',
+        turn: 2,
+        step: 1,
+      },
+    });
+
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'chunk',
+        chunk: {
+          type: 'text-delta',
+          text: 'Response after V4 job completion.',
+        },
+      },
+    });
+
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'end',
+        outcome: { kind: 'committed', eventType: 'assistant/message', seq: 6 },
+      },
+    });
+
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 7,
+      time: 405,
+      data: { turn: 2, reason: { kind: 'completed' } },
+    });
+
+    await service.flush();
+
+    const autoFrames = dispatchedFrames.filter((f) => f.originTurnId === parentPlatformTurnId);
+    expect(autoFrames.length).toBeGreaterThan(0);
+    for (const frame of autoFrames) {
+      expect(frame.causeChildId).toBe(jobId);
+      expect(frame.payload.causeChildId).toBe(jobId);
+      expect(frame.originTurnId).toBe(parentPlatformTurnId);
+    }
+  });
 });

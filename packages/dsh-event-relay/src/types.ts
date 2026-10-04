@@ -7,6 +7,53 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 
+export type AssistantStreamChunk = {
+  readonly type: string;
+  readonly text?: string;
+  readonly delta?: string;
+  readonly [key: string]: unknown;
+};
+
+export type AssistantStreamOutcome =
+  | {
+      readonly kind: 'committed';
+      readonly eventType?: string;
+      readonly seq?: number;
+    }
+  | {
+      readonly kind: 'abandoned';
+    };
+
+export type AssistantStreamFrame =
+  | {
+      readonly type: 'start';
+      readonly attemptId?: string;
+      readonly revision?: number;
+      readonly turn: number;
+      readonly step: number;
+    }
+  | {
+      readonly type: 'chunk';
+      readonly attemptId?: string;
+      readonly revision?: number;
+      readonly index?: number;
+      readonly time?: number;
+      readonly chunk: AssistantStreamChunk;
+    }
+  | {
+      readonly type: 'end';
+      readonly attemptId?: string;
+      readonly revision?: number;
+      readonly index?: number;
+      readonly outcome?: AssistantStreamOutcome;
+    };
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'agent/assistant-stream'(payload: { agent: { session: Session }; frame: AssistantStreamFrame }): void;
+  }
+}
+
 export interface RelayEnvelope {
   /**
    * Deterministic per-session cursor string: `${sessionId}:${seq}`.
@@ -142,6 +189,11 @@ export interface IEventRelayService {
    * Ingest a session event into the bounded buffer and notify subscribers.
    */
   ingest(session: Session, event: SessionEvent): RelayEnvelope;
+
+  /**
+   * Ingest a transient assistant stream frame from agent/assistant-stream.
+   */
+  ingestAssistantStream(session: Session, frame: AssistantStreamFrame): void;
 
   /**
    * Attach and subscribe to live agent-scoped context.

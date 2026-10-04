@@ -17,9 +17,11 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
     ctx.platformClient = mockPlatformClient as any;
   });
 
-  it('maps DSH turn/start, assistant/chunk, tool/call, tool/result, and turn/end into typed platform streaming frames', async () => {
+  it('maps DSH turn/start, agent/assistant-stream, tool/call, tool/result, and turn/end into typed platform streaming frames', async () => {
     const service = new EventRelayService(ctx, { batchIntervalMs: 25 });
     const session = { id: 'ses_00000000000000000000000000000001' } as Session;
+    const agentCtx = new Context();
+    service.attachAgent(agentCtx);
 
     // 1. turn/start
     const ev1: SessionEvent = {
@@ -30,54 +32,65 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
     };
     service.ingest(session, ev1);
 
-    // 2. assistant/chunk (thinking / reasoning-delta)
-    const ev2: SessionEvent = {
-      type: 'assistant/chunk',
-      seq: 2,
-      time: Date.now(),
-      data: {
+    // 2. agent/assistant-stream (start)
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'start',
         turn: 1,
         step: 1,
+      },
+    });
+
+    // 3. agent/assistant-stream (thinking / reasoning-delta)
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'chunk',
         chunk: {
           type: 'reasoning-delta',
           text: 'Thinking about the problem...',
-        } as any,
+        },
       },
-    };
-    service.ingest(session, ev2);
+    });
 
-    // 3. assistant/chunk (text-delta)
-    const ev3: SessionEvent = {
-      type: 'assistant/chunk',
-      seq: 3,
-      time: Date.now(),
-      data: {
-        turn: 1,
-        step: 1,
+    // 4. agent/assistant-stream (text-delta)
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'chunk',
         chunk: {
           type: 'text-delta',
           text: 'Hello ',
-        } as any,
+        },
       },
-    };
-    service.ingest(session, ev3);
+    });
 
-    const ev4: SessionEvent = {
-      type: 'assistant/chunk',
-      seq: 4,
-      time: Date.now(),
-      data: {
-        turn: 1,
-        step: 1,
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'chunk',
         chunk: {
           type: 'text-delta',
           text: 'world!',
-        } as any,
+        },
       },
-    };
-    service.ingest(session, ev4);
+    });
 
-    // 4. tool/call
+    // 5. agent/assistant-stream (end)
+    agentCtx.emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'end',
+        outcome: {
+          kind: 'committed',
+          eventType: 'assistant/message',
+          seq: 7,
+        },
+      },
+    });
+
+    // 6. tool/call
     const ev5: SessionEvent = {
       type: 'tool/call',
       seq: 5,
@@ -92,7 +105,7 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
     };
     service.ingest(session, ev5);
 
-    // 5. tool/result
+    // 7. tool/result
     const ev6: SessionEvent = {
       type: 'tool/result',
       seq: 6,
@@ -105,7 +118,7 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
     };
     service.ingest(session, ev6);
 
-    // 6. assistant/message
+    // 8. assistant/message
     const ev7: SessionEvent = {
       type: 'assistant/message',
       seq: 7,
@@ -124,7 +137,7 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
     };
     service.ingest(session, ev7);
 
-    // 7. turn/end
+    // 9. turn/end
     const ev8: SessionEvent = {
       type: 'turn/end',
       seq: 8,
@@ -205,19 +218,14 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
       data: { turn: 1 },
     });
 
-    // Ingest huge flood of text deltas (exceeding 1KB)
+    // Ingest huge flood of text deltas (exceeding 1KB) via agent/assistant-stream
     for (let i = 0; i < 50; i++) {
-      service.ingest(session, {
-        type: 'assistant/chunk',
-        seq: 2 + i,
-        time: Date.now(),
-        data: {
-          turn: 1,
-          step: 1,
-          chunk: {
-            type: 'text-delta',
-            text: `chunk_${i}_` + 'x'.repeat(100),
-          } as any,
+      service.ingestAssistantStream(session, {
+        type: 'chunk',
+        turn: 1,
+        chunk: {
+          type: 'text-delta',
+          text: `chunk_${i}_` + 'x'.repeat(100),
         },
       });
     }
@@ -267,15 +275,10 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
         data: { turn: 1 },
       });
 
-      service.ingest(session, {
-        type: 'assistant/chunk',
-        seq: 2,
-        time: Date.now(),
-        data: {
-          turn: 1,
-          step: 1,
-          chunk: { type: 'text-delta', text: 'hi' } as any,
-        },
+      service.ingestAssistantStream(session, {
+        type: 'chunk',
+        turn: 1,
+        chunk: { type: 'text-delta', text: 'hi' },
       });
     }).not.toThrow();
 
