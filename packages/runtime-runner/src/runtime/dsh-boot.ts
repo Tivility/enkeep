@@ -2385,6 +2385,120 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     };
   }
 
+  function remapSeedEventSequences(seedEvents: any[], oldSeqToNewSeq: Map<number, number>): void {
+    for (const ev of seedEvents) {
+      // 1. sourceEventSeqs on surface-eligible events
+      if (Array.isArray(ev.sourceEventSeqs)) {
+        ev.sourceEventSeqs = ev.sourceEventSeqs
+          .map((oldSeq: number) => oldSeqToNewSeq.get(oldSeq))
+          .filter((newSeq: number | undefined): newSeq is number => typeof newSeq === 'number' && Number.isSafeInteger(newSeq) && newSeq >= 0 && newSeq < ev.seq);
+      }
+
+      // 2. surfaceOp on surface-eligible events (replace operation requires startSeq and endSeq in DSH 0.2)
+      if (ev.surfaceOp && typeof ev.surfaceOp === 'object' && ev.surfaceOp.op === 'replace') {
+        const rawStart = ev.surfaceOp.startSeq ?? ev.surfaceOp.start;
+        const rawEnd = ev.surfaceOp.endSeq ?? ev.surfaceOp.end;
+        const mappedStart = typeof rawStart === 'number' ? oldSeqToNewSeq.get(rawStart) : undefined;
+        const mappedEnd = typeof rawEnd === 'number' ? oldSeqToNewSeq.get(rawEnd) : undefined;
+        if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
+          ev.surfaceOp = {
+            op: 'replace',
+            startSeq: mappedStart,
+            endSeq: mappedEnd,
+          };
+        }
+      }
+
+      // 3. developer/message: headerSeq referencing earlier request/header
+      if (ev.type === 'developer/message' && ev.data && typeof ev.data.headerSeq === 'number') {
+        const mappedHeader = oldSeqToNewSeq.get(ev.data.headerSeq);
+        if (typeof mappedHeader === 'number') {
+          ev.data = {
+            ...ev.data,
+            headerSeq: mappedHeader,
+          };
+        }
+      }
+
+      // 4. compaction/summary: shadowedRange.start, shadowedRange.end, shadowedSeqs
+      if (ev.type === 'compaction/summary' && ev.data) {
+        let dataModified = false;
+        let newShadowedRange = ev.data.shadowedRange;
+        let newShadowedSeqs = ev.data.shadowedSeqs;
+
+        if (newShadowedRange && typeof newShadowedRange === 'object') {
+          const rawStart = newShadowedRange.start;
+          const rawEnd = newShadowedRange.end;
+          const mappedStart = typeof rawStart === 'number' ? oldSeqToNewSeq.get(rawStart) : undefined;
+          const mappedEnd = typeof rawEnd === 'number' ? oldSeqToNewSeq.get(rawEnd) : undefined;
+          if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
+            newShadowedRange = { ...newShadowedRange, start: mappedStart, end: mappedEnd };
+            dataModified = true;
+          }
+        }
+
+        if (Array.isArray(newShadowedSeqs)) {
+          newShadowedSeqs = newShadowedSeqs
+            .map((s: number) => oldSeqToNewSeq.get(s))
+            .filter((s: number | undefined): s is number => typeof s === 'number');
+          dataModified = true;
+        }
+
+        if (dataModified) {
+          ev.data = {
+            ...ev.data,
+            ...(newShadowedRange !== undefined ? { shadowedRange: newShadowedRange } : {}),
+            ...(newShadowedSeqs !== undefined ? { shadowedSeqs: newShadowedSeqs } : {}),
+          };
+        }
+      }
+
+      // 5. compaction/prune: shadowedRange.start, shadowedRange.end, shadowedSeqs
+      if (ev.type === 'compaction/prune' && ev.data) {
+        let dataModified = false;
+        let newShadowedRange = ev.data.shadowedRange;
+        let newShadowedSeqs = ev.data.shadowedSeqs;
+
+        if (newShadowedRange && typeof newShadowedRange === 'object') {
+          const rawStart = newShadowedRange.start;
+          const rawEnd = newShadowedRange.end;
+          const mappedStart = typeof rawStart === 'number' ? oldSeqToNewSeq.get(rawStart) : undefined;
+          const mappedEnd = typeof rawEnd === 'number' ? oldSeqToNewSeq.get(rawEnd) : undefined;
+          if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
+            newShadowedRange = { ...newShadowedRange, start: mappedStart, end: mappedEnd };
+            dataModified = true;
+          }
+        }
+
+        if (Array.isArray(newShadowedSeqs)) {
+          newShadowedSeqs = newShadowedSeqs
+            .map((s: number) => oldSeqToNewSeq.get(s))
+            .filter((s: number | undefined): s is number => typeof s === 'number');
+          dataModified = true;
+        }
+
+        if (dataModified) {
+          ev.data = {
+            ...ev.data,
+            ...(newShadowedRange !== undefined ? { shadowedRange: newShadowedRange } : {}),
+            ...(newShadowedSeqs !== undefined ? { shadowedSeqs: newShadowedSeqs } : {}),
+          };
+        }
+      }
+
+      // 6. command/done: sourceEventSeq
+      if (ev.type === 'command/done' && ev.data && typeof ev.data.sourceEventSeq === 'number') {
+        const mappedSource = oldSeqToNewSeq.get(ev.data.sourceEventSeq);
+        if (typeof mappedSource === 'number') {
+          ev.data = {
+            ...ev.data,
+            sourceEventSeq: mappedSource,
+          };
+        }
+      }
+    }
+  }
+
   async function recoverSessionPrefix(options: {
     sourceSessionId: string;
     targetSessionId: string;
@@ -2488,29 +2602,13 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       const newEv = {
         ...ev,
         seq: seq++,
+        ...(ev.data ? { data: { ...ev.data } } : {}),
       };
       seedEvents.push(newEv);
     }
 
-    // Remap sourceEventSeqs and surfaceOp for each event to reference new seq numbers
-    for (const ev of seedEvents) {
-      if (Array.isArray(ev.sourceEventSeqs)) {
-        ev.sourceEventSeqs = ev.sourceEventSeqs
-          .map((oldSeq: number) => oldSeqToNewSeq.get(oldSeq))
-          .filter((newSeq: number | undefined): newSeq is number => typeof newSeq === 'number' && Number.isSafeInteger(newSeq) && newSeq >= 0 && newSeq < ev.seq);
-      }
-      if (ev.surfaceOp && typeof ev.surfaceOp === 'object' && ev.surfaceOp.op === 'replace') {
-        const mappedStart = oldSeqToNewSeq.get(ev.surfaceOp.start);
-        const mappedEnd = oldSeqToNewSeq.get(ev.surfaceOp.end);
-        if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
-          ev.surfaceOp = {
-            op: 'replace',
-            start: mappedStart,
-            end: mappedEnd,
-          };
-        }
-      }
-    }
+    // Remap sourceEventSeqs, surfaceOp, headerSeq, and other seq-referencing fields per DSH 0.2 event schema
+    remapSeedEventSequences(seedEvents, oldSeqToNewSeq);
 
     // 3. Validate prefix events via official Session.create invariant engine
     const targetSid = SessionId(targetSessionId);
@@ -2725,29 +2823,13 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       const newEv = {
         ...ev,
         seq: seq++,
+        ...(ev.data ? { data: { ...ev.data } } : {}),
       };
       seedEvents.push(newEv);
     }
 
-    // Remap sourceEventSeqs and surfaceOp for each event to reference new seq numbers
-    for (const ev of seedEvents) {
-      if (Array.isArray(ev.sourceEventSeqs)) {
-        ev.sourceEventSeqs = ev.sourceEventSeqs
-          .map((oldSeq: number) => oldSeqToNewSeq.get(oldSeq))
-          .filter((newSeq: number | undefined): newSeq is number => typeof newSeq === 'number' && newSeq < ev.seq);
-      }
-      if (ev.surfaceOp && typeof ev.surfaceOp === 'object' && ev.surfaceOp.op === 'replace') {
-        const mappedStart = oldSeqToNewSeq.get(ev.surfaceOp.start);
-        const mappedEnd = oldSeqToNewSeq.get(ev.surfaceOp.end);
-        if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
-          ev.surfaceOp = {
-            op: 'replace',
-            start: mappedStart,
-            end: mappedEnd,
-          };
-        }
-      }
-    }
+    // Remap sourceEventSeqs, surfaceOp, headerSeq, and other seq-referencing fields per DSH 0.2 event schema
+    remapSeedEventSequences(seedEvents, oldSeqToNewSeq);
 
     // Always append session/end-seed marker
     seedEvents.push({
