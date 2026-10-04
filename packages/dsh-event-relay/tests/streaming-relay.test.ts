@@ -348,4 +348,324 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
 
     service.clear();
   });
+
+  it('resolves tool name and call id for two interleaved tool calls of different names with results in reverse order', async () => {
+    const service = new EventRelayService(ctx, { batchIntervalMs: 20 });
+    const session = { id: 'ses_synthetic_interleaved_0000000001' } as Session;
+
+    // 1. turn/start
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 1,
+      time: 100,
+      data: { turn: 1 },
+    });
+
+    // 2. First tool call: web_search with callId call_search_01
+    service.ingest(session, {
+      type: 'tool/call',
+      seq: 2,
+      time: 101,
+      data: {
+        turn: 1,
+        step: 1,
+        callId: 'call_search_01' as any,
+        name: 'web_search',
+        arguments: '{"queries":["test"]}',
+      },
+    });
+
+    // 3. Second interleaved tool call: bash with callId call_bash_02
+    service.ingest(session, {
+      type: 'tool/call',
+      seq: 3,
+      time: 102,
+      data: {
+        turn: 1,
+        step: 2,
+        callId: 'call_bash_02' as any,
+        name: 'bash',
+        arguments: '{"command":"ls"}',
+      },
+    });
+
+    // 4. First result in reverse order: bash result arrives first
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 4,
+      time: 103,
+      data: {
+        turn: 1,
+        step: 2,
+        message: {
+          role: 'tool',
+          toolCallId: 'call_bash_02' as any,
+          content: 'file1.txt\nfile2.txt',
+        } as any,
+      },
+    });
+
+    // 5. Second result in reverse order: web_search result arrives second
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 5,
+      time: 104,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'tool',
+          toolCallId: 'call_search_01' as any,
+          content: 'search results',
+        } as any,
+      },
+    });
+
+    // 6. turn/end
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 6,
+      time: 105,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    await service.flush();
+
+    expect(mockPlatformClient.request).toHaveBeenCalled();
+    const calls = mockPlatformClient.request.mock.calls;
+    const allEvents: any[] = calls.flatMap((c) => c[1].body.events);
+
+    const startedFrames = allEvents.filter((e) => e.type === 'tool_started');
+    const completedFrames = allEvents.filter((e) => e.type === 'tool_completed');
+
+    expect(startedFrames).toHaveLength(2);
+    expect(completedFrames).toHaveLength(2);
+
+    // Verify started frames have correct toolName and callId
+    expect(startedFrames[0].payload.toolName).toBe('web_search');
+    expect(startedFrames[0].payload.callId).toBe('call_search_01');
+    expect((startedFrames[0] as any).callId).toBe('call_search_01');
+
+    expect(startedFrames[1].payload.toolName).toBe('bash');
+    expect(startedFrames[1].payload.callId).toBe('call_bash_02');
+    expect((startedFrames[1] as any).callId).toBe('call_bash_02');
+
+    // Verify completed frames in order of receipt:
+    // First completed frame was bash (call_bash_02)
+    expect(completedFrames[0].payload.toolName).toBe('bash');
+    expect(completedFrames[0].payload.status).toBe('completed');
+    expect(completedFrames[0].payload.callId).toBe('call_bash_02');
+    expect((completedFrames[0] as any).callId).toBe('call_bash_02');
+
+    // Second completed frame was web_search (call_search_01)
+    expect(completedFrames[1].payload.toolName).toBe('web_search');
+    expect(completedFrames[1].payload.status).toBe('completed');
+    expect(completedFrames[1].payload.callId).toBe('call_search_01');
+    expect((completedFrames[1] as any).callId).toBe('call_search_01');
+
+    service.clear();
+  });
+
+  it('resolves tool name and call id for two parallel subagent tool calls without falling back to phantom tool', async () => {
+    const service = new EventRelayService(ctx, { batchIntervalMs: 20 });
+    const session = { id: 'ses_synthetic_parallel_subagent_00000001' } as Session;
+
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 1,
+      time: 100,
+      data: { turn: 1 },
+    });
+
+    service.ingest(session, {
+      type: 'tool/call',
+      seq: 2,
+      time: 101,
+      data: {
+        turn: 1,
+        step: 1,
+        callId: 'call_subagent_01' as any,
+        name: 'subagent',
+        arguments: '{"task":"one"}',
+      },
+    });
+
+    service.ingest(session, {
+      type: 'tool/call',
+      seq: 3,
+      time: 102,
+      data: {
+        turn: 1,
+        step: 1,
+        callId: 'call_subagent_02' as any,
+        name: 'subagent',
+        arguments: '{"task":"two"}',
+      },
+    });
+
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 4,
+      time: 103,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'tool',
+          toolCallId: 'call_subagent_01' as any,
+          content: 'started subagent ses_child_01',
+        } as any,
+      },
+    });
+
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 5,
+      time: 104,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'tool',
+          toolCallId: 'call_subagent_02' as any,
+          content: 'started subagent ses_child_02',
+        } as any,
+      },
+    });
+
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 6,
+      time: 105,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    await service.flush();
+
+    const calls = mockPlatformClient.request.mock.calls;
+    const allEvents: any[] = calls.flatMap((c) => c[1].body.events);
+    const completedFrames = allEvents.filter((e) => e.type === 'tool_completed');
+
+    expect(completedFrames).toHaveLength(2);
+    // Neither should have toolName === 'tool' (phantom tool bug)
+    expect(completedFrames[0].payload.toolName).toBe('subagent');
+    expect(completedFrames[0].payload.callId).toBe('call_subagent_01');
+    expect(completedFrames[1].payload.toolName).toBe('subagent');
+    expect(completedFrames[1].payload.callId).toBe('call_subagent_02');
+
+    service.clear();
+  });
+
+  it('resolves tool name, call id, and error status for canonical DSH 0.2 tool/result structure', async () => {
+    const service = new EventRelayService(ctx, { batchIntervalMs: 20 });
+    const session = { id: 'ses_synthetic_dsh02_structure_00000001' } as Session;
+
+    service.ingest(session, {
+      type: 'turn/start',
+      seq: 1,
+      time: 100,
+      data: { turn: 1 },
+    });
+
+    // 1. Tool call 1: read_file
+    service.ingest(session, {
+      type: 'tool/call',
+      seq: 2,
+      time: 101,
+      data: {
+        turn: 1,
+        step: 1,
+        callId: 'call_read_01' as any,
+        name: 'read',
+        arguments: '{"file_path":"test.txt"}',
+      },
+    });
+
+    // 2. Tool call 2: bash
+    service.ingest(session, {
+      type: 'tool/call',
+      seq: 3,
+      time: 102,
+      data: {
+        turn: 1,
+        step: 2,
+        callId: 'call_bash_02' as any,
+        name: 'bash',
+        arguments: '{"command":"npm test"}',
+      },
+    });
+
+    // 3. DSH 0.2 Canonical Tool result 1: success using message.source.callId and message.content[0].toolCallId
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 4,
+      time: 103,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: 'msg_res_01' as any,
+          role: 'user',
+          source: { kind: 'tool', callId: 'call_read_01' },
+          content: [
+            {
+              type: 'tool-result',
+              toolCallId: 'call_read_01',
+              content: [{ type: 'text', text: 'file content' }],
+              isError: false,
+            },
+          ],
+        } as any,
+      },
+    });
+
+    // 4. DSH 0.2 Canonical Tool result 2: failure using content[0].isError
+    service.ingest(session, {
+      type: 'tool/result',
+      seq: 5,
+      time: 104,
+      data: {
+        turn: 1,
+        step: 2,
+        message: {
+          id: 'msg_res_02' as any,
+          role: 'user',
+          source: { kind: 'tool', callId: 'call_bash_02' },
+          content: [
+            {
+              type: 'tool-result',
+              toolCallId: 'call_bash_02',
+              content: [{ type: 'text', text: 'command failed' }],
+              isError: true,
+            },
+          ],
+        } as any,
+        error: { name: 'ProcessError', code: 'EXIT_1' },
+      },
+    });
+
+    service.ingest(session, {
+      type: 'turn/end',
+      seq: 6,
+      time: 105,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    await service.flush();
+
+    const calls = mockPlatformClient.request.mock.calls;
+    const allEvents: any[] = calls.flatMap((c) => c[1].body.events);
+    const completedFrames = allEvents.filter((e) => e.type === 'tool_completed');
+
+    expect(completedFrames).toHaveLength(2);
+    expect(completedFrames[0].payload.toolName).toBe('read');
+    expect(completedFrames[0].payload.callId).toBe('call_read_01');
+    expect(completedFrames[0].payload.status).toBe('completed');
+
+    expect(completedFrames[1].payload.toolName).toBe('bash');
+    expect(completedFrames[1].payload.callId).toBe('call_bash_02');
+    expect(completedFrames[1].payload.status).toBe('failed');
+
+    service.clear();
+  });
 });

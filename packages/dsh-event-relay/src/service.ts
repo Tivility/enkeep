@@ -55,6 +55,8 @@ export class EventRelayService implements IEventRelayService {
   private readonly pendingAutonomousOrigins = new Map<string, { originTurnId: string; causeChildId: string }>();
   private readonly activeTurnSessions = new Set<string>();
   private readonly childOriginMap = new Map<string, string>();
+  private readonly sessionToolCalls = new Map<string, Map<string, string>>();
+  private readonly sessionPendingToolCalls = new Map<string, Array<{ callId?: string; toolName: string }>>();
   private pendingOutboundFrames: ContainerStreamingEventFrame[] = [];
   private pendingOutboundBytes = 0;
   private batchTimer: NodeJS.Timeout | null = null;
@@ -275,6 +277,95 @@ export class EventRelayService implements IEventRelayService {
       const summary = typeof s.summary === 'string' ? s.summary : '';
       const match = summary.match(/(?:job\s+)?([a-zA-Z0-9_\-]+-\d+)/i);
       if (match) return match[1];
+    }
+    return undefined;
+  }
+
+  private extractCallIdFromToolCall(event: SessionEvent): string | undefined {
+    const data = event.data as any;
+    if (!data) return undefined;
+    if (typeof data.callId === 'string' && data.callId.length > 0) {
+      return data.callId;
+    }
+    if (typeof data.toolCallId === 'string' && data.toolCallId.length > 0) {
+      return data.toolCallId;
+    }
+    if (typeof data.call_id === 'string' && data.call_id.length > 0) {
+      return data.call_id;
+    }
+    if (typeof data.id === 'string' && data.id.length > 0) {
+      return data.id;
+    }
+    if (typeof data.message?.source?.callId === 'string' && data.message.source.callId.length > 0) {
+      return data.message.source.callId;
+    }
+    if (typeof data.message?.callId === 'string' && data.message.callId.length > 0) {
+      return data.message.callId;
+    }
+    if (typeof data.message?.toolCallId === 'string' && data.message.toolCallId.length > 0) {
+      return data.message.toolCallId;
+    }
+    if (typeof data.message?.call_id === 'string' && data.message.call_id.length > 0) {
+      return data.message.call_id;
+    }
+    if (typeof data.message?.id === 'string' && data.message.id.length > 0) {
+      return data.message.id;
+    }
+    return undefined;
+  }
+
+  private extractCallIdFromToolResult(event: SessionEvent): string | undefined {
+    const data = event.data as any;
+    if (!data) return undefined;
+    if (typeof data.message?.source?.callId === 'string' && data.message.source.callId.length > 0) {
+      return data.message.source.callId;
+    }
+    if (typeof data.message?.source?.toolCallId === 'string' && data.message.source.toolCallId.length > 0) {
+      return data.message.source.toolCallId;
+    }
+    if (Array.isArray(data.message?.content)) {
+      for (const block of data.message.content) {
+        if (!block || typeof block !== 'object') continue;
+        if (typeof block.toolCallId === 'string' && block.toolCallId.length > 0) {
+          return block.toolCallId;
+        }
+        if (typeof block.callId === 'string' && block.callId.length > 0) {
+          return block.callId;
+        }
+        if (typeof block.call_id === 'string' && block.call_id.length > 0) {
+          return block.call_id;
+        }
+      }
+    }
+    if (typeof data.message?.toolCallId === 'string' && data.message.toolCallId.length > 0) {
+      return data.message.toolCallId;
+    }
+    if (typeof data.message?.callId === 'string' && data.message.callId.length > 0) {
+      return data.message.callId;
+    }
+    if (typeof data.message?.call_id === 'string' && data.message.call_id.length > 0) {
+      return data.message.call_id;
+    }
+    if (typeof data.message?.id === 'string' && data.message.id.length > 0) {
+      return data.message.id;
+    }
+    if (typeof data.meta?.callId === 'string' && data.meta.callId.length > 0) {
+      return data.meta.callId;
+    }
+    if (typeof data.meta?.toolCallId === 'string' && data.meta.toolCallId.length > 0) {
+      return data.meta.toolCallId;
+    }
+    if (typeof data.toolCallId === 'string' && data.toolCallId.length > 0) {
+      return data.toolCallId;
+    }
+    if (typeof data.callId === 'string' && data.callId.length > 0) {
+      return data.callId;
+    }
+    if (typeof data.call_id === 'string' && data.call_id.length > 0) {
+      return data.call_id;
+    }
+    if (typeof data.id === 'string' && data.id.length > 0) {
+      return data.id;
     }
     return undefined;
   }
@@ -529,34 +620,131 @@ export class EventRelayService implements IEventRelayService {
 
       case 'tool/call': {
         const streamState = this.getOrCreateStreamState(sessionId);
-        const toolName = typeof event.data.name === 'string' ? event.data.name : 'tool';
+        const toolName = typeof event.data.name === 'string' && event.data.name.length > 0 ? event.data.name : 'tool';
+        const callId = this.extractCallIdFromToolCall(event);
         streamState.activeToolName = toolName;
-        frames.push({
+
+        if (callId) {
+          let toolMap = this.sessionToolCalls.get(sessionId);
+          if (!toolMap) {
+            toolMap = new Map();
+            this.sessionToolCalls.set(sessionId, toolMap);
+          }
+          toolMap.set(callId, toolName);
+        }
+
+        let pendingList = this.sessionPendingToolCalls.get(sessionId);
+        if (!pendingList) {
+          pendingList = [];
+          this.sessionPendingToolCalls.set(sessionId, pendingList);
+        }
+        pendingList.push({ callId, toolName });
+
+        const payload: Record<string, unknown> = {
+          toolName,
+          status: 'started',
+        };
+        if (callId) {
+          payload.callId = callId;
+        }
+
+        const frame: ContainerStreamingEventFrame = {
           sessionId,
           type: 'tool_started',
-          payload: {
-            toolName,
-            status: 'started',
-          },
+          payload,
           createdAt: this.getMonotonicIsoTimestamp(),
-        });
+        };
+        if (callId) {
+          (frame as any).callId = callId;
+        }
+        frames.push(frame);
         break;
       }
 
       case 'tool/result': {
         const streamState = this.getOrCreateStreamState(sessionId);
-        const toolName = streamState.activeToolName || 'tool';
-        const hasError = Boolean(event.data.error);
-        frames.push({
+        const callId = this.extractCallIdFromToolResult(event);
+        const toolMap = this.sessionToolCalls.get(sessionId);
+        const pendingList = this.sessionPendingToolCalls.get(sessionId);
+
+        let resolvedToolName: string | undefined;
+        let resolvedCallId: string | undefined = callId;
+
+        if (callId && toolMap?.has(callId)) {
+          resolvedToolName = toolMap.get(callId);
+          toolMap.delete(callId);
+          if (toolMap.size === 0) {
+            this.sessionToolCalls.delete(sessionId);
+          }
+          if (pendingList) {
+            const idx = pendingList.findIndex((item) => item.callId === callId);
+            if (idx !== -1) {
+              pendingList.splice(idx, 1);
+            }
+            if (pendingList.length === 0) {
+              this.sessionPendingToolCalls.delete(sessionId);
+            }
+          }
+        } else if (pendingList && pendingList.length > 0) {
+          const idx = callId ? pendingList.findIndex((item) => item.callId === callId) : -1;
+          const [matched] = idx !== -1 ? pendingList.splice(idx, 1) : [pendingList.shift()!];
+          resolvedToolName = matched.toolName;
+          if (!resolvedCallId) {
+            resolvedCallId = matched.callId;
+          }
+          if (matched.callId && toolMap) {
+            toolMap.delete(matched.callId);
+            if (toolMap.size === 0) {
+              this.sessionToolCalls.delete(sessionId);
+            }
+          }
+          if (pendingList.length === 0) {
+            this.sessionPendingToolCalls.delete(sessionId);
+          }
+        }
+
+        if (!resolvedToolName) {
+          const directName = (event.data as any).name ?? (event.data as any).toolName ?? (event.data as any).tool_name ?? (event.data as any).message?.name ?? (event.data as any).message?.toolName ?? (event.data as any).meta?.toolName ?? (event.data as any).meta?.name;
+          if (typeof directName === 'string' && directName.length > 0) {
+            resolvedToolName = directName;
+          }
+        }
+
+        const toolName = resolvedToolName ?? streamState.activeToolName ?? 'tool';
+        const msgContent = (event.data.message as any)?.content;
+        const hasContentError = Array.isArray(msgContent)
+          ? msgContent.some((c: any) => c && (c.isError === true || c.type === 'tool-error'))
+          : false;
+        const hasError = Boolean(
+          event.data.error ||
+          (event.data as any).isError ||
+          (event.data.message as any)?.isError ||
+          hasContentError
+        );
+
+        const payload: Record<string, unknown> = {
+          toolName,
+          status: hasError ? 'failed' : 'completed',
+        };
+        if (resolvedCallId) {
+          payload.callId = resolvedCallId;
+        }
+
+        const frame: ContainerStreamingEventFrame = {
           sessionId,
           type: 'tool_completed',
-          payload: {
-            toolName,
-            status: hasError ? 'failed' : 'completed',
-          },
+          payload,
           createdAt: this.getMonotonicIsoTimestamp(),
-        });
-        streamState.activeToolName = undefined;
+        };
+        if (resolvedCallId) {
+          (frame as any).callId = resolvedCallId;
+        }
+        frames.push(frame);
+
+        const remainingPending = this.sessionPendingToolCalls.get(sessionId);
+        streamState.activeToolName = remainingPending && remainingPending.length > 0
+          ? remainingPending[remainingPending.length - 1].toolName
+          : undefined;
         break;
       }
 
@@ -625,6 +813,8 @@ export class EventRelayService implements IEventRelayService {
 
         this.sessionStreams.delete(sessionId);
         this.activeTurnSessions.delete(sessionId);
+        this.sessionToolCalls.delete(sessionId);
+        this.sessionPendingToolCalls.delete(sessionId);
         if (scopedCtx?.platformTurnId && this.activeTurnContexts.get(sessionId)?.platformTurnId === scopedCtx.platformTurnId) {
           this.activeTurnContexts.delete(sessionId);
         }
@@ -875,6 +1065,8 @@ export class EventRelayService implements IEventRelayService {
     this.pendingOutboundBytes = 0;
     this.sessionStreams.clear();
     this.activeTurnSessions.clear();
+    this.sessionToolCalls.clear();
+    this.sessionPendingToolCalls.clear();
     this.buffer.clear();
     this.subscribers.clear();
   }
