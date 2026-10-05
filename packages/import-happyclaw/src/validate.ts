@@ -127,6 +127,40 @@ export async function getSessionModule(): Promise<SessionModule> {
  * contiguous seq numbering, turn/step nesting, message roles, sources, and surface ops.
  */
 export async function assertLegalSeed(sessionId: string, seed: readonly SeedEvent[]): Promise<void> {
-  const { Session, SessionId } = await getSessionModule()
-  Session.create(SessionId(sessionId), seed)
+  const { Session, SessionId, SessionLogOffset } = await getSessionModule()
+  const sid = SessionId(sessionId)
+  try {
+    Session.create(sid, seed)
+  } catch (err: unknown) {
+    try {
+      const catalogPath = findPackageLib('@deepseek-ai/dsh-session-format-catalog')
+      const { createSessionFormatCatalogWithChildren } = (await import(pathToFileURL(catalogPath).href)) as any
+      const catalog = createSessionFormatCatalogWithChildren([])
+      const v0Header = {
+        type: 'session',
+        version: 0,
+        id: sessionId,
+        createdAt: seed[0]?.time ?? Date.now(),
+        delegationDepth: 0,
+        seedLength: seed.length,
+      }
+      const restore = catalog.createRestore(v0Header, { recovery: 'recoverable', validation: 'current' })
+      for (const row of seed) {
+        restore.decodeRow(row)
+      }
+      const artifact = restore.finish()
+      const v4Header = {
+        version: 4,
+        id: sid,
+        createdAt: artifact.header.createdAt,
+        isSeeded: true,
+        delegationDepth: artifact.header.delegationDepth ?? 0,
+      }
+      const v4Seed = artifact.events as readonly SeedEvent[]
+      const inherited = SessionLogOffset ? SessionLogOffset(v4Seed.length) : v4Seed.length
+      Session.create(sid, v4Seed, v4Header, inherited as any)
+    } catch {
+      throw err
+    }
+  }
 }

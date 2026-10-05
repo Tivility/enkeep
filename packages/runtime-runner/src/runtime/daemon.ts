@@ -413,26 +413,35 @@ export class RuntimeDaemon extends EventEmitter {
         };
         this.emit('stream', decidedPush);
       }
+    });
 
-      // Chunk streaming push
-      if (event.type === 'assistant/chunk') {
-        const chunkData = (event.data as any)?.chunk;
-        if (chunkData && turnId) {
-          const chunkPush: DaemonStreamEvent = {
-            type: 'event',
-            event: DAEMON_STREAM_EVENTS.TURN_CHUNK,
-            turnId,
-            sessionId: sessionIdStr,
-            timestamp: Date.now(),
-            chunk: chunkData,
-          };
-          this.emit('stream', chunkPush);
-        }
+    // Chunk streaming push from new agent/assistant-stream event
+    const disposeAssistantStream = ctx.on('agent/assistant-stream', (payload: any) => {
+      const frame = payload?.frame;
+      if (!frame || frame.type !== 'chunk') return;
+      const agent = payload?.agent;
+      const sessionIdStr = agent?.session?.id ? String(agent.session.id) : undefined;
+      if (!sessionIdStr) return;
+
+      const entry = this.agents.get(sessionIdStr);
+      const turnId = this.currentTurns.get(sessionIdStr)?.turnId ?? entry?.currentTurn?.turnId;
+      const chunkData = frame.chunk;
+      if (chunkData && turnId) {
+        const chunkPush: DaemonStreamEvent = {
+          type: 'event',
+          event: DAEMON_STREAM_EVENTS.TURN_CHUNK,
+          turnId,
+          sessionId: sessionIdStr,
+          timestamp: Date.now(),
+          chunk: chunkData,
+        };
+        this.emit('stream', chunkPush);
       }
     });
 
     this.eventRelayCleanup = () => {
       disposeSessionEvent();
+      disposeAssistantStream();
     };
   }
 

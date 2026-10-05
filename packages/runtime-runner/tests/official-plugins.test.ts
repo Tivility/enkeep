@@ -154,18 +154,17 @@ describe('Official DSH 0.1.1-rc.2 Capability Plugins Integration', () => {
           expect(compactResult.summary.length).toBeGreaterThan(0);
         }
 
-        // Verify JSONL persistence via official readRaw service
-        const rawArtifact = await runtime.context.sessionPersistence.readRaw(SessionId(sessionId));
-        expect(rawArtifact).toBeDefined();
-        expect(rawArtifact?.filename).toBe('session.jsonl');
+        // Verify JSONL persistence via official open handle
+        const handle = await runtime.context.sessionPersistence.open(SessionId(sessionId), 'read');
+        let events: SessionEvent[];
+        try {
+          const res = await handle.read();
+          events = res.events;
+        } finally {
+          await handle.close();
+        }
 
-        const logLines = rawArtifact!.content
-          .trim()
-          .split('\n')
-          .slice(1) // skip header line
-          .map((line) => JSON.parse(line));
-
-        const eventTypes = logLines.map((e) => e.type);
+        const eventTypes = events.map((e) => e.type);
         expect(eventTypes).toContain('compaction/start');
         expect(eventTypes).toContain('compaction/end');
         expect(eventTypes).toContain('user/message');

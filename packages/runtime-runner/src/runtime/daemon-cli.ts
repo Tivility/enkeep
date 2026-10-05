@@ -33,6 +33,7 @@ import {
 import { isValidUserId, isNormalizedAbsolutePath } from './dsh-boot.js';
 import type { ResolvedRuntimeMount } from '../spec/types.js';
 import { deriveCompactionThresholdRatio, type CompactionMountConfig } from './official-plugins.js';
+import { runSessionPremigrateCli } from './session-premigrate.js';
 
 export { deriveCompactionThresholdRatio };
 
@@ -316,7 +317,12 @@ export async function runDaemonCli(argv: string[] = process.argv.slice(2)): Prom
     process.exit(res.ok ? 0 : 1);
   }
 
-  process.stderr.write(`Unknown command "${command}". Available commands: daemon, health\n`);
+  if (command === 'premigrate') {
+    await runSessionPremigrateCli(argv.slice(1));
+    return;
+  }
+
+  process.stderr.write(`Unknown command "${command}". Available commands: daemon, health, premigrate\n`);
   process.exit(1);
 }
 

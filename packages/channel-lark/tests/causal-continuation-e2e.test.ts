@@ -216,15 +216,10 @@ describe('Real Producer-Sequence Causality Regression: tool/result -> subagent-s
       time: Date.now(),
       data: { turn: 2 },
     });
-    relay.ingest(mockSession, {
-      type: 'assistant/chunk',
-      seq: 5 as any,
-      time: Date.now(),
-      data: {
-        turn: 2,
-        step: 1,
-        chunk: { type: 'text-delta', text: 'Turn B direct answer to Group B' },
-      },
+    relay.ingestAssistantStream(mockSession as any, {
+      type: 'chunk',
+      turn: 2,
+      chunk: { type: 'text-delta', text: 'Turn B direct answer to Group B' },
     });
     relay.ingest(mockSession, {
       type: 'turn/end',
@@ -298,15 +293,10 @@ describe('Real Producer-Sequence Causality Regression: tool/result -> subagent-s
       time: Date.now(),
       data: { turn: 3 },
     });
-    relay.ingest(mockSession, {
-      type: 'assistant/chunk',
-      seq: 9 as any,
-      time: Date.now(),
-      data: {
-        turn: 3,
-        step: 1,
-        chunk: { type: 'text-delta', text: 'Summary of subagent results for Group A task' },
-      },
+    relay.ingestAssistantStream(mockSession as any, {
+      type: 'chunk',
+      turn: 3,
+      chunk: { type: 'text-delta', text: 'Summary of subagent results for Group A task' },
     });
     relay.ingest(mockSession, {
       type: 'turn/end',

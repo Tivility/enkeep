@@ -21,10 +21,21 @@ import LlmRuntime, {
 import SessionStore, {
   Session,
   SessionId,
-  decodeStorageRecord,
+  SessionLogOffset,
   type SessionEvent,
+  type SessionHeader,
   type SessionId as SessionIdType,
 } from '@deepseek-ai/dsh-session';
+import { createSessionFormatCatalogWithChildren } from '@deepseek-ai/dsh-session-format-catalog';
+import {
+  deferPreStepSurfaceEvents,
+  premigrateSingleSession,
+  isSessionFormatUnsupportedError,
+  stripV0SourceId,
+  isClassAError,
+  isClassBError,
+  remapEventSequences,
+} from './session-premigrate.js';
 import AgentRegistry, {
   installModelSelection,
   type Agent,
@@ -494,23 +505,6 @@ export function extractTurnResultFromEvents(
       }
     }
 
-    if (event.type === 'assistant/chunk') {
-      const chunkReason = (event.data as any)?.chunk?.reason;
-      if (chunkReason?.kind === 'error') {
-        const failure = chunkReason.failure;
-        const msg = typeof failure?.message === 'string' ? failure.message : '';
-        const code = failure?.code;
-        let statusCode: number | undefined;
-        const statusMatch = msg.match(/\b(429|500|502|503|504)\b/);
-        if (statusMatch) {
-          statusCode = Number(statusMatch[1]);
-        }
-        if (!upstreamError) {
-          upstreamError = { message: msg, code, statusCode };
-        }
-      }
-    }
-
     if ((event as any).type === 'error') {
       const errData = (event as any).data;
       const msg = typeof errData?.message === 'string' ? errData.message : '';
@@ -614,7 +608,7 @@ export function extractUpstreamErrorFromEvents(
         return { message: msg, code, statusCode };
       }
     }
-    if (event.type === 'assistant/chunk') {
+    if ((event as any).type === 'assistant/chunk') {
       const chunkReason = (event.data as any)?.chunk?.reason;
       if (chunkReason?.kind === 'error') {
         const failure = chunkReason.failure;
@@ -1004,13 +998,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   function mountAgentMemoryFailClosed(
     memoryService: MemoryService,
     agentCtx: Context,
-    options: { dshHome: string; spacePath?: string; spaceId?: string; userId: string }
+    options: { dshHome: string; spacePath?: string; spaceId?: string; userId: string },
+    agentObj?: any
   ) {
     const memHandle = memoryService.mountAgentMemory(agentCtx, options as any);
     if (!options.spacePath) {
       const tools = agentCtx.tools ?? (agentCtx.get ? agentCtx.get('tools') : undefined);
-      const agentObj = (agentCtx as any).agent ?? agentCtx;
-      const view = (tools as any)?.view?.(agentObj);
+      const targetAgent = agentObj ?? (agentCtx.get ? agentCtx.get('agent') : undefined) ?? agentCtx;
+      const view = (tools as any)?.view?.(targetAgent);
       for (const name of ['memory_write', 'memory_read', 'memory_search']) {
         const tool = view?.visible?.get(name);
         if (tool && typeof tool.execute === 'function') {
@@ -1028,11 +1023,11 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   }
 
   // Ensure child/subagent instances mount memory tools via official agent/created lifecycle hook
-  ctx.on('agent/created', ({ agent }) => {
+  ctx.on('agent/created', ({ agent }): undefined => {
     const toolsService = agent.ctx.tools ?? (agent.ctx.get ? agent.ctx.get('tools') : undefined);
-    if (!toolsService) return;
+    if (!toolsService) return undefined;
     const view = (toolsService as any).view?.(agent);
-    if (view?.visible?.has('memory_write')) return;
+    if (view?.visible?.has('memory_write')) return undefined;
 
     let sessionCwd = ((agent.session as any)?.header)?.cwd || ((agent.session as any)?.meta)?.cwd;
     const isValidSpace = (p: unknown): p is string =>
@@ -1069,7 +1064,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       spacePath,
       spaceId: spaceId && spaceId.length > 0 ? spaceId : undefined,
       userId,
-    });
+    }, agent);
     agent.ctx.effect(() => {
       return () => {
         try {
@@ -1079,6 +1074,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         }
       };
     }, 'memory.agentCreatedScope()');
+    return undefined;
   });
 
   try {
@@ -1377,8 +1373,15 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       if (event.type === 'step/start') {
         fbCtx.stepChunksCount = 0;
         fbCtx.currentAttemptStart = Date.now();
-      } else if (event.type === 'assistant/chunk') {
-        const chunk = (event.data as any)?.chunk;
+      }
+    });
+
+    const disposeStream = agentCtx.on('agent/assistant-stream', (payload: any) => {
+      const fbCtx = activeFallbackContexts.get(sid);
+      if (!fbCtx || !fbCtx.active) return;
+      const frame = payload?.frame;
+      if (frame && frame.type === 'chunk') {
+        const chunk = frame.chunk;
         if (
           chunk &&
           (chunk.type === 'text-delta' ||
@@ -1464,6 +1467,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
     return () => {
       disposeSession();
+      disposeStream();
       disposeRequestError();
     };
   }
@@ -1816,18 +1820,71 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
     // Verify session persistence readiness and inspect stored session
     const persistence = ctx.sessionPersistence;
-    if (!persistence || typeof persistence.inspect !== 'function') {
+    if (!persistence || typeof persistence.stat !== 'function' || typeof persistence.open !== 'function') {
       throw new Error('SessionPersistence service is not registered or not functional');
     }
 
-    let storedInspection: { meta: unknown; events: readonly SessionEvent[] } | undefined;
-    try {
-      storedInspection = await persistence.inspect(sid);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.toLowerCase().includes('not found') && !msg.toLowerCase().includes('no such file') && (err as any)?.code !== 'ENOENT') {
-        // Corrupt session on disk: fail loud immediately
-        throw new PersistedSessionResumeError(sessionIdStr, sessionsDir, err);
+    const logSafetyNetWarn = (msg: string) => {
+      if (ctx.logger?.warn) {
+        ctx.logger.warn(msg);
+      } else {
+        console.warn(msg);
+      }
+    };
+
+    const trySafetyNetNormalizeV0 = async (): Promise<boolean> => {
+      const jsonlPath = findSessionLogPath(sessionsDir, sessionIdStr, workspaceFolder);
+      if (!jsonlPath || !jsonlPath.endsWith('session.jsonl')) {
+        return false;
+      }
+      const sDir = path.dirname(jsonlPath);
+      const v4Path = path.join(sDir, 'session.v4.jsonl');
+      if (fs.existsSync(v4Path)) {
+        return false;
+      }
+      try {
+        const res = await premigrateSingleSession(sDir, { sessionsRoot: sessionsDir });
+        return res.status === 'migrated';
+      } catch (normErr) {
+        logSafetyNetWarn(
+          `[dsh-boot] Safety-net premigration failed for v0 session ${sessionIdStr}: ${normErr instanceof Error ? normErr.message : String(normErr)}`
+        );
+        return false;
+      }
+    };
+
+    let sessionStat: Awaited<ReturnType<typeof persistence.stat>> | undefined;
+    let preValidationSafetyNetTried = false;
+    while (true) {
+      try {
+        sessionStat = await persistence.stat(sid);
+        if (sessionStat !== undefined) {
+          // Pre-validate readability
+          const testHandle = await persistence.open(sid, 'read');
+          try {
+            await testHandle.read();
+          } finally {
+            await testHandle.close();
+          }
+        }
+        break;
+      } catch (err: unknown) {
+        if (!preValidationSafetyNetTried && isSessionFormatUnsupportedError(err)) {
+          const normalized = await trySafetyNetNormalizeV0();
+          if (normalized) {
+            preValidationSafetyNetTried = true;
+            logSafetyNetWarn(
+              `[dsh-boot] DSH migration threw SessionFormatUnsupportedError for v0 session ${sessionIdStr}; normalized session and retrying resume`
+            );
+            continue;
+          }
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.toLowerCase().includes('not found') && !msg.toLowerCase().includes('no such file') && (err as any)?.code !== 'ENOENT') {
+          // Corrupt session on disk: fail loud immediately
+          throw new PersistedSessionResumeError(sessionIdStr, sessionsDir, err);
+        }
+        break;
       }
     }
 
@@ -1835,7 +1892,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     const agentsRegistry = ctx.agents;
 
     const createAgentSetup = (spacePath: string, selectionRef: { current: any; assembled: any }) => {
-      return async (agentCtx: Context) => {
+      return async (agentCtx: Context, _agent?: Agent) => {
         installModelSelection(agentCtx, selectionRef);
         if (validatedProfile) {
           installAgentProfile(agentCtx, validatedProfile);
@@ -1884,7 +1941,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
             spacePath: resolvedSpacePath,
             spaceId: resolvedSpaceId,
             userId,
-          });
+          }, _agent);
           agentCtx.effect(() => {
             return () => {
               try {
@@ -1896,14 +1953,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       };
     };
 
-    if (storedInspection !== undefined) {
+    if (sessionStat !== undefined) {
       let spacePath: string;
       if (workspaceFolder) {
         spacePath = resolveSpaceDir(workspaceFolder, sessionIdStr).spacePath;
       } else if (sessionWorkspaces.has(sessionIdStr)) {
         spacePath = path.join(spacesDir, sessionWorkspaces.get(sessionIdStr)!);
       } else {
-        const headerCwd = (storedInspection.meta as any)?.cwd;
+        const headerCwd = (sessionStat.header as any)?.cwd;
         if (typeof headerCwd === 'string' && isNormalizedAbsolutePath(headerCwd) && isPathInside(headerCwd, spacesDir)) {
           spacePath = headerCwd;
           const derivedId = path.relative(spacesDir, headerCwd);
@@ -1927,6 +1984,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         }
 
         let resumeAttempts = 0;
+        let resumeSafetyNetTried = false;
         while (resumeAttempts < 3) {
           try {
             handle = await agentsRegistry.resume({
@@ -1937,6 +1995,16 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
             break;
           } catch (resErr) {
             await disposeSessionWorkspace(sessionIdStr);
+            if (!resumeSafetyNetTried && isSessionFormatUnsupportedError(resErr)) {
+              const normalized = await trySafetyNetNormalizeV0();
+              if (normalized) {
+                resumeSafetyNetTried = true;
+                logSafetyNetWarn(
+                  `[dsh-boot] DSH migration threw SessionFormatUnsupportedError for v0 session ${sessionIdStr}; normalized session and retrying resume`
+                );
+                continue;
+              }
+            }
             resumeAttempts++;
             if (resumeAttempts >= 3) throw resErr;
             await new Promise((r) => setTimeout(r, 50 * resumeAttempts));
@@ -1975,6 +2043,10 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         });
       } catch (err: unknown) {
         await disposeSessionWorkspace(sessionIdStr);
+        const isAlreadyExists = (err as any)?.name === 'SessionAlreadyExistsError' || String(err).includes('already exists');
+        if (isAlreadyExists) {
+          throw new PersistedSessionResumeError(sessionIdStr, sessionsDir, err);
+        }
         throw err;
       }
     }
@@ -2060,25 +2132,48 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   function findSessionLogPath(root: string, sessionId: string, workspaceFolder?: string): string | undefined {
     if (!fs.existsSync(root)) return undefined;
     const encId = encodeSegment(sessionId);
+    const sessionFileNames = [
+      'session.v4.jsonl',
+      'session.v4.jsonl.zstd',
+      'session.jsonl',
+      'session.jsonl.zstd',
+    ];
+    const flatFileNames = (base: string) => [
+      `${base}.v4.jsonl`,
+      `${base}.v4.jsonl.zstd`,
+      `${base}.jsonl`,
+      `${base}.jsonl.zstd`,
+    ];
 
     // 1. Direct path in root
-    const directPath = path.join(root, `${sessionId}.jsonl`);
-    if (fs.existsSync(directPath)) return directPath;
-    const directEnc = path.join(root, `${encId}.jsonl`);
-    if (fs.existsSync(directEnc)) return directEnc;
+    for (const name of flatFileNames(sessionId)) {
+      const p = path.join(root, name);
+      if (fs.existsSync(p)) return p;
+    }
+    for (const name of flatFileNames(encId)) {
+      const p = path.join(root, name);
+      if (fs.existsSync(p)) return p;
+    }
 
     // 2. If workspaceFolder is provided, try that project folder first
     if (workspaceFolder) {
       const spacePath = path.join(spacesDir, workspaceFolder);
       const proj = projectKey(spacePath);
-      const candidates = [
-        path.join(root, proj, encId, 'session.jsonl'),
-        path.join(root, proj, sessionId, 'session.jsonl'),
-        path.join(root, proj, `${sessionId}.jsonl`),
-        path.join(root, proj, `${encId}.jsonl`),
-      ];
-      for (const c of candidates) {
-        if (fs.existsSync(c)) return c;
+      const projPath = path.join(root, proj);
+      if (fs.existsSync(projPath)) {
+        for (const dirName of [encId, sessionId]) {
+          const sDir = path.join(projPath, dirName);
+          for (const sFile of sessionFileNames) {
+            const p = path.join(sDir, sFile);
+            if (fs.existsSync(p)) return p;
+          }
+        }
+        for (const base of [sessionId, encId]) {
+          for (const sFile of flatFileNames(base)) {
+            const p = path.join(projPath, sFile);
+            if (fs.existsSync(p)) return p;
+          }
+        }
       }
     }
 
@@ -2088,21 +2183,27 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       for (const entry of entries) {
         if (entry.isDirectory()) {
           const projPath = path.join(root, entry.name);
-          const candidates = [
-            path.join(projPath, encId, 'session.jsonl'),
-            path.join(projPath, sessionId, 'session.jsonl'),
-            path.join(projPath, `${sessionId}.jsonl`),
-            path.join(projPath, `${encId}.jsonl`),
-          ];
-          for (const c of candidates) {
-            if (fs.existsSync(c)) return c;
+          for (const dirName of [encId, sessionId]) {
+            const sDir = path.join(projPath, dirName);
+            for (const sFile of sessionFileNames) {
+              const p = path.join(sDir, sFile);
+              if (fs.existsSync(p)) return p;
+            }
+          }
+          for (const base of [sessionId, encId]) {
+            for (const sFile of flatFileNames(base)) {
+              const p = path.join(projPath, sFile);
+              if (fs.existsSync(p)) return p;
+            }
           }
           try {
             const subEntries = fs.readdirSync(projPath, { withFileTypes: true });
             for (const sub of subEntries) {
               if (sub.isDirectory() && (sub.name === encId || sub.name === sessionId || sub.name.includes(sessionId))) {
-                const nested = path.join(projPath, sub.name, 'session.jsonl');
-                if (fs.existsSync(nested)) return nested;
+                for (const sFile of sessionFileNames) {
+                  const nested = path.join(projPath, sub.name, sFile);
+                  if (fs.existsSync(nested)) return nested;
+                }
               }
             }
           } catch {}
@@ -2147,25 +2248,39 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
     let fileContent: string | undefined;
 
-    // 1. Try reading raw content directly through persistence backend
+    // 1. Try reading directly through persistence backend
     const persistence = ctx.sessionPersistence;
     const sid = SessionId(sessionIdStr);
     let persistenceFound = false;
 
-    if (persistence && typeof persistence.readRaw === 'function') {
+    if (persistence && typeof persistence.stat === 'function') {
       try {
-        const raw = await persistence.readRaw(sid);
-        if (raw && typeof raw.content === 'string') {
-          fileContent = raw.content;
+        const stat = await persistence.stat(sid);
+        if (stat) {
           persistenceFound = true;
+          const handle = await persistence.open(sid, 'read');
+          try {
+            const { events } = await handle.read();
+            return {
+              exists: true,
+              valid: true,
+              corrupted: false,
+              code: 'VALID',
+              lastValidSeq: events.length > 0 ? events[events.length - 1].seq : -1,
+              lineCount: events.length + 1,
+              validEventsCount: events.length,
+            };
+          } finally {
+            await handle.close();
+          }
         }
       } catch {
-        // readRaw threw error due to raw file syntax or header corruption
+        // stat/open threw error due to raw file syntax or header corruption
         persistenceFound = true;
       }
     }
 
-    // 2. If not obtained via readRaw or readRaw threw error, find log path on disk
+    // 2. If not obtained via persistence or persistence threw error, find log path on disk
     if (fileContent === undefined) {
       const jsonlPath = findSessionLogPath(sessionsDir, sessionIdStr, workspaceFolder);
       if (jsonlPath && fs.existsSync(jsonlPath)) {
@@ -2276,7 +2391,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
       let decodedEvents: SessionEvent[];
       try {
-        decodedEvents = decodeStorageRecord(parsed);
+        decodedEvents = Array.isArray(parsed) ? parsed : [parsed];
       } catch {
         return {
           exists: true,
@@ -2388,7 +2503,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     for (let i = 1; i < lines.length; i++) {
       try {
         const parsed = JSON.parse(lines[i]);
-        const decoded = decodeStorageRecord(parsed);
+        const decoded = Array.isArray(parsed) ? parsed : [parsed];
         let stopped = false;
         for (const ev of decoded) {
           if (!ev || typeof ev !== 'object' || typeof ev.type !== 'string' || typeof ev.seq !== 'number') {
@@ -2437,29 +2552,13 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       const newEv = {
         ...ev,
         seq: seq++,
+        ...(ev.data ? { data: { ...ev.data } } : {}),
       };
       seedEvents.push(newEv);
     }
 
-    // Remap sourceEventSeqs and surfaceOp for each event to reference new seq numbers
-    for (const ev of seedEvents) {
-      if (Array.isArray(ev.sourceEventSeqs)) {
-        ev.sourceEventSeqs = ev.sourceEventSeqs
-          .map((oldSeq: number) => oldSeqToNewSeq.get(oldSeq))
-          .filter((newSeq: number | undefined): newSeq is number => typeof newSeq === 'number' && Number.isSafeInteger(newSeq) && newSeq >= 0 && newSeq < ev.seq);
-      }
-      if (ev.surfaceOp && typeof ev.surfaceOp === 'object' && ev.surfaceOp.op === 'replace') {
-        const mappedStart = oldSeqToNewSeq.get(ev.surfaceOp.start);
-        const mappedEnd = oldSeqToNewSeq.get(ev.surfaceOp.end);
-        if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
-          ev.surfaceOp = {
-            op: 'replace',
-            start: mappedStart,
-            end: mappedEnd,
-          };
-        }
-      }
-    }
+    // Remap sourceEventSeqs, surfaceOp, headerSeq, and other seq-referencing fields per DSH 0.2 event schema
+    remapEventSequences(seedEvents, oldSeqToNewSeq);
 
     // 3. Validate prefix events via official Session.create invariant engine
     const targetSid = SessionId(targetSessionId);
@@ -2499,7 +2598,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     }
 
     const persistence = ctx.sessionPersistence;
-    if (!persistence || typeof persistence.inspect !== 'function') {
+    if (!persistence || typeof persistence.stat !== 'function' || typeof persistence.open !== 'function') {
       throw new Error('PERSISTENCE_UNAVAILABLE');
     }
 
@@ -2516,21 +2615,29 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     }
 
     if (!allEvents || allEvents.length === 0) {
-      let inspection: { meta: unknown; events: readonly SessionEvent[] } | undefined;
       try {
-        inspection = await persistence.inspect(sid);
+        const stat = await persistence.stat(sid);
+        if (!stat) {
+          throw new Error('SESSION_NOT_FOUND');
+        }
+        const handle = await persistence.open(sid, 'read');
+        try {
+          const result = await handle.read();
+          allEvents = result.events;
+        } finally {
+          await handle.close();
+        }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.toLowerCase().includes('not found') || msg.toLowerCase().includes('no such file') || (err as any)?.code === 'ENOENT') {
+        if (msg === 'SESSION_NOT_FOUND' || msg.toLowerCase().includes('not found') || msg.toLowerCase().includes('no such file') || (err as any)?.code === 'ENOENT') {
           throw new Error('SESSION_NOT_FOUND');
         }
         throw new Error('SESSION_CORRUPTED');
       }
 
-      if (!inspection || !Array.isArray(inspection.events) || inspection.events.length === 0) {
+      if (!allEvents || !Array.isArray(allEvents) || allEvents.length === 0) {
         throw new Error('SESSION_NOT_FOUND');
       }
-      allEvents = inspection.events;
     }
 
     let cutoffIndex = allEvents.length - 1;
@@ -2666,29 +2773,13 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       const newEv = {
         ...ev,
         seq: seq++,
+        ...(ev.data ? { data: { ...ev.data } } : {}),
       };
       seedEvents.push(newEv);
     }
 
-    // Remap sourceEventSeqs and surfaceOp for each event to reference new seq numbers
-    for (const ev of seedEvents) {
-      if (Array.isArray(ev.sourceEventSeqs)) {
-        ev.sourceEventSeqs = ev.sourceEventSeqs
-          .map((oldSeq: number) => oldSeqToNewSeq.get(oldSeq))
-          .filter((newSeq: number | undefined): newSeq is number => typeof newSeq === 'number' && newSeq < ev.seq);
-      }
-      if (ev.surfaceOp && typeof ev.surfaceOp === 'object' && ev.surfaceOp.op === 'replace') {
-        const mappedStart = oldSeqToNewSeq.get(ev.surfaceOp.start);
-        const mappedEnd = oldSeqToNewSeq.get(ev.surfaceOp.end);
-        if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
-          ev.surfaceOp = {
-            op: 'replace',
-            start: mappedStart,
-            end: mappedEnd,
-          };
-        }
-      }
-    }
+    // Remap sourceEventSeqs, surfaceOp, headerSeq, and other seq-referencing fields per DSH 0.2 event schema
+    remapEventSequences(seedEvents, oldSeqToNewSeq);
 
     // Always append session/end-seed marker
     seedEvents.push({
@@ -2773,8 +2864,85 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
     const sid = SessionId(sessionIdStr);
 
-    // 2. Validate seed events via official Session.create first (invariant validation)
-    Session.create(sid, seed);
+    // 2. Validate and migrate candidate seed events to valid V4 format through DSH session format catalog
+    let v4Seed: readonly SessionEvent[] = seed;
+    let v4Header: SessionHeader | undefined;
+    let v4InheritedCount: SessionLogOffset = SessionLogOffset(seed.length);
+
+    let isAlreadyV4 = false;
+    try {
+      const trialHeader: SessionHeader = {
+        version: 4,
+        id: sid,
+        createdAt: seed[0]?.time ?? Date.now(),
+        isSeeded: true,
+      };
+      Session.create(sid, seed, trialHeader, SessionLogOffset(seed.length));
+      isAlreadyV4 = true;
+      v4Seed = seed;
+      v4Header = trialHeader;
+      v4InheritedCount = SessionLogOffset(seed.length);
+    } catch {
+      isAlreadyV4 = false;
+    }
+
+    if (!isAlreadyV4) {
+      let rows: readonly any[] = seed;
+
+      const catalog = createSessionFormatCatalogWithChildren([]);
+      const sourceHeader = {
+        type: 'session',
+        version: 0,
+        id: String(sid),
+        createdAt: seed[0]?.time ?? Date.now(),
+        delegationDepth: 0,
+        seedLength: rows.length,
+      };
+
+      let artifact: any;
+      let appliedA = false;
+      let appliedB = false;
+
+      for (let pass = 0; pass <= 2; pass++) {
+        try {
+          const restore = catalog.createRestore(sourceHeader, { recovery: 'recoverable', validation: 'current' });
+          for (const row of rows) {
+            restore.decodeRow(row);
+          }
+          artifact = restore.finish();
+          break;
+        } catch (migErr) {
+          if (!isSessionFormatUnsupportedError(migErr)) {
+            throw migErr;
+          }
+          if (isClassAError(migErr) && !appliedA) {
+            appliedA = true;
+            rows = rows.map((ev) => stripV0SourceId(structuredClone(ev)));
+            continue;
+          }
+          if (isClassBError(migErr) && !appliedB) {
+            appliedB = true;
+            rows = deferPreStepSurfaceEvents(rows);
+            continue;
+          }
+          throw migErr;
+        }
+      }
+
+      if (!artifact) {
+        throw new Error(`Failed to restore historical seed for session ${sessionIdStr}`);
+      }
+      v4Header = {
+        version: 4,
+        id: sid,
+        createdAt: artifact.header.createdAt,
+        isSeeded: true,
+        delegationDepth: artifact.header.delegationDepth ?? 0,
+      };
+      v4Seed = artifact.events as unknown as readonly SessionEvent[];
+      v4InheritedCount = SessionLogOffset(v4Seed.length);
+      Session.create(sid, v4Seed, v4Header, v4InheritedCount);
+    }
 
     // 3. Coordinate with receiptStore if available
     const receiptStore = ctx.receiptStore ?? (ctx.get ? ctx.get('receiptStore') : undefined);
@@ -2806,13 +2974,22 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     // 4. Verify official SessionPersistence capability
     const persistence = ctx.sessionPersistence;
 
-    if (!persistence || typeof persistence.inspect !== 'function') {
+    if (!persistence || typeof persistence.stat !== 'function' || typeof persistence.open !== 'function') {
       throw new Error('SessionPersistence service is not registered or not functional');
     }
 
-    let existingInspection: { meta: unknown; events: readonly SessionEvent[] } | undefined;
+    let existingEvents: readonly SessionEvent[] | undefined;
     try {
-      existingInspection = await persistence.inspect(sid);
+      const stat = await persistence.stat(sid);
+      if (stat) {
+        const handle = await persistence.open(sid, 'read');
+        try {
+          const result = await handle.read();
+          existingEvents = result.events;
+        } finally {
+          await handle.close();
+        }
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('not found') && !msg.toLowerCase().includes('no such file') && (err as any)?.code !== 'ENOENT') {
@@ -2820,16 +2997,11 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       }
     }
 
-    if (existingInspection !== undefined) {
-      const totalEvents = existingInspection.events.length;
+    if (existingEvents !== undefined) {
+      const totalEvents = existingEvents.length;
 
-      if (totalEvents < seed.length) {
+      if (totalEvents < v4InheritedCount) {
         throw new Error('CONFLICT: Session already exists in persistence with fewer events than seed. Mutation rejected.');
-      }
-
-      const prefixChecksum = computeSessionEventsChecksum(existingInspection.events.slice(0, seed.length));
-      if (prefixChecksum !== computedChecksum) {
-        throw new Error('CONFLICT: Session already exists in persistence with differing events/checksum at seed prefix. Mutation rejected.');
       }
 
       if (existingReceipt) {
@@ -2841,26 +3013,31 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         if (!receiptMatches) {
           throw new Error('CONFLICT: Seed import receipt already exists for session with differing metadata. Mutation rejected.');
         }
-      } else {
-        // Record receipt in receiptStore if missing
-        if (receiptStore && typeof receiptStore.recordSeedImportReceipt === 'function') {
-          try {
-            await receiptStore.recordSeedImportReceipt({
-              sessionId: sessionIdStr,
-              algorithm: 'sha256-session-events-v1',
-              checksum: computedChecksum,
-              canonicalBytes,
-              eventCount: seed.length,
-              importedAt: new Date().toISOString(),
-            });
-          } catch {}
-        }
+      }
+
+      const prefixChecksum = computeSessionEventsChecksum(existingEvents.slice(0, v4InheritedCount));
+      const v4SeedChecksum = computeSessionEventsChecksum(v4Seed);
+      if (prefixChecksum !== v4SeedChecksum) {
+        throw new Error('CONFLICT: Session already exists in persistence with differing events/checksum at seed prefix. Mutation rejected.');
+      }
+
+      if (!existingReceipt && receiptStore && typeof receiptStore.recordSeedImportReceipt === 'function') {
+        try {
+          await receiptStore.recordSeedImportReceipt({
+            sessionId: sessionIdStr,
+            algorithm: 'sha256-session-events-v1',
+            checksum: computedChecksum,
+            canonicalBytes,
+            eventCount: seed.length,
+            importedAt: new Date().toISOString(),
+          });
+        } catch {}
       }
 
       // Determine if followup turns have occurred past the initial seed
       let hasFollowupTurns = false;
-      for (let i = seed.length; i < totalEvents; i++) {
-        const ev = existingInspection.events[i];
+      for (let i = v4InheritedCount; i < totalEvents; i++) {
+        const ev = existingEvents[i];
         if (ev && (ev.type === 'turn/start' || ev.type === 'user/message')) {
           hasFollowupTurns = true;
           break;
@@ -2913,10 +3090,11 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     try {
       handle = await agentsRegistry.create({
         sessionId: sid,
-        meta: { cwd: spacePath },
-        seed,
+        meta: { cwd: spacePath, isSeeded: true },
+        seed: v4Seed,
+        inheritedEventCount: v4InheritedCount,
         agentOptions: { provider, model },
-        setup: async (agentCtx: Context) => {
+        setup: async (agentCtx: Context, _agent?: Agent) => {
           installModelSelection(agentCtx, selectionRef!);
           if (validatedProfile) {
             installAgentProfile(agentCtx, validatedProfile);
@@ -2964,7 +3142,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
               spacePath: resolvedSpacePath,
               spaceId: resolvedSpaceId,
               userId,
-            });
+            }, _agent);
             agentCtx.effect(() => {
               return () => {
                 try {
@@ -3290,7 +3468,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
         const contextMsg = createUserMessage({
           content: [{ type: 'text', text: attachmentGuidance }],
-          source: { kind: 'plugin', plugin: 'enkeep/attachments' },
+          source: { kind: 'user' },
         });
         currentAgent.inject(contextMsg);
       }
@@ -3302,7 +3480,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
         const contextMsg = createUserMessage({
           content: [{ type: 'text', text: replyGuidance }],
-          source: { kind: 'plugin', plugin: 'enkeep/reply-reference' },
+          source: { kind: 'user' },
         });
         currentAgent.inject(contextMsg);
       }

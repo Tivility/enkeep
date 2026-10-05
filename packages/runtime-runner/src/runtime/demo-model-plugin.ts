@@ -20,6 +20,7 @@ import {
   type LlmResolvedModelInfo,
   type StreamChunk,
   type Message,
+  type RequestMessage,
 } from '@deepseek-ai/dsh-llm';
 
 export const DEMO_PROVIDER_ID = 'demo-provider';
@@ -40,7 +41,7 @@ interface AgentInstructionSourcePayload {
   readonly plugin?: string;
 }
 
-function extractMessageContentText(msg: Message | undefined | null): string {
+function extractMessageContentText(msg: Message | RequestMessage | undefined | null): string {
   if (!msg || !msg.content) return '';
   if (typeof msg.content === 'string') return msg.content;
   if (Array.isArray(msg.content)) {
@@ -190,14 +191,22 @@ function parseInstructionSections(text: string): ParsedInstructionSection[] {
  * - Ignores regular user, assistant, and tool messages to prevent instruction token leakage.
  */
 export function computeEffectiveInstructionTokens(
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   system?: string
 ): string[] {
   const scopeTokensMap = new Map<string, Set<string>>();
   let systemTokens = new Set<string>();
 
-  if (typeof system === 'string') {
-    for (const t of extractInstructionTokens(system)) {
+  let effectiveSystem = system;
+  if (!effectiveSystem && Array.isArray(messages) && messages.length > 0) {
+    const firstMsg = messages[0];
+    if (firstMsg && firstMsg.role === 'system') {
+      effectiveSystem = extractMessageContentText(firstMsg).trim();
+    }
+  }
+
+  if (typeof effectiveSystem === 'string') {
+    for (const t of extractInstructionTokens(effectiveSystem)) {
       systemTokens.add(t);
     }
   }
@@ -311,7 +320,7 @@ export function computeEffectiveInstructionTokens(
   return Array.from(effectiveTokens).sort();
 }
 
-function isAgentInstructionUpdateMessage(msg: Message | undefined | null): boolean {
+function isAgentInstructionUpdateMessage(msg: Message | RequestMessage | undefined | null): boolean {
   if (!msg || typeof msg !== 'object') return false;
   const source = (msg as { source?: AgentInstructionSourcePayload }).source;
   if (!source || typeof source !== 'object') return false;
@@ -325,7 +334,7 @@ function isAgentInstructionUpdateMessage(msg: Message | undefined | null): boole
   return source.form === 'instructions';
 }
 
-function isAgentInstructionBaselineOrSystemMessage(msg: Message | undefined | null): boolean {
+function isAgentInstructionBaselineOrSystemMessage(msg: Message | RequestMessage | undefined | null): boolean {
   if (!msg || typeof msg !== 'object') return false;
   const source = (msg as { source?: AgentInstructionSourcePayload }).source;
   if (msg.role === 'system') return true;
@@ -508,10 +517,18 @@ export class DeterministicDemoLlmAdapter extends LlmAdapter {
    * Generates a deterministic response based on conversation history and call purpose.
    */
   private generateDeterministicResponse(
-    messages: readonly Message[],
+    messages: readonly RequestMessage[],
     purpose?: string,
     system?: string
   ): string {
+    let effectiveSystem = system;
+    if (!effectiveSystem && Array.isArray(messages) && messages.length > 0) {
+      const firstMsg = messages[0];
+      if (firstMsg && firstMsg.role === 'system') {
+        effectiveSystem = extractMessageContentText(firstMsg).trim();
+      }
+    }
+
     let userMsg: any = undefined;
     let userMsgIdx = -1;
     if (Array.isArray(messages)) {
@@ -526,7 +543,7 @@ export class DeterministicDemoLlmAdapter extends LlmAdapter {
               else if (b && typeof b === 'object' && typeof b.text === 'string') text += b.text;
             }
           }
-          if (m.source?.kind === 'user' && !text.startsWith('Current runtime context.')) {
+          if ((!m.source || m.source.kind === 'user') && !text.startsWith('Current runtime context.')) {
             userMsg = m;
             userMsgIdx = i;
             break;
@@ -578,19 +595,16 @@ export class DeterministicDemoLlmAdapter extends LlmAdapter {
       const currentTurnMessages = messages.slice(currentTurnStartIdx);
       for (const m of currentTurnMessages) {
         const msg = m as any;
-        if (msg && (msg.role === 'tool' || msg.source?.kind === 'tool' || (Array.isArray(msg.content) && msg.content.some((b: any) => b && (b.type === 'tool-result' || b.type === 'tool_result'))))) {
-          if (Array.isArray(msg.content)) {
+        if (msg && (msg.role === 'tool' || msg.source?.kind === 'tool')) {
+          const _callId = msg.toolCallId ?? msg.source?.callId;
+          if (typeof msg.content === 'string') {
+            toolResultsText += (toolResultsText ? ' ' : '') + msg.content;
+          } else if (Array.isArray(msg.content)) {
             for (const b of msg.content) {
-              if (b && (b.type === 'tool-result' || b.type === 'tool_result')) {
-                if (Array.isArray(b.content)) {
-                  for (const sub of b.content) {
-                    if (sub && typeof sub === 'object' && typeof sub.text === 'string') {
-                      toolResultsText += (toolResultsText ? ' ' : '') + sub.text;
-                    }
-                  }
-                } else if (typeof b.content === 'string') {
-                  toolResultsText += (toolResultsText ? ' ' : '') + b.content;
-                }
+              if (typeof b === 'string') {
+                toolResultsText += (toolResultsText ? ' ' : '') + b;
+              } else if (b && typeof b === 'object' && typeof b.text === 'string') {
+                toolResultsText += (toolResultsText ? ' ' : '') + b.text;
               }
             }
           }
@@ -633,7 +647,7 @@ export class DeterministicDemoLlmAdapter extends LlmAdapter {
     // Check for explicit test directive [enkeep-test-echo-instructions]
     // Faithfully handles DSH baseline and replacement semantics across historical and current agent-instructions:
     if (userText.includes('[enkeep-test-echo-instructions]')) {
-      const effectiveTokens = computeEffectiveInstructionTokens(messages, system);
+      const effectiveTokens = computeEffectiveInstructionTokens(messages, effectiveSystem);
       const tokensFormatted = effectiveTokens.length > 0 ? effectiveTokens.join(', ') : 'none';
 
       const effectiveText = toolResultsText ? `${userText} (Result: ${toolResultsText})` : userText;
@@ -744,11 +758,7 @@ export class DeterministicDemoLlmAdapter extends LlmAdapter {
     }
     const messagesSinceLastUser = lastUserIdx >= 0 ? options.messages.slice(lastUserIdx + 1) : options.messages;
     const toolResultsCount = messagesSinceLastUser.filter((m: any) => {
-      if (m.role === 'tool' || m.source?.kind === 'tool') return true;
-      if (Array.isArray(m.content)) {
-        return m.content.some((b: any) => b && (b.type === 'tool-result' || b.type === 'tool_result'));
-      }
-      return false;
+      return Boolean(m && (m.role === 'tool' || m.source?.kind === 'tool'));
     }).length;
 
     if (promptToolCalls.length > 0 && toolResultsCount < promptToolCalls.length) {
@@ -814,7 +824,12 @@ export class DeterministicDemoLlmAdapter extends LlmAdapter {
       };
     }
 
-    const text = this.generateDeterministicResponse(options.messages, options.purpose, options.system);
+    const effectiveSystem = options.system || (
+      Array.isArray(options.messages) && options.messages.length > 0 && options.messages[0]?.role === 'system'
+        ? extractMessageContentText(options.messages[0]).trim()
+        : undefined
+    );
+    const text = this.generateDeterministicResponse(options.messages, options.purpose, effectiveSystem);
 
     // Yield text block start
     yield {

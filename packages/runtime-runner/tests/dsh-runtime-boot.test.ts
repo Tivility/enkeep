@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import type { SessionEvent } from '@deepseek-ai/dsh-session';
+import { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session';
 import {
   bootDshRuntime,
   validateDshRuntimeBootConfig,
@@ -1117,5 +1117,280 @@ describe('Official DSH Runtime Boot & Followup Integration', () => {
     const turnResult = extractTurnResultFromEvents(sampleEvents as any);
     expect(turnResult.replyText).toBe('Final conclusion: All tests passed successfully.');
     expect(turnResult.isCancelled).toBe(false);
+  });
+
+  it('exports fork seed for synthetic v0 session migrated to v4 with developer/message and tool rounds, validating Session.create and succeeding in importSeed', async () => {
+    const aliceHome = path.join(tmpDir, 'alice-v0-fork', '.dsh');
+    const aliceSpaces = path.join(tmpDir, 'alice-v0-fork', 'spaces');
+    const sourceSessionId = 'ses_00000000000000000000000000000001';
+    const targetSessionId = 'ses_00000000000000000000000000000002';
+
+    // 1. Prepare synthetic v0 session on disk in _no-cwd directory
+    const sessionDir = path.join(aliceHome, 'sessions', '_no-cwd', sourceSessionId);
+    fs.mkdirSync(sessionDir, { recursive: true });
+
+    const v0Header = { type: 'session', version: 0, id: sourceSessionId, createdAt: 1700000000000, delegationDepth: 0 };
+    const v0Rows = [
+      v0Header,
+      { type: 'turn/start', seq: 0, time: 1700000000001, data: { turn: 1 } },
+      { type: 'step/start', seq: 1, time: 1700000000002, data: { turn: 1, step: 1 } },
+      {
+        type: 'request/header',
+        seq: 2,
+        time: 1700000000003,
+        data: {
+          header: {
+            config: { provider: 'deepseek', model: 'deepseek-chat' },
+            system: 'You are a helpful assistant.',
+          },
+          reason: 'initial',
+        },
+      },
+      {
+        type: 'user/message',
+        seq: 3,
+        time: 1700000000004,
+        surfaceOp: 'append',
+        data: {
+          role: 'user',
+          id: 'msg_00000000000000000000000000000001',
+          content: [{ type: 'text', text: 'Hello from synthetic v0 session.' }],
+          source: { kind: 'user' },
+        },
+      },
+      {
+        type: 'assistant/message',
+        seq: 4,
+        time: 1700000000005,
+        surfaceOp: 'append',
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'assistant',
+            id: 'msg_00000000000000000000000000000002',
+            content: [{ type: 'text', text: 'Hello! How can I assist you today?' }],
+            source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+          },
+        },
+      },
+      { type: 'step/end', seq: 5, time: 1700000000006, data: { turn: 1, step: 1 } },
+      { type: 'turn/end', seq: 6, time: 1700000000007, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    fs.writeFileSync(path.join(sessionDir, 'session.jsonl'), v0Rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+    // 2. Boot genuine runtime and load session (triggers v0 -> v4 migration and appends session/end-seed)
+    const runtime = await bootDshRuntime({
+      userId: 'alice',
+      dshHome: aliceHome,
+      spacesDir: aliceSpaces,
+      llmEnabled: false,
+    });
+
+    try {
+      const agent = await runtime.getOrCreateAgent(sourceSessionId);
+      const session = agent.session;
+
+      // Verify that migration inserted session/end-seed
+      const hasEndSeed = session.log.some((ev) => ev.type === 'session/end-seed');
+      expect(hasEndSeed).toBe(true);
+
+      // 3. Append Turn 2 after migration: request/header + developer/message + tool rounds
+      session.append('turn/start', { turn: 2 });
+      session.append('step/start', { turn: 2, step: 1 });
+      const reqHeader = session.append('request/header', {
+        header: {
+          config: { provider: 'deepseek', model: 'deepseek-chat' },
+          tools: [{
+            name: 'synthetic_tool',
+            description: 'A synthetic tool for testing fork renumbering',
+            parameters: { type: 'object', properties: { input: { type: 'string' } } },
+          }],
+        },
+        reason: 'change',
+      });
+
+      const devMsg = session.append('developer/message', {
+        turn: 2,
+        step: 1,
+        headerSeq: reqHeader.seq,
+        message: {
+          role: 'developer',
+          id: 'msg_00000000000000000000000000000003',
+          content: [{ type: 'tool-addition', toolName: 'synthetic_tool' }],
+          source: { kind: 'tool-registry' },
+        },
+      }, { surfaceOp: 'append' });
+      expect((devMsg.data as any).headerSeq).toBe(reqHeader.seq);
+
+      session.append('tool/call', {
+        turn: 2,
+        step: 1,
+        callId: 'call_00000000000000000000000000000001',
+        name: 'synthetic_tool',
+        arguments: JSON.stringify({ input: 'status' }),
+      });
+
+      session.append('tool/result', {
+        turn: 2,
+        step: 1,
+        message: {
+          role: 'tool',
+          id: 'msg_00000000000000000000000000000004',
+          toolCallId: 'call_00000000000000000000000000000001',
+          content: [{ type: 'text', text: 'synthetic tool result' }],
+          source: { kind: 'tool', callId: 'call_00000000000000000000000000000001' },
+        },
+      }, { surfaceOp: 'append' });
+
+      session.append('assistant/message', {
+        turn: 2,
+        step: 1,
+        message: {
+          role: 'assistant',
+          id: 'msg_00000000000000000000000000000005',
+          content: [{ type: 'text', text: 'Synthetic tool execution completed.' }],
+          source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+        },
+        stream: [],
+      }, { surfaceOp: 'append' });
+
+      session.append('step/end', { turn: 2, step: 1 });
+      session.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+
+      // 4. exportForkSeed must succeed, remapping headerSeq and validating through Session.create
+      const exportResult = await runtime.exportForkSeed(sourceSessionId);
+      expect(exportResult).toBeDefined();
+      expect(exportResult.events.length).toBeGreaterThan(0);
+
+      // Verify Session.create validation passes explicitly
+      expect(() => {
+        Session.create(SessionId(sourceSessionId), exportResult.events);
+      }).not.toThrow();
+
+      // Verify that headerSeq in exported developer/message was remapped to the renumbered request/header seq
+      const exportedReqHeader = exportResult.events.find((ev) => ev.type === 'request/header' && (ev.data as any)?.header?.tools?.length > 0);
+      const exportedDevMsg = exportResult.events.find((ev) => ev.type === 'developer/message');
+      expect(exportedReqHeader).toBeDefined();
+      expect(exportedDevMsg).toBeDefined();
+      expect((exportedDevMsg!.data as any).headerSeq).toBe(exportedReqHeader!.seq);
+      expect((exportedDevMsg!.data as any).headerSeq).toBeLessThan(exportedDevMsg!.seq);
+
+      // 5. importSeed into a new session succeeds
+      const importResult = await runtime.importSeed(targetSessionId, exportResult.events, exportResult.receipt, null);
+      expect(importResult.sessionId).toBe(targetSessionId);
+      expect(importResult.persisted).toBe(true);
+      expect(importResult.duplicate).toBe(false);
+      expect(importResult.eventsCount).toBe(exportResult.events.length);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('exports fork seed for a pure-v4 session with tool rounds, passes Session.create validation, and succeeds in importSeed', async () => {
+    const aliceHome = path.join(tmpDir, 'alice-v4-fork', '.dsh');
+    const aliceSpaces = path.join(tmpDir, 'alice-v4-fork', 'spaces');
+    const sourceSessionId = 'ses_00000000000000000000000000000010';
+    const targetSessionId = 'ses_00000000000000000000000000000020';
+
+    const runtime = await bootDshRuntime({
+      userId: 'alice',
+      dshHome: aliceHome,
+      spacesDir: aliceSpaces,
+      llmEnabled: false,
+    });
+
+    try {
+      const agent = await runtime.getOrCreateAgent(sourceSessionId);
+      const session = agent.session;
+
+      session.append('turn/start', { turn: 1 });
+      session.append('step/start', { turn: 1, step: 1 });
+      const reqHeader = session.append('request/header', {
+        header: {
+          config: { provider: 'deepseek', model: 'deepseek-chat' },
+          tools: [{
+            name: 'v4_tool',
+            description: 'Pure-v4 test tool',
+            parameters: { type: 'object', properties: { q: { type: 'string' } } },
+          }],
+        },
+        reason: 'initial',
+      });
+
+      const devMsg = session.append('developer/message', {
+        turn: 1,
+        step: 1,
+        headerSeq: reqHeader.seq,
+        message: {
+          role: 'developer',
+          id: 'msg_00000000000000000000000000000011',
+          content: [{ type: 'tool-addition', toolName: 'v4_tool' }],
+          source: { kind: 'tool-registry' },
+        },
+      }, { surfaceOp: 'append' });
+      expect((devMsg.data as any).headerSeq).toBe(reqHeader.seq);
+
+      session.append('user/message', {
+        role: 'user',
+        id: 'msg_00000000000000000000000000000012',
+        content: [{ type: 'text', text: 'Run v4 tool query.' }],
+        source: { kind: 'user' },
+      }, { surfaceOp: 'append' });
+
+      session.append('tool/call', {
+        turn: 1,
+        step: 1,
+        callId: 'call_00000000000000000000000000000011',
+        name: 'v4_tool',
+        arguments: JSON.stringify({ q: 'check' }),
+      });
+
+      session.append('tool/result', {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'tool',
+          id: 'msg_00000000000000000000000000000013',
+          toolCallId: 'call_00000000000000000000000000000011',
+          content: [{ type: 'text', text: 'v4 result ok' }],
+          source: { kind: 'tool', callId: 'call_00000000000000000000000000000011' },
+        },
+      }, { surfaceOp: 'append' });
+
+      session.append('assistant/message', {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'assistant',
+          id: 'msg_00000000000000000000000000000014',
+          content: [{ type: 'text', text: 'Finished v4 round.' }],
+          source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+        },
+        stream: [],
+      }, { surfaceOp: 'append' });
+
+      session.append('step/end', { turn: 1, step: 1 });
+      session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+
+      // Export fork seed
+      const exportResult = await runtime.exportForkSeed(sourceSessionId);
+      expect(exportResult).toBeDefined();
+      expect(exportResult.events.length).toBeGreaterThan(0);
+
+      // Validate Session.create passes
+      expect(() => {
+        Session.create(SessionId(sourceSessionId), exportResult.events);
+      }).not.toThrow();
+
+      // Import seed into new session
+      const importResult = await runtime.importSeed(targetSessionId, exportResult.events, exportResult.receipt, null);
+      expect(importResult.sessionId).toBe(targetSessionId);
+      expect(importResult.persisted).toBe(true);
+      expect(importResult.duplicate).toBe(false);
+      expect(importResult.eventsCount).toBe(exportResult.events.length);
+    } finally {
+      await runtime.dispose();
+    }
   });
 });

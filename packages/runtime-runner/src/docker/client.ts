@@ -2419,12 +2419,23 @@ export class SafeDockerClient {
     // Derive canonical session file path internally
     const pKey = projectKey('/home/dsh/spaces');
     const seg = encodeSessionSegment(sessionId);
-    const canonicalPath = `/home/dsh/.dsh/sessions/${pKey}/${seg}/session.jsonl`;
+    const sessionDir = `/home/dsh/.dsh/sessions/${pKey}/${seg}`;
+    const canonicalPath = `${sessionDir}/session.v4.jsonl`;
 
     const nodeScript = `
 const fs = require('node:fs');
-const filePath = process.argv.slice(1).find((a) => a !== '[eval]') || '';
-if (!filePath || !filePath.startsWith('/home/dsh/.dsh/sessions/') || !filePath.endsWith('/session.jsonl') || filePath.includes('..')) {
+const targetArg = process.argv.slice(1).find((a) => a !== '[eval]') || '';
+let filePath = targetArg;
+if (!filePath || !filePath.startsWith('/home/dsh/.dsh/sessions/') || filePath.includes('..')) {
+  process.exit(10);
+}
+if (!fs.existsSync(filePath)) {
+  const v0Path = filePath.replace(/\\/session\\.v4\\.jsonl$/, '/session.jsonl');
+  if (fs.existsSync(v0Path)) {
+    filePath = v0Path;
+  }
+}
+if (!/\\/session(\\.v4)?\\.jsonl$/.test(filePath)) {
   process.exit(10);
 }
 let stat;

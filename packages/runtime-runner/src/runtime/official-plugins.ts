@@ -60,7 +60,18 @@ export { LocalSubprocess };
 import * as ToolFsSearchPlugin from '@deepseek-ai/dsh-tool-fs-search';
 import * as ShellEnvPlugin from '@deepseek-ai/dsh-shell-env';
 import { LocalBashExecutor } from '@deepseek-ai/dsh-bash-local';
-import type { ShellExecRequest, ShellExecSpec } from '@deepseek-ai/dsh-shell';
+import type {
+  ShellExecRequest,
+  ShellExecSpec,
+  ShellExecution,
+  ShellProcessRead,
+  ShellRunResult,
+} from '@deepseek-ai/dsh-shell';
+import type {
+  SubprocessOutputReader,
+  SubprocessOutputRead,
+} from '@deepseek-ai/dsh-subprocess';
+import type { Volatile, VolatileSnapshot } from '@deepseek-ai/cordis';
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox';
 import * as ToolBashPlugin from '@deepseek-ai/dsh-tool-bash';
 import LocalJobsPlugin from '@deepseek-ai/dsh-jobs-local';
@@ -566,7 +577,7 @@ export class InstructionsFileSystem extends LocalFileSystem {
     if (!isAllowed) {
       throw new FsError(
         `Access denied: path "${filePath}" resolves outside instructions boundary`,
-        'FS_SANDBOX_DENIED'
+        'FS_NOT_FOUND'
       );
     }
     return target;
@@ -645,7 +656,7 @@ export class InstructionsFileSystem extends LocalFileSystem {
           if (!allowedMissing) {
             throw new FsError(
               `Access denied: lstat path "${filePath}" is outside space boundary "${cwd}"`,
-              'FS_SANDBOX_DENIED'
+              'FS_NOT_FOUND'
             );
           }
         }
@@ -682,7 +693,7 @@ export class InstructionsFileSystem extends LocalFileSystem {
     if (!isCandidateAllowed) {
       throw new FsError(
         `Access denied: lstat path "${filePath}" resolves outside space boundary "${cwd}"`,
-        'FS_SANDBOX_DENIED'
+        'FS_NOT_FOUND'
       );
     }
 
@@ -691,15 +702,36 @@ export class InstructionsFileSystem extends LocalFileSystem {
 }
 
 export interface SpaceIsolatedBashConfig {
-  cwd?: string;
+  cwd?: string | Volatile<string | undefined>;
   mounts?: readonly ResolvedRuntimeMount[];
   /** DSH home; always denied for shell workdir resolution. */
   dshHome?: string;
-  timeoutMs?: number;
-  maxTimeoutMs?: number;
-  maxOutputBytes?: number;
-  maxSpillBytes?: number;
-  graceMs?: number;
+  timeoutMs?: number | Volatile<number>;
+  maxTimeoutMs?: number | Volatile<number>;
+  maxOutputBytes?: number | Volatile<number>;
+  maxSpillBytes?: number | Volatile<number>;
+  graceMs?: number | Volatile<number>;
+}
+
+export namespace SpaceIsolatedBashExecutor {
+  export type Config = SpaceIsolatedBashConfig;
+}
+
+function toVolatile<T>(val: T | Volatile<T> | undefined, fallback: T): Volatile<T> {
+  if (val !== undefined && typeof val === 'object' && val !== null && 'get' in val && typeof (val as any).get === 'function') {
+    return val as Volatile<T>;
+  }
+  const current = (val !== undefined ? val : fallback) as VolatileSnapshot<T>;
+  return {
+    get: () => current,
+  };
+}
+
+function unwrapVolatile<T>(val: T | Volatile<T> | undefined): T | undefined {
+  if (val !== undefined && typeof val === 'object' && val !== null && 'get' in val && typeof (val as any).get === 'function') {
+    return (val as Volatile<T>).get() as T;
+  }
+  return val as T | undefined;
 }
 
 /**
@@ -714,16 +746,17 @@ export class SpaceIsolatedBashExecutor extends LocalBashExecutor {
   constructor(ctx: Context, config: SpaceIsolatedBashConfig) {
     const { mounts, dshHome: bashDshHome, ...baseConfig } = config || {};
     super(ctx, {
-      cwd: baseConfig.cwd ?? process.cwd(),
-      timeoutMs: baseConfig.timeoutMs ?? 60000,
-      maxTimeoutMs: baseConfig.maxTimeoutMs ?? 600000,
-      maxOutputBytes: baseConfig.maxOutputBytes ?? 64000,
-      maxSpillBytes: baseConfig.maxSpillBytes ?? 64 * 1024 * 1024,
-      graceMs: baseConfig.graceMs ?? 3000,
+      cwd: toVolatile(baseConfig.cwd, process.cwd()),
+      timeoutMs: toVolatile(baseConfig.timeoutMs, 60000),
+      maxTimeoutMs: toVolatile(baseConfig.maxTimeoutMs, 600000),
+      maxOutputBytes: toVolatile(baseConfig.maxOutputBytes, 64000),
+      maxSpillBytes: toVolatile(baseConfig.maxSpillBytes, 64 * 1024 * 1024),
+      graceMs: toVolatile(baseConfig.graceMs, 3000),
     });
     this.spaceBashConfig = config || {};
+    const effectiveCwd = unwrapVolatile(this.spaceBashConfig.cwd) ?? this.config.cwd.get() ?? process.cwd();
     this.mountResolver = new VirtualMountResolver(
-      this.spaceBashConfig.cwd ?? this.config.cwd ?? process.cwd(),
+      effectiveCwd,
       this.spaceBashConfig.mounts,
       { deniedRoots: bashDshHome ? [bashDshHome] : [] }
     );
@@ -782,23 +815,70 @@ export class SpaceIsolatedBashExecutor extends LocalBashExecutor {
     };
   }
 
-  override async run(spec: ShellExecSpec) {
-    const outcome = await super.run(spec);
-    let stdoutText = outcome.stdout?.text ?? '';
-    let stderrText = outcome.stderr?.text ?? '';
+  override async execute(spec: ShellExecSpec): Promise<ShellExecution> {
+    const execution = await super.execute(spec);
+    return this.wrapSanitizedExecution(execution);
+  }
 
-    stdoutText = this.mountResolver.sanitizeText(stdoutText);
-    stderrText = this.mountResolver.sanitizeText(stderrText);
+  async run(spec: ShellExecSpec): Promise<ShellRunResult> {
+    const execution = await this.execute(spec);
+    return execution.result();
+  }
+
+  private wrapSanitizedExecution(execution: ShellExecution): ShellExecution {
+    const wrapReader = (reader: SubprocessOutputReader): SubprocessOutputReader => ({
+      readFrom: (fromByte: number): SubprocessOutputRead => {
+        const read = reader.readFrom(fromByte);
+        return {
+          ...read,
+          text: this.mountResolver.sanitizeText(read.text),
+        };
+      },
+    });
 
     return {
-      ...outcome,
-      stdout: {
-        ...outcome.stdout,
-        text: stdoutText,
+      get status() {
+        return execution.status;
       },
-      stderr: {
-        ...outcome.stderr,
-        text: stderrText,
+      get exitCode() {
+        return execution.exitCode;
+      },
+      get signal() {
+        return execution.signal;
+      },
+      get done() {
+        return execution.done;
+      },
+      get sandbox() {
+        return execution.sandbox;
+      },
+      readOutput: (): ShellProcessRead => {
+        const read = execution.readOutput();
+        return {
+          ...read,
+          delta: this.mountResolver.sanitizeText(read.delta),
+        };
+      },
+      observed: {
+        stdout: wrapReader(execution.observed.stdout),
+        stderr: wrapReader(execution.observed.stderr),
+      },
+      kill: (): boolean => {
+        return execution.kill();
+      },
+      result: async (): Promise<ShellRunResult> => {
+        const outcome = await execution.result();
+        return {
+          ...outcome,
+          stdout: {
+            ...outcome.stdout,
+            text: this.mountResolver.sanitizeText(outcome.stdout.text),
+          },
+          stderr: {
+            ...outcome.stderr,
+            text: this.mountResolver.sanitizeText(outcome.stderr.text),
+          },
+        };
       },
     };
   }
@@ -996,7 +1076,7 @@ export async function mountWorkspaceTools(
     fibers.push(spillStoreFiber);
 
     const spillPolicyFiber = await agentCtx.plugin(SpillPolicyPlugin, {
-      maxInlineBytes: 50000,
+      maxInlineTokens: 12500,
     });
     fibers.push(spillPolicyFiber);
 

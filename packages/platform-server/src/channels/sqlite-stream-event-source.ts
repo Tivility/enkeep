@@ -118,27 +118,107 @@ export class SqliteStreamEventSource implements StreamEventSource {
     }) as unknown as StreamAssistantEvent[];
   }
 
-  async resolveTurnOrigin(turnId: string): Promise<ChannelTurnOrigin | null> {
+  async resolveTurnOrigin(
+    turnId: string,
+    sessionRouteId?: string
+  ): Promise<ChannelTurnOrigin | null> {
+    return this.resolveTurnOriginRecursive(turnId, sessionRouteId, new Set<string>(), 0);
+  }
+
+  private resolveTurnOriginRecursive(
+    turnId: string,
+    sessionRouteId: string | undefined,
+    visited: Set<string>,
+    depth: number
+  ): ChannelTurnOrigin | null {
     if (!turnId || typeof turnId !== 'string') return null;
+    const trimmedTurnId = turnId.trim();
+    if (!trimmedTurnId) return null;
+
+    if (depth >= 8) return null;
+    if (visited.has(trimmedTurnId)) return null;
+    visited.add(trimmedTurnId);
+
     const row = this.db
       .prepare('SELECT * FROM channel_turn_origins WHERE turn_id = ? LIMIT 1')
-      .get(turnId) as any;
-    if (!row) return null;
-    return {
-      turnId: row.turn_id,
-      userId: row.user_id,
-      sessionId: row.session_id,
-      accountId: row.account_id,
-      channel: row.channel,
-      chatId: row.chat_id,
-      nativeContextId: row.native_context_id,
-      nativeEventId: row.native_event_id ?? null,
-      replyToMessageId: row.reply_to_message_id ?? null,
-      rootId: row.root_id ?? null,
-      threadId: row.thread_id ?? null,
-      originTurnId: row.origin_turn_id ?? null,
-      createdAt: row.created_at,
-    };
+      .get(trimmedTurnId) as any;
+    if (row) {
+      if (sessionRouteId && row.session_id !== sessionRouteId) {
+        return null;
+      }
+      return {
+        turnId: row.turn_id,
+        userId: row.user_id,
+        sessionId: row.session_id,
+        accountId: row.account_id,
+        channel: row.channel,
+        chatId: row.chat_id,
+        nativeContextId: row.native_context_id,
+        nativeEventId: row.native_event_id ?? null,
+        replyToMessageId: row.reply_to_message_id ?? null,
+        rootId: row.root_id ?? null,
+        threadId: row.thread_id ?? null,
+        originTurnId: row.origin_turn_id ?? null,
+        createdAt: row.created_at,
+      };
+    }
+
+    const eventRow = (
+      sessionRouteId
+        ? this.db
+            .prepare(
+              `SELECT session_id,
+                      COALESCE(
+                        json_extract(payload, '$.originTurnId'),
+                        json_extract(payload, '$.origin_turn_id')
+                      ) AS origin_turn_id
+               FROM web_events
+               WHERE session_id = ?
+                 AND json_valid(payload) = 1
+                 AND (
+                   json_extract(payload, '$.turnId') = ?
+                   OR json_extract(payload, '$.turn_id') = ?
+                 )
+                 AND (
+                   (json_extract(payload, '$.originTurnId') IS NOT NULL AND json_extract(payload, '$.originTurnId') != '')
+                   OR (json_extract(payload, '$.origin_turn_id') IS NOT NULL AND json_extract(payload, '$.origin_turn_id') != '')
+                 )
+               ORDER BY rowid DESC
+               LIMIT 1`
+            )
+            .get(sessionRouteId, trimmedTurnId, trimmedTurnId)
+        : this.db
+            .prepare(
+              `SELECT session_id,
+                      COALESCE(
+                        json_extract(payload, '$.originTurnId'),
+                        json_extract(payload, '$.origin_turn_id')
+                      ) AS origin_turn_id
+               FROM web_events
+               WHERE json_valid(payload) = 1
+                 AND (
+                   json_extract(payload, '$.turnId') = ?
+                   OR json_extract(payload, '$.turn_id') = ?
+                 )
+                 AND (
+                   (json_extract(payload, '$.originTurnId') IS NOT NULL AND json_extract(payload, '$.originTurnId') != '')
+                   OR (json_extract(payload, '$.origin_turn_id') IS NOT NULL AND json_extract(payload, '$.origin_turn_id') != '')
+                 )
+               ORDER BY rowid DESC
+               LIMIT 1`
+            )
+            .get(trimmedTurnId, trimmedTurnId)
+    ) as { session_id?: string; origin_turn_id?: string } | undefined;
+
+    if (!eventRow || typeof eventRow.origin_turn_id !== 'string') {
+      return null;
+    }
+
+    const nextOriginTurnId = eventRow.origin_turn_id.trim();
+    if (!nextOriginTurnId) return null;
+
+    const effectiveSessionId = sessionRouteId ?? eventRow.session_id;
+    return this.resolveTurnOriginRecursive(nextOriginTurnId, effectiveSessionId, visited, depth + 1);
   }
 
   async getPlatformTurnState(

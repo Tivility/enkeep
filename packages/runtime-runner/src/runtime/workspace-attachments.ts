@@ -10,7 +10,7 @@ import {
   type ImageAttachmentLimits,
   type ImageAttachmentRef,
   type ImageMediaType,
-  type ImageRequestPolicy,
+  type ImageRequestTarget,
   type RequestImageAttachment,
   type SaveImageAttachment,
   type StoredImageAttachment,
@@ -413,12 +413,12 @@ export class WorkspaceAttachmentStore extends AttachmentStore {
 
   override async readImageRequest(
     ref: ImageAttachmentRef,
-    policy: ImageRequestPolicy,
+    target: ImageRequestTarget,
     signal?: AbortSignal
   ): Promise<RequestImageAttachment> {
     signal?.throwIfAborted();
     const stored = await this.readImage(ref, signal);
-    const variantId = ImageVariantId(`req:${String(ref.attachmentId)}:${policy.maxPixels}:${policy.maxBytes}`);
+    const variantId = ImageVariantId(`req:${String(ref.attachmentId)}:${target.width}x${target.height}:${target.maxBytes}`);
     return {
       variantId,
       attachment: ref,

@@ -222,7 +222,7 @@ describe('dsh-boot inline attachment extraction and nonce fence prompt injection
       const events = agent.session.snapshotEvents();
 
       const attMsgEvent = events.find(
-        (e) => e.type === 'user/message' && (e.data as any).source?.plugin === 'enkeep/attachments'
+        (e) => e.type === 'user/message' && JSON.stringify((e.data as any).content).includes('Bank Statement')
       );
       expect(attMsgEvent).toBeDefined();
 

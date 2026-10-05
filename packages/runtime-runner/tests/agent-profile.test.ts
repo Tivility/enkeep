@@ -367,15 +367,15 @@ describe('Official DSH Agent Profile Runtime Integration', () => {
       // Verify sections presence
       const sectionNames = assembly.sections.map((s) => s.name);
       expect(sectionNames).toContain('harness:identity');
-      expect(sectionNames).toContain('deployment:persona');
+      expect(sectionNames).toContain('deployment:persona-prefix');
       expect(sectionNames).toContain(PROFILE_SECTION_NAMES.identity);
       expect(sectionNames).toContain(PROFILE_SECTION_NAMES.soul);
       expect(sectionNames).toContain(PROFILE_SECTION_NAMES.agents);
       expect(sectionNames).toContain(PROFILE_SECTION_NAMES.tools);
 
-      // Verify ordering: harness:identity (-100) -> deployment:persona (0) -> profile:identity (10) -> profile:soul (20) -> profile:agents (30) -> profile:tools (40)
+      // Verify ordering: harness:identity (-100) -> deployment:persona-prefix (0) -> profile:identity (10) -> profile:soul (20) -> profile:agents (30) -> profile:tools (40)
       const harnessIdx = sectionNames.indexOf('harness:identity');
-      const personaIdx = sectionNames.indexOf('deployment:persona');
+      const personaIdx = sectionNames.indexOf('deployment:persona-prefix');
       const identityIdx = sectionNames.indexOf(PROFILE_SECTION_NAMES.identity);
       const soulIdx = sectionNames.indexOf(PROFILE_SECTION_NAMES.soul);
       const agentsIdx = sectionNames.indexOf(PROFILE_SECTION_NAMES.agents);

@@ -20,7 +20,7 @@ import {
   loadLarkTestCredentials,
   LARK_TEST_SPACE_FOLDER,
 } from './utils/lark-credentials.js';
-import { findRepoRoot, getDemoPathConfig } from './config.js';
+import { findRepoRoot, getDemoPathConfig, validateResourceSuffix } from './config.js';
 import { loadDshDeploymentConfig } from '@enkeep/runtime-runner';
 import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
 import { DatabaseSync } from 'node:sqlite';
@@ -52,6 +52,7 @@ COMMANDS:
 OPTIONS:
   --port <number>             Fixed loopback Platform port for up (default dynamic)
   --network-mode <mode>       Container network mode: "none" (default) or "bridge"
+  --resource-suffix <suffix>  Resource suffix for Docker containers and volumes (or env ENKEEP_RESOURCE_SUFFIX)
   --lark-test-credentials <f> Path to Lark test credentials file (0600 mode)
   --json                      Output results as JSON (errors omit stack trace)
   --remove-vols               Remove demo Docker volumes on teardown
@@ -166,6 +167,53 @@ export function parseContainerNetworkMode(
   return trimmed as import('@enkeep/runtime-runner').RuntimeNetworkMode;
 }
 
+/**
+ * Parses and validates resource suffix from CLI arguments or environment variables.
+ * Priority: CLI `--resource-suffix <suffix>` > env `ENKEEP_RESOURCE_SUFFIX` > undefined.
+ * Validated by existing `validateResourceSuffix`.
+ */
+export function parseResourceSuffix(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  let rawSuffix: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--resource-suffix') {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        throw new Error('Safety Violation: --resource-suffix requires a valid suffix string.');
+      }
+      rawSuffix = next;
+      break;
+    } else if (arg.startsWith('--resource-suffix=')) {
+      const val = arg.slice('--resource-suffix='.length);
+      if (!val) {
+        throw new Error('Safety Violation: --resource-suffix requires a valid suffix string.');
+      }
+      rawSuffix = val;
+      break;
+    }
+  }
+
+  if (rawSuffix === undefined && env.ENKEEP_RESOURCE_SUFFIX !== undefined && env.ENKEEP_RESOURCE_SUFFIX !== '') {
+    rawSuffix = env.ENKEEP_RESOURCE_SUFFIX;
+  }
+
+  if (rawSuffix === undefined) {
+    return undefined;
+  }
+
+  const trimmed = rawSuffix.trim();
+  if (trimmed === '') {
+    throw new Error('Safety Violation: --resource-suffix cannot be empty.');
+  }
+
+  validateResourceSuffix(trimmed);
+  return trimmed;
+}
+
 export async function getStatus(options?: DemoStatusOptions | string): Promise<DemoStatusResult> {
   const pathOptions: DemoPathOptions = typeof options === 'string' ? { repoRoot: options } : (options ?? {});
   const processes = listSignedProcesses(pathOptions);
@@ -254,12 +302,14 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         const platformPort = parsePlatformPort(args);
         const larkTestCredentialsFile = parseLarkTestCredentialsPath(args);
         const containerNetworkMode = parseContainerNetworkMode(args);
+        const resourceSuffix = parseResourceSuffix(args);
         const system = await launchDemoSystem({
           repoRoot,
           allowHostRuntime,
           platformPort,
           larkTestCredentialsFile,
           containerNetworkMode,
+          resourceSuffix,
         });
         const dshConfig = loadDshDeploymentConfig();
         const isLlmConfigured = Boolean(

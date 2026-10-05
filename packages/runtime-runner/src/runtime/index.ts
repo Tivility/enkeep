@@ -18,6 +18,7 @@ export * from './daemon-journal.js';
 export * from './daemon.js';
 export * from './daemon-cli.js';
 export * from './daemon-bridge.js';
+export * from './session-premigrate.js';
 export {
   acquireSessionLock,
   deriveSafeLockPath,

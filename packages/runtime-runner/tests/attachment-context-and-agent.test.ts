@@ -98,7 +98,7 @@ describe('Runtime Agent Attachment Context & Execution', () => {
 
       // 1. Verify synthetic attachment context user/message injected before human user message
       const attMsgEvent = events.find(
-        (e) => e.type === 'user/message' && (e.data as any).source?.plugin === 'enkeep/attachments'
+        (e) => e.type === 'user/message' && JSON.stringify((e.data as any).content).includes('.attachments/')
       );
       expect(attMsgEvent).toBeDefined();
       const attText = JSON.stringify((attMsgEvent!.data as any).content);
@@ -106,7 +106,7 @@ describe('Runtime Agent Attachment Context & Execution', () => {
       expect(attText).toContain('Audit Report');
 
       // 2. Verify user message contains original text
-      const userMsgEvent = events.find((e) => e.type === 'user/message' && (e.data as any).source?.kind === 'user');
+      const userMsgEvent = events.findLast((e) => e.type === 'user/message' && (e.data as any).source?.kind === 'user');
       expect(userMsgEvent).toBeDefined();
       const userMsgData = userMsgEvent!.data as any;
       const textBlock = userMsgData.content.find((c: any) => c.type === 'text');
@@ -250,7 +250,7 @@ describe('Runtime Agent Attachment Context & Execution', () => {
       const events = resumedAgent.session.snapshotEvents();
 
       const attMsgEvent = events.find(
-        (e) => e.type === 'user/message' && (e.data as any).source?.plugin === 'enkeep/attachments'
+        (e) => e.type === 'user/message' && JSON.stringify((e.data as any).content).includes('.attachments/')
       );
       expect(attMsgEvent).toBeDefined();
       const attText = JSON.stringify((attMsgEvent!.data as any).content);

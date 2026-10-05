@@ -200,6 +200,7 @@ export function compileSeed(
         data: {
           turn,
           step: 1,
+          stream: [],
           message: {
             id: messageIdFor(chatJid, row.id),
             role: 'assistant',
@@ -246,7 +247,7 @@ export function compileSeed(
       type: 'session/end-seed',
       seq,
       time,
-      data: {},
+      data: { inherited: true },
     })
   }
 

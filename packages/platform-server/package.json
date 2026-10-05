@@ -42,7 +42,7 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cordis": "^4.0.4",
     "@types/busboy": "^1.5.4",
     "@types/node": "^26.2.0",
     "typescript": "^5.9.0",

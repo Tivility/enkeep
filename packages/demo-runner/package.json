@@ -59,8 +59,8 @@
     "@enkeep/web-ui": "workspace:*"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-user-approval": "0.1.2-rc.1",
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-user-approval": "0.2.0-rc.2",
     "@enkeep/backup-restore": "workspace:*",
     "@enkeep/dsh-external-interaction": "workspace:*",
     "@enkeep/dsh-mcp-governance": "workspace:*",
