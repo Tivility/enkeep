@@ -15557,12 +15557,11 @@ async function loadSessions(spaceId) {
         // Ignore sessionStorage access error in restricted environment
       }
 
-      // Preserve user choice (active or archived) valid in selected space; canonical first ONLY on normal initial open
+      // Preserve user choice (active or archived) valid in selected space; most recent activity first on normal initial open
       const userChoiceSession = (state.currentSessionId && state.sessions.find((s) => s.id === state.currentSessionId)) ||
         (savedSessionId && state.sessions.find((s) => s.id === savedSessionId));
 
-      const canonicalSession = canonicalId ? state.sessions.find((s) => s.id === canonicalId) : null;
-      const targetSession = userChoiceSession || canonicalSession || state.sessions[0];
+      const targetSession = userChoiceSession || state.sessions[0];
 
       selectSession(targetSession.id);
     } else if (spaceId && !state.showArchivedSessions && !state.currentSessionId) {

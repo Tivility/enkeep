@@ -54,6 +54,7 @@ export interface PublicSpace {
   readonly canonicalSessionId?: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly lastActivityAt?: string;
   readonly profileBinding?: PublicProfileBinding | null;
 }
 
@@ -72,6 +73,7 @@ export interface PublicSession {
   readonly currentGeneration: number;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly lastActivityAt?: string;
 }
 
 /**

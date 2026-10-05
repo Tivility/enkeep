@@ -329,18 +329,48 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
   // --- Spaces APIs ---
 
   async listSpaces(userId: string, options?: { includeArchived?: boolean; status?: LifecycleStatus }): Promise<PublicSpace[]> {
-    const result: PublicSpace[] = [];
+    const rawSpaces: Space[] = [];
     for (const space of this.spaces.values()) {
       if (space.userId === userId) {
         if (options?.status) {
           if (space.status === options.status) {
-            result.push(this.toPublicSpace(space));
+            rawSpaces.push(space);
           }
         } else if (options?.includeArchived || space.status !== 'archived') {
-          result.push(this.toPublicSpace(space));
+          rawSpaces.push(space);
         }
       }
     }
+
+    const spaceMaxMap = new Map<string, string>();
+    for (const route of this.sessionRoutes.values()) {
+      if (route.userId === userId && route.status !== 'deleted') {
+        const msgs = this.messages.get(route.id) || [];
+        let maxMsg: string | undefined;
+        for (const m of msgs) {
+          if (!maxMsg || new Date(m.createdAt).getTime() > new Date(maxMsg).getTime()) {
+            maxMsg = m.createdAt;
+          }
+        }
+        const sAct = maxMsg || route.updatedAt || route.createdAt;
+        const curMax = spaceMaxMap.get(route.spaceId);
+        if (!curMax || new Date(sAct).getTime() > new Date(curMax).getTime()) {
+          spaceMaxMap.set(route.spaceId, sAct);
+        }
+      }
+    }
+
+    const result = rawSpaces.map((space) => {
+      const pub = this.toPublicSpace(space);
+      const sessionMax = spaceMaxMap.get(space.id);
+      const lastActivityAt = sessionMax || space.updatedAt || space.createdAt;
+      return { ...pub, lastActivityAt };
+    });
+
+    result.sort((a, b) => {
+      const diff = new Date(b.lastActivityAt!).getTime() - new Date(a.lastActivityAt!).getTime();
+      return diff !== 0 ? diff : b.id.localeCompare(a.id);
+    });
     return result;
   }
 
@@ -456,21 +486,39 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
     const includeArchived = Boolean(options?.includeArchived);
     const statusFilter = options?.status;
 
-    const result: PublicSession[] = [];
+    const result: SessionRoute[] = [];
     for (const route of this.sessionRoutes.values()) {
       if (route.userId === userId) {
         if (!spaceId || route.spaceId === spaceId) {
           if (statusFilter) {
             if (route.status === statusFilter) {
-              result.push(this.toPublicSession(route));
+              result.push(route);
             }
           } else if (includeArchived || route.status !== 'archived') {
-            result.push(this.toPublicSession(route));
+            result.push(route);
           }
         }
       }
     }
-    return result;
+
+    const sessions = result.map((route) => {
+      const pub = this.toPublicSession(route);
+      const msgs = this.messages.get(route.id) || [];
+      let maxMsg: string | undefined;
+      for (const m of msgs) {
+        if (!maxMsg || new Date(m.createdAt).getTime() > new Date(maxMsg).getTime()) {
+          maxMsg = m.createdAt;
+        }
+      }
+      const lastActivityAt = maxMsg || route.updatedAt || route.createdAt;
+      return { ...pub, lastActivityAt };
+    });
+
+    sessions.sort((a, b) => {
+      const diff = new Date(b.lastActivityAt!).getTime() - new Date(a.lastActivityAt!).getTime();
+      return diff !== 0 ? diff : b.id.localeCompare(a.id);
+    });
+    return sessions;
   }
 
   async getSession(userId: string, sessionId: string): Promise<PublicSession | null> {

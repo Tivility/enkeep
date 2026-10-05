@@ -77,8 +77,8 @@ describe('UI Canonical Session & Image Preview Contract & Behavioral Suite', () 
     });
   });
 
-  describe('2. Decisive Behavioral Test 1: Authoritative Canonical ID Not First', () => {
-    it('authoritatively selects space.canonicalSessionId over legacy/first active session', async () => {
+  describe('2. Decisive Behavioral Test 1: Recent Activity Default Session Selection', () => {
+    it('opens session with most recent activity (first session) on default open', async () => {
       // Extract loadSessions logic from app.js
       const fnMatch = appJsCode.match(/let sessionLoadEpoch = 0;[\s\S]*?async function loadSessions\(spaceId\) \{[\s\S]*?\n\}/);
       expect(fnMatch).not.toBeNull();
@@ -92,7 +92,7 @@ describe('UI Canonical Session & Image Preview Contract & Behavioral Suite', () 
             id: 'spc_test_canonical',
             name: 'Test Space',
             executionMode: 'container',
-            canonicalSessionId: 'ses_authoritative_canon_999', // Canonical session is NOT first in list
+            canonicalSessionId: 'ses_authoritative_canon_999',
           },
         ],
         sessions: [],
@@ -102,9 +102,9 @@ describe('UI Canonical Session & Image Preview Contract & Behavioral Suite', () 
       const mockApiRequest = vi.fn().mockResolvedValue({
         data: {
           sessions: [
-            { id: 'ses_legacy_old_001', spaceId: 'spc_test_canonical', title: 'Old First Session', status: 'active' },
-            { id: 'ses_authoritative_canon_999', spaceId: 'spc_test_canonical', title: 'Sole Canonical', status: 'active' },
-            { id: 'ses_legacy_old_002', spaceId: 'spc_test_canonical', title: 'Old Second Session', status: 'active' },
+            { id: 'ses_recent_active_001', spaceId: 'spc_test_canonical', title: 'Most Recent Session', status: 'active', lastActivityAt: '2026-09-02T10:00:00Z' },
+            { id: 'ses_authoritative_canon_999', spaceId: 'spc_test_canonical', title: 'Sole Canonical', status: 'active', lastActivityAt: '2026-08-01T10:00:00Z' },
+            { id: 'ses_legacy_old_002', spaceId: 'spc_test_canonical', title: 'Old Second Session', status: 'active', lastActivityAt: '2026-07-01T10:00:00Z' },
           ],
         },
       });
@@ -142,10 +142,9 @@ describe('UI Canonical Session & Image Preview Contract & Behavioral Suite', () 
 
       await runner('spc_test_canonical');
 
-      // Crucial assertion: Must select canonicalSessionId ('ses_authoritative_canon_999'), NOT the first element ('ses_legacy_old_001')
-      expect(selectedSessionIds).toContain('ses_authoritative_canon_999');
-      expect(state.currentSessionId).toBe('ses_authoritative_canon_999');
-      expect(state.currentSessionId).not.toBe('ses_legacy_old_001');
+      // Crucial assertion: Must select the session with most recent activity (first element), NOT old canonical
+      expect(selectedSessionIds).toContain('ses_recent_active_001');
+      expect(state.currentSessionId).toBe('ses_recent_active_001');
     });
   });
 
