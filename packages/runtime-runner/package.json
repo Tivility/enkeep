@@ -5,6 +5,9 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./src/index.ts",
+  "bin": {
+    "enkeep-session-premigrate": "./dist/runtime/session-premigrate-cli.js"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",

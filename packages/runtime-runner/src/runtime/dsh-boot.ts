@@ -27,6 +27,11 @@ import SessionStore, {
   type SessionId as SessionIdType,
 } from '@deepseek-ai/dsh-session';
 import { createSessionFormatCatalogWithChildren } from '@deepseek-ai/dsh-session-format-catalog';
+import {
+  deferPreStepSurfaceEvents,
+  premigrateSingleSession,
+  isSessionFormatUnsupportedError,
+} from './session-premigrate.js';
 import AgentRegistry, {
   installModelSelection,
   type Agent,
@@ -1815,23 +1820,67 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       throw new Error('SessionPersistence service is not registered or not functional');
     }
 
-    let sessionStat: Awaited<ReturnType<typeof persistence.stat>> | undefined;
-    try {
-      sessionStat = await persistence.stat(sid);
-      if (sessionStat !== undefined) {
-        // Pre-validate readability
-        const testHandle = await persistence.open(sid, 'read');
-        try {
-          await testHandle.read();
-        } finally {
-          await testHandle.close();
-        }
+    const logSafetyNetWarn = (msg: string) => {
+      if (ctx.logger?.warn) {
+        ctx.logger.warn(msg);
+      } else {
+        console.warn(msg);
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.toLowerCase().includes('not found') && !msg.toLowerCase().includes('no such file') && (err as any)?.code !== 'ENOENT') {
-        // Corrupt session on disk: fail loud immediately
-        throw new PersistedSessionResumeError(sessionIdStr, sessionsDir, err);
+    };
+
+    const trySafetyNetNormalizeV0 = async (): Promise<boolean> => {
+      const jsonlPath = findSessionLogPath(sessionsDir, sessionIdStr, workspaceFolder);
+      if (!jsonlPath || !jsonlPath.endsWith('session.jsonl')) {
+        return false;
+      }
+      const sDir = path.dirname(jsonlPath);
+      const v4Path = path.join(sDir, 'session.v4.jsonl');
+      if (fs.existsSync(v4Path)) {
+        return false;
+      }
+      try {
+        const res = await premigrateSingleSession(sDir, { sessionsRoot: sessionsDir });
+        return res.status === 'migrated';
+      } catch (normErr) {
+        logSafetyNetWarn(
+          `[dsh-boot] Safety-net premigration failed for v0 session ${sessionIdStr}: ${normErr instanceof Error ? normErr.message : String(normErr)}`
+        );
+        return false;
+      }
+    };
+
+    let sessionStat: Awaited<ReturnType<typeof persistence.stat>> | undefined;
+    let preValidationSafetyNetTried = false;
+    while (true) {
+      try {
+        sessionStat = await persistence.stat(sid);
+        if (sessionStat !== undefined) {
+          // Pre-validate readability
+          const testHandle = await persistence.open(sid, 'read');
+          try {
+            await testHandle.read();
+          } finally {
+            await testHandle.close();
+          }
+        }
+        break;
+      } catch (err: unknown) {
+        if (!preValidationSafetyNetTried && isSessionFormatUnsupportedError(err)) {
+          const normalized = await trySafetyNetNormalizeV0();
+          if (normalized) {
+            preValidationSafetyNetTried = true;
+            logSafetyNetWarn(
+              `[dsh-boot] DSH migration threw SessionFormatUnsupportedError for v0 session ${sessionIdStr}; normalized session and retrying resume`
+            );
+            continue;
+          }
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.toLowerCase().includes('not found') && !msg.toLowerCase().includes('no such file') && (err as any)?.code !== 'ENOENT') {
+          // Corrupt session on disk: fail loud immediately
+          throw new PersistedSessionResumeError(sessionIdStr, sessionsDir, err);
+        }
+        break;
       }
     }
 
@@ -1931,6 +1980,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         }
 
         let resumeAttempts = 0;
+        let resumeSafetyNetTried = false;
         while (resumeAttempts < 3) {
           try {
             handle = await agentsRegistry.resume({
@@ -1941,6 +1991,16 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
             break;
           } catch (resErr) {
             await disposeSessionWorkspace(sessionIdStr);
+            if (!resumeSafetyNetTried && isSessionFormatUnsupportedError(resErr)) {
+              const normalized = await trySafetyNetNormalizeV0();
+              if (normalized) {
+                resumeSafetyNetTried = true;
+                logSafetyNetWarn(
+                  `[dsh-boot] DSH migration threw SessionFormatUnsupportedError for v0 session ${sessionIdStr}; normalized session and retrying resume`
+                );
+                continue;
+              }
+            }
             resumeAttempts++;
             if (resumeAttempts >= 3) throw resErr;
             await new Promise((r) => setTimeout(r, 50 * resumeAttempts));
@@ -2937,36 +2997,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     }
 
     if (!isAlreadyV4) {
-      const rows: SessionEvent[] = [];
-      let stepStartFound = false;
-      const deferredSurface: SessionEvent[] = [];
-      for (let i = 0; i < seed.length; i++) {
-        const ev = structuredClone(seed[i]) as SessionEvent;
-        if (!stepStartFound) {
-          if (ev.type === 'turn/start') {
-            rows.push(ev);
-          } else if (ev.type === 'step/start') {
-            rows.push(ev);
-            stepStartFound = true;
-            for (const def of deferredSurface) rows.push(def);
-            deferredSurface.length = 0;
-          } else if (
-            (ev as any).surfaceOp ||
-            ev.type === 'user/message' ||
-            ev.type === 'assistant/message' ||
-            ev.type === 'tool/result'
-          ) {
-            deferredSurface.push(ev);
-          } else {
-            rows.push(ev);
-          }
-        } else {
-          rows.push(ev);
-        }
-      }
-      for (let i = 0; i < rows.length; i++) {
-        (rows[i] as any).seq = i;
-      }
+      const rows = deferPreStepSurfaceEvents(seed);
 
       const catalog = createSessionFormatCatalogWithChildren([]);
       const sourceHeader = {
