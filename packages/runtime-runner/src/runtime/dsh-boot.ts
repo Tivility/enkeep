@@ -31,6 +31,9 @@ import {
   deferPreStepSurfaceEvents,
   premigrateSingleSession,
   isSessionFormatUnsupportedError,
+  stripV0SourceId,
+  isClassAError,
+  isClassBError,
 } from './session-premigrate.js';
 import AgentRegistry, {
   installModelSelection,
@@ -2997,7 +3000,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     }
 
     if (!isAlreadyV4) {
-      const rows = deferPreStepSurfaceEvents(seed);
+      let rows: readonly any[] = seed;
 
       const catalog = createSessionFormatCatalogWithChildren([]);
       const sourceHeader = {
@@ -3008,11 +3011,40 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         delegationDepth: 0,
         seedLength: rows.length,
       };
-      const restore = catalog.createRestore(sourceHeader, { recovery: 'recoverable', validation: 'current' });
-      for (const row of rows) {
-        restore.decodeRow(row);
+
+      let artifact: any;
+      let appliedA = false;
+      let appliedB = false;
+
+      for (let pass = 0; pass <= 2; pass++) {
+        try {
+          const restore = catalog.createRestore(sourceHeader, { recovery: 'recoverable', validation: 'current' });
+          for (const row of rows) {
+            restore.decodeRow(row);
+          }
+          artifact = restore.finish();
+          break;
+        } catch (migErr) {
+          if (!isSessionFormatUnsupportedError(migErr)) {
+            throw migErr;
+          }
+          if (isClassAError(migErr) && !appliedA) {
+            appliedA = true;
+            rows = rows.map((ev) => stripV0SourceId(structuredClone(ev)));
+            continue;
+          }
+          if (isClassBError(migErr) && !appliedB) {
+            appliedB = true;
+            rows = deferPreStepSurfaceEvents(rows);
+            continue;
+          }
+          throw migErr;
+        }
       }
-      const artifact = restore.finish();
+
+      if (!artifact) {
+        throw new Error(`Failed to restore historical seed for session ${sessionIdStr}`);
+      }
       v4Header = {
         version: 4,
         id: sid,

@@ -21,9 +21,25 @@ import { Context } from '@deepseek-ai/cordis';
 import SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
 import { createSessionFormatCatalogWithChildren } from '@deepseek-ai/dsh-session-format-catalog';
 
+export const PACKED_CHUNK_TYPES = new Set([
+  'text-chunks',
+  'reasoning-chunks',
+  'tool-call-chunks',
+]);
+
+/**
+ * Classifies whether a row is a non-event streaming chunk record in DSH v0.
+ */
+export function isChunkRecord(row: any): boolean {
+  return typeof row?.type === 'string' && PACKED_CHUNK_TYPES.has(row.type);
+}
+
 /**
  * Defers pre-step surface events (user/message, assistant/message, tool/result, surfaceOp)
- * that appear before the first step/start into that first step, renumbering sequence IDs.
+ * that appear before the first step/start into that first step.
+ *
+ * Never touches non-event records (chunk lines) and never renumbers/injects seq unless
+ * pre-step surface events were present and required deferral.
  *
  * Reusable helper extracted from `importSeed` in `dsh-boot.ts`.
  */
@@ -31,6 +47,8 @@ export function deferPreStepSurfaceEvents<T extends { type: string; seq?: number
   const rows: T[] = [];
   let stepStartFound = false;
   const deferredSurface: T[] = [];
+  let hasPreStepSurface = false;
+
   for (let i = 0; i < events.length; i++) {
     const ev = structuredClone(events[i]) as T;
     if (!stepStartFound) {
@@ -45,8 +63,10 @@ export function deferPreStepSurfaceEvents<T extends { type: string; seq?: number
         (ev as any).surfaceOp ||
         ev.type === 'user/message' ||
         ev.type === 'assistant/message' ||
-        ev.type === 'tool/result'
+        ev.type === 'tool/result' ||
+        ev.type === 'system/message'
       ) {
+        hasPreStepSurface = true;
         deferredSurface.push(ev);
       } else {
         rows.push(ev);
@@ -59,9 +79,29 @@ export function deferPreStepSurfaceEvents<T extends { type: string; seq?: number
     for (const def of deferredSurface) rows.push(def);
     deferredSurface.length = 0;
   }
-  for (let i = 0; i < rows.length; i++) {
-    (rows[i] as any).seq = i;
+
+  // If no pre-step surface events were deferred, do not touch or renumber events
+  if (!hasPreStepSurface) {
+    return structuredClone(events) as T[];
   }
+
+  // Renumber sequence numbers only on event records; never inject seq into chunk lines
+  let currentSeq = 0;
+  for (const row of rows) {
+    if (isChunkRecord(row)) {
+      const data = (row as any).data;
+      const count = Array.isArray(data?.args)
+        ? data.args.length
+        : Array.isArray(data?.texts)
+          ? data.texts.length
+          : 1;
+      currentSeq += count;
+    } else {
+      (row as any).seq = currentSeq;
+      currentSeq += 1;
+    }
+  }
+
   return rows;
 }
 
@@ -99,15 +139,45 @@ export function isSessionFormatUnsupportedError(err: unknown): boolean {
   const anyErr = err as any;
   if (anyErr.name === 'SessionFormatUnsupportedError') return true;
   if (anyErr.constructor?.name === 'SessionFormatUnsupportedError') return true;
+  if (anyErr.name === 'SessionFormatUnsupportedMigrationError') return true;
+  if (anyErr.constructor?.name === 'SessionFormatUnsupportedMigrationError') return true;
+  const msg = typeof anyErr.message === 'string' ? anyErr.message : '';
   if (
-    typeof anyErr.message === 'string' &&
-    (anyErr.message.includes('SessionFormatUnsupportedError') ||
-      anyErr.message.includes('refuses this format v') ||
-      anyErr.message.includes('cannot acquire a system head'))
+    msg.includes('SessionFormatUnsupportedError') ||
+    msg.includes('SessionFormatUnsupportedMigrationError') ||
+    msg.includes('refuses this format v') ||
+    msg.includes('cannot acquire a system head') ||
+    msg.includes('pre-step surface') ||
+    msg.includes('unexpected member "sourceId"')
   ) {
     return true;
   }
   return false;
+}
+
+/**
+ * Determines whether an error corresponds to Class A (unexpected member "sourceId" in user/message source).
+ */
+export function isClassAError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('unexpected member "sourceId"') ||
+    msg.includes("unexpected member 'sourceId'")
+  );
+}
+
+/**
+ * Determines whether an error corresponds to Class B (pre-step surface rejection).
+ */
+export function isClassBError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('cannot acquire a system head') ||
+    msg.includes('surface before first step') ||
+    msg.includes('pre-step surface')
+  );
 }
 
 export interface PremigrateSessionOptions {
@@ -212,37 +282,6 @@ export async function premigrateSingleSession(
   const originalUserMessages = rawEvents.filter((e) => e.type === 'user/message').length;
   const originalAssistantMessages = rawEvents.filter((e) => e.type === 'assistant/message').length;
 
-  // Apply Normalizations in memory:
-  // (A) Delete data.source.sourceId from user/message events
-  let removedSourceIdsCount = 0;
-  for (const ev of rawEvents) {
-    if (ev.type === 'user/message' && ev.data?.source && typeof ev.data.source === 'object') {
-      if ('sourceId' in ev.data.source) {
-        delete ev.data.source.sourceId;
-        removedSourceIdsCount++;
-      }
-    }
-  }
-
-  // (B) Defer pre-step surface events into the first step exactly as importSeed does in dsh-boot
-  let deferredSurfaceCount = 0;
-  let firstStepSeen = false;
-  for (const ev of rawEvents) {
-    if (!firstStepSeen) {
-      if (ev.type === 'step/start') {
-        firstStepSeen = true;
-      } else if (
-        ev.surfaceOp ||
-        ev.type === 'user/message' ||
-        ev.type === 'assistant/message' ||
-        ev.type === 'tool/result'
-      ) {
-        deferredSurfaceCount++;
-      }
-    }
-  }
-  const rows = deferPreStepSurfaceEvents(rawEvents);
-
   // Migrate through DSH 0.2 session-format catalog
   const catalog = createSessionFormatCatalogWithChildren([]);
   const sourceHeader: Record<string, unknown> = {
@@ -258,22 +297,86 @@ export async function premigrateSingleSession(
     ...(rawHeader.agentPreset !== undefined ? { agentPreset: rawHeader.agentPreset } : {}),
   };
 
-  let artifact: ReturnType<ReturnType<typeof catalog.createRestore>['finish']>;
-  try {
-    const restore = catalog.createRestore(sourceHeader, {
-      recovery: 'recoverable',
-      validation: 'current',
-    });
-    for (const row of rows) {
-      restore.decodeRow(row);
+  // New behavior per dryrun2 RCA:
+  // For each session, FIRST attempt the standard DSH 0.2 migration on the ORIGINAL v0 content unchanged.
+  // Only if it fails with SessionFormatUnsupportedError, apply ONLY the normalization matching the error:
+  // (A) 'source has unexpected member "sourceId"' -> remove data.source.sourceId on user/message events;
+  // (B) pre-step surface rejection -> defer only offending pre-step surface events into the first step;
+  //     never touch non-event records (chunk lines) and never renumber/inject seq unless DSH rules require it;
+  // Allow A then B sequentially if both apply (max 2 normalization passes).
+  let currentEvents = structuredClone(rawEvents);
+  let removedSourceIdsCount = 0;
+  let deferredSurfaceCount = 0;
+  let appliedA = false;
+  let appliedB = false;
+
+  let artifact: ReturnType<ReturnType<typeof catalog.createRestore>['finish']> | undefined;
+  let lastError: unknown;
+
+  for (let pass = 0; pass <= 2; pass++) {
+    try {
+      const restore = catalog.createRestore(sourceHeader, {
+        recovery: 'recoverable',
+        validation: 'current',
+      });
+      for (const row of currentEvents) {
+        restore.decodeRow(row);
+      }
+      artifact = restore.finish();
+      lastError = undefined;
+      break;
+    } catch (migErr) {
+      lastError = migErr;
+      if (!isSessionFormatUnsupportedError(migErr)) {
+        break;
+      }
+      if (isClassAError(migErr) && !appliedA) {
+        appliedA = true;
+        let stripped = 0;
+        for (const ev of currentEvents) {
+          if (ev.type === 'user/message' && ev.data?.source && typeof ev.data.source === 'object') {
+            if ('sourceId' in ev.data.source) {
+              delete ev.data.source.sourceId;
+              stripped++;
+            }
+          }
+        }
+        removedSourceIdsCount += stripped;
+        continue;
+      }
+      if (isClassBError(migErr) && !appliedB) {
+        appliedB = true;
+        let countBeforeStep = 0;
+        let firstStepSeen = false;
+        for (const ev of currentEvents) {
+          if (!firstStepSeen) {
+            if (ev.type === 'step/start') {
+              firstStepSeen = true;
+            } else if (
+              ev.surfaceOp ||
+              ev.type === 'user/message' ||
+              ev.type === 'assistant/message' ||
+              ev.type === 'tool/result' ||
+              ev.type === 'system/message'
+            ) {
+              countBeforeStep++;
+            }
+          }
+        }
+        deferredSurfaceCount += countBeforeStep;
+        currentEvents = deferPreStepSurfaceEvents(currentEvents);
+        continue;
+      }
+      break;
     }
-    artifact = restore.finish();
-  } catch (migErr) {
+  }
+
+  if (!artifact) {
     return {
       sessionId,
       sessionDir,
       status: 'failed',
-      error: `Format catalog migration failed: ${migErr instanceof Error ? migErr.message : String(migErr)}`,
+      error: `Format catalog migration failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
     };
   }
 
