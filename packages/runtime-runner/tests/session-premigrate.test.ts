@@ -1073,5 +1073,191 @@ describe('Session Premigration and Runtime Safety Net', () => {
     expect(reportContent.sessions[0].sessionId).toBe(sessionId);
     expect(JSON.stringify(reportContent)).not.toContain('CLI test user prompt');
   });
+
+  it('Class B with compaction: defers pre-step surface and remaps compaction summary/range references to same logical events', async () => {
+    const sessionId = 'ses_00000000000000000000000000000020';
+    const spacePath = path.join(spacesDir, 'space-compaction-remap');
+    fs.mkdirSync(spacePath, { recursive: true });
+    const sDir = createSessionDir(sessionId, spacePath);
+
+    const v0Header = {
+      type: 'session',
+      version: 0,
+      id: sessionId,
+      createdAt: 1770000000000,
+      cwd: spacePath,
+      delegationDepth: 0,
+    };
+
+    // Synthetic v0 session: pre-step user/message at seq 0, turn/step at seq 1-2,
+    // assistant/message at seq 3, compaction referencing both [0, 3]
+    const v0Events = [
+      {
+        type: 'user/message',
+        seq: 0,
+        time: 1770000000001,
+        surfaceOp: 'append',
+        data: {
+          id: 'msg_u_20_pre',
+          role: 'user',
+          content: [{ type: 'text', text: 'Pre-step initial inquiry' }],
+          source: { kind: 'user' },
+        },
+      },
+      {
+        type: 'turn/start',
+        seq: 1,
+        time: 1770000000002,
+        data: { turn: 1 },
+      },
+      {
+        type: 'step/start',
+        seq: 2,
+        time: 1770000000003,
+        data: { turn: 1, step: 1 },
+      },
+      {
+        type: 'assistant/message',
+        seq: 3,
+        time: 1770000000004,
+        surfaceOp: 'append',
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            id: 'msg_a_20_1',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'First response' }],
+            source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+          },
+        },
+      },
+      {
+        type: 'step/end',
+        seq: 4,
+        time: 1770000000005,
+        data: { turn: 1, step: 1 },
+      },
+      {
+        type: 'compaction/start',
+        seq: 5,
+        time: 1770000000006,
+        data: { compactionId: 'cmp_synthetic_20', turn: 1 },
+      },
+      {
+        type: 'compaction/summary',
+        seq: 6,
+        time: 1770000000007,
+        data: {
+          compactionId: 'cmp_synthetic_20',
+          summary: [{ type: 'text', text: 'Compacted summary' }],
+          shadowedRange: { start: 0, end: 3 },
+          shadowedSeqs: [0, 3],
+          shadowedTokenCount: 30,
+          provider: 'deepseek',
+          model: 'deepseek-chat',
+        },
+      },
+      {
+        type: 'user/message',
+        seq: 7,
+        time: 1770000000008,
+        surfaceOp: { op: 'replace', start: 0, end: 3 },
+        sourceEventSeqs: [0, 3],
+        data: {
+          id: 'msg_u_20_compact',
+          role: 'user',
+          content: [{ type: 'text', text: 'Compacted summary' }],
+          source: { kind: 'plugin', plugin: 'compact', compactionId: 'cmp_synthetic_20' },
+        },
+      },
+      {
+        type: 'compaction/end',
+        seq: 8,
+        time: 1770000000009,
+        data: { compactionId: 'cmp_synthetic_20', turn: 1 },
+      },
+      {
+        type: 'turn/end',
+        seq: 9,
+        time: 1770000000010,
+        data: { turn: 1, reason: { kind: 'completed' } },
+      },
+    ];
+
+    // Verify deferPreStepSurfaceEvents unit behavior first: minimal resequencing & remapping
+    const deferredUnit = deferPreStepSurfaceEvents(v0Events);
+    expect(deferredUnit.map((e) => e.type)).toEqual([
+      'turn/start',
+      'step/start',
+      'user/message',
+      'assistant/message',
+      'step/end',
+      'compaction/start',
+      'compaction/summary',
+      'user/message',
+      'compaction/end',
+      'turn/end',
+    ]);
+    expect(deferredUnit.map((e) => e.seq)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+    const unitCompSummary = deferredUnit.find((e) => e.type === 'compaction/summary');
+    expect((unitCompSummary?.data as any).shadowedRange).toEqual({ start: 2, end: 3 });
+    expect((unitCompSummary?.data as any).shadowedSeqs).toEqual([2, 3]);
+
+    const unitUserCheckpoint = deferredUnit.find((e) => e.type === 'user/message' && (e as any).surfaceOp?.op === 'replace');
+    expect((unitUserCheckpoint as any).surfaceOp).toEqual({ op: 'replace', start: 2, end: 3 });
+    expect((unitUserCheckpoint as any).sourceEventSeqs).toEqual([2, 3]);
+
+    // Write full v0 session to disk
+    const v0Content = [JSON.stringify(v0Header), ...v0Events.map((e) => JSON.stringify(e))].join('\n') + '\n';
+    fs.writeFileSync(path.join(sDir, 'session.jsonl'), v0Content, 'utf8');
+
+    // Execute premigration
+    const result = await runSessionPremigrate({
+      sessionsRoot: sessionsDir,
+      sessionIds: [sessionId],
+    });
+
+    expect(result.failedCount).toBe(0);
+    expect(result.migratedCount).toBe(1);
+    expect(result.sessions[0].status).toBe('migrated');
+    expect(result.sessions[0].deferredSurfaceCount).toBe(1);
+
+    // Verify published session.v4.jsonl can be opened and read by official SessionPersistence
+    const handle = await persistence.open(sessionId, 'read');
+    const readRes = await handle.read();
+    await handle.close();
+
+    const userMsgs = readRes.events.filter((e: any) => e.type === 'user/message');
+    const asstMsgs = readRes.events.filter((e: any) => e.type === 'assistant/message');
+    expect(userMsgs.length).toBe(2);
+    expect(asstMsgs.length).toBe(1);
+
+    // Verify logical event references in migrated v4 events
+    const initialUserMsg = userMsgs.find((m: any) => m.data?.content?.[0]?.text === 'Pre-step initial inquiry');
+    const asstMsg = asstMsgs[0];
+    const migratedSummary = readRes.events.find((e: any) => e.type === 'compaction/summary');
+    const migratedCheckpoint = userMsgs.find((m: any) => m.data?.content?.[0]?.text === 'Compacted summary');
+
+    expect(initialUserMsg).toBeDefined();
+    expect(asstMsg).toBeDefined();
+    expect(migratedSummary).toBeDefined();
+    expect(migratedCheckpoint).toBeDefined();
+
+    // Verify references point to the exact same logical events
+    const sumData = migratedSummary!.data as any;
+    expect(sumData.shadowedSeqs).toContain(initialUserMsg!.seq);
+    expect(sumData.shadowedSeqs).toContain(asstMsg!.seq);
+    expect(sumData.shadowedRange.start).toBe(initialUserMsg!.seq);
+    expect(sumData.shadowedRange.end).toBe(asstMsg!.seq);
+
+    const chkSurfaceOp = (migratedCheckpoint as any).surfaceOp;
+    const rawChkStart = chkSurfaceOp.startSeq ?? chkSurfaceOp.start;
+    const rawChkEnd = chkSurfaceOp.endSeq ?? chkSurfaceOp.end;
+    expect(rawChkStart).toBe(initialUserMsg!.seq);
+    expect(rawChkEnd).toBe(asstMsg!.seq);
+    expect((migratedCheckpoint as any).sourceEventSeqs).toEqual([initialUserMsg!.seq, asstMsg!.seq]);
+  });
 });
 

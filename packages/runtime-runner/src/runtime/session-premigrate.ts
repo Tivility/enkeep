@@ -35,13 +35,239 @@ export function isChunkRecord(row: any): boolean {
 }
 
 /**
+ * Remaps sequence references across an array of session events using oldSeq -> newSeq mapping.
+ * Shared between pre-migration normalization and fork seed export.
+ *
+ * Covers every seq-referencing field defined across DSH 0.1.2 (v0) and DSH 0.2 (v1-v4):
+ * - sourceEventSeqs on surface-eligible events (number[] or v0 [[start, end]] ranges)
+ * - surfaceOp on replace operations (start/end in v0/v1/v2, startSeq/endSeq in v3/v4)
+ * - developer/message: headerSeq
+ * - compaction/summary & compaction/prune: shadowedRange (start/end, startSeq/endSeq) and shadowedSeqs
+ * - command/done: sourceEventSeq
+ * - session/title & session/title-llm-request: messageSeqs
+ * - session-log-deepseek/delivery-accepted: throughSeq
+ * - image/offload: targets[{ seq }]
+ * - Any other *Seq or *Seqs member on event data
+ */
+export function remapEventSequences<T = any>(
+  events: T[],
+  oldSeqToNewSeq: ReadonlyMap<number, number> | Map<number, number>
+): void {
+  const mapSeq = (oldSeq: number): number | undefined => {
+    return oldSeqToNewSeq.has(oldSeq) ? oldSeqToNewSeq.get(oldSeq) : oldSeq;
+  };
+
+  for (const ev of events as any[]) {
+    if (!ev || typeof ev !== 'object') continue;
+
+    // 1. sourceEventSeqs on surface-eligible events (or any event with sourceEventSeqs)
+    if (Array.isArray(ev.sourceEventSeqs)) {
+      ev.sourceEventSeqs = ev.sourceEventSeqs
+        .map((entry: any) => {
+          if (typeof entry === 'number') {
+            return mapSeq(entry);
+          }
+          if (Array.isArray(entry) && entry.length === 2) {
+            const start = typeof entry[0] === 'number' ? mapSeq(entry[0]) : entry[0];
+            const end = typeof entry[1] === 'number' ? mapSeq(entry[1]) : entry[1];
+            return [start, end];
+          }
+          return entry;
+        })
+        .filter((s: any): boolean => {
+          if (typeof s === 'number') {
+            return Number.isSafeInteger(s) && s >= 0 && (ev.seq === undefined || s < ev.seq);
+          }
+          if (Array.isArray(s) && s.length === 2) {
+            return (
+              typeof s[0] === 'number' &&
+              typeof s[1] === 'number' &&
+              Number.isSafeInteger(s[0]) &&
+              Number.isSafeInteger(s[1]) &&
+              s[0] >= 0 &&
+              s[1] >= s[0] &&
+              (ev.seq === undefined || s[1] < ev.seq)
+            );
+          }
+          return false;
+        });
+    }
+
+    // 2. surfaceOp on surface-eligible events (replace operation requires start/end or startSeq/endSeq)
+    if (ev.surfaceOp && typeof ev.surfaceOp === 'object' && ev.surfaceOp.op === 'replace') {
+      const rawStart = ev.surfaceOp.startSeq ?? ev.surfaceOp.start;
+      const rawEnd = ev.surfaceOp.endSeq ?? ev.surfaceOp.end;
+      const mappedStart = typeof rawStart === 'number' ? mapSeq(rawStart) : undefined;
+      const mappedEnd = typeof rawEnd === 'number' ? mapSeq(rawEnd) : undefined;
+      if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
+        if (ev.surfaceOp.startSeq !== undefined || ev.surfaceOp.start === undefined) {
+          ev.surfaceOp = {
+            op: 'replace',
+            startSeq: mappedStart,
+            endSeq: mappedEnd,
+          };
+        } else {
+          ev.surfaceOp = {
+            op: 'replace',
+            start: mappedStart,
+            end: mappedEnd,
+          };
+        }
+      }
+    }
+
+    // 3. developer/message: headerSeq referencing earlier request/header
+    if (ev.type === 'developer/message' && ev.data && typeof ev.data.headerSeq === 'number') {
+      const mappedHeader = mapSeq(ev.data.headerSeq);
+      if (typeof mappedHeader === 'number') {
+        ev.data = {
+          ...ev.data,
+          headerSeq: mappedHeader,
+        };
+      }
+    }
+
+    // 4. compaction/summary and compaction/prune: shadowedRange (start/end or startSeq/endSeq) and shadowedSeqs
+    if ((ev.type === 'compaction/summary' || ev.type === 'compaction/prune') && ev.data) {
+      let dataModified = false;
+      let newShadowedRange = ev.data.shadowedRange;
+      let newShadowedSeqs = ev.data.shadowedSeqs;
+
+      if (newShadowedRange && typeof newShadowedRange === 'object') {
+        const rawStart = newShadowedRange.startSeq ?? newShadowedRange.start;
+        const rawEnd = newShadowedRange.endSeq ?? newShadowedRange.end;
+        const mappedStart = typeof rawStart === 'number' ? mapSeq(rawStart) : undefined;
+        const mappedEnd = typeof rawEnd === 'number' ? mapSeq(rawEnd) : undefined;
+        if (typeof mappedStart === 'number' && typeof mappedEnd === 'number') {
+          newShadowedRange = {
+            ...newShadowedRange,
+            ...(newShadowedRange.start !== undefined || newShadowedRange.startSeq === undefined ? { start: mappedStart } : {}),
+            ...(newShadowedRange.end !== undefined || newShadowedRange.endSeq === undefined ? { end: mappedEnd } : {}),
+            ...(newShadowedRange.startSeq !== undefined ? { startSeq: mappedStart } : {}),
+            ...(newShadowedRange.endSeq !== undefined ? { endSeq: mappedEnd } : {}),
+          };
+          dataModified = true;
+        }
+      }
+
+      if (Array.isArray(newShadowedSeqs)) {
+        newShadowedSeqs = newShadowedSeqs
+          .map((s: number) => (typeof s === 'number' ? mapSeq(s) : s))
+          .filter((s: number | undefined): s is number => typeof s === 'number' && Number.isSafeInteger(s) && s >= 0);
+        dataModified = true;
+      }
+
+      if (dataModified) {
+        ev.data = {
+          ...ev.data,
+          ...(newShadowedRange !== undefined ? { shadowedRange: newShadowedRange } : {}),
+          ...(newShadowedSeqs !== undefined ? { shadowedSeqs: newShadowedSeqs } : {}),
+        };
+      }
+    }
+
+    // 5. command/done: sourceEventSeq
+    if (ev.type === 'command/done' && ev.data && typeof ev.data.sourceEventSeq === 'number') {
+      const mappedSource = mapSeq(ev.data.sourceEventSeq);
+      if (typeof mappedSource === 'number') {
+        ev.data = {
+          ...ev.data,
+          sourceEventSeq: mappedSource,
+        };
+      }
+    }
+
+    // 6. session/title and session/title-llm-request: messageSeqs
+    if ((ev.type === 'session/title' || ev.type === 'session/title-llm-request') && ev.data && Array.isArray(ev.data.messageSeqs)) {
+      ev.data = {
+        ...ev.data,
+        messageSeqs: ev.data.messageSeqs
+          .map((s: number) => (typeof s === 'number' ? mapSeq(s) : s))
+          .filter((s: number | undefined): s is number => typeof s === 'number' && Number.isSafeInteger(s) && s >= 0),
+      };
+    }
+
+    // 7. session-log-deepseek/delivery-accepted: throughSeq
+    if (ev.type === 'session-log-deepseek/delivery-accepted' && ev.data && typeof ev.data.throughSeq === 'number') {
+      const mappedThrough = mapSeq(ev.data.throughSeq);
+      if (typeof mappedThrough === 'number') {
+        ev.data = {
+          ...ev.data,
+          throughSeq: mappedThrough,
+        };
+      }
+    }
+
+    // 8. image/offload: targets: [{ seq }]
+    if (ev.type === 'image/offload' && ev.data && Array.isArray(ev.data.targets)) {
+      ev.data = {
+        ...ev.data,
+        targets: ev.data.targets.map((t: any) => {
+          if (t && typeof t === 'object' && typeof t.seq === 'number') {
+            const mapped = mapSeq(t.seq);
+            return typeof mapped === 'number' ? { ...t, seq: mapped } : t;
+          }
+          return t;
+        }),
+      };
+    }
+
+    // 9. Generic remap for any other *Seq or *Seqs member on ev.data
+    const EXPLICIT_DATA_KEYS = new Set([
+      'headerSeq',
+      'sourceEventSeq',
+      'throughSeq',
+      'messageSeqs',
+      'shadowedSeqs',
+      'shadowedRange',
+      'targets',
+    ]);
+    if (ev.data && typeof ev.data === 'object') {
+      let modifiedData: any = null;
+      for (const [key, val] of Object.entries(ev.data)) {
+        if (key === 'seq' || EXPLICIT_DATA_KEYS.has(key)) continue;
+        if (key.endsWith('Seq') && typeof val === 'number') {
+          const mapped = mapSeq(val);
+          if (typeof mapped === 'number' && mapped !== val) {
+            modifiedData = modifiedData ?? { ...ev.data };
+            modifiedData[key] = mapped;
+          }
+        } else if (key.endsWith('Seqs') && Array.isArray(val)) {
+          let listChanged = false;
+          const mappedList = val.map((s: any) => {
+            if (typeof s === 'number') {
+              const m = mapSeq(s);
+              if (typeof m === 'number' && m !== s) {
+                listChanged = true;
+                return m;
+              }
+            }
+            return s;
+          });
+          if (listChanged) {
+            modifiedData = modifiedData ?? { ...ev.data };
+            modifiedData[key] = mappedList;
+          }
+        }
+      }
+      if (modifiedData) {
+        ev.data = modifiedData;
+      }
+    }
+  }
+}
+
+export const remapSeedEventSequences = remapEventSequences;
+
+/**
  * Defers pre-step surface events (user/message, assistant/message, tool/result, surfaceOp)
  * that appear before the first step/start into that first step.
  *
  * Never touches non-event records (chunk lines) and never renumbers/injects seq unless
  * pre-step surface events were present and required deferral.
  *
- * Reusable helper extracted from `importSeed` in `dsh-boot.ts`.
+ * Resequences minimally (only shifting numbers where needed) and remaps all sequence
+ * references across the session using the shared `remapEventSequences` helper.
  */
 export function deferPreStepSurfaceEvents<T extends { type: string; seq?: number }>(events: readonly T[]): T[] {
   const rows: T[] = [];
@@ -85,7 +311,8 @@ export function deferPreStepSurfaceEvents<T extends { type: string; seq?: number
     return structuredClone(events) as T[];
   }
 
-  // Renumber sequence numbers only on event records; never inject seq into chunk lines
+  // Minimal resequencing: only shift sequence numbers when needed to maintain dense order
+  const oldSeqToNewSeq = new Map<number, number>();
   let currentSeq = 0;
   for (const row of rows) {
     if (isChunkRecord(row)) {
@@ -95,11 +322,33 @@ export function deferPreStepSurfaceEvents<T extends { type: string; seq?: number
         : Array.isArray(data?.texts)
           ? data.texts.length
           : 1;
+      const oldSeq0 = (row as any).seq0;
+      if (typeof oldSeq0 === 'number') {
+        for (let c = 0; c < count; c++) {
+          oldSeqToNewSeq.set(oldSeq0 + c, currentSeq + c);
+        }
+        if (oldSeq0 !== currentSeq) {
+          (row as any).seq0 = currentSeq;
+        }
+      }
       currentSeq += count;
     } else {
-      (row as any).seq = currentSeq;
+      const oldSeq = (row as any).seq;
+      if (typeof oldSeq === 'number') {
+        oldSeqToNewSeq.set(oldSeq, currentSeq);
+        if (oldSeq !== currentSeq) {
+          (row as any).seq = currentSeq;
+        }
+      } else {
+        (row as any).seq = currentSeq;
+      }
       currentSeq += 1;
     }
+  }
+
+  const hasSeqChanges = Array.from(oldSeqToNewSeq.entries()).some(([oldS, newS]) => oldS !== newS);
+  if (hasSeqChanges) {
+    remapEventSequences(rows, oldSeqToNewSeq);
   }
 
   return rows;
