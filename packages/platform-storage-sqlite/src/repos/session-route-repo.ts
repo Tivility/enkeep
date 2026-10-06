@@ -611,9 +611,17 @@ export class SqliteTenantScopedSessionRouteRepository implements TenantScopedSes
       const spaceExecutionMode = (spaceRow.execution_mode ?? 'container') as ExecutionMode;
       const channel = options?.channel || 'web';
       const accountId = options?.accountId || 'default';
-      const nativeContextId = options?.nativeContextId || newSessionId;
-      const peerId = options?.peerId || `${channel}:${newSessionId}`;
+      let nativeContextId = options?.nativeContextId || newSessionId;
+      let peerId = options?.peerId || `${channel}:${newSessionId}`;
       const title = options?.title ?? null;
+
+      const existingIdentity = this.db.prepare(
+        'SELECT 1 FROM session_routes WHERE user_id = ? AND channel = ? AND account_id = ? AND native_context_id = ?'
+      ).get(this.userId, channel, accountId, nativeContextId);
+      if (existingIdentity) {
+        nativeContextId = newSessionId;
+        peerId = `${channel}:${newSessionId}`;
+      }
 
       let initialGenSnapshotId = spaceRow.agent_profile_snapshot_id;
 
