@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { ValidationError, PlatformError } from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 
-export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind';
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list';
 
 export interface ParsedChatCommand {
   command: ChatCommandType;
@@ -22,6 +22,8 @@ const HELP_USAGE = `Available commands:
   /help - Show this help message
   /status - Show current space, session, model, and turn status
   /new - Start a new session generation (aliases: /reset, /clear)
+  /newws - Create a new workspace (alias: /new-workspace <name>)
+  /list - List active spaces ordered by recent activity (alias: /ls)
   /stop - Cancel running or queued turn
   /compact - Force session compaction regardless of threshold
   /model - Show, list, set, or reset session model override
@@ -55,13 +57,36 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
   }
 
   const trimmed = content.trim();
-  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind)(?:[\s\t\r\n]+([\s\S]*))?$/i);
+  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
     return null;
   }
 
-  const cmd = match[1].toLowerCase() as 'model' | 'effort' | 'help' | 'status' | 'new' | 'reset' | 'clear' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind';
+  const cmd = match[1].toLowerCase() as 'model' | 'effort' | 'help' | 'status' | 'new' | 'reset' | 'clear' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'new-workspace' | 'list' | 'ls';
   const rest = match[2] !== undefined ? match[2].trim() : '';
+
+  if (cmd === 'newws' || cmd === 'new-workspace') {
+    return {
+      command: 'newws',
+      type: 'newws',
+      subcommand: 'create',
+      action: 'create',
+      arg: rest || undefined,
+      target: rest || undefined,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'list' || cmd === 'ls') {
+    return {
+      command: 'list',
+      type: 'list',
+      subcommand: 'list',
+      action: 'list',
+      arg: rest || undefined,
+      raw: trimmed,
+    };
+  }
 
   if (cmd === 'sw' || cmd === 'spawn') {
     if (!rest) {
@@ -293,8 +318,27 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
   };
 }
 
+let _cachedDockerAvailable: boolean | null = null;
+export async function isDockerAvailable(): Promise<boolean> {
+  if (_cachedDockerAvailable !== null) return _cachedDockerAvailable;
+  try {
+    const { execFile } = await import('node:child_process');
+    await new Promise<void>((resolve, reject) => {
+      execFile('docker', ['info'], { timeout: 2000 }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    _cachedDockerAvailable = true;
+  } catch {
+    _cachedDockerAvailable = false;
+  }
+  return _cachedDockerAvailable;
+}
+
 export interface ChatCommandServiceOptions {
   modelSelectionService: ModelSelectionService;
+  isDockerAvailable?: () => Promise<boolean> | boolean;
   platformApi?: {
     resetSession: (
       userId: string,
@@ -329,6 +373,31 @@ export interface ChatCommandServiceOptions {
       task: { id: string; title?: string; status?: string; [key: string]: unknown };
       isIdempotentHit?: boolean;
     }>;
+    createSpace?: (
+      userId: string,
+      input: {
+        name: string;
+        folder?: string;
+        executionMode?: 'container' | 'host';
+      }
+    ) => Promise<{
+      id: string;
+      name: string;
+      folder?: string;
+      executionMode?: 'container' | 'host';
+      [key: string]: unknown;
+    }>;
+    listSpaces?: (
+      userId: string,
+      options?: any
+    ) => Promise<Array<{
+      id: string;
+      name: string;
+      folder?: string;
+      executionMode?: 'container' | 'host';
+      lastActivityAt?: string;
+      [key: string]: unknown;
+    }>>;
   };
   taskOperations?: (userId: string) => {
     createTask: (input: {
@@ -358,6 +427,7 @@ export class ChatCommandService {
   private taskOperations?: ChatCommandServiceOptions['taskOperations'];
   private gateway?: ChatCommandServiceOptions['gateway'];
   private db?: DatabaseSync;
+  private isDockerAvailableFn?: () => Promise<boolean> | boolean;
 
   constructor(optionsOrModelSelection: ModelSelectionService | ChatCommandServiceOptions) {
     if ('resolveEffectiveModel' in optionsOrModelSelection || 'getDshCatalog' in optionsOrModelSelection) {
@@ -369,7 +439,19 @@ export class ChatCommandService {
       this.taskOperations = opts.taskOperations;
       this.gateway = opts.gateway;
       this.db = opts.db;
+      this.isDockerAvailableFn = opts.isDockerAvailable;
     }
+  }
+
+  setDockerAvailableCheck(fn: () => Promise<boolean> | boolean): void {
+    this.isDockerAvailableFn = fn;
+  }
+
+  private async checkDockerAvailability(): Promise<boolean> {
+    if (this.isDockerAvailableFn) {
+      return Boolean(await this.isDockerAvailableFn());
+    }
+    return await isDockerAvailable();
   }
 
   setPlatformApi(platformApi: ChatCommandServiceOptions['platformApi']): void {
@@ -410,6 +492,10 @@ export class ChatCommandService {
           return await this.executeStopCommand(params, parsed);
         case 'new':
           return await this.executeNewCommand(params, parsed);
+        case 'newws':
+          return await this.executeNewwsCommand(params, parsed);
+        case 'list':
+          return await this.executeListCommand(params, parsed);
         case 'compact':
           return await this.executeCompactCommand(params, parsed);
         case 'model':
@@ -903,6 +989,10 @@ export class ChatCommandService {
     params: { userId: string; sessionId: string; idempotencyKey?: string },
     _parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
+    if (_parsed.arg?.trim()) {
+      return { replyText: '新会话请直接发送 /new；新建工作区请用 /newws <名称>.' };
+    }
+
     const { userId, sessionId, idempotencyKey } = params;
 
     let hasActiveTurn = false;
@@ -947,6 +1037,192 @@ export class ChatCommandService {
     const newGen = resetResult.generation.generation;
     const oldGen = newGen - 1;
     return { replyText: `Started generation ${newGen} (was ${oldGen})` };
+  }
+
+  private async executeNewwsCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId } = params;
+
+    const rawName = parsed.arg !== undefined ? parsed.arg : (parsed.target !== undefined ? parsed.target : '');
+    const trimmedName = typeof rawName === 'string' ? rawName.trim() : '';
+
+    if (!trimmedName || trimmedName.length < 1 || trimmedName.length > 50) {
+      return { replyText: '工作区名称长度必须在 1 到 50 个字符之间。' };
+    }
+
+    const dockerAvailable = await this.checkDockerAvailability();
+    const executionMode: 'container' | 'host' = dockerAvailable ? 'container' : 'host';
+
+    let createdSpace: { id: string; name: string; folder?: string; executionMode?: string } | undefined;
+
+    if (this.platformApi?.createSpace) {
+      const res = await this.platformApi.createSpace(userId, {
+        name: trimmedName,
+        executionMode,
+      });
+      createdSpace = {
+        id: res.id,
+        name: res.name,
+        folder: (res as any).folder,
+        executionMode: res.executionMode ?? (res as any).execution_mode ?? executionMode,
+      };
+    } else if (this.db) {
+      const newId = `spc_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+      const folderHex = randomUUID().replace(/-/g, '').slice(0, 16);
+      const internalFolder = `space-${folderHex}`;
+      this.db.prepare(`
+        INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(newId, userId, trimmedName, internalFolder, executionMode);
+      createdSpace = {
+        id: newId,
+        name: trimmedName,
+        folder: internalFolder,
+        executionMode,
+      };
+    } else {
+      return { replyText: '平台服务未连接，无法创建工作区。' };
+    }
+
+    let channel = 'web';
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT channel FROM session_routes WHERE id = ?')
+          .get(sessionId) as { channel?: string } | undefined;
+        if (routeRow?.channel) {
+          channel = routeRow.channel;
+        }
+      } catch {}
+    }
+
+    if (channel === 'web') {
+      return {
+        replyText: `工作区 "${createdSpace.name}" 已创建。Web 会话工作区绑定固定，请从工作区列表切换打开。`,
+      };
+    }
+
+    // Channel (Lark/WeChat) context: switch current chat binding to the new space using existing /bind path
+    const bindResult = await this.executeBindCommand(params, {
+      command: 'bind',
+      type: 'bind',
+      subcommand: 'bind',
+      action: 'bind',
+      target: createdSpace.id,
+      arg: createdSpace.id,
+      raw: `/bind ${createdSpace.id}`,
+    });
+
+    if (bindResult.replyText.startsWith('已成功绑定到工作区')) {
+      return {
+        replyText: `工作区 "${createdSpace.name}" 已创建。\n${bindResult.replyText}`,
+      };
+    }
+
+    return {
+      replyText: `工作区 "${createdSpace.name}" 已创建，但绑定失败: ${bindResult.replyText}`,
+    };
+  }
+
+  private async executeListCommand(
+    params: { userId: string; sessionId: string; spaceId: string },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId, spaceId } = params;
+
+    let currentSpaceId = spaceId;
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT space_id FROM session_routes WHERE id = ?')
+          .get(sessionId) as { space_id?: string } | undefined;
+        if (routeRow?.space_id) {
+          currentSpaceId = routeRow.space_id;
+        }
+      } catch {}
+    }
+
+    let spaceList: Array<{
+      id: string;
+      name: string;
+      executionMode?: string;
+      lastActivityAt?: string;
+    }> = [];
+
+    if (this.db) {
+      try {
+        const msgRows = this.db.prepare(
+          'SELECT session_id, MAX(created_at) as last_msg FROM web_messages WHERE user_id = ? GROUP BY session_id'
+        ).all(userId) as Array<{ session_id: string; last_msg?: string | null }>;
+        const msgMap = new Map<string, string>();
+        for (const row of msgRows) {
+          if (row.last_msg) msgMap.set(row.session_id, row.last_msg);
+        }
+
+        const sessionRows = this.db.prepare(
+          "SELECT id, space_id, created_at, updated_at FROM session_routes WHERE user_id = ? AND status != 'deleted'"
+        ).all(userId) as Array<{ id: string; space_id: string; created_at: string; updated_at: string }>;
+
+        const spaceMaxMap = new Map<string, string>();
+        for (const s of sessionRows) {
+          const sAct = msgMap.get(s.id) || s.updated_at || s.created_at;
+          const curMax = spaceMaxMap.get(s.space_id);
+          if (!curMax || new Date(sAct).getTime() > new Date(curMax).getTime()) {
+            spaceMaxMap.set(s.space_id, sAct);
+          }
+        }
+
+        const spaceRows = this.db.prepare(
+          "SELECT id, name, execution_mode, created_at, updated_at FROM spaces WHERE user_id = ? AND (status = 'active' OR status IS NULL)"
+        ).all(userId) as Array<{ id: string; name: string; execution_mode?: string; created_at: string; updated_at: string }>;
+
+        spaceList = spaceRows.map((s) => {
+          const sessionMax = spaceMaxMap.get(s.id);
+          const lastActivityAt = sessionMax || s.updated_at || s.created_at;
+          return {
+            id: s.id,
+            name: s.name,
+            executionMode: s.execution_mode || 'container',
+            lastActivityAt,
+          };
+        });
+
+        spaceList.sort((a, b) => {
+          const diff = new Date(b.lastActivityAt || 0).getTime() - new Date(a.lastActivityAt || 0).getTime();
+          return diff !== 0 ? diff : b.id.localeCompare(a.id);
+        });
+      } catch {}
+    } else if (this.platformApi?.listSpaces) {
+      try {
+        const apiSpaces = await this.platformApi.listSpaces(userId, { includeArchived: false });
+        spaceList = apiSpaces.map((s) => ({
+          id: s.id,
+          name: s.name,
+          executionMode: s.executionMode || (s as any).execution_mode || 'container',
+          lastActivityAt: s.lastActivityAt,
+        }));
+        spaceList.sort((a, b) => {
+          const diff = new Date(b.lastActivityAt || 0).getTime() - new Date(a.lastActivityAt || 0).getTime();
+          return diff !== 0 ? diff : b.id.localeCompare(a.id);
+        });
+      } catch {}
+    }
+
+    if (spaceList.length === 0) {
+      return { replyText: '没有可用的工作区' };
+    }
+
+    const lines: string[] = [];
+    for (const space of spaceList) {
+      const isCurrent = space.id === currentSpaceId;
+      const mode = space.executionMode || 'container';
+      const prefix = isCurrent ? '* ' : '  ';
+      lines.push(`${prefix}${space.name} (${mode})`);
+    }
+
+    return { replyText: lines.join('\n') };
   }
 
   private async executeCompactCommand(
