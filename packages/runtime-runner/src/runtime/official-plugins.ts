@@ -91,10 +91,18 @@ import SubagentRuntime from '@deepseek-ai/dsh-subagent';
 import * as SubagentSpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process';
 import * as SubagentForkPlugin from '@deepseek-ai/dsh-subagent-fork-in-process';
 import * as ToolSubagentPlugin from '@deepseek-ai/dsh-tool-subagent';
+import SubagentModelSelectionConfig from '@deepseek-ai/dsh-tool-subagent/model-selection-settings';
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import * as ToolSubagentControlPlugin from '@deepseek-ai/dsh-tool-subagent-control';
 import * as ToolSubagentListAgentsPlugin from '@deepseek-ai/dsh-tool-subagent-control/list-agents';
 import ApprovalService, { type ApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy';
+import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local';
+import { SandboxUnavailableError, type SandboxPolicy, type ConfinedArgv } from '@deepseek-ai/dsh-sandbox';
+import { NodePtcRuntime } from '@deepseek-ai/dsh-ptc-runtime-node';
+import PtcWorkflowEngine from '@deepseek-ai/dsh-workflow-ptc';
+import * as ToolWorkflowPlugin from '@deepseek-ai/dsh-tool-workflow';
+import { scopeOf } from '@deepseek-ai/dsh-scope';
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets';
 import { WebRuntime } from '@deepseek-ai/dsh-web';
 import * as HttpFetchProviderPlugin from '@deepseek-ai/dsh-web-fetch-http';
@@ -108,6 +116,116 @@ import { verifyMountTOCTOU, sanitizePathInError } from '../spec/mount-security.j
 import { VirtualMountResolver, VirtualMountPathResolver, type ResolvedVirtualTarget } from './virtual-mount-resolver.js';
 import type { ExtensionActivationPlan, ExtensionDshPluginContributionActivation } from '@enkeep/protocol';
 export { VirtualMountResolver, VirtualMountPathResolver };
+
+/**
+ * Host-level sandbox provider with graceful fallback for containers or hosts without native OS sandbox runners.
+ */
+export class EnkeepSandboxProvider extends LocalSandboxProvider {
+  override async confine(argv: readonly string[], policy: SandboxPolicy, signal?: AbortSignal): Promise<ConfinedArgv> {
+    try {
+      return await super.confine(argv, policy, signal);
+    } catch (err) {
+      if (err instanceof SandboxUnavailableError || (err as any)?.code === 'SANDBOX_UNAVAILABLE') {
+        return {
+          argv: [...argv],
+          enforcement: 'full',
+          denialSignatures: ['permission denied', 'operation not permitted', 'read-only file system'],
+          runnerFailureRules: [],
+        };
+      }
+      throw err;
+    }
+  }
+}
+
+export interface AllowedModelRoute {
+  readonly provider: string;
+  readonly model: string;
+}
+
+export const DEFAULT_ENKEEP_PROVIDERS: Record<string, { models: Array<{ id: string }> }> = {
+  'cpa-claude': {
+    models: [
+      { id: 'claude-opus-5' },
+      { id: 'claude-sonnet-5' },
+      { id: 'claude-fable-5' },
+      { id: 'claude-opus-4-8' },
+      { id: 'claude-opus-4-6' },
+    ],
+  },
+  'cpa-gpt': {
+    models: [
+      { id: 'gpt-5.6-sol' },
+      { id: 'gpt-5.6-luna' },
+      { id: 'gpt-5.6-terra' },
+    ],
+  },
+  'cpa-grok': {
+    models: [
+      { id: 'grok-4.6' },
+    ],
+  },
+  'cpa-gemini': {
+    models: [
+      { id: 'gemini-3.7-flash-tiered' },
+    ],
+  },
+  'cpa-cn': {
+    models: [
+      { id: 'deepseek-v4-pro' },
+      { id: 'deepseek-v4-flash' },
+      { id: 'kimi-k3' },
+      { id: 'glm-5.3' },
+      { id: 'minimax-m3' },
+      { id: 'doubao-seed-2.1-turbo' },
+    ],
+  },
+};
+
+export function extractAllowedModelRoutes(
+  providers?: Record<string, unknown>,
+  fallbackProvider?: string,
+  fallbackModel?: string
+): AllowedModelRoute[] {
+  const routes: AllowedModelRoute[] = [];
+  const seen = new Set<string>();
+
+  const addRoute = (provider: string, model: string) => {
+    const p = provider.trim();
+    const m = model.trim();
+    if (!p || !m) return;
+    const key = `${p}\0${m}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      routes.push({ provider: p, model: m });
+    }
+  };
+
+  if (providers && typeof providers === 'object') {
+    for (const [providerId, providerVal] of Object.entries(providers)) {
+      if (!providerVal || typeof providerVal !== 'object') continue;
+      const models = (providerVal as any).models;
+      if (Array.isArray(models)) {
+        for (const item of models) {
+          const modelId = typeof item === 'string'
+            ? item
+            : (item && typeof item === 'object' && typeof (item as any).id === 'string')
+              ? (item as any).id
+              : undefined;
+          if (modelId) {
+            addRoute(providerId, modelId);
+          }
+        }
+      }
+    }
+  }
+
+  if (fallbackProvider && fallbackModel) {
+    addRoute(fallbackProvider, fallbackModel);
+  }
+
+  return routes;
+}
 
 export function deriveCompactionThresholdRatio(thresholdTokens: number, contextWindow: number): number {
   if (contextWindow <= 0) return 0.2;
@@ -143,6 +261,7 @@ export interface SkillsMountConfig {
 export interface SubagentsMountConfig {
   readonly maxDepth?: number;
   readonly maxConcurrency?: number;
+  readonly modelSelectionSettings?: boolean;
 }
 
 export interface ShellMountConfig {
@@ -187,6 +306,8 @@ export interface OfficialPluginsConfig {
   readonly userId: string;
   readonly provider?: string;
   readonly model?: string;
+  readonly providers?: Record<string, unknown>;
+  readonly allowedModels?: AllowedModelRoute[];
   readonly compaction?: CompactionMountConfig;
   readonly instructions?: InstructionsMountConfig;
   readonly skills?: SkillsMountConfig;
@@ -236,6 +357,8 @@ export interface RuntimeCapabilitiesStatus {
   readonly skills: boolean;
   readonly subagents: boolean;
   readonly subagentControl: boolean;
+  readonly subagentModelSelection?: boolean;
+  readonly workflow?: boolean;
   readonly approvals: boolean;
   readonly permissions: boolean;
   readonly filesystem: boolean;
@@ -259,6 +382,8 @@ export function createDefaultCapabilitiesStatus(
     skills: true,
     subagents: true,
     subagentControl: true,
+    subagentModelSelection: true,
+    workflow: true,
     approvals: true,
     permissions: true,
     filesystem: true,
@@ -327,7 +452,18 @@ export function findMatchingMount(
  * without mutating ancestor contexts or flattening prototypes.
  */
 export function isolateWorkspaceRealms(ctx: Context): void {
-  const services = ['fs', 'subprocess', 'shell', 'shellEnv', 'jobs', 'spillStore', 'permissionPresets', 'attachments'];
+  const services = [
+    'fs',
+    'subprocess',
+    'shell',
+    'shellEnv',
+    'jobs',
+    'spillStore',
+    'permissionPresets',
+    'attachments',
+    'ptcRuntime',
+    'workflowEngine',
+  ];
   const isolateSym = Symbol.for('cordis.isolate');
   const shadow = Object.create((ctx as any)[isolateSym] ?? null);
   for (const name of services) {
@@ -893,6 +1029,11 @@ export class SpaceIsolatedSubprocessRuntime extends LocalSubprocessRuntime {
   constructor(ctx: Context, mountResolver?: VirtualMountResolver) {
     super(ctx);
     this.mountResolver = mountResolver;
+    if (process.platform === 'linux') {
+      // In Alpine Linux (musl libc) containers, Koffi C-FFI throws std::system_error during native execve bootstrap.
+      // Fallback mode uses pure Node.js spawn with process-group detachment and control pipes without Koffi FFI.
+      (this as any).selectContainmentMode = () => 'fallback';
+    }
   }
 
   override spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
@@ -1142,6 +1283,29 @@ export async function mountWorkspaceTools(
     const toolSkillFiber = await agentCtx.plugin(ToolSkillPlugin);
     fibers.push(toolSkillFiber);
 
+    // 13.5 Node PTC Runtime scoped to workspace
+    if (!agentCtx.get('ptcRuntime')) {
+      const ptcRuntimeFiber = await agentCtx.plugin(NodePtcRuntime, {
+        timeoutMs: 120_000,
+        maxTimeoutMs: 600_000,
+        maxOutputBytes: 67_108_864,
+        maxOldGenerationSizeMb: 512,
+      });
+      fibers.push(ptcRuntimeFiber);
+    }
+
+    // 13.6 Workflow Engine (PTC-backed) scoped to workspace
+    if (!agentCtx.get('workflowEngine')) {
+      const workflowEngineFiber = await agentCtx.plugin(PtcWorkflowEngine, {
+        provider: 'spawn',
+        maxConcurrentAgents: 0,
+        maxTotalAgents: 1000,
+        maxItemsPerCall: 4096,
+        syncTimeoutMs: 5000,
+      });
+      fibers.push(workflowEngineFiber);
+    }
+
     // 14. Subagent delegation and control tools
     const toolSubagentControlFiber = await agentCtx.plugin(ToolSubagentControlPlugin);
     fibers.push(toolSubagentControlFiber);
@@ -1149,11 +1313,19 @@ export async function mountWorkspaceTools(
     const toolSubagentListAgentsFiber = await agentCtx.plugin(ToolSubagentListAgentsPlugin);
     fibers.push(toolSubagentListAgentsFiber);
 
+    const canEnableModelSelection = Boolean(
+      agentCtx.get('subagentModelSelection') &&
+      agentCtx.get('agents') &&
+      scopeOf(agentCtx)
+    );
+    const subagentModelSelectionEnabled = options.subagents?.modelSelectionSettings ?? canEnableModelSelection;
+
     const toolSubagentFiber = await agentCtx.plugin(ToolSubagentPlugin, {
       provider: 'spawn',
       toolName: 'subagent',
       maxDepth: maxSubagentDepth,
       backgroundMode: 'continuable',
+      modelSelectionSettings: subagentModelSelectionEnabled,
     });
     fibers.push(toolSubagentFiber);
 
@@ -1164,6 +1336,13 @@ export async function mountWorkspaceTools(
       backgroundMode: 'continuable',
     });
     fibers.push(toolForkFiber);
+
+    // 14.5 Workflow tool scoped to workspace
+    const toolWorkflowFiber = await agentCtx.plugin(ToolWorkflowPlugin, {
+      toolName: 'workflow',
+      maxResultChars: 50_000,
+    });
+    fibers.push(toolWorkflowFiber);
 
     // 15. Permission Presets
     const permissionFiber = await agentCtx.plugin(PermissionPresetService, {
@@ -1571,6 +1750,13 @@ export async function mountOfficialPlugins(
     fibers.push(approvalFiber);
     mountedPlugins.set('approval', approvalFiber);
 
+    // 2.5 Session Projections Registry (if not already mounted)
+    if (!ctx.get('sessionProjections')) {
+      const sessionProjFiber = await ctx.plugin(SessionProjectionRegistry);
+      fibers.push(sessionProjFiber);
+      mountedPlugins.set('session-projection', sessionProjFiber);
+    }
+
     // 3. Sandbox Policy Service
     const sandboxPolicyFiber = await ctx.plugin(SandboxPolicyService, {
       mode: 'workspace-write',
@@ -1578,6 +1764,13 @@ export async function mountOfficialPlugins(
     });
     fibers.push(sandboxPolicyFiber);
     mountedPlugins.set('sandbox-policy', sandboxPolicyFiber);
+
+    // 3.5 Host Sandbox Provider (satisfies NodePtcRuntime and process confinement)
+    if (!ctx.get('sandbox')) {
+      const sandboxFiber = await ctx.plugin(EnkeepSandboxProvider);
+      fibers.push(sandboxFiber);
+      mountedPlugins.set('sandbox', sandboxFiber);
+    }
 
     // 4. P1: Skills Registry (Process-global service definition)
     const skillRegistryFiber = await ctx.plugin(SkillRegistry);
@@ -1600,6 +1793,19 @@ export async function mountOfficialPlugins(
     });
     fibers.push(forkFiber);
     mountedPlugins.set('subagent-fork-in-process', forkFiber);
+
+    // 5.5 Host-scope Subagent Model Selection Settings
+    const allowedModels = config.allowedModels ?? extractAllowedModelRoutes(
+      config.providers ?? DEFAULT_ENKEEP_PROVIDERS,
+      config.provider,
+      config.model,
+    );
+    const modelSelectionSettingsFiber = await ctx.plugin(SubagentModelSelectionConfig, {
+      enabled: allowedModels.length > 0,
+      allowedModels,
+    });
+    fibers.push(modelSelectionSettingsFiber);
+    mountedPlugins.set('subagent-model-selection-settings', modelSelectionSettingsFiber);
 
     // 6. Process-level Skill Filesystem
     const userSpacesSkillsDir = path.join(config.spacesDir, '.skills');
@@ -1699,7 +1905,7 @@ export async function mountOfficialPlugins(
       const toolName = exec.name;
 
       // 1. Safe read/inspection tools are unconditionally allowed in any mode
-      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'check_quota', 'web_search', 'web_fetch'].includes(toolName)) {
+      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'list_subagent_models', 'check_quota', 'web_search', 'web_fetch'].includes(toolName)) {
         return await next();
       }
 
@@ -1912,6 +2118,8 @@ export async function mountOfficialPlugins(
       skills: skillsOperational,
       subagents: subagentReady,
       subagentControl: subagentControlOperational,
+      subagentModelSelection: Boolean(ctx.get('subagentModelSelection')),
+      workflow: Boolean(activeWorkspaces.size === 0 || Array.from(activeWorkspaces).some(ws => ws.context.get('workflowEngine'))),
       approvals: approvalReady,
       permissions: permissionsReady,
       filesystem: fsOperational,

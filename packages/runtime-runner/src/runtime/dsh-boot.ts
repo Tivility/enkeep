@@ -1105,104 +1105,104 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   ctx.provide('platformClient', platformClient);
   ctx.platformClient = platformClient;
 
+  // In-container placeholder credential environment variable
+  process.env.IN_CONTAINER_PLACEHOLDER = 'in-container-placeholder';
+
+  let resolvedProviders: Record<string, unknown> | undefined = validConfig.providers;
+  if (!resolvedProviders && process.env.ENKEEP_LLM_PROVIDERS) {
+    try {
+      const parsed = JSON.parse(process.env.ENKEEP_LLM_PROVIDERS);
+      if (isRecord(parsed)) {
+        resolvedProviders = parsed;
+      }
+    } catch {}
+  }
+
+  if (!resolvedProviders || Object.keys(resolvedProviders).length === 0) {
+    // Default in-container rewritten providers table
+    resolvedProviders = {
+      'cpa-claude': {
+        displayName: 'Claude',
+        apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
+        api: 'anthropic-messages',
+        baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-claude`,
+        defaultContextWindow: 1000000,
+        defaultMaxTokens: 128000,
+        defaultInput: ['text', 'image'],
+        models: [
+          { id: 'claude-opus-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'claude-sonnet-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'claude-fable-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'claude-opus-4-8', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'claude-opus-4-6', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+        ],
+      },
+      'cpa-gpt': {
+        displayName: 'GPT',
+        apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
+        api: 'openai-completions',
+        baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-gpt`,
+        defaultContextWindow: 920000,
+        defaultMaxTokens: 128000,
+        models: [
+          { id: 'gpt-5.6-sol', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'gpt-5.6-luna', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'gpt-5.6-terra', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+        ],
+      },
+      'cpa-grok': {
+        displayName: 'Grok',
+        apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
+        api: 'openai-completions',
+        baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-grok`,
+        defaultContextWindow: 400000,
+        defaultMaxTokens: 64000,
+        models: [
+          { id: 'grok-4.6', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+        ],
+      },
+      'cpa-gemini': {
+        displayName: 'Gemini',
+        apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
+        api: 'anthropic-messages',
+        baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-gemini`,
+        defaultContextWindow: 1000000,
+        defaultMaxTokens: 64000,
+        models: [
+          {
+            id: 'gemini-3.7-flash-tiered',
+            contextWindow: 1000000,
+            maxTokens: 64000,
+            reasoningEfforts: {
+              low: 'low',
+              medium: 'medium',
+              high: 'high',
+              max: 'max',
+            },
+          },
+        ],
+      },
+      'cpa-cn': {
+        displayName: '国产模型',
+        apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
+        api: 'anthropic-messages',
+        baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-cn`,
+        defaultContextWindow: 1000000,
+        defaultMaxTokens: 64000,
+        models: [
+          { id: 'deepseek-v4-pro', contextWindow: 1048566, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'deepseek-v4-flash', contextWindow: 1048566, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'kimi-k3', contextWindow: 1000000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'glm-5.3', contextWindow: 1000000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'minimax-m3', contextWindow: 1000000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+          { id: 'doubao-seed-2.1-turbo', contextWindow: 200000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
+        ],
+      },
+    };
+  }
+
   // 2. Mount LLM adapter: official @deepseek-ai/dsh-llm-pi-ai when enabled, demo adapter otherwise
   if (llmEnabled) {
-    // In-container placeholder credential environment variable
-    process.env.IN_CONTAINER_PLACEHOLDER = 'in-container-placeholder';
-
-    let resolvedProviders: Record<string, unknown> | undefined = validConfig.providers;
-    if (!resolvedProviders && process.env.ENKEEP_LLM_PROVIDERS) {
-      try {
-        const parsed = JSON.parse(process.env.ENKEEP_LLM_PROVIDERS);
-        if (isRecord(parsed)) {
-          resolvedProviders = parsed;
-        }
-      } catch {}
-    }
-
-    if (!resolvedProviders || Object.keys(resolvedProviders).length === 0) {
-      // Default in-container rewritten providers table
-      resolvedProviders = {
-        'cpa-claude': {
-          displayName: 'Claude',
-          apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
-          api: 'anthropic-messages',
-          baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-claude`,
-          defaultContextWindow: 1000000,
-          defaultMaxTokens: 128000,
-          defaultInput: ['text', 'image'],
-          models: [
-            { id: 'claude-opus-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'claude-sonnet-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'claude-fable-5', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'claude-opus-4-8', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'claude-opus-4-6', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-          ],
-        },
-        'cpa-gpt': {
-          displayName: 'GPT',
-          apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
-          api: 'openai-completions',
-          baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-gpt`,
-          defaultContextWindow: 920000,
-          defaultMaxTokens: 128000,
-          models: [
-            { id: 'gpt-5.6-sol', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'gpt-5.6-luna', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'gpt-5.6-terra', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-          ],
-        },
-        'cpa-grok': {
-          displayName: 'Grok',
-          apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
-          api: 'openai-completions',
-          baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-grok`,
-          defaultContextWindow: 400000,
-          defaultMaxTokens: 64000,
-          models: [
-            { id: 'grok-4.6', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-          ],
-        },
-        'cpa-gemini': {
-          displayName: 'Gemini',
-          apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
-          api: 'anthropic-messages',
-          baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-gemini`,
-          defaultContextWindow: 1000000,
-          defaultMaxTokens: 64000,
-          models: [
-            {
-              id: 'gemini-3.7-flash-tiered',
-              contextWindow: 1000000,
-              maxTokens: 64000,
-              reasoningEfforts: {
-                low: 'low',
-                medium: 'medium',
-                high: 'high',
-                max: 'max',
-              },
-            },
-          ],
-        },
-        'cpa-cn': {
-          displayName: '国产模型',
-          apiKeyEnv: 'IN_CONTAINER_PLACEHOLDER',
-          api: 'anthropic-messages',
-          baseURL: `${llmBaseUrl.replace(/\/+$/, '')}/cpa-cn`,
-          defaultContextWindow: 1000000,
-          defaultMaxTokens: 64000,
-          models: [
-            { id: 'deepseek-v4-pro', contextWindow: 1048566, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'deepseek-v4-flash', contextWindow: 1048566, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'kimi-k3', contextWindow: 1000000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'glm-5.3', contextWindow: 1000000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'minimax-m3', contextWindow: 1000000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-            { id: 'doubao-seed-2.1-turbo', contextWindow: 200000, reasoningEfforts: { low: 'low', medium: 'medium', high: 'high', max: 'max' } },
-          ],
-        },
-      };
-    }
-
     const proxyToken = process.env.ENKEEP_LLM_PROXY_TOKEN;
     if (proxyToken && resolvedProviders) {
       for (const [key, prov] of Object.entries(resolvedProviders)) {
@@ -1245,6 +1245,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       'cpa-gpt',
       'cpa-grok',
       'cpa-cn',
+      ...(validConfig.providers ? Object.keys(validConfig.providers) : []),
     ]));
     ctx.llm.registerAdapter(demoProviders, adapter);
   }
@@ -1289,6 +1290,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     userId,
     provider,
     model,
+    providers: resolvedProviders,
     compaction: validConfig.compaction,
     instructions: validConfig.instructions,
     skills: validConfig.skills,
@@ -1894,6 +1896,39 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     const createAgentSetup = (spacePath: string, selectionRef: { current: any; assembled: any }) => {
       return async (agentCtx: Context, _agent?: Agent) => {
         installModelSelection(agentCtx, selectionRef);
+        // Ensure child/subagent instances created under this context preserve their own explicit model selection
+        agentCtx.on('agent/request', async (payload: any, next: any) => {
+          const res = await next();
+          if (payload?.agent && payload.agent.id !== sessionIdStr && payload.agent.options) {
+            const childOpts = payload.agent.options;
+            if (childOpts.provider && childOpts.model) {
+              return {
+                ...res,
+                provider: childOpts.provider,
+                model: childOpts.model,
+                reasoningEffort: childOpts.reasoningEffort ?? res.reasoningEffort,
+              };
+            }
+          }
+          return res;
+        }, { prepend: true });
+        agentCtx.on('system-prompt/assemble', async (assembly: any, context: any, next: any) => {
+          const res = await next();
+          if (context?.agent && context.agent.id !== sessionIdStr && context.agent.options) {
+            const childOpts = context.agent.options;
+            if (childOpts.provider && childOpts.model && res?.variables) {
+              return {
+                ...res,
+                variables: {
+                  ...res.variables,
+                  provider: childOpts.provider,
+                  model: childOpts.model,
+                },
+              };
+            }
+          }
+          return res;
+        }, { prepend: true });
         if (validatedProfile) {
           installAgentProfile(agentCtx, validatedProfile);
         }
@@ -3096,6 +3131,39 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         agentOptions: { provider, model },
         setup: async (agentCtx: Context, _agent?: Agent) => {
           installModelSelection(agentCtx, selectionRef!);
+          // Ensure child/subagent instances created under this context preserve their own explicit model selection
+          agentCtx.on('agent/request', async (payload: any, next: any) => {
+            const res = await next();
+            if (payload?.agent && payload.agent.id !== sessionIdStr && payload.agent.options) {
+              const childOpts = payload.agent.options;
+              if (childOpts.provider && childOpts.model) {
+                return {
+                  ...res,
+                  provider: childOpts.provider,
+                  model: childOpts.model,
+                  reasoningEffort: childOpts.reasoningEffort ?? res.reasoningEffort,
+                };
+              }
+            }
+            return res;
+          }, { prepend: true });
+          agentCtx.on('system-prompt/assemble', async (assembly: any, context: any, next: any) => {
+            const res = await next();
+            if (context?.agent && context.agent.id !== sessionIdStr && context.agent.options) {
+              const childOpts = context.agent.options;
+              if (childOpts.provider && childOpts.model && res?.variables) {
+                return {
+                  ...res,
+                  variables: {
+                    ...res.variables,
+                    provider: childOpts.provider,
+                    model: childOpts.model,
+                  },
+                };
+              }
+            }
+            return res;
+          }, { prepend: true });
           if (validatedProfile) {
             installAgentProfile(agentCtx, validatedProfile);
           }
