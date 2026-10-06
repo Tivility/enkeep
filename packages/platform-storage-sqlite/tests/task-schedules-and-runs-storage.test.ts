@@ -1072,4 +1072,57 @@ describe('Task Schedules, Recurrences and Execution Runs Storage', () => {
       expect(taskRow.lease_expires_at).toBeNull();
     });
   });
+
+  describe('9. Legacy and Unexpected Task Payload Resiliency', () => {
+    it('lists tasks successfully even when a task row contains a legacy or unexpected payload shape', async () => {
+      const normalTask = await repo1.create({
+        title: 'Normal Active Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute normal check',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      // Insert synthetic legacy task matching HappyClaw payload shape (keys only, no type property)
+      const legacyTaskId = 'task_synth_00000000000000000000000001';
+      db.prepare(`
+        INSERT INTO platform_tasks (
+          id, user_id, title, status, priority, lease_duration_ms, claim_count, max_retries, payload, created_at, updated_at
+        ) VALUES (
+          ?, ?, 'Legacy Imported Task', 'pending', 'medium', 60000, 0, 3, ?,
+          '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z'
+        )
+      `).run(
+        legacyTaskId,
+        user1,
+        JSON.stringify({
+          chatJid: 'oc_test0000000000000000000000000001',
+          executionMode: 'container',
+          executionType: 'agent_prompt',
+          groupFolder: 'synth_group_01',
+          originalTaskId: 'synth_original_task_01',
+          prompt: 'Synthetic maintenance prompt',
+          status: 'pending',
+        })
+      );
+
+      const tasks = await repo1.list();
+      expect(tasks.length).toBe(2);
+
+      const legacy = tasks.find((t) => t.id === legacyTaskId);
+      expect(legacy).toBeDefined();
+      expect(legacy?.title).toBe('Legacy Imported Task');
+      expect(legacy?.status).toBe('pending');
+      expect(legacy?.payload.type).toBe('agent_prompt');
+      expect(legacy?.payload.prompt).toBe('Synthetic maintenance prompt');
+      expect((legacy?.payload as any).originalTaskId).toBe('synth_original_task_01');
+      expect((legacy?.payload as any).groupFolder).toBe('synth_group_01');
+
+      const normal = tasks.find((t) => t.id === normalTask.id);
+      expect(normal).toBeDefined();
+      expect(normal?.payload.prompt).toBe('Execute normal check');
+    });
+  });
 });
