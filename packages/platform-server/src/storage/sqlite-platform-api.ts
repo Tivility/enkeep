@@ -967,12 +967,24 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
         )
         .run(gen1Id, userId, sessionId, sessionId, boundSnapshotId);
 
-      // 3. Persist new session as canonical_session_id on spaces table
-      this.db
-        .prepare(
-          'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
-        )
-        .run(sessionId, input.spaceId, userId);
+      // 3. Persist new session as canonical_session_id on spaces table only if null or pointing to a non-active route
+      const hasActiveCanonical = spaceRow.canonical_session_id
+        ? Boolean(
+            this.db
+              .prepare(
+                'SELECT 1 FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? AND status = ? LIMIT 1'
+              )
+              .get(spaceRow.canonical_session_id, input.spaceId, userId, 'active')
+          )
+        : false;
+
+      if (!hasActiveCanonical) {
+        this.db
+          .prepare(
+            'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+          )
+          .run(sessionId, input.spaceId, userId);
+      }
 
       this.db.exec('COMMIT');
       inTx = false;

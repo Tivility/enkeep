@@ -135,7 +135,7 @@ const ALLOWED_ACCOUNT_PREFERENCES_KEYS = new Set(["locale", "theme"]);
 const ALLOWED_ACCOUNT_THEME_KEYS = new Set(["theme"]);
 const ALLOWED_CREATE_SPACE_KEYS = new Set(["name", "folder", "executionMode"]);
 const ALLOWED_UPDATE_SPACE_KEYS = new Set(["name", "executionMode"]);
-const ALLOWED_CREATE_SESSION_KEYS = new Set(["spaceId", "title", "executionMode", "peerId"]);
+const ALLOWED_CREATE_SESSION_KEYS = new Set(["spaceId", "title", "executionMode", "peerId", "forceNew"]);
 const ALLOWED_UPDATE_SESSION_KEYS = new Set(["title"]);
 const ALLOWED_RESET_SESSION_KEYS = new Set(["reason"]);
 const ALLOWED_FORK_SESSION_KEYS = new Set(["fromMessageId", "fromTurnId", "title", "targetSpaceId"]);
@@ -2510,10 +2510,15 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             }
           }
 
+          if (body.forceNew !== undefined && typeof body.forceNew !== "boolean") {
+            throw new ValidationError('Field "forceNew" must be a boolean');
+          }
+
           const session = await platformApi.createSession(user.id, {
             spaceId,
             title,
             executionMode: space.executionMode,
+            forceNew: body.forceNew !== undefined ? Boolean(body.forceNew) : undefined,
           });
           sendJsonResponse(res, 201, createSuccessEnvelope(session));
           return;

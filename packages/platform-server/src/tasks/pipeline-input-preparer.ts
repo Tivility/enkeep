@@ -930,30 +930,35 @@ export class PipelineTaskInputPreparerService {
       eligibleSpaceIds = rows.map((r) => r.id);
     }
 
-    // 5. Query web_messages strictly scoped to tenant + eligible spaces with active canonical session routes
+    // 5. Query web_messages strictly scoped to tenant + eligible spaces across all active session routes
     const spacePlaceholders = eligibleSpaceIds.map(() => '?').join(', ');
     let querySql = `
       SELECT m.id, m.session_id, m.role, m.content, m.status, m.turn_id, m.created_at,
-             canonical.space_id, canonical.folder
+             sec.space_id, sec.folder
       FROM web_messages m
       JOIN (
-        SELECT r.id AS session_id, s.id AS space_id, s.folder AS folder
+        SELECT r.id AS session_id, r.created_at AS route_created_at, s.id AS space_id, s.folder AS folder,
+               CASE
+                 WHEN r.id = s.canonical_session_id THEN 1
+                 WHEN (s.canonical_session_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM session_routes r0
+                   WHERE r0.id = s.canonical_session_id AND r0.user_id = s.user_id AND r0.status = 'active'
+                 )) AND r.id = (
+                   SELECT r2.id FROM session_routes r2
+                   WHERE r2.space_id = s.id AND r2.user_id = s.user_id AND r2.status = 'active'
+                   ORDER BY r2.created_at ASC, r2.id ASC LIMIT 1
+                 ) THEN 1
+                 ELSE 0
+               END AS is_canonical
         FROM session_routes r
         JOIN spaces s ON r.space_id = s.id AND r.user_id = s.user_id
         WHERE r.user_id = ?
           AND r.status = 'active'
           AND s.status = 'active'
-          AND (
-            r.id = s.canonical_session_id
-            OR (s.canonical_session_id IS NULL AND r.id = (
-              SELECT r2.id FROM session_routes r2
-              WHERE r2.space_id = s.id AND r2.user_id = s.user_id AND r2.status = 'active'
-              ORDER BY r2.created_at ASC LIMIT 1
-            ))
-          )
           AND s.id IN (${spacePlaceholders})
-      ) canonical ON m.session_id = canonical.session_id
+      ) sec ON m.session_id = sec.session_id
       WHERE m.user_id = ?
+        AND (sec.is_canonical = 1 OR m.created_at >= sec.route_created_at)
     `;
     const queryParams: any[] = [tenantId, ...eligibleSpaceIds, tenantId];
 

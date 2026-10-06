@@ -793,4 +793,91 @@ Preamble reflection that should not be considered an observation section
     expect(allStagedObsStr).not.toContain('Old observation from 2 weeks ago');
     expect(allStagedObsStr).not.toContain('Preamble reflection');
   });
+
+  it('13. pipeline preparer includes aux active session messages created after route, excludes fork-inherited ones and archived sessions', async () => {
+    const preparer = new PipelineTaskInputPreparerService({
+      database: db,
+      fileService: fakeFileService as any,
+    });
+
+    const pipelineTaskId = 'task_00000000000000000000000000000013';
+    preparer.registerCapability(pipelineTaskId, {
+      capability: 'pipeline_observation',
+      checkpointPath: 'pipeline/.test-checkpoint-multi-session',
+      stagedInputPrefix: 'pipeline/inputs',
+    });
+
+    // Explicitly mark aliceSessionId as canonical on aliceSpaceId and set route created_at
+    db.prepare('UPDATE spaces SET canonical_session_id = ? WHERE id = ?').run(aliceSessionId, aliceSpaceId);
+    db.prepare('UPDATE session_routes SET created_at = ? WHERE id = ?').run('2026-09-10T08:00:00.000Z', aliceSessionId);
+
+    // 1. Auxiliary active session created at 14:00
+    const auxSessionId = 'ses_aux_active_000000000000000001';
+    const auxCreatedAt = '2026-09-10T14:00:00.000Z';
+    db.prepare(`
+      INSERT INTO session_routes (
+        id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, status, created_at, updated_at
+      ) VALUES (?, ?, ?, 'web', 'default', ?, ?, 'dsh_aux_1', 'container', 'active', ?, ?)
+    `).run(auxSessionId, aliceSpaceId, tenantAlice, auxSessionId, `web:${auxSessionId}`, auxCreatedAt, auxCreatedAt);
+
+    // 2. Archived session created at 15:00
+    const archSessionId = 'ses_archived_000000000000000002';
+    const archCreatedAt = '2026-09-10T15:00:00.000Z';
+    db.prepare(`
+      INSERT INTO session_routes (
+        id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, status, created_at, updated_at
+      ) VALUES (?, ?, ?, 'web', 'default', ?, ?, 'dsh_arch_1', 'container', 'archived', ?, ?)
+    `).run(archSessionId, aliceSpaceId, tenantAlice, archSessionId, `web:${archSessionId}`, archCreatedAt, archCreatedAt);
+
+    // Insert messages:
+    // a. Fork-inherited message in aux session with timestamp prior to aux session route creation (t = 11:00)
+    // b. New message in aux session with timestamp after aux session route creation (t = 14:30)
+    // c. Message in archived session (t = 15:30)
+    db.prepare(`
+      INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, created_at)
+      VALUES
+        ('msg_aux_inherited', ?, ?, 'user', 'Forked old message', 'delivered', 'rt_1', 'turn_f1', '2026-09-10T11:00:00.000Z'),
+        ('msg_aux_new', ?, ?, 'user', 'Brand new auxiliary message', 'delivered', 'rt_1', 'turn_a1', '2026-09-10T14:30:00.000Z'),
+        ('msg_archived_session', ?, ?, 'user', 'Archived session message', 'delivered', 'rt_1', 'turn_x1', '2026-09-10T15:30:00.000Z')
+    `).run(auxSessionId, tenantAlice, auxSessionId, tenantAlice, archSessionId, tenantAlice);
+
+    const runId = 'run_multi_session_test_0000000001';
+    const result = await preparer.prepare({
+      task: { id: pipelineTaskId } as any,
+      payload: {
+        type: 'agent_prompt',
+        prompt: 'Multi-session pipeline preparation test',
+        sessionId: aliceSessionId,
+        sessionPolicy: 'existing_session',
+        spaceId: aliceSpaceId,
+      },
+      tenantId: tenantAlice,
+      runId,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toBeDefined();
+    const fileKey = `${tenantAlice}:${aliceSpaceId}:pipeline/inputs/${runId}/input.json`;
+    expect(writtenFiles.has(fileKey)).toBe(true);
+    const envelope = JSON.parse(writtenFiles.get(fileKey)!);
+
+    const recordIds = envelope.records.map((r: any) => r.id);
+    // Canonical session messages msg_0001, msg_0002, msg_0003 are present
+    expect(recordIds).toContain('msg_0001');
+    expect(recordIds).toContain('msg_0002');
+    expect(recordIds).toContain('msg_0003');
+    // Aux session new message created after route is present
+    expect(recordIds).toContain('msg_aux_new');
+    // Fork-inherited message in aux session is EXCLUDED (no double counting)
+    expect(recordIds).not.toContain('msg_aux_inherited');
+    // Message from archived session is EXCLUDED
+    expect(recordIds).not.toContain('msg_archived_session');
+
+    // Verify record attribution schema: sessionId, spaceId, folder
+    const auxRecord = envelope.records.find((r: any) => r.id === 'msg_aux_new');
+    expect(auxRecord).toBeDefined();
+    expect(auxRecord.sessionId).toBe(auxSessionId);
+    expect(auxRecord.spaceId).toBe(aliceSpaceId);
+    expect(auxRecord.folder).toBe('space-alice-pipe');
+  });
 });

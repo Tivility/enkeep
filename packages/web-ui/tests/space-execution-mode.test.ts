@@ -119,7 +119,7 @@ describe('Web UI Execution Mode & Host Security Subsystem', () => {
       expect(fnBody).toContain('...(space && space.executionMode ? { executionMode: space.executionMode } : {})');
     });
 
-    it('+ 会话 click handler uses space executionMode and toasts on canonical session reuse', () => {
+    it('+ 会话 click handler uses space executionMode and creates new session with forceNew', () => {
       const handlerStart = jsCode.indexOf("newSessionBtn.addEventListener('click'");
       expect(handlerStart).toBeGreaterThan(-1);
       const handlerBody = jsCode.slice(handlerStart, handlerStart + 1500);
@@ -127,8 +127,17 @@ describe('Web UI Execution Mode & Host Security Subsystem', () => {
       expect(handlerBody).not.toContain("executionMode: 'container'");
       expect(handlerBody).toContain('state.spaces.find((s) => s.id === state.currentSpaceId)');
       expect(handlerBody).toContain('...(space && space.executionMode ? { executionMode: space.executionMode } : {})');
-      expect(handlerBody).toContain('chat.canonicalSessionReused');
-      expect(handlerBody).toContain('showToast(');
+      expect(handlerBody).toContain('forceNew: true');
+      expect(handlerBody).not.toContain('chat.canonicalSessionReused');
+    });
+
+    it('handleCreateSession submits forceNew: true and selects newly created session', () => {
+      const fnStart = jsCode.indexOf('async function handleCreateSession(');
+      expect(fnStart).toBeGreaterThan(-1);
+      const fnBody = jsCode.slice(fnStart, fnStart + 2500);
+
+      expect(fnBody).toContain('forceNew: true');
+      expect(fnBody).toContain('selectSession(res.data.id)');
     });
 
     it('simulates session creation body resolution across host, container, and undefined space modes', () => {
