@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createSqliteStorage, SqlitePlatformStorage } from '../src/index.js';
+import {
+  createSqliteStorage,
+  SqlitePlatformStorage,
+  MIGRATION_036_SPACE_CANONICAL_SESSION_SQL,
+} from '../src/index.js';
 import { NotFoundError } from '@enkeep/platform-core';
 import { TEST_FULL_MIGRATIONS } from './v9-agent-profiles-repo.test.js';
 
@@ -135,5 +139,56 @@ describe('Sqlite Core Repositories', () => {
       });
       expect(otherUserFailures).toBe(0);
     }
+  });
+
+  it('creates canonical session when chat identity already owns a route in space A', async () => {
+    storage.db.exec(MIGRATION_036_SPACE_CANONICAL_SESSION_SQL);
+
+    const user = await storage.users.create({
+      username: 'user-synth-01',
+      passwordHash: 'hash-synthetic-01',
+      role: 'user',
+    });
+    const tenant = storage.forTenant(user.id);
+
+    const spaceA = await tenant.spaces.create({
+      name: 'Space A',
+      folder: 'space-00000000000000000000000000000001',
+    });
+    const spaceB = await tenant.spaces.create({
+      name: 'Space B',
+      folder: 'space-00000000000000000000000000000002',
+    });
+
+    const chatContextId = 'oc_test0000000000000000000000000001';
+    const routeA = await tenant.sessionRoutes.create({
+      spaceId: spaceA.id,
+      channel: 'lark',
+      accountId: 'cli_synthetic_01',
+      nativeContextId: chatContextId,
+      peerId: chatContextId,
+      dshSessionId: 'ses_00000000000000000000000000000001',
+    });
+
+    const routeB = await tenant.sessionRoutes.getOrCreateCanonicalSession(spaceB.id, {
+      channel: 'lark',
+      accountId: 'cli_synthetic_01',
+      nativeContextId: chatContextId,
+      peerId: chatContextId,
+    });
+
+    expect(routeB.spaceId).toBe(spaceB.id);
+    expect(routeB.channel).toBe('lark');
+    expect(routeB.accountId).toBe('cli_synthetic_01');
+    expect(routeB.nativeContextId).toBe(routeB.id);
+    expect(routeB.peerId).toBe(`lark:${routeB.id}`);
+
+    const freshRouteA = await tenant.sessionRoutes.findById(routeA.id);
+    expect(freshRouteA).not.toBeNull();
+    expect(freshRouteA?.spaceId).toBe(spaceA.id);
+    expect(freshRouteA?.channel).toBe('lark');
+    expect(freshRouteA?.accountId).toBe('cli_synthetic_01');
+    expect(freshRouteA?.nativeContextId).toBe(chatContextId);
+    expect(freshRouteA?.peerId).toBe(chatContextId);
   });
 });
