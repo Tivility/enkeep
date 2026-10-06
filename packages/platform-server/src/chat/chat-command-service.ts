@@ -421,6 +421,13 @@ export interface ChatCommandServiceOptions {
   db?: DatabaseSync;
 }
 
+export interface ChatCommandChannelContext {
+  channel?: string;
+  accountId?: string;
+  nativeContextId?: string;
+  chatId?: string;
+}
+
 export class ChatCommandService {
   private readonly modelSelectionService: ModelSelectionService;
   private platformApi?: ChatCommandServiceOptions['platformApi'];
@@ -470,12 +477,46 @@ export class ChatCommandService {
     this.db = db;
   }
 
+  private resolveChannelContext(params: {
+    sessionId: string;
+    channelContext?: ChatCommandChannelContext;
+  }): { channel: string; accountId: string | null; nativeContextId: string | null } {
+    if (params.channelContext) {
+      return {
+        channel: params.channelContext.channel || 'web',
+        accountId: params.channelContext.accountId ?? null,
+        nativeContextId: params.channelContext.nativeContextId || params.channelContext.chatId || null,
+      };
+    }
+    let channel = 'web';
+    let accountId: string | null = null;
+    let nativeContextId: string | null = null;
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT channel, account_id, native_context_id FROM session_routes WHERE id = ?')
+          .get(params.sessionId) as {
+            channel?: string;
+            account_id?: string | null;
+            native_context_id?: string | null;
+          } | undefined;
+        if (routeRow) {
+          if (routeRow.channel) channel = routeRow.channel;
+          accountId = routeRow.account_id ?? null;
+          nativeContextId = routeRow.native_context_id ?? null;
+        }
+      } catch {}
+    }
+    return { channel, accountId, nativeContextId };
+  }
+
   async execute(params: {
     userId: string;
     sessionId: string;
     spaceId: string;
     content: string;
     idempotencyKey?: string;
+    channelContext?: ChatCommandChannelContext;
   }): Promise<{ replyText: string }> {
     try {
       const parsed = parseChatCommand(params.content);
@@ -787,31 +828,16 @@ export class ChatCommandService {
   }
 
   private async executeBindCommand(
-    params: { userId: string; sessionId: string; spaceId: string },
+    params: {
+      userId: string;
+      sessionId: string;
+      spaceId: string;
+      channelContext?: ChatCommandChannelContext;
+    },
     parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
-    const { userId, sessionId } = params;
-
-    let channel = 'web';
-    let accountId: string | null = null;
-    let nativeContextId: string | null = null;
-
-    if (this.db) {
-      try {
-        const routeRow = this.db
-          .prepare('SELECT channel, account_id, native_context_id FROM session_routes WHERE id = ?')
-          .get(sessionId) as {
-            channel?: string;
-            account_id?: string | null;
-            native_context_id?: string | null;
-          } | undefined;
-        if (routeRow) {
-          if (routeRow.channel) channel = routeRow.channel;
-          accountId = routeRow.account_id ?? null;
-          nativeContextId = routeRow.native_context_id ?? null;
-        }
-      } catch {}
-    }
+    const { userId } = params;
+    const { channel, accountId, nativeContextId } = this.resolveChannelContext(params);
 
     if (channel === 'web') {
       return { replyText: 'Web 会话工作区绑定固定，请在目标工作区新建会话。' };
@@ -832,38 +858,55 @@ export class ChatCommandService {
 
     const cleanTarget = rawTarget.replace(/^["']|["']$/g, '').trim();
 
-    // Resolve target space: priority id -> folder -> name
+    // Resolve target space: special targets 'main' / 'home' -> id -> folder -> name (case-insensitive for folder/name)
     let targetSpace: { id: string; name: string; folder: string; execution_mode: string } | undefined;
+    const targetLower = cleanTarget.toLowerCase();
+
     try {
-      const byId = this.db
-        .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND id = ?')
-        .get(userId, cleanTarget) as { id: string; name: string; folder: string; execution_mode: string } | undefined;
-      if (byId) {
-        targetSpace = byId;
-      } else {
-        const byFolder = this.db
-          .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND folder = ?')
-          .get(userId, cleanTarget) as { id: string; name: string; folder: string; execution_mode: string } | undefined;
-        if (byFolder) {
-          targetSpace = byFolder;
+      if (targetLower === 'main' || targetLower === 'home') {
+        if (accountId) {
+          const accRow = this.db
+            .prepare('SELECT default_space_id FROM channel_accounts WHERE id = ? AND user_id = ?')
+            .get(accountId, userId) as { default_space_id?: string | null } | undefined;
+          if (accRow?.default_space_id) {
+            targetSpace = this.db
+              .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND id = ?')
+              .get(userId, accRow.default_space_id) as typeof targetSpace;
+          }
+        }
+      }
+
+      if (!targetSpace) {
+        const byId = this.db
+          .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND id = ?')
+          .get(userId, cleanTarget) as typeof targetSpace;
+        if (byId) {
+          targetSpace = byId;
         } else {
-          const byName = this.db
-            .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND name = ?')
-            .all(userId, cleanTarget) as Array<{ id: string; name: string; folder: string; execution_mode: string }>;
-          if (byName.length === 1) {
-            targetSpace = byName[0];
-          } else if (byName.length > 1) {
-            return { replyText: `工作区名称 "${cleanTarget}" 存在歧义，请使用准确的工作区 ID。` };
+          const byFolder = this.db
+            .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND LOWER(folder) = LOWER(?)')
+            .get(userId, cleanTarget) as typeof targetSpace;
+          if (byFolder) {
+            targetSpace = byFolder;
+          } else {
+            const byName = this.db
+              .prepare('SELECT id, name, folder, execution_mode FROM spaces WHERE user_id = ? AND LOWER(name) = LOWER(?)')
+              .all(userId, cleanTarget) as Array<{ id: string; name: string; folder: string; execution_mode: string }>;
+            if (byName.length === 1) {
+              targetSpace = byName[0];
+            } else if (byName.length > 1) {
+              return { replyText: `工作区名称 "${cleanTarget}" 存在歧义，请使用准确的工作区 ID。` };
+            }
           }
         }
       }
     } catch {}
 
     if (!targetSpace) {
-      return { replyText: `未找到工作区 "${cleanTarget}"。` };
+      return { replyText: `未找到工作区 "${cleanTarget}"。请使用 /list 查看可用工作区。` };
     }
 
-    // Update channel_bindings and session_routes
+    // Update channel_bindings only (do not update session_routes)
     try {
       const existing = this.db
         .prepare('SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
@@ -883,11 +926,7 @@ export class ChatCommandService {
           .run(newId, userId, accountId, targetSpace.id, nativeContextId);
       }
 
-      this.db
-        .prepare('UPDATE session_routes SET space_id = ?, execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(targetSpace.id, targetSpace.execution_mode || 'container', sessionId, userId);
-
-      return { replyText: `已成功绑定到工作区: ${targetSpace.name} (${targetSpace.folder || targetSpace.id})` };
+      return { replyText: `已绑定到工作区: ${targetSpace.name}。之后本聊天的消息会进入该工作区的会话。` };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return { replyText: `绑定失败: ${msg}` };
@@ -895,31 +934,16 @@ export class ChatCommandService {
   }
 
   private async executeUnbindCommand(
-    params: { userId: string; sessionId: string; spaceId: string },
+    params: {
+      userId: string;
+      sessionId: string;
+      spaceId: string;
+      channelContext?: ChatCommandChannelContext;
+    },
     _parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
-    const { userId, sessionId } = params;
-
-    let channel = 'web';
-    let accountId: string | null = null;
-    let nativeContextId: string | null = null;
-
-    if (this.db) {
-      try {
-        const routeRow = this.db
-          .prepare('SELECT channel, account_id, native_context_id FROM session_routes WHERE id = ?')
-          .get(sessionId) as {
-            channel?: string;
-            account_id?: string | null;
-            native_context_id?: string | null;
-          } | undefined;
-        if (routeRow) {
-          if (routeRow.channel) channel = routeRow.channel;
-          accountId = routeRow.account_id ?? null;
-          nativeContextId = routeRow.native_context_id ?? null;
-        }
-      } catch {}
-    }
+    const { userId } = params;
+    const { channel, accountId, nativeContextId } = this.resolveChannelContext(params);
 
     if (channel === 'web') {
       return { replyText: 'Web 会话工作区绑定固定，无需解除绑定。' };
@@ -958,10 +982,6 @@ export class ChatCommandService {
       this.db
         .prepare('DELETE FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
         .run(userId, accountId, nativeContextId);
-
-      this.db
-        .prepare('UPDATE session_routes SET space_id = ?, execution_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(defaultSpace.id, defaultSpace.execution_mode || 'container', sessionId, userId);
 
       return { replyText: `已恢复渠道默认工作区: ${defaultSpace.name} (${defaultSpace.folder || defaultSpace.id})` };
     } catch (err: unknown) {
@@ -1040,7 +1060,12 @@ export class ChatCommandService {
   }
 
   private async executeNewwsCommand(
-    params: { userId: string; sessionId: string; spaceId: string },
+    params: {
+      userId: string;
+      sessionId: string;
+      spaceId: string;
+      channelContext?: ChatCommandChannelContext;
+    },
     parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
     const { userId, sessionId } = params;
@@ -1086,17 +1111,7 @@ export class ChatCommandService {
       return { replyText: '平台服务未连接，无法创建工作区。' };
     }
 
-    let channel = 'web';
-    if (this.db) {
-      try {
-        const routeRow = this.db
-          .prepare('SELECT channel FROM session_routes WHERE id = ?')
-          .get(sessionId) as { channel?: string } | undefined;
-        if (routeRow?.channel) {
-          channel = routeRow.channel;
-        }
-      } catch {}
-    }
+    const { channel } = this.resolveChannelContext(params);
 
     if (channel === 'web') {
       return {
@@ -1115,7 +1130,7 @@ export class ChatCommandService {
       raw: `/bind ${createdSpace.id}`,
     });
 
-    if (bindResult.replyText.startsWith('已成功绑定到工作区')) {
+    if (bindResult.replyText.startsWith('已绑定到工作区')) {
       return {
         replyText: `工作区 "${createdSpace.name}" 已创建。\n${bindResult.replyText}`,
       };

@@ -1309,6 +1309,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       spaceId,
       content: envelope.content,
       idempotencyKey,
+      channelContext: envelope.channelContext,
     });
 
     // 3. Atomically persist synthetic turn in SQLite transaction
