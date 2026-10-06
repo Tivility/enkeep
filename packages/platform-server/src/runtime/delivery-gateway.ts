@@ -465,6 +465,18 @@ export interface DeliveryRuntimeGatewayOptions {
         priority?: string;
       }
     ) => Promise<any>;
+    createSpace?: (
+      userId: string,
+      input: {
+        name: string;
+        folder?: string;
+        executionMode?: 'container' | 'host';
+      }
+    ) => Promise<any>;
+    listSpaces?: (
+      userId: string,
+      options?: any
+    ) => Promise<any>;
     taskOperations?: (userId: string) => {
       createTask: (input: any) => Promise<any>;
     };
@@ -633,16 +645,20 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     const resetSessionFn = options.chatCommandDeps?.resetSession ?? (options as any).platformApi?.resetSession;
     const compactSessionFn = options.chatCommandDeps?.compactSession ?? (options as any).platformApi?.compactSession;
     const createTaskFn = options.chatCommandDeps?.createTask ?? (options as any).platformApi?.createTask;
+    const createSpaceFn = options.chatCommandDeps?.createSpace ?? (options as any).platformApi?.createSpace;
+    const listSpacesFn = options.chatCommandDeps?.listSpaces ?? (options as any).platformApi?.listSpaces;
     const taskOps = options.chatCommandDeps?.taskOperations ?? options.taskOperations;
     this.chatCommandService =
       options.chatCommandService ??
       (this.modelSelectionService
         ? new ChatCommandService({
             modelSelectionService: this.modelSelectionService,
-            platformApi: (resetSessionFn || compactSessionFn || createTaskFn) ? {
+            platformApi: (resetSessionFn || compactSessionFn || createTaskFn || createSpaceFn || listSpacesFn) ? {
               resetSession: resetSessionFn,
               compactSession: compactSessionFn,
               createTask: createTaskFn,
+              createSpace: createSpaceFn,
+              listSpaces: listSpacesFn,
             } : undefined,
             taskOperations: taskOps,
             gateway: this,
@@ -716,6 +732,18 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         priority?: string;
       }
     ) => Promise<any>;
+    createSpace?: (
+      userId: string,
+      input: {
+        name: string;
+        folder?: string;
+        executionMode?: 'container' | 'host';
+      }
+    ) => Promise<any>;
+    listSpaces?: (
+      userId: string,
+      options?: any
+    ) => Promise<any>;
     taskOperations?: (userId: string) => {
       createTask: (input: any) => Promise<any>;
     };
@@ -727,6 +755,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         ...(deps.resetSession ? { resetSession: deps.resetSession } : {}),
         ...(deps.compactSession ? { compactSession: deps.compactSession } : {}),
         ...(deps.createTask ? { createTask: deps.createTask } : {}),
+        ...(deps.createSpace ? { createSpace: deps.createSpace } : {}),
+        ...(deps.listSpaces ? { listSpaces: deps.listSpaces } : {}),
       });
       if (deps.taskOperations) {
         this.chatCommandService.setTaskOperations(deps.taskOperations);

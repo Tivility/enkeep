@@ -821,6 +821,8 @@ export class PlatformServer {
         compactSession: typeof (this.platformApi as any).compactSession === 'function'
           ? (this.platformApi as any).compactSession.bind(this.platformApi)
           : undefined,
+        createSpace: this.platformApi.createSpace.bind(this.platformApi),
+        listSpaces: this.platformApi.listSpaces.bind(this.platformApi),
         taskOperations: (userId: string) => this.operationsService.forTenant(userId).tasks,
       });
     }
