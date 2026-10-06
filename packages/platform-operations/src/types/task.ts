@@ -727,6 +727,7 @@ export const ALLOWED_UPDATE_TASK_KEYS = new Set([
   'command',
   'script_command',
   'timeoutMs',
+  'silent',
   'payload',
   'dueDate',
   'scheduleType',
@@ -853,6 +854,15 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
     hasEditableField = true;
   }
 
+  let silent: boolean | undefined;
+  if (obj.silent !== undefined) {
+    if (typeof obj.silent !== 'boolean') {
+      throw new ValidationError('Task silent must be a boolean');
+    }
+    silent = obj.silent;
+    hasEditableField = true;
+  }
+
   if (obj.payload !== undefined && obj.payload !== null) {
     if (typeof obj.payload !== 'object' || Array.isArray(obj.payload)) {
       throw new ValidationError('Task payload must be a plain object');
@@ -865,8 +875,7 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
         k === 'contextMode' ||
         k === 'spaceId' ||
         k === 'spaceFolder' ||
-        k === 'delivery' ||
-        k === 'silent'
+        k === 'delivery'
       ) {
         throw new ValidationError('Task session and space bindings are immutable');
       }
@@ -875,7 +884,8 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
         k !== 'type' &&
         k !== 'command' &&
         k !== 'script_command' &&
-        k !== 'timeoutMs'
+        k !== 'timeoutMs' &&
+        k !== 'silent'
       ) {
         throw new ValidationError(`Field "payload.${k}" is immutable and cannot be updated`);
       }
@@ -926,6 +936,16 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
         throw new ValidationError('Conflicting timeoutMs values provided in root and payload');
       }
       timeoutMs = payloadObj.timeoutMs;
+      hasEditableField = true;
+    }
+    if (payloadObj.silent !== undefined) {
+      if (typeof payloadObj.silent !== 'boolean') {
+        throw new ValidationError('Task payload silent must be a boolean');
+      }
+      if (silent !== undefined && silent !== payloadObj.silent) {
+        throw new ValidationError('Conflicting silent values provided in root and payload');
+      }
+      silent = payloadObj.silent;
       hasEditableField = true;
     }
   }
@@ -980,6 +1000,7 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
   if (prompt !== undefined) returnPayload.prompt = prompt;
   if (command !== undefined) returnPayload.command = command;
   if (timeoutMs !== undefined) returnPayload.timeoutMs = timeoutMs;
+  if (silent !== undefined) returnPayload.silent = silent;
   const hasPayload = Object.keys(returnPayload).length > 0;
 
   return {
@@ -990,6 +1011,7 @@ export function validateUpdateTaskInput(input: unknown): UpdateTaskInput {
     ...(prompt !== undefined ? { prompt } : {}),
     ...(command !== undefined ? { command } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(silent !== undefined ? { silent } : {}),
     ...(hasPayload ? { payload: returnPayload as any } : {}),
     ...(dueDate !== undefined ? { dueDate } : {}),
     ...(scheduleType !== undefined ? { scheduleType } : {}),
@@ -1029,10 +1051,12 @@ export interface UpdateTaskInput {
   command?: string;
   script_command?: string;
   timeoutMs?: number;
+  silent?: boolean;
   payload?: {
     prompt?: string;
     command?: string;
     timeoutMs?: number;
+    silent?: boolean;
   };
   dueDate?: string | null;
   scheduleType?: TaskScheduleType;

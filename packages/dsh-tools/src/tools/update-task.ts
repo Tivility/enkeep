@@ -88,6 +88,7 @@ export const ALLOWED_UPDATE_KEYS = Object.freeze([
   'timezone',
   'misfirePolicy',
   'overlapPolicy',
+  'silent',
 ] as const);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -178,6 +179,11 @@ export function createUpdateTaskTool(
           enum: ['skip'],
           description:
             'Optional updated policy for handling overlapping schedule executions.',
+        },
+        silent: {
+          type: 'boolean',
+          description:
+            'Optional updated flag indicating whether the task executes silently without sending external channel notifications.',
         },
       },
       required: ['taskId'],
@@ -481,6 +487,15 @@ export function createUpdateTaskTool(
         overlapPolicy = rawArgs.overlapPolicy as TaskScheduleOverlapPolicy;
       }
 
+      // Silent validation
+      let silent: boolean | undefined;
+      if (rawArgs.silent !== undefined) {
+        if (typeof rawArgs.silent !== 'boolean') {
+          throw new TypeError('Task silent must be a boolean');
+        }
+        silent = rawArgs.silent;
+      }
+
       // At least one editable field must be provided
       const hasEditableField = [
         title,
@@ -495,6 +510,7 @@ export function createUpdateTaskTool(
         timezone,
         misfirePolicy,
         overlapPolicy,
+        silent,
       ].some((v) => v !== undefined);
 
       if (!hasEditableField) {
@@ -517,6 +533,7 @@ export function createUpdateTaskTool(
         ...(timezone !== undefined ? { timezone } : {}),
         ...(misfirePolicy !== undefined ? { misfirePolicy } : {}),
         ...(overlapPolicy !== undefined ? { overlapPolicy } : {}),
+        ...(silent !== undefined ? { silent } : {}),
       };
 
       // Platform client verification

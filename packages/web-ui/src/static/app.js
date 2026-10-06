@@ -5981,6 +5981,34 @@ async function renderTasksView(container) {
     });
     tdActions.appendChild(pauseBtn);
 
+    // Silent / Notify Toggle Button
+    const silentToggleBtn = document.createElement('button');
+    silentToggleBtn.type = 'button';
+    silentToggleBtn.className = 'btn btn-secondary btn-xs';
+    silentToggleBtn.textContent = tr('tasks.btnToggleSilent', null, getLocale() === 'zh-CN' ? '静默/通知' : 'Silent/Notify');
+    silentToggleBtn.disabled = isFinished;
+    silentToggleBtn.addEventListener('click', async () => {
+      silentToggleBtn.disabled = true;
+      try {
+        const currentTaskRes = await apiRequest(`/api/manage/tasks/${t.id}`);
+        const currentPayload = currentTaskRes && currentTaskRes.data && currentTaskRes.data.payload;
+        const currentSilent = Boolean(currentPayload && currentPayload.silent === true);
+        const nextSilent = !currentSilent;
+        await apiRequest(`/api/manage/tasks/${t.id}`, {
+          method: 'PUT',
+          body: { silent: nextSilent },
+        });
+        const msgZh = nextSilent ? '任务已切换为静默执行' : '任务已切换为通知模式';
+        const msgEn = nextSilent ? 'Task switched to silent mode' : 'Task switched to notify mode';
+        showToast(getLocale() === 'zh-CN' ? msgZh : msgEn, 'success');
+        renderManagementView('tasks');
+      } catch (err) {
+        showToast(getSafeErrorMessage(err, getLocale() === 'zh-CN' ? '切换静默/通知模式失败' : 'Failed to toggle silent/notify mode.'), 'error');
+        silentToggleBtn.disabled = false;
+      }
+    });
+    tdActions.appendChild(silentToggleBtn);
+
     // 3. Runs History Button
     const historyBtn = document.createElement('button');
     historyBtn.type = 'button';

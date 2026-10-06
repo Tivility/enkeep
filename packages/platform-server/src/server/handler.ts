@@ -3927,12 +3927,142 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
 
                 const validatedInput = validateUpdateTaskInput(body);
 
+                const targetSilent = validatedInput.silent !== undefined
+                  ? validatedInput.silent
+                  : validatedInput.payload?.silent;
+
+                if (targetSilent === false) {
+                  const existingPayload = existingTask.payload as any;
+                  const delivery = existingPayload?.delivery;
+                  const hasChannelDeliveryTarget = Boolean(
+                    delivery &&
+                    typeof delivery.channel === "string" &&
+                    delivery.channel.trim().length > 0 &&
+                    delivery.channel !== "web" &&
+                    delivery.accountId &&
+                    typeof delivery.accountId === "string" &&
+                    delivery.accountId.trim().length > 0 &&
+                    delivery.nativeContextId &&
+                    typeof delivery.nativeContextId === "string" &&
+                    delivery.nativeContextId.trim().length > 0
+                  );
+
+                  let hasDerivableOrigin = false;
+
+                  if (!hasChannelDeliveryTarget) {
+                    let sessionSpaceId: string | undefined;
+
+                    // 1. Check origin session in session_routes
+                    if (existingPayload?.sessionId) {
+                      if (db) {
+                        try {
+                          const route = db.prepare(`
+                            SELECT channel, account_id, native_context_id, space_id
+                            FROM session_routes
+                            WHERE id = ? AND user_id = ?
+                            LIMIT 1
+                          `).get(existingPayload.sessionId, user.id) as any;
+                          if (route) {
+                            sessionSpaceId = route.space_id;
+                            if (
+                              route.channel &&
+                              route.channel !== "web" &&
+                              route.account_id &&
+                              typeof route.account_id === "string" &&
+                              route.account_id.trim().length > 0 &&
+                              route.native_context_id &&
+                              typeof route.native_context_id === "string" &&
+                              route.native_context_id.trim().length > 0
+                            ) {
+                              hasDerivableOrigin = true;
+                            }
+                          }
+                        } catch {}
+                      }
+
+                      if (!hasDerivableOrigin && storage && "forTenant" in storage) {
+                        try {
+                          const tenantStorage = (storage as any).forTenant(user.id);
+                          if (tenantStorage?.sessionRoutes?.findById) {
+                            const route = await tenantStorage.sessionRoutes.findById(existingPayload.sessionId);
+                            if (route) {
+                              sessionSpaceId = sessionSpaceId || route.spaceId;
+                              if (
+                                route.channel &&
+                                route.channel !== "web" &&
+                                route.accountId &&
+                                route.nativeContextId
+                              ) {
+                                hasDerivableOrigin = true;
+                              }
+                            }
+                          }
+                        } catch {}
+                      }
+                    }
+
+                    // 2. Check origin space in channel_bindings
+                    if (!hasDerivableOrigin) {
+                      const effectiveSpaceId = existingPayload?.spaceId || sessionSpaceId;
+                      if (effectiveSpaceId && db) {
+                        try {
+                          const bindings = db.prepare(`
+                            SELECT account_id, native_context_id
+                            FROM channel_bindings
+                            WHERE space_id = ? AND user_id = ?
+                          `).all(effectiveSpaceId, user.id) as any[];
+                          if (bindings && bindings.length > 0) {
+                            const validBindings = bindings.filter(
+                              (b: any) =>
+                                b.account_id &&
+                                typeof b.account_id === "string" &&
+                                b.account_id.trim().length > 0 &&
+                                b.native_context_id &&
+                                typeof b.native_context_id === "string" &&
+                                b.native_context_id.trim().length > 0
+                            );
+                            if (validBindings.length > 0) {
+                              hasDerivableOrigin = true;
+                            }
+                          }
+                        } catch {}
+                      }
+                    }
+                  }
+
+                  if (!hasChannelDeliveryTarget && !hasDerivableOrigin) {
+                    throw new ValidationError(
+                      "Cannot switch task to notify mode (silent=false): task has no channel delivery target and no derivable origin"
+                    );
+                  }
+                }
+
                 const updated = opsProvider && opsProvider.updateTask
                   ? await opsProvider.updateTask(user.id, taskId, validatedInput)
                   : (operations ? await (operations as PlatformOperationsService).forTenant(user.id).tasks.updateTask(taskId, validatedInput) : null);
 
                 if (!updated) {
                   throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
+                }
+
+                if (targetSilent !== undefined) {
+                  if (db) {
+                    try {
+                      const row = db.prepare("SELECT payload FROM platform_tasks WHERE id = ? AND user_id = ?").get(taskId, user.id) as any;
+                      if (row && row.payload) {
+                        const p = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
+                        p.silent = targetSilent;
+                        db.prepare("UPDATE platform_tasks SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?").run(
+                          JSON.stringify(p),
+                          taskId,
+                          user.id
+                        );
+                      }
+                    } catch {}
+                  }
+                  if (updated && updated.payload) {
+                    (updated.payload as any).silent = targetSilent;
+                  }
                 }
 
                 if (
