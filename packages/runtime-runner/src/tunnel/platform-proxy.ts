@@ -1507,7 +1507,88 @@ export class PlatformProxyHandler implements StreamHandler {
 
     if (this.operations) {
       try {
+        const targetSilent = validatedInput.silent !== undefined ? validatedInput.silent : validatedInput.payload?.silent;
+        if (targetSilent === false && this.db) {
+          try {
+            const existingRow = this.db.prepare(
+              'SELECT payload FROM platform_tasks WHERE id = ? AND user_id = ? LIMIT 1'
+            ).get(taskId, this.platformUserId) as any;
+            if (existingRow) {
+              let existingPayloadObj: any = {};
+              try {
+                existingPayloadObj = existingRow.payload ? (typeof existingRow.payload === 'string' ? JSON.parse(existingRow.payload) : existingRow.payload) : {};
+              } catch {}
+              const delivery = existingPayloadObj.delivery;
+              const hasChannelDeliveryTarget = Boolean(
+                delivery &&
+                typeof delivery.channel === 'string' &&
+                delivery.channel.trim().length > 0 &&
+                delivery.channel !== 'web' &&
+                delivery.accountId &&
+                delivery.nativeContextId
+              );
+              let hasDerivableOrigin = false;
+              if (!hasChannelDeliveryTarget) {
+                let sessionSpaceId: string | undefined;
+                if (existingPayloadObj.sessionId) {
+                  try {
+                    const route = this.db.prepare(
+                      'SELECT channel, account_id, native_context_id, space_id FROM session_routes WHERE id = ? AND user_id = ? LIMIT 1'
+                    ).get(existingPayloadObj.sessionId, this.platformUserId) as any;
+                    if (route) {
+                      sessionSpaceId = route.space_id;
+                      if (route.channel && route.channel !== 'web' && route.account_id && route.native_context_id) {
+                        hasDerivableOrigin = true;
+                      }
+                    }
+                  } catch {}
+                }
+                if (!hasDerivableOrigin) {
+                  const effectiveSpaceId = existingPayloadObj.spaceId || sessionSpaceId;
+                  if (effectiveSpaceId) {
+                    try {
+                      const bindings = this.db.prepare(
+                        'SELECT account_id, native_context_id FROM channel_bindings WHERE space_id = ? AND user_id = ?'
+                      ).all(effectiveSpaceId, this.platformUserId) as any[];
+                      if (bindings && bindings.length > 0 && bindings.some((b: any) => b.account_id && b.native_context_id)) {
+                        hasDerivableOrigin = true;
+                      }
+                    } catch {}
+                  }
+                }
+              }
+              if (!hasChannelDeliveryTarget && !hasDerivableOrigin) {
+                this.writeJsonResponse(stream, 400, {
+                  error: {
+                    code: 'VALIDATION_ERROR',
+                    message: 'Cannot switch task to notify mode (silent=false): task has no channel delivery target and no derivable origin',
+                  },
+                });
+                return;
+              }
+            }
+          } catch {}
+        }
+
         const updated = await this.operations.forTenant(this.platformUserId).tasks.updateTask(taskId, validatedInput);
+        if (targetSilent !== undefined) {
+          if (this.db) {
+            try {
+              const row = this.db.prepare('SELECT payload FROM platform_tasks WHERE id = ?').get(taskId) as any;
+              if (row && row.payload) {
+                const p = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+                p.silent = targetSilent;
+                this.db.prepare('UPDATE platform_tasks SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
+                  JSON.stringify(p),
+                  taskId
+                );
+              }
+            } catch {}
+          }
+          if (updated && updated.payload) {
+            (updated.payload as any).silent = targetSilent;
+          }
+        }
         this.writeJsonResponse(stream, 200, {
           success: true,
           data: {
@@ -1590,8 +1671,64 @@ export class PlatformProxyHandler implements StreamHandler {
         const newDescription = validatedInput.description !== undefined ? validatedInput.description : existing.description;
         const newDueDate = validatedInput.dueDate !== undefined ? validatedInput.dueDate : existing.due_date;
 
+        const targetSilent = validatedInput.silent !== undefined ? validatedInput.silent : validatedInput.payload?.silent;
+        if (targetSilent === false) {
+          let existingPayloadObj: any = {};
+          try {
+            existingPayloadObj = existing.payload ? (typeof existing.payload === 'string' ? JSON.parse(existing.payload) : existing.payload) : {};
+          } catch {}
+          const delivery = existingPayloadObj.delivery;
+          const hasChannelDeliveryTarget = Boolean(
+            delivery &&
+            typeof delivery.channel === 'string' &&
+            delivery.channel.trim().length > 0 &&
+            delivery.channel !== 'web' &&
+            delivery.accountId &&
+            delivery.nativeContextId
+          );
+          let hasDerivableOrigin = false;
+          if (!hasChannelDeliveryTarget) {
+            let sessionSpaceId: string | undefined;
+            if (existingPayloadObj.sessionId) {
+              try {
+                const route = this.db.prepare(
+                  'SELECT channel, account_id, native_context_id, space_id FROM session_routes WHERE id = ? AND user_id = ? LIMIT 1'
+                ).get(existingPayloadObj.sessionId, this.platformUserId) as any;
+                if (route) {
+                  sessionSpaceId = route.space_id;
+                  if (route.channel && route.channel !== 'web' && route.account_id && route.native_context_id) {
+                    hasDerivableOrigin = true;
+                  }
+                }
+              } catch {}
+            }
+            if (!hasDerivableOrigin) {
+              const effectiveSpaceId = existingPayloadObj.spaceId || sessionSpaceId;
+              if (effectiveSpaceId) {
+                try {
+                  const bindings = this.db.prepare(
+                    'SELECT account_id, native_context_id FROM channel_bindings WHERE space_id = ? AND user_id = ?'
+                  ).all(effectiveSpaceId, this.platformUserId) as any[];
+                  if (bindings && bindings.length > 0 && bindings.some((b: any) => b.account_id && b.native_context_id)) {
+                    hasDerivableOrigin = true;
+                  }
+                } catch {}
+              }
+            }
+          }
+          if (!hasChannelDeliveryTarget && !hasDerivableOrigin) {
+            this.writeJsonResponse(stream, 400, {
+              error: {
+                code: 'VALIDATION_ERROR',
+                message: 'Cannot switch task to notify mode (silent=false): task has no channel delivery target and no derivable origin',
+              },
+            });
+            return;
+          }
+        }
+
         let newPayload = existing.payload;
-        if (validatedInput.prompt !== undefined || validatedInput.payload !== undefined) {
+        if (validatedInput.prompt !== undefined || validatedInput.payload !== undefined || validatedInput.silent !== undefined) {
           let payloadObj: any = {};
           try {
             payloadObj = existing.payload ? JSON.parse(existing.payload) : {};
@@ -1600,6 +1737,9 @@ export class PlatformProxyHandler implements StreamHandler {
           }
           if (validatedInput.prompt !== undefined) {
             payloadObj.prompt = validatedInput.prompt;
+          }
+          if (validatedInput.silent !== undefined) {
+            payloadObj.silent = validatedInput.silent;
           }
           if (validatedInput.payload) {
             payloadObj = { ...payloadObj, ...validatedInput.payload };

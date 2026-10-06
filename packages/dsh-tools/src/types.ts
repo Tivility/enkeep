@@ -117,6 +117,7 @@ export interface UpdateTaskPayload {
   readonly timezone?: string;
   readonly misfirePolicy?: TaskScheduleMisfirePolicy;
   readonly overlapPolicy?: TaskScheduleOverlapPolicy;
+  readonly silent?: boolean;
 }
 
 export interface UpdateTaskArgs {
@@ -133,6 +134,7 @@ export interface UpdateTaskArgs {
   readonly timezone?: string;
   readonly misfirePolicy?: TaskScheduleMisfirePolicy;
   readonly overlapPolicy?: TaskScheduleOverlapPolicy;
+  readonly silent?: boolean;
 }
 
 export interface UpdateTaskResult {
