@@ -289,7 +289,7 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
 
       // Reply includes space name and bind confirmation
       expect(result.replyText).toContain('Synthetic Channel Workspace');
-      expect(result.replyText).toContain('已成功绑定到工作区');
+      expect(result.replyText).toContain('已绑定到工作区');
 
       // Verify createSpace called with executionMode 'container'
       expect(createSpaceMock).toHaveBeenCalledWith(userId, {
@@ -306,9 +306,9 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
       const bindRow = db.prepare('SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?').get(userId, accountId, nativeContextId) as { space_id: string };
       expect(bindRow.space_id).toBe(createdSpaceRow.id);
 
-      // Verify session route space_id updated to new space
+      // Verify session route space_id is unchanged (not modified by /bind)
       const routeRow = db.prepare('SELECT space_id, execution_mode FROM session_routes WHERE id = ?').get(channelSessionId) as { space_id: string; execution_mode: string };
-      expect(routeRow.space_id).toBe(createdSpaceRow.id);
+      expect(routeRow.space_id).toBe(space1Id);
       expect(routeRow.execution_mode).toBe('container');
     });
 
@@ -323,7 +323,7 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
       });
 
       expect(result.replyText).toContain('Synthetic Host Mode Space');
-      expect(result.replyText).toContain('已成功绑定到工作区');
+      expect(result.replyText).toContain('已绑定到工作区');
 
       // Verify createSpace called with executionMode 'host'
       expect(createSpaceMock).toHaveBeenCalledWith(userId, {
@@ -336,8 +336,8 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
       expect(createdSpaceRow.execution_mode).toBe('host');
 
       const routeRow = db.prepare('SELECT space_id, execution_mode FROM session_routes WHERE id = ?').get(channelSessionId) as { space_id: string; execution_mode: string };
-      expect(routeRow.space_id).toBe(createdSpaceRow.id);
-      expect(routeRow.execution_mode).toBe('host');
+      expect(routeRow.space_id).toBe(space1Id);
+      expect(routeRow.execution_mode).toBe('container');
     });
   });
 

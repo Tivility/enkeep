@@ -215,7 +215,7 @@ describe('D5 Chat Slash Commands & Telemetry Metrics', () => {
         expect(result.replyText).toContain('Web 会话工作区绑定固定，无需解除绑定。');
       });
 
-      it('executes /bind by space folder in lark session and updates session route and binding', async () => {
+      it('executes /bind by space folder in lark session, updating binding without modifying session routes', async () => {
         const result = await chatCommandService.execute({
           userId,
           sessionId: larkSessionId,
@@ -223,25 +223,16 @@ describe('D5 Chat Slash Commands & Telemetry Metrics', () => {
           content: '/bind spc-target-folder',
         });
 
-        expect(result.replyText).toContain('已成功绑定到工作区: Target Space');
+        expect(result.replyText).toBe('已绑定到工作区: Target Space。之后本聊天的消息会进入该工作区的会话。');
 
-        // Check session_routes updated
+        // Check session_routes NOT modified (canonical route unchanged)
         const routeRow = db.prepare('SELECT space_id, execution_mode FROM session_routes WHERE id = ?').get(larkSessionId) as { space_id: string; execution_mode: string };
-        expect(routeRow.space_id).toBe(targetSpaceId);
-        expect(routeRow.execution_mode).toBe('host');
+        expect(routeRow.space_id).toBe(spaceId);
+        expect(routeRow.execution_mode).toBe('container');
 
         // Check channel_bindings updated
         const bindRow = db.prepare('SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?').get(userId, accountId, nativeContextId) as { space_id: string };
         expect(bindRow.space_id).toBe(targetSpaceId);
-
-        // Verify next /where reflects the new target space
-        const whereResult = await chatCommandService.execute({
-          userId,
-          sessionId: larkSessionId,
-          spaceId: targetSpaceId,
-          content: '/where',
-        });
-        expect(whereResult.replyText).toContain('space: Target Space');
       });
 
       it('executes /unbind in lark session, clearing binding and reverting to default space', async () => {
