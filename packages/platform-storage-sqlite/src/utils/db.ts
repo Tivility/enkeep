@@ -369,9 +369,23 @@ export function parseFileMetadataRow(row: DbRow): FileMetadata {
 }
 
 export function parsePlatformTaskRow(row: DbRow): Task {
-  const payload = getJson<TaskPayload>(row, 'payload');
-  if (!payload || typeof payload !== 'object' || (payload.type !== 'agent_prompt' && (payload as any).type !== 'script')) {
-    throw new Error(`Corrupted task row: missing or invalid payload for task '${getString(row, 'id')}'`);
+  const rawPayload = getJson<Record<string, unknown>>(row, 'payload');
+  let payload: TaskPayload;
+  if (rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)) {
+    if (rawPayload.type === 'agent_prompt' || rawPayload.type === 'script') {
+      payload = rawPayload as unknown as TaskPayload;
+    } else {
+      payload = {
+        ...rawPayload,
+        type: (rawPayload.type === 'script' ? 'script' : 'agent_prompt') as any,
+        prompt: typeof rawPayload.prompt === 'string' ? rawPayload.prompt : '',
+      } as unknown as TaskPayload;
+    }
+  } else {
+    payload = {
+      type: 'agent_prompt',
+      prompt: '',
+    } as unknown as TaskPayload;
   }
   const rawScheduleType = getNullableString(row, 'schedule_type');
   return {
