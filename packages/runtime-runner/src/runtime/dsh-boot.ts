@@ -1942,6 +1942,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         }, 'eventRelay.agentScope()');
 
         const wsHandle = await mountWorkspaceTools(agentCtx, {
+          session: (_agent as any)?.session,
           spacePath,
           dshHome,
           sessionId: sessionIdStr,
@@ -3183,6 +3184,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           const spaceMounts = resolveRuntimeMounts(spaceMountSpecs);
 
           const wsHandle = await mountWorkspaceTools(agentCtx, {
+            session: (_agent as any)?.session,
             spacePath,
             dshHome,
             sessionId: sessionIdStr,
