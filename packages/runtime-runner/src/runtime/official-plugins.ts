@@ -93,6 +93,7 @@ import * as SubagentForkPlugin from '@deepseek-ai/dsh-subagent-fork-in-process';
 import * as ToolSubagentPlugin from '@deepseek-ai/dsh-tool-subagent';
 import SubagentModelSelectionConfig from '@deepseek-ai/dsh-tool-subagent/model-selection-settings';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
+import { SessionSeq, SessionId, type Session } from '@deepseek-ai/dsh-session';
 import * as ToolSubagentControlPlugin from '@deepseek-ai/dsh-tool-subagent-control';
 import * as ToolSubagentListAgentsPlugin from '@deepseek-ai/dsh-tool-subagent-control/list-agents';
 import ApprovalService, { type ApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
@@ -227,6 +228,47 @@ export function extractAllowedModelRoutes(
   return routes;
 }
 
+/** Read the exact route list captured for a model-selectable definition. */
+export function subagentModelSelectionPolicy(
+  projections: Pick<SessionProjectionRegistry, 'stateOf'> | undefined,
+  session: Session,
+): AllowedModelRoute[] | undefined {
+  const policy = projections?.stateOf(session, 'subagentModelSelectionPolicy' as any);
+  if (policy !== undefined && policy !== null) {
+    return (policy as AllowedModelRoute[]).map((r) => ({ ...r }));
+  }
+  const events = session.snapshotEvents ? session.snapshotEvents() : [];
+  const ev = events.find((e: any) => e.type === 'subagent/model-selection-policy');
+  if (ev && Array.isArray((ev as any).data?.allowedModels)) {
+    return (ev as any).data.allowedModels.map((r: any) => ({ ...r }));
+  }
+  return undefined;
+}
+
+/** Record the subagent model selection policy once on the session. */
+export function recordSubagentModelSelection(
+  projections: Pick<SessionProjectionRegistry, 'stateOf'> | undefined,
+  session: Session,
+  allowedModels: readonly AllowedModelRoute[],
+): void {
+  if (subagentModelSelectionPolicy(projections, session) !== undefined) return;
+  session.append('subagent/model-selection-policy' as any, {
+    allowedModels: allowedModels.map((route) => ({ ...route })),
+  } as any);
+}
+
+/** Backfill subagent model selection projection for an existing top-level session. */
+export function backfillSubagentModelSelection(ctx: Context, session?: Session): void {
+  if (!session || session.header?.origin === 'subagent') return;
+  const isFresh = session.firstLiveSeq === 0 && session.eventAt?.(SessionSeq(0))?.type !== 'session/end-seed';
+  if (isFresh) return;
+  const settingsService = ctx.get('subagentModelSelection');
+  if (!settingsService) return;
+  const current = settingsService.current();
+  if (!current?.enabled || !current.allowedModels?.length) return;
+  recordSubagentModelSelection(ctx.get('sessionProjections'), session, current.allowedModels);
+}
+
 export function deriveCompactionThresholdRatio(thresholdTokens: number, contextWindow: number): number {
   if (contextWindow <= 0) return 0.2;
   const ratio = thresholdTokens / contextWindow;
@@ -325,6 +367,7 @@ export interface OfficialPluginsConfig {
 export interface WorkspaceToolsMountOptions {
   readonly spacePath: string;
   readonly dshHome: string;
+  readonly session?: Session;
   readonly sessionId?: string;
   readonly userId?: string;
   readonly spaceId?: string;
@@ -1319,6 +1362,11 @@ export async function mountWorkspaceTools(
       scopeOf(agentCtx)
     );
     const subagentModelSelectionEnabled = options.subagents?.modelSelectionSettings ?? canEnableModelSelection;
+
+    const session = options.session ?? (options.sessionId ? agentCtx.get('sessions')?.get(SessionId(options.sessionId)) : undefined);
+    if (subagentModelSelectionEnabled && session) {
+      backfillSubagentModelSelection(agentCtx, session);
+    }
 
     const toolSubagentFiber = await agentCtx.plugin(ToolSubagentPlugin, {
       provider: 'spawn',
