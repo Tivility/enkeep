@@ -246,7 +246,39 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       spaces = await tenant.spaces.list({ status: 'active' });
     }
 
-    return spaces.map((s) => this.toPublicSpace(userId, s));
+    const msgRows = this.db.prepare(
+      'SELECT session_id, MAX(created_at) as last_msg FROM web_messages WHERE user_id = ? GROUP BY session_id'
+    ).all(userId) as Array<{ session_id: string; last_msg?: string | null }>;
+    const msgMap = new Map<string, string>();
+    for (const row of msgRows) {
+      if (row.last_msg) msgMap.set(row.session_id, row.last_msg);
+    }
+
+    const sessionRows = this.db.prepare(
+      "SELECT id, space_id, created_at, updated_at FROM session_routes WHERE user_id = ? AND status != 'deleted'"
+    ).all(userId) as Array<{ id: string; space_id: string; created_at: string; updated_at: string }>;
+
+    const spaceMaxMap = new Map<string, string>();
+    for (const s of sessionRows) {
+      const sAct = msgMap.get(s.id) || s.updated_at || s.created_at;
+      const curMax = spaceMaxMap.get(s.space_id);
+      if (!curMax || new Date(sAct).getTime() > new Date(curMax).getTime()) {
+        spaceMaxMap.set(s.space_id, sAct);
+      }
+    }
+
+    const result: PublicSpace[] = spaces.map((s) => {
+      const pub = this.toPublicSpace(userId, s);
+      const sessionMax = spaceMaxMap.get(s.id);
+      const lastActivityAt = sessionMax || s.updatedAt || s.createdAt;
+      return { ...pub, lastActivityAt };
+    });
+
+    result.sort((a, b) => {
+      const diff = new Date(b.lastActivityAt!).getTime() - new Date(a.lastActivityAt!).getTime();
+      return diff !== 0 ? diff : b.id.localeCompare(a.id);
+    });
+    return result;
   }
 
   async getSpace(userId: string, spaceId: string): Promise<PublicSpace | null> {
@@ -560,7 +592,25 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
         : allRoutes.filter((r) => r.status !== 'archived' && r.status !== 'deleted');
     }
 
-    return routes.map((r) => this.toPublicSession(r));
+    const msgRows = this.db.prepare(
+      'SELECT session_id, MAX(created_at) as last_msg FROM web_messages WHERE user_id = ? GROUP BY session_id'
+    ).all(userId) as Array<{ session_id: string; last_msg?: string | null }>;
+    const msgMap = new Map<string, string>();
+    for (const row of msgRows) {
+      if (row.last_msg) msgMap.set(row.session_id, row.last_msg);
+    }
+
+    const sessions: PublicSession[] = routes.map((r) => {
+      const pub = this.toPublicSession(r);
+      const lastActivityAt = msgMap.get(r.id) || r.updatedAt || r.createdAt;
+      return { ...pub, lastActivityAt };
+    });
+
+    sessions.sort((a, b) => {
+      const diff = new Date(b.lastActivityAt!).getTime() - new Date(a.lastActivityAt!).getTime();
+      return diff !== 0 ? diff : b.id.localeCompare(a.id);
+    });
+    return sessions;
   }
 
   async getSession(userId: string, sessionId: string): Promise<PublicSession | null> {
