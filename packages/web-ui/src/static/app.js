@@ -16763,6 +16763,7 @@ async function handleCreateSession(e) {
     const space = state.spaces.find((s) => s.id === spaceId);
     const body = {
       spaceId,
+      forceNew: true,
       ...(space && space.executionMode ? { executionMode: space.executionMode } : {}),
       ...(title ? { title } : {}),
     };
@@ -20232,31 +20233,23 @@ document.addEventListener('DOMContentLoaded', () => {
   if (newSessionBtn) {
     newSessionBtn.addEventListener('click', async () => {
       if (state.currentSpaceId) {
-        // Open/focus workspace conversation or get/create canonical session
-        const canonical = state.sessions.find((s) => s.isCanonical || s.channel === 'canonical') ||
-          state.sessions.find((s) => s.status === 'active') ||
-          state.sessions[0];
-        if (canonical) {
-          selectSession(canonical.id);
-          showToast(tr('chat.canonicalSessionReused', null, '该空间使用单一主会话，已切换到主会话；如需分支请使用「派生」'), 'info');
-        } else {
-          try {
-            const space = state.spaces.find((s) => s.id === state.currentSpaceId);
-            const body = {
-              spaceId: state.currentSpaceId,
-              ...(space && space.executionMode ? { executionMode: space.executionMode } : {}),
-            };
-            const res = await apiRequest('/api/sessions', {
-              method: 'POST',
-              body,
-            });
-            if (res && res.data && res.data.id) {
-              await loadSessions(state.currentSpaceId);
-              selectSession(res.data.id);
-            }
-          } catch {
-            openModal('modal-session');
+        try {
+          const space = state.spaces.find((s) => s.id === state.currentSpaceId);
+          const body = {
+            spaceId: state.currentSpaceId,
+            forceNew: true,
+            ...(space && space.executionMode ? { executionMode: space.executionMode } : {}),
+          };
+          const res = await apiRequest('/api/sessions', {
+            method: 'POST',
+            body,
+          });
+          if (res && res.data && res.data.id) {
+            await loadSessions(state.currentSpaceId);
+            await selectSession(res.data.id);
           }
+        } catch {
+          openModal('modal-session');
         }
       } else {
         openModal('modal-session');

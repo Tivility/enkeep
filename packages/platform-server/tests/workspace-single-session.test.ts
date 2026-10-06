@@ -447,4 +447,57 @@ describe('Workspace Single-Session Production Convergence: Web + Lark + SQLite G
     const spaceRow = await platformApi.getSpace(testUser, spaceB);
     expect(spaceRow?.canonicalSessionId).toBe(session.id);
   });
+
+  it('11. forceNew create keeps existing active canonical session pointer', async () => {
+    const canonicalSession = await platformApi.createSession(testUser, { spaceId: spaceA });
+    const spaceBefore = await platformApi.getSpace(testUser, spaceA);
+    expect(spaceBefore?.canonicalSessionId).toBe(canonicalSession.id);
+
+    // Create session with forceNew: true via platformApi
+    const auxSession = await platformApi.createSession(testUser, { spaceId: spaceA, forceNew: true, title: 'Auxiliary Session' });
+    expect(auxSession.id).not.toBe(canonicalSession.id);
+    expect(auxSession.title).toBe('Auxiliary Session');
+
+    // Space canonical pointer MUST NOT be overwritten
+    const spaceAfter = await platformApi.getSpace(testUser, spaceA);
+    expect(spaceAfter?.canonicalSessionId).toBe(canonicalSession.id);
+
+    // sessionRouteRepo.getOrCreateCanonicalSession with forceNew: true preserves existing canonical
+    const repoAuxSession = await sessionRouteRepo.getOrCreateCanonicalSession(spaceA, { forceNew: true });
+    expect(repoAuxSession.id).not.toBe(canonicalSession.id);
+    const spaceAfterRepo = await platformApi.getSpace(testUser, spaceA);
+    expect(spaceAfterRepo?.canonicalSessionId).toBe(canonicalSession.id);
+  });
+
+  it('12. forceNew in a space whose canonical is archived sets the canonical pointer', async () => {
+    const initialSession = await platformApi.createSession(testUser, { spaceId: spaceA });
+    await storage.forTenant(testUser).sessionRoutes.archive(initialSession.id);
+
+    const spaceArchived = await platformApi.getSpace(testUser, spaceA);
+    expect(spaceArchived?.canonicalSessionId).toBe(initialSession.id);
+
+    // forceNew in space with archived canonical session sets pointer to new session
+    const newSession = await platformApi.createSession(testUser, { spaceId: spaceA, forceNew: true, title: 'New Primary' });
+    expect(newSession.id).not.toBe(initialSession.id);
+
+    const spaceAfter = await platformApi.getSpace(testUser, spaceA);
+    expect(spaceAfter?.canonicalSessionId).toBe(newSession.id);
+
+    // sessionRouteRepo with forceNew when canonical pointer is archived sets pointer
+    await storage.forTenant(testUser).sessionRoutes.archive(newSession.id);
+    const repoNewSession = await sessionRouteRepo.getOrCreateCanonicalSession(spaceA, { forceNew: true });
+    expect(repoNewSession.id).not.toBe(newSession.id);
+    const spaceAfterRepo = await platformApi.getSpace(testUser, spaceA);
+    expect(spaceAfterRepo?.canonicalSessionId).toBe(repoNewSession.id);
+  });
+
+  it('13. non-forceNew returns canonical session without spawning duplicate', async () => {
+    const canonicalSession = await platformApi.createSession(testUser, { spaceId: spaceA });
+
+    const secondCall = await platformApi.createSession(testUser, { spaceId: spaceA });
+    expect(secondCall.id).toBe(canonicalSession.id);
+
+    const repoCall = await sessionRouteRepo.getOrCreateCanonicalSession(spaceA);
+    expect(repoCall.id).toBe(canonicalSession.id);
+  });
 });

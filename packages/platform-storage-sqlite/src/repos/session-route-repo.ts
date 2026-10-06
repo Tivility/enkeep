@@ -661,10 +661,22 @@ export class SqliteTenantScopedSessionRouteRepository implements TenantScopedSes
         initialGenSnapshotId ?? null
       );
 
-      // Persist as canonical_session_id on spaces
-      this.db.prepare(
-        'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
-      ).run(newSessionId, spaceId, this.userId);
+      // Persist as canonical_session_id on spaces only if null or pointing to a non-active route
+      const hasActiveCanonical = spaceRow.canonical_session_id
+        ? Boolean(
+            this.db
+              .prepare(
+                'SELECT 1 FROM session_routes WHERE id = ? AND space_id = ? AND user_id = ? AND status = ? LIMIT 1'
+              )
+              .get(spaceRow.canonical_session_id, spaceId, this.userId, 'active')
+          )
+        : false;
+
+      if (!hasActiveCanonical) {
+        this.db.prepare(
+          'UPDATE spaces SET canonical_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?'
+        ).run(newSessionId, spaceId, this.userId);
+      }
 
       const routeStmt = this.db.prepare('SELECT * FROM session_routes WHERE id = ? AND user_id = ?');
       const created = queryOne(routeStmt, parseSessionRouteRow, newSessionId, this.userId);
