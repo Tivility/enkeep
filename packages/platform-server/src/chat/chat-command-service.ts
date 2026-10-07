@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { ValidationError, PlatformError } from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 
-export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses';
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention';
 
 export interface ParsedChatCommand {
   command: ChatCommandType;
@@ -15,6 +15,7 @@ export interface ParsedChatCommand {
   effort?: string;
   raw: string;
   isConfirm?: boolean;
+  all?: boolean;
   legacy?: 'where' | 'list' | 'bind' | 'unbind' | 'newws' | 'new' | 'clear' | 'reset';
 }
 
@@ -43,6 +44,7 @@ export const HELP_USAGE = `Available commands:
   /model - Show, list, set, or reset session model override
   /effort - List, set, or reset reasoning effort override
   /sw - Start parallel background task in current space (alias: /spawn)
+  /mention [on|off] - 查看或设置群聊回复模式 (别名: /require_mention true|false)
   /help - Show this help message
 
 过渡期兼容提示:
@@ -172,12 +174,12 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
   }
 
   const trimmed = content.trim();
-  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses)(?:[\s\t\r\n]+([\s\S]*))?$/i);
+  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
     return null;
   }
 
-  const cmd = match[1].toLowerCase() as 'model' | 'effort' | 'help' | 'status' | 'new' | 'reset' | 'clear' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'new-workspace' | 'list' | 'ls' | 'ws' | 'session' | 'ses';
+  const cmd = match[1].toLowerCase() as ChatCommandType | 'new-workspace' | 'ls' | 'reset' | 'clear' | 'spawn';
   const rest = match[2] !== undefined ? match[2].trim() : '';
 
   if (cmd === 'ws') {
@@ -268,13 +270,17 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
       };
     }
     if (sub === 'use') {
+      const allMatch = subRest.match(/^(.*?)\s+all$/i);
+      const applyAll = Boolean(allMatch);
+      const target = allMatch ? allMatch[1].trim() : subRest;
       return {
         command: 'session',
         type: 'session',
         subcommand: 'use',
         action: 'use',
-        target: subRest || undefined,
-        arg: subRest || undefined,
+        target: target || undefined,
+        arg: target || undefined,
+        all: applyAll,
         raw: trimmed,
       };
     }
@@ -303,6 +309,49 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
     return {
       command: 'session',
       type: 'session',
+      subcommand: 'unknown',
+      action: 'unknown',
+      arg: rest,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'mention' || cmd === 'require_mention') {
+    if (!rest) {
+      return {
+        command: cmd,
+        type: cmd,
+        subcommand: 'show',
+        action: 'show',
+        raw: trimmed,
+      };
+    }
+    const low = rest.toLowerCase();
+    if (low === 'on' || low === 'true') {
+      return {
+        command: cmd,
+        type: cmd,
+        subcommand: 'set',
+        action: 'set',
+        target: 'on',
+        arg: 'on',
+        raw: trimmed,
+      };
+    }
+    if (low === 'off' || low === 'false') {
+      return {
+        command: cmd,
+        type: cmd,
+        subcommand: 'set',
+        action: 'set',
+        target: 'off',
+        arg: 'off',
+        raw: trimmed,
+      };
+    }
+    return {
+      command: cmd,
+      type: cmd,
       subcommand: 'unknown',
       action: 'unknown',
       arg: rest,
@@ -818,6 +867,67 @@ export class ChatCommandService {
     };
   }
 
+  private getChatAndTopicIds(params: {
+    sessionId: string;
+    channelContext?: ChatCommandChannelContext;
+  }): {
+    channel: string;
+    accountId: string | null;
+    chatNativeContextId: string | null;
+    nativeContextId: string | null;
+    isTopic: boolean;
+    chatType: string;
+    senderId: string | null;
+  } {
+    const ctx = this.resolveChannelContext(params);
+    const rawNative = ctx.nativeContextId;
+
+    let chatNativeContextId: string | null = null;
+    let isTopic = false;
+
+    if (ctx.channel === 'lark') {
+      if (params.channelContext?.chatId) {
+        chatNativeContextId = params.channelContext.chatId;
+      } else if (rawNative) {
+        const colonIdx = rawNative.indexOf(':');
+        chatNativeContextId = colonIdx >= 0 ? rawNative.slice(0, colonIdx) : rawNative;
+      }
+      isTopic = Boolean(rawNative && chatNativeContextId && rawNative !== chatNativeContextId);
+    } else {
+      chatNativeContextId = rawNative;
+      isTopic = false;
+    }
+
+    return {
+      channel: ctx.channel,
+      accountId: ctx.accountId,
+      chatNativeContextId,
+      nativeContextId: rawNative,
+      isTopic,
+      chatType: ctx.chatType,
+      senderId: ctx.senderId,
+    };
+  }
+
+  private resetTopicBindings(userId: string, accountId: string, chatNativeContextId: string): number {
+    if (!this.db || !accountId || !chatNativeContextId) return 0;
+    const pattern = `${chatNativeContextId}:%`;
+    try {
+      const countRow = this.db.prepare(
+        'SELECT COUNT(*) as count FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id LIKE ?'
+      ).get(userId, accountId, pattern) as { count?: number } | undefined;
+      const count = countRow?.count ?? 0;
+      if (count > 0) {
+        this.db.prepare(
+          'DELETE FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id LIKE ?'
+        ).run(userId, accountId, pattern);
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  }
+
   async execute(params: {
     userId: string;
     sessionId: string;
@@ -900,6 +1010,10 @@ export class ChatCommandService {
         case 'unbind':
           result = await this.executeUnbindCommand(params, parsed);
           break;
+        case 'mention':
+        case 'require_mention':
+          result = await this.executeMentionCommand(params, parsed);
+          break;
         default:
           result = { replyText: 'Unrecognized command.' };
           break;
@@ -936,6 +1050,9 @@ export class ChatCommandService {
     }
     if (parsed.command === 'bind' || parsed.command === 'unbind' || parsed.command === 'newws') {
       return true;
+    }
+    if (parsed.command === 'mention' || parsed.command === 'require_mention') {
+      return parsed.subcommand === 'set';
     }
     return false;
   }
@@ -1180,7 +1297,8 @@ export class ChatCommandService {
     parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
     const { userId, sessionId, spaceId } = params;
-    const { channel, accountId, nativeContextId } = this.resolveChannelContext(params);
+    const { channel, accountId, chatNativeContextId, nativeContextId } = this.getChatAndTopicIds(params);
+    const lookupCtxId = chatNativeContextId || nativeContextId;
 
     let targetSpaceId = spaceId;
     let agentProfileId: string | null = null;
@@ -1214,14 +1332,14 @@ export class ChatCommandService {
     let bindingOrigin = '默认';
     if (channel === 'web') {
       bindingOrigin = '默认';
-    } else if (this.db && accountId && nativeContextId) {
+    } else if (this.db && accountId && lookupCtxId) {
       try {
         const accRow = this.db
           .prepare('SELECT default_space_id FROM channel_accounts WHERE id = ? AND user_id = ?')
           .get(accountId, userId) as { default_space_id?: string | null } | undefined;
         const bindingRow = this.db
           .prepare('SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
-          .get(userId, accountId, nativeContextId) as { space_id?: string } | undefined;
+          .get(userId, accountId, lookupCtxId) as { space_id?: string } | undefined;
 
         if (bindingRow) {
           if (accRow?.default_space_id && bindingRow.space_id === accRow.default_space_id) {
@@ -1364,7 +1482,8 @@ export class ChatCommandService {
     parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
     const { userId } = params;
-    const { channel, accountId, nativeContextId } = this.resolveChannelContext(params);
+    const { channel, accountId, chatNativeContextId, nativeContextId } = this.getChatAndTopicIds(params);
+    const targetCtxId = chatNativeContextId || nativeContextId;
     const isLegacyBind = parsed.legacy === 'bind';
 
     if (channel === 'web') {
@@ -1386,7 +1505,7 @@ export class ChatCommandService {
       return { replyText: '数据库未连接，无法执行切换。' };
     }
 
-    if (!accountId || !nativeContextId) {
+    if (!accountId || !targetCtxId) {
       return { replyText: '当前会话缺少渠道上下文，无法切换。' };
     }
 
@@ -1435,9 +1554,11 @@ export class ChatCommandService {
     }
 
     try {
+      const resetCount = this.resetTopicBindings(userId, accountId, targetCtxId);
+
       const existing = this.db
         .prepare('SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
-        .get(userId, accountId, nativeContextId) as { id: string } | undefined;
+        .get(userId, accountId, targetCtxId) as { id: string } | undefined;
 
       if (existing) {
         this.db
@@ -1450,13 +1571,14 @@ export class ChatCommandService {
             INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, session_route_id, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, 'mention', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
           `)
-          .run(newId, userId, accountId, targetSpace.id, nativeContextId);
+          .run(newId, userId, accountId, targetSpace.id, targetCtxId);
       }
 
+      const resetNotice = resetCount > 0 ? `\n已重置 ${resetCount} 个话题。` : '';
       if (isLegacyBind) {
-        return { replyText: `已绑定到工作区: ${targetSpace.name}。之后本聊天的消息会进入该工作区的会话。` };
+        return { replyText: `已绑定到工作区: ${targetSpace.name}。之后本聊天的消息会进入该工作区的会话。${resetNotice}` };
       }
-      return { replyText: `已切换到工作区: ${targetSpace.name} (主会话)` };
+      return { replyText: `已切换到工作区: ${targetSpace.name} (主会话)${resetNotice}` };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return { replyText: `切换失败: ${msg}` };
@@ -1540,7 +1662,8 @@ export class ChatCommandService {
     parsed?: ParsedChatCommand
   ): Promise<{ replyText: string }> {
     const { userId } = params;
-    const { channel, accountId, nativeContextId } = this.resolveChannelContext(params);
+    const { channel, accountId, chatNativeContextId, nativeContextId } = this.getChatAndTopicIds(params);
+    const targetCtxId = chatNativeContextId || nativeContextId;
     const isLegacyUnbind = parsed?.legacy === 'unbind' || parsed?.command === 'unbind';
 
     if (channel === 'web') {
@@ -1554,7 +1677,7 @@ export class ChatCommandService {
       return { replyText: '数据库未连接，无法执行回到默认工作区。' };
     }
 
-    if (!accountId || !nativeContextId) {
+    if (!accountId || !targetCtxId) {
       return { replyText: '当前会话缺少渠道上下文，无法回到默认工作区。' };
     }
 
@@ -1575,14 +1698,17 @@ export class ChatCommandService {
         return { replyText: '默认工作区不存在，已保留当前绑定。' };
       }
 
+      const resetCount = this.resetTopicBindings(userId, accountId, targetCtxId);
+
       this.db
         .prepare('DELETE FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
-        .run(userId, accountId, nativeContextId);
+        .run(userId, accountId, targetCtxId);
 
+      const resetNotice = resetCount > 0 ? `\n已重置 ${resetCount} 个话题。` : '';
       if (isLegacyUnbind) {
-        return { replyText: `已恢复渠道默认工作区: ${defaultSpace.name} (${defaultSpace.folder || defaultSpace.id})` };
+        return { replyText: `已恢复渠道默认工作区: ${defaultSpace.name} (${defaultSpace.folder || defaultSpace.id})${resetNotice}` };
       }
-      return { replyText: `已回到账号默认工作区: ${defaultSpace.name}` };
+      return { replyText: `已回到账号默认工作区: ${defaultSpace.name}${resetNotice}` };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return { replyText: `操作失败: ${msg}` };
@@ -1746,7 +1872,7 @@ export class ChatCommandService {
     parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
     const { userId, sessionId, spaceId } = params;
-    const { channel, accountId, nativeContextId } = this.resolveChannelContext(params);
+    const { channel, accountId, chatNativeContextId, nativeContextId, isTopic } = this.getChatAndTopicIds(params);
 
     if (channel === 'web') {
       return { replyText: '请在侧栏切换会话。' };
@@ -1760,22 +1886,33 @@ export class ChatCommandService {
     if (!this.db) {
       return { replyText: '数据库未连接，无法切换会话。' };
     }
-    if (!accountId || !nativeContextId) {
+    const targetCtxId = chatNativeContextId || nativeContextId;
+    if (!accountId || !targetCtxId) {
       return { replyText: '当前会话缺少渠道上下文，无法切换。' };
     }
 
     let targetSpaceId = spaceId;
     try {
-      const routeRow = this.db.prepare('SELECT space_id FROM session_routes WHERE id = ? AND user_id = ?').get(sessionId, userId) as { space_id?: string } | undefined;
-      if (routeRow?.space_id) targetSpaceId = routeRow.space_id;
+      const bindingRow = this.db.prepare(
+        'SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, targetCtxId) as { space_id?: string } | undefined;
+      if (bindingRow?.space_id) {
+        targetSpaceId = bindingRow.space_id;
+      } else {
+        const routeRow = this.db.prepare('SELECT space_id FROM session_routes WHERE id = ? AND user_id = ?').get(sessionId, userId) as { space_id?: string } | undefined;
+        if (routeRow?.space_id) targetSpaceId = routeRow.space_id;
+      }
     } catch {}
+
+    const writeToChatLevel = parsed.all || !isTopic;
+    const bindingTargetCtx = writeToChatLevel ? targetCtxId : nativeContextId!;
 
     const targetLower = rawTarget.toLowerCase();
     if (targetLower === 'main') {
       try {
         const existing = this.db.prepare(
           'SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
-        ).get(userId, accountId, nativeContextId) as { id: string } | undefined;
+        ).get(userId, accountId, bindingTargetCtx) as { id: string } | undefined;
         if (existing) {
           this.db.prepare('UPDATE channel_bindings SET session_route_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(existing.id);
         }
@@ -1802,20 +1939,28 @@ export class ChatCommandService {
 
     const matchedSession = matchRes.matched;
     try {
+      let chatActivationMode = 'mention';
+      const chatBinding = this.db.prepare(
+        'SELECT activation_mode FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, targetCtxId) as { activation_mode?: string } | undefined;
+      if (chatBinding?.activation_mode) {
+        chatActivationMode = chatBinding.activation_mode;
+      }
+
       const existing = this.db.prepare(
         'SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
-      ).get(userId, accountId, nativeContextId) as { id: string } | undefined;
+      ).get(userId, accountId, bindingTargetCtx) as { id: string } | undefined;
 
       if (existing) {
         this.db.prepare(
-          'UPDATE channel_bindings SET session_route_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-        ).run(matchedSession.id, existing.id);
+          'UPDATE channel_bindings SET space_id = ?, session_route_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+        ).run(targetSpaceId, matchedSession.id, existing.id);
       } else {
         const newId = `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
         this.db.prepare(`
           INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, session_route_id, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, 'mention', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        `).run(newId, userId, accountId, targetSpaceId, nativeContextId, matchedSession.id);
+          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(newId, userId, accountId, targetSpaceId, bindingTargetCtx, chatActivationMode, matchedSession.id);
       }
 
       const allIds = activeSessions.map((s) => s.id);
@@ -1831,13 +1976,24 @@ export class ChatCommandService {
     parsed: ParsedChatCommand
   ): Promise<{ replyText: string }> {
     const { userId, sessionId, spaceId } = params;
-    const { channel, accountId, nativeContextId } = this.resolveChannelContext(params);
+    const { channel, accountId, chatNativeContextId, nativeContextId, isTopic } = this.getChatAndTopicIds(params);
 
+    const targetCtxId = chatNativeContextId || nativeContextId;
     let targetSpaceId = spaceId;
     if (this.db) {
       try {
-        const routeRow = this.db.prepare('SELECT space_id FROM session_routes WHERE id = ? AND user_id = ?').get(sessionId, userId) as { space_id?: string } | undefined;
-        if (routeRow?.space_id) targetSpaceId = routeRow.space_id;
+        if (targetCtxId && accountId) {
+          const bindingRow = this.db.prepare(
+            'SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+          ).get(userId, accountId, targetCtxId) as { space_id?: string } | undefined;
+          if (bindingRow?.space_id) {
+            targetSpaceId = bindingRow.space_id;
+          }
+        }
+        if (!targetSpaceId) {
+          const routeRow = this.db.prepare('SELECT space_id FROM session_routes WHERE id = ? AND user_id = ?').get(sessionId, userId) as { space_id?: string } | undefined;
+          if (routeRow?.space_id) targetSpaceId = routeRow.space_id;
+        }
       } catch {}
     }
 
@@ -1913,20 +2069,31 @@ export class ChatCommandService {
       return { replyText: `会话 "${createdSession.title || shortId}" 已创建。请在侧栏切换打开。` };
     }
 
-    if (this.db && accountId && nativeContextId) {
+    const bindingTargetCtx = isTopic ? nativeContextId : targetCtxId;
+    if (this.db && accountId && bindingTargetCtx) {
       try {
+        let chatActivationMode = 'mention';
+        if (targetCtxId) {
+          const chatBinding = this.db.prepare(
+            'SELECT activation_mode FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+          ).get(userId, accountId, targetCtxId) as { activation_mode?: string } | undefined;
+          if (chatBinding?.activation_mode) {
+            chatActivationMode = chatBinding.activation_mode;
+          }
+        }
+
         const existing = this.db.prepare(
           'SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
-        ).get(userId, accountId, nativeContextId) as { id: string } | undefined;
+        ).get(userId, accountId, bindingTargetCtx) as { id: string } | undefined;
 
         if (existing) {
-          this.db.prepare('UPDATE channel_bindings SET session_route_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(createdSession.id, existing.id);
+          this.db.prepare('UPDATE channel_bindings SET space_id = ?, session_route_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(targetSpaceId, createdSession.id, existing.id);
         } else {
           const newId = `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
           this.db.prepare(`
             INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, session_route_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'mention', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-          `).run(newId, userId, accountId, targetSpaceId, nativeContextId, createdSession.id);
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+          `).run(newId, userId, accountId, targetSpaceId, bindingTargetCtx, chatActivationMode, createdSession.id);
         }
       } catch (err: unknown) {
         return { replyText: `新建会话成功但固定失败: ${err instanceof Error ? err.message : String(err)}` };
@@ -1934,6 +2101,88 @@ export class ChatCommandService {
     }
 
     return { replyText: `已新建会话并固定: ${shortId}${createdSession.title ? ` (${createdSession.title})` : ''}` };
+  }
+
+  private async executeMentionCommand(
+    params: { userId: string; sessionId: string; spaceId: string; channelContext?: ChatCommandChannelContext },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId } = params;
+    const { channel, accountId, chatNativeContextId, nativeContextId, chatType } = this.getChatAndTopicIds(params);
+
+    if (channel === 'web' || chatType === 'p2p') {
+      return { replyText: '私聊不适用（总是回复）。' };
+    }
+
+    if (parsed.subcommand === 'unknown') {
+      return { replyText: '用法: /mention [on|off] 或 /require_mention [true|false]' };
+    }
+
+    const targetCtxId = chatNativeContextId || nativeContextId;
+    if (!this.db || !accountId || !targetCtxId) {
+      return { replyText: '当前会话缺少渠道上下文，无法配置 @ 模式。' };
+    }
+
+    if (parsed.subcommand === 'show') {
+      let mode = 'mention';
+      try {
+        const binding = this.db.prepare(
+          'SELECT activation_mode FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+        ).get(userId, accountId, targetCtxId) as { activation_mode?: string } | undefined;
+        if (binding?.activation_mode) {
+          mode = binding.activation_mode;
+        } else {
+          const acc = this.db.prepare(
+            'SELECT group_activation_mode FROM channel_accounts WHERE id = ? AND user_id = ?'
+          ).get(accountId, userId) as { group_activation_mode?: string | null } | undefined;
+          if (acc?.group_activation_mode) {
+            mode = acc.group_activation_mode;
+          }
+        }
+      } catch {}
+
+      if (mode === 'always') {
+        return { replyText: '当前设置: 回复所有消息 (off)' };
+      }
+      return { replyText: '当前设置: 仅在被 @ 时回复 (on)' };
+    }
+
+    // parsed.subcommand === 'set'
+    const targetMode = parsed.target === 'off' ? 'always' : 'mention';
+    try {
+      const existing = this.db.prepare(
+        'SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, targetCtxId) as { id: string } | undefined;
+
+      if (existing) {
+        this.db.prepare(
+          'UPDATE channel_bindings SET activation_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+        ).run(targetMode, existing.id);
+      } else {
+        let defaultSpaceId = params.spaceId;
+        try {
+          const acc = this.db.prepare(
+            'SELECT default_space_id FROM channel_accounts WHERE id = ? AND user_id = ?'
+          ).get(accountId, userId) as { default_space_id?: string | null } | undefined;
+          if (acc?.default_space_id) {
+            defaultSpaceId = acc.default_space_id;
+          }
+        } catch {}
+
+        const newId = `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+        this.db.prepare(`
+          INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, session_route_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(newId, userId, accountId, defaultSpaceId, targetCtxId, targetMode);
+      }
+
+      if (parsed.target === 'off') {
+        return { replyText: '已关闭 @ 模式：机器人将回复群内所有消息。\n提示：需要在飞书开放平台开通“获取群组中所有消息”权限。' };
+      }
+      return { replyText: '已开启 @ 模式：仅在被 @ 机器人时回复。' };
+    } catch (err: unknown) {
+      return { replyText: `配置失败: ${err instanceof Error ? err.message : String(err)}` };
+    }
   }
 
   private async executeSessionClearCommand(

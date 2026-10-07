@@ -170,6 +170,7 @@ export interface TenantScopedChannelRepository {
   updateBinding(id: string, input: UpdateChannelBindingInput): Promise<ChannelBinding>;
   setGroupActivationModeForAccountBindings(accountId: string, mode: ChannelActivationMode): Promise<number>;
   deleteBinding(id: string): Promise<boolean>;
+  deleteTopicBindingsForChat?(accountId: string, chatNativeContextId: string): Promise<number>;
 
   // Inbox operations (idempotent inbound event ingestion)
   findInboxByEvent(accountId: string, nativeEventId: string): Promise<ChannelInboxItem | null>;
@@ -191,4 +192,5 @@ export interface TenantScopedChannelRepository {
   findTurnOriginByTurnId(turnId: string): Promise<ChannelTurnOrigin | null>;
   findTurnOriginsBySessionId(sessionId: string): Promise<ChannelTurnOrigin[]>;
   findTurnOriginsByOriginTurnId(originTurnId: string): Promise<ChannelTurnOrigin[]>;
+  hasTurnOriginForContext?(accountId: string, nativeContextId: string): Promise<boolean>;
 }
