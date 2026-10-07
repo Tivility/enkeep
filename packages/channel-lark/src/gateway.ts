@@ -404,15 +404,13 @@ export class LarkChannelGateway {
 
     const nativeEventId = rawEvent.header?.event_id ?? rawEvent.uuid ?? parsed.messageId;
     const nativeContextId = buildNativeContextId(parsed.chatId, parsed.threadId, parsed.rootId);
+    const chatNativeContextId = parsed.chatId;
+    const isTopic = nativeContextId !== chatNativeContextId;
 
-    // 2. Resolve binding and activation mode
-    let binding = await this.channelRepo.findBindingByContext(this.accountId, nativeContextId);
-    if (!binding && parsed.chatId !== nativeContextId) {
-      // Fall back to chat-level binding if thread-specific binding doesn't exist
-      binding = await this.channelRepo.findBindingByContext(this.accountId, parsed.chatId);
-    }
+    // 2. Resolve chat-level binding (workspace always from chat level)
+    let binding = await this.channelRepo.findBindingByContext(this.accountId, chatNativeContextId);
 
-    // Auto-create binding to default space if configured and none exists
+    // Auto-create chat-level binding to default space if configured and none exists
     if (!binding) {
       const liveAccount = await this.channelRepo.findAccountById(this.accountId);
       let targetDefaultSpaceId: string | null = null;
@@ -451,7 +449,7 @@ export class LarkChannelGateway {
           binding = await this.channelRepo.createBinding({
             accountId: this.accountId,
             spaceId: targetDefaultSpaceId,
-            nativeContextId,
+            nativeContextId: chatNativeContextId,
             activationMode: isP2P ? 'always' : targetGroupActivationMode,
             chatType: parsed.chatType,
           });
@@ -464,16 +462,34 @@ export class LarkChannelGateway {
       return { handled: false, ignoredReason: 'no_binding' };
     }
 
+    // Resolve optional topic-level binding
+    let topicBinding = isTopic
+      ? await this.channelRepo.findBindingByContext(this.accountId, nativeContextId)
+      : null;
+
     // 3. Mention Gating Check
     const isP2P = parsed.chatType === 'p2p';
-    const isInsideThread = !!(parsed.rootId || parsed.threadId);
+    // Topic bindings never decide activation mode (read chat-level)
     let requiresMention = binding.activationMode === 'mention' && !isP2P;
 
-    // Waiver: if the binding is mention mode but a session_routes row ALREADY exists for this nativeContextId
-    // and the message is inside a thread (rootId/threadId present), do not require the @mention.
-    if (requiresMention && isInsideThread) {
-      const existingRoute = await this.sessionRouteRepo.findByRouteIdentity('lark', this.accountId, nativeContextId);
-      if (existingRoute) {
+    // Thread mention waiver when:
+    // - The topic has a topic-level binding (and belongs to the chat's workspace)
+    // - The bot has replied in that thread context (channel_turn_origins)
+    // - An established route exists for this topic context
+    if (requiresMention && isTopic) {
+      const hasTopicBinding = Boolean(topicBinding && topicBinding.spaceId === binding.spaceId);
+      const hasRepliedInTopic = typeof (this.channelRepo as any).hasTurnOriginForContext === 'function'
+        ? await (this.channelRepo as any).hasTurnOriginForContext(this.accountId, nativeContextId)
+        : false;
+      let hasEstablishedRoute = false;
+      if (!hasTopicBinding && !hasRepliedInTopic && typeof this.sessionRouteRepo.findByRouteIdentity === 'function') {
+        const existingRoute = await this.sessionRouteRepo.findByRouteIdentity('lark', this.accountId, nativeContextId);
+        if (existingRoute) {
+          hasEstablishedRoute = true;
+        }
+      }
+
+      if (hasTopicBinding || hasRepliedInTopic || hasEstablishedRoute) {
         requiresMention = false;
       }
     }
@@ -564,12 +580,14 @@ export class LarkChannelGateway {
     const resolved = await resolveInboundRoute<SessionRoute>({
       userId: this.userId,
       binding,
+      topicBinding,
       sessionRouteRepo: this.sessionRouteRepo,
       channelRepo: this.channelRepo,
       canonicalOptions: {
         channel: 'lark',
         accountId: this.accountId,
         nativeContextId,
+        fallbackNativeContextId: chatNativeContextId,
         peerId: parsed.senderId || nativeContextId,
         title: `Lark ${parsed.chatType === 'p2p' ? 'Direct' : 'Chat'} ${parsed.chatId}`,
       },
@@ -1145,7 +1163,7 @@ export class LarkChannelGateway {
       replyToMessageId: parsed.messageId,
       rootId: parsed.rootId,
       threadId: parsed.threadId,
-      nativeContextId: parsed.chatId,
+      nativeContextId,
     });
 
     const envelope: InboundEnvelope = {
@@ -1159,7 +1177,7 @@ export class LarkChannelGateway {
         channel: 'lark',
         accountId: this.accountId,
         chatId: parsed.chatId,
-        nativeContextId: parsed.chatId,
+        nativeContextId,
         nativeEventId,
         replyToMessageId: parsed.messageId,
         rootId: parsed.rootId,

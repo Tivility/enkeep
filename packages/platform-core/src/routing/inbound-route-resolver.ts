@@ -7,6 +7,11 @@ export interface InboundRouteResolverParams<TRoute = any, TBinding = any> {
     spaceId: string;
     sessionRouteId?: string | null;
   };
+  topicBinding?: (TBinding & {
+    id: string;
+    spaceId: string;
+    sessionRouteId?: string | null;
+  }) | null;
   sessionRouteRepo: {
     findById(id: string): Promise<TRoute | null>;
     getOrCreateCanonicalSession?(spaceId: string, options: any): Promise<TRoute>;
@@ -15,6 +20,7 @@ export interface InboundRouteResolverParams<TRoute = any, TBinding = any> {
   };
   channelRepo?: {
     updateBinding?(id: string, input: { sessionRouteId?: string | null }): Promise<any>;
+    deleteBinding?(id: string): Promise<any>;
   };
   canonicalOptions: {
     channel: string;
@@ -25,6 +31,7 @@ export interface InboundRouteResolverParams<TRoute = any, TBinding = any> {
     title?: string;
   };
   fallbackNoticeMessage?: string;
+  spaceMismatchNoticeMessage?: string;
 }
 
 export interface InboundRouteResolverResult<TRoute = any> {
@@ -34,13 +41,30 @@ export interface InboundRouteResolverResult<TRoute = any> {
 }
 
 export const DEFAULT_INVALID_PIN_FALLBACK_NOTICE = '提示：此前固定的会话已失效，已自动切回主会话。';
+export const DEFAULT_TOPIC_SPACE_MISMATCH_NOTICE = '提示：该话题此前固定的工作区已失效，已自动切回主会话。';
+
+/**
+ * Strips the thread part from a Lark nativeContextId ('chatId:threadId') to get the chat-level ID ('chatId').
+ * For WeChat or contexts without colons, returns the nativeContextId unchanged.
+ */
+export function getChatLevelNativeContextId(nativeContextId: string): string {
+  const colonIdx = nativeContextId.indexOf(':');
+  return colonIdx >= 0 ? nativeContextId.slice(0, colonIdx) : nativeContextId;
+}
+
+export function isTopicNativeContextId(nativeContextId: string): boolean {
+  return nativeContextId.includes(':');
+}
 
 /**
  * Shared inbound session route resolver for IM channels (Lark, WeChat).
- * Enforces session pinning contract:
- * - If channel_bindings.session_route_id points to an active session in the same workspace & user, enters it.
- * - Otherwise enters canonical main session.
- * - If the pinned session was invalid/archived/deleted, clears session_route_id and generates a fallback notice.
+ * Enforces two-layer session pinning contract (Section 4A):
+ * - Resolver order: topic -> chat -> main session
+ * - Workspace always from chat level (binding.spaceId)
+ * - Invalidate topic bindings whose space differs: delete + one-time notice
+ * - If topic pin is invalid/archived: clear pin, set fallback notice, fall back to chat pin or main session
+ * - If chat pin is invalid/archived: clear pin, set fallback notice, fall back to main session
+ * - Otherwise canonical main session
  */
 export async function resolveInboundRoute<TRoute = any, TBinding = any>(
   params: InboundRouteResolverParams<TRoute, TBinding>
@@ -48,13 +72,65 @@ export async function resolveInboundRoute<TRoute = any, TBinding = any>(
   const {
     userId,
     binding,
+    topicBinding,
     sessionRouteRepo,
     channelRepo,
     canonicalOptions,
     fallbackNoticeMessage = DEFAULT_INVALID_PIN_FALLBACK_NOTICE,
+    spaceMismatchNoticeMessage = DEFAULT_TOPIC_SPACE_MISMATCH_NOTICE,
   } = params;
 
-  // 1. Session pinning check
+  let fallbackNotice: string | undefined;
+
+  // 1. Topic-level binding check (if in a topic)
+  if (topicBinding) {
+    if (topicBinding.spaceId !== binding.spaceId) {
+      // Space mismatch: invalidate topic binding (delete it) and give one-time notice
+      if (channelRepo && typeof channelRepo.deleteBinding === 'function') {
+        try {
+          await channelRepo.deleteBinding(topicBinding.id);
+        } catch {}
+      }
+      fallbackNotice = spaceMismatchNoticeMessage;
+      // Do not use topicBinding further
+    } else if (topicBinding.sessionRouteId) {
+      let pinnedRoute: TRoute | null = null;
+      try {
+        pinnedRoute = await sessionRouteRepo.findById(topicBinding.sessionRouteId);
+      } catch {
+        pinnedRoute = null;
+      }
+
+      const routeSpaceId = (pinnedRoute as any)?.spaceId ?? (pinnedRoute as any)?.space_id;
+      const routeUserId = (pinnedRoute as any)?.userId ?? (pinnedRoute as any)?.user_id;
+      const routeStatus = (pinnedRoute as any)?.status;
+
+      const isValid = Boolean(
+        pinnedRoute &&
+        routeStatus === 'active' &&
+        routeSpaceId === binding.spaceId &&
+        (!routeUserId || routeUserId === userId)
+      );
+
+      if (isValid) {
+        return {
+          route: pinnedRoute as TRoute,
+          pinned: true,
+        };
+      }
+
+      // Topic pin is invalid (archived / deleted) -> clear topic pin
+      if (channelRepo && typeof channelRepo.updateBinding === 'function') {
+        try {
+          await channelRepo.updateBinding(topicBinding.id, { sessionRouteId: null });
+        } catch {}
+      }
+      topicBinding.sessionRouteId = null;
+      fallbackNotice = fallbackNoticeMessage;
+    }
+  }
+
+  // 2. Chat-level session pinning check
   if (binding.sessionRouteId) {
     let pinnedRoute: TRoute | null = null;
     try {
@@ -78,33 +154,23 @@ export async function resolveInboundRoute<TRoute = any, TBinding = any>(
       return {
         route: pinnedRoute as TRoute,
         pinned: true,
+        fallbackNotice,
       };
     }
 
-    // Pinned route is invalid / archived / deleted / wrong space
-    // Clear session_route_id from channel_bindings
+    // Chat pin is invalid -> clear chat pin
     if (channelRepo && typeof channelRepo.updateBinding === 'function') {
       try {
         await channelRepo.updateBinding(binding.id, { sessionRouteId: null });
       } catch {}
     }
     binding.sessionRouteId = null;
-
-    // Fall back to canonical session with notice
-    const canonicalRoute = await resolveCanonicalSession<TRoute>(
-      sessionRouteRepo,
-      binding.spaceId,
-      canonicalOptions
-    );
-
-    return {
-      route: canonicalRoute,
-      fallbackNotice: fallbackNoticeMessage,
-      pinned: false,
-    };
+    if (!fallbackNotice) {
+      fallbackNotice = fallbackNoticeMessage;
+    }
   }
 
-  // 2. Default to canonical main session
+  // 3. Fall back to canonical main session in chat's workspace
   const canonicalRoute = await resolveCanonicalSession<TRoute>(
     sessionRouteRepo,
     binding.spaceId,
@@ -114,6 +180,7 @@ export async function resolveInboundRoute<TRoute = any, TBinding = any>(
   return {
     route: canonicalRoute,
     pinned: false,
+    fallbackNotice,
   };
 }
 

@@ -280,6 +280,21 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
     return Number(result.changes) > 0;
   }
 
+  async deleteTopicBindingsForChat(accountId: string, chatNativeContextId: string): Promise<number> {
+    if (!accountId || !chatNativeContextId) return 0;
+    const pattern = `${chatNativeContextId}:%`;
+    const countRow = this.db.prepare(
+      'SELECT COUNT(*) as count FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id LIKE ?'
+    ).get(this.userId, accountId, pattern) as { count?: number } | undefined;
+    const count = countRow?.count ?? 0;
+    if (count > 0) {
+      this.db.prepare(
+        'DELETE FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id LIKE ?'
+      ).run(this.userId, accountId, pattern);
+    }
+    return count;
+  }
+
   // ──────────────── Inbox Operations ────────────────
 
   async findInboxByEvent(accountId: string, nativeEventId: string): Promise<ChannelInboxItem | null> {
@@ -638,5 +653,14 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
       'SELECT * FROM channel_turn_origins WHERE user_id = ? AND origin_turn_id = ? ORDER BY created_at ASC'
     );
     return queryAll(stmt, parseChannelTurnOriginRow, this.userId, originTurnId);
+  }
+
+  async hasTurnOriginForContext(accountId: string, nativeContextId: string): Promise<boolean> {
+    if (!accountId || !nativeContextId) return false;
+    const stmt = this.db.prepare(
+      'SELECT 1 FROM channel_turn_origins WHERE user_id = ? AND account_id = ? AND native_context_id = ? LIMIT 1'
+    );
+    const row = stmt.get(this.userId, accountId, nativeContextId);
+    return Boolean(row);
   }
 }
