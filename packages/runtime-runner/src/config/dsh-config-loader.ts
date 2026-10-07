@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
+import { resolvePlatformDshHome, type ResolvePlatformDshHomeOptions } from '@enkeep/platform-core';
 import type { RuntimeNetworkMode } from '../spec/types.js';
 
 export interface DshParsedModel {
@@ -413,22 +414,7 @@ export interface DshConfigLoaderOptions {
   isProduction?: boolean;
 }
 
-/**
- * Resolves the platform-side DSH home directory.
- * Priority:
- * 1. customDshHome (explicit argument)
- * 2. ENKEEP_DSH_HOME (preferred environment variable)
- * 3. DSH_HOME (fallback environment variable)
- *
- * Never falls back to os.homedir()/.dsh.
- */
-export function resolvePlatformDshHome(customDshHome?: string): string | null {
-  const candidate = customDshHome || process.env.ENKEEP_DSH_HOME || process.env.DSH_HOME;
-  if (!candidate || typeof candidate !== 'string' || candidate.trim().length === 0) {
-    return null;
-  }
-  return path.resolve(candidate.trim());
-}
+export { resolvePlatformDshHome, type ResolvePlatformDshHomeOptions };
 
 /**
  * Loads DSH deployment configuration from filesystem ($ENKEEP_DSH_HOME or $DSH_HOME).

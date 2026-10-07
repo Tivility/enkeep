@@ -6,6 +6,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   PlatformError,
+  resolvePlatformDshHome,
   type PlatformStorage,
   type AuthService,
 } from '@enkeep/platform-core';
@@ -591,6 +592,18 @@ export class PlatformServer {
     this.operationsProvider = createManagementOperationsAdapter(this.operationsService);
     this.quotaProvider = options.quotaProvider ?? createOperationsTenantQuotaProvider(this.operationsService);
 
+    const effectiveDshHome = resolvePlatformDshHome(options.dshHome);
+    this.dshHome = effectiveDshHome ?? '';
+    this.dataRoot = options.dataRoot ?? (options.dshHome ?? (effectiveDshHome || undefined));
+
+    this.modelSelectionService =
+      options.modelSelectionService ??
+      new ModelSelectionService({
+        db,
+        operations: this.operationsService,
+        customDshHome: effectiveDshHome ?? undefined,
+      });
+
     if (options.consoleDataSource) {
       this.consoleDataSource = options.consoleDataSource;
     } else {
@@ -600,6 +613,7 @@ export class PlatformServer {
           database: db,
           storage: this.storage,
           quotaDefaults,
+          modelSelectionService: this.modelSelectionService,
         });
       }
     }
@@ -712,14 +726,10 @@ export class PlatformServer {
       this.csrfToken
     );
 
-    const effectiveDshHome = options.dshHome ?? (process.env.DSH_HOME || path.join(os.homedir(), '.dsh'));
-    this.dshHome = effectiveDshHome;
-    this.dataRoot = options.dataRoot ?? options.dshHome;
-
     const extensionService =
       options.extensionService ??
       new ExtensionService(this.storage, db, {
-        dshHome: effectiveDshHome,
+        dshHome: this.dshHome,
         spacesDir: options.spacesDir ?? (process.env.ENKEEP_SPACES_DIR || path.join(os.homedir(), '.enkeep', 'spaces')),
         bundledSkillDir: options.bundledSkillDir ?? (process.env.DSH_BUNDLED_SKILL_DIR || undefined),
         gitSourcePolicy: options.gitSourcePolicy,
@@ -784,13 +794,6 @@ export class PlatformServer {
         db,
         securityOptions: options.webhookSecurityOptions,
         cipherKey: options.cookieSecret,
-      });
-
-    this.modelSelectionService =
-      options.modelSelectionService ??
-      new ModelSelectionService({
-        db,
-        operations: this.operationsService,
       });
 
     this.skillCatalogService = skillCatalogService;
@@ -1077,6 +1080,7 @@ export class PlatformServer {
       auditExportService: this.auditExportService,
       usageExportService: this.usageExportService,
       taskNotificationService: this.taskNotificationService,
+      modelSelectionService: this.modelSelectionService,
       sessionLifecycleService: this.sessionLifecycleService,
       runtimeArtifactPort: this.runtimeArtifactPort,
       externalInteractionService: options.externalInteractionService,

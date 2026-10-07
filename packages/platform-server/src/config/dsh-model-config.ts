@@ -13,9 +13,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import crypto from 'node:crypto';
 import YAML from 'yaml';
+import { resolvePlatformDshHome, type ResolvePlatformDshHomeOptions } from '@enkeep/platform-core';
 import type {
   SafeDshModel,
   SafeDshProvider,
@@ -206,9 +206,20 @@ export function parseDshConfigToSafeModels(
  * Loads DSH configuration from disk ($DSH_HOME) in a strictly read-only manner.
  *
  * @param customDshHome - Optional explicit directory override
+ * @param options - Optional resolution options or isProduction boolean flag
  */
-export function loadDshSafeModelConfig(customDshHome?: string): RawDshModelConfig {
-  const dshHome = customDshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+export function loadDshSafeModelConfig(
+  customDshHome?: string,
+  options?: ResolvePlatformDshHomeOptions | boolean
+): RawDshModelConfig {
+  const dshHome = resolvePlatformDshHome(customDshHome, options);
+
+  if (!dshHome) {
+    return {
+      providers: {},
+      defaultModel: { provider: '', model: '' },
+    };
+  }
 
   const candidatePatchPaths = [
     path.join(dshHome, 'profiles', 'web', 'cordis.patch.yml'),

@@ -29,6 +29,7 @@ import type { TaskNotificationService } from '../notifications/task-notification
 import {
   PipelineTaskInputPreparerService,
 } from './pipeline-input-preparer.js';
+import { resolvePlatformDshHome } from '@enkeep/platform-core';
 
 export {
   AgentPromptTaskWorker,
@@ -208,11 +209,12 @@ export function createPlatformServerTaskWorker(
       .get(params.tenantId) as { username: string } | undefined;
     const username = userRow?.username || params.tenantId;
 
+    const resolvedDshHome = resolvePlatformDshHome(options.dshHome);
+
     const dataRoots = [
       options.dataRoot,
-      options.dshHome,
+      resolvedDshHome,
       process.env.ENKEEP_DATA_DIR,
-      process.env.DSH_HOME,
       path.join(process.cwd(), '.demo-data'),
       path.join(process.cwd(), 'data'),
     ].filter((r): r is string => typeof r === 'string' && r.trim().length > 0);

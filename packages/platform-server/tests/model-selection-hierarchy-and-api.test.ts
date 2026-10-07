@@ -25,8 +25,15 @@ describe('Model Selection Hierarchy, Tenant Isolation & Canonical APIs', () => {
   let bobSessionId: string;
 
   let csrfHeader: string;
+  let origDshHome: string | undefined;
+  let origEnkeepDshHome: string | undefined;
 
   beforeEach(async () => {
+    origEnkeepDshHome = process.env.ENKEEP_DSH_HOME;
+    origDshHome = process.env.DSH_HOME;
+    delete process.env.ENKEEP_DSH_HOME;
+    delete process.env.DSH_HOME;
+
     db = new DatabaseSync(':memory:');
     const runner = new PlatformServerMigrationRunner(db);
     await runner.migrate(ALL_PLATFORM_MIGRATIONS);
@@ -102,6 +109,12 @@ describe('Model Selection Hierarchy, Tenant Isolation & Canonical APIs', () => {
   });
 
   afterEach(async () => {
+    if (origEnkeepDshHome !== undefined) process.env.ENKEEP_DSH_HOME = origEnkeepDshHome;
+    else delete process.env.ENKEEP_DSH_HOME;
+
+    if (origDshHome !== undefined) process.env.DSH_HOME = origDshHome;
+    else delete process.env.DSH_HOME;
+
     try {
       await server.close();
     } catch {}
