@@ -11,8 +11,6 @@
  * @module @enkeep/runtime-runner/tunnel/llm-proxy
  */
 
-import path from 'node:path';
-import os from 'node:os';
 import { Duplex, PassThrough } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { StreamHandler, StreamMetadata } from './contract.js';
@@ -20,7 +18,7 @@ import type {
   DshParsedProvider,
   DshDeploymentConfig,
 } from '../config/dsh-config-loader.js';
-import { loadDshDeploymentConfig } from '../config/dsh-config-loader.js';
+import { loadDshDeploymentConfig, resolvePlatformDshHome } from '../config/dsh-config-loader.js';
 
 import type { FallbackTarget } from '../transport/types.js';
 
@@ -416,7 +414,7 @@ export class LlmProxyHandler implements StreamHandler {
     }
     if (this.customProviders && this.customTokens) {
       return {
-        dshHome: path.join(os.homedir(), '.dsh'),
+        dshHome: resolvePlatformDshHome() || '',
         providers: this.customProviders,
         tokens: this.customTokens,
         defaultModel: {

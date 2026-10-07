@@ -53,6 +53,7 @@ OPTIONS:
   --port <number>             Fixed loopback Platform port for up (default dynamic)
   --network-mode <mode>       Container network mode: "none" (default) or "bridge"
   --resource-suffix <suffix>  Resource suffix for Docker containers and volumes (or env ENKEEP_RESOURCE_SUFFIX)
+  --dsh-home <dir>            Explicit DSH home directory (or env ENKEEP_DSH_HOME, DSH_HOME)
   --lark-test-credentials <f> Path to Lark test credentials file (0600 mode)
   --json                      Output results as JSON (errors omit stack trace)
   --remove-vols               Remove demo Docker volumes on teardown
@@ -109,6 +110,44 @@ export function parsePlatformPort(
 }
 
 /**
+ * Parses and validates the DSH home directory from CLI arguments or environment variables.
+ * Priority: CLI `--dsh-home <path>` > env `ENKEEP_DSH_HOME` > env `DSH_HOME` > undefined.
+ */
+export function parseDshHome(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  let rawHome: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--dsh-home') {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        throw new Error('Safety Violation: --dsh-home requires a valid directory path.');
+      }
+      rawHome = next;
+      break;
+    } else if (arg.startsWith('--dsh-home=')) {
+      const val = arg.slice('--dsh-home='.length);
+      if (!val) {
+        throw new Error('Safety Violation: --dsh-home requires a valid directory path.');
+      }
+      rawHome = val;
+      break;
+    }
+  }
+
+  if (rawHome === undefined && env.ENKEEP_DSH_HOME !== undefined && env.ENKEEP_DSH_HOME !== '') {
+    rawHome = env.ENKEEP_DSH_HOME;
+  } else if (rawHome === undefined && env.DSH_HOME !== undefined && env.DSH_HOME !== '') {
+    rawHome = env.DSH_HOME;
+  }
+
+  return rawHome;
+}
+
+/**
  * Parses and validates container network mode from CLI arguments, environment variables, or DSH settings.
  * Whitelist supported: 'none' | 'bridge'. Defaults to 'none' for backwards compatibility.
  * Priority: CLI `--network-mode <mode>` / `--network <mode>` > env `ENKEEP_CONTAINER_NETWORK_MODE` > env `DSH_CONTAINER_NETWORK_MODE` > settings `container-network-mode` > default 'none'.
@@ -117,7 +156,7 @@ export function parsePlatformPort(
 export function parseContainerNetworkMode(
   args: string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
-  dshConfig: import('@enkeep/runtime-runner').DshDeploymentConfig | null = loadDshDeploymentConfig()
+  dshConfig: import('@enkeep/runtime-runner').DshDeploymentConfig | null = loadDshDeploymentConfig(parseDshHome(args, env))
 ): import('@enkeep/runtime-runner').RuntimeNetworkMode {
   let rawMode: string | undefined;
 
@@ -303,6 +342,7 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         const larkTestCredentialsFile = parseLarkTestCredentialsPath(args);
         const containerNetworkMode = parseContainerNetworkMode(args);
         const resourceSuffix = parseResourceSuffix(args);
+        const dshHome = parseDshHome(args);
         const system = await launchDemoSystem({
           repoRoot,
           allowHostRuntime,
@@ -310,8 +350,9 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
           larkTestCredentialsFile,
           containerNetworkMode,
           resourceSuffix,
+          dshHome,
         });
-        const dshConfig = loadDshDeploymentConfig();
+        const dshConfig = loadDshDeploymentConfig(dshHome);
         const isLlmConfigured = Boolean(
           dshConfig &&
           dshConfig.providers &&

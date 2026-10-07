@@ -491,7 +491,8 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     options.allowHostRuntime ??
     (process.env.ENKEEP_ALLOW_HOST_RUNTIME === '1' || process.env.ENKEEP_ALLOW_HOST_RUNTIME === 'true');
 
-  const dshDeploymentConfig = loadDshDeploymentConfig();
+  const isProduction = options.mode === 'production' || (!options.mode && process.env.NODE_ENV === 'production');
+  const dshDeploymentConfig = loadDshDeploymentConfig(options.dshHome, { isProduction });
 
   const containerNetworkMode =
     options.containerNetworkMode ??
@@ -1204,6 +1205,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
   const modelSelectionService = new ModelSelectionService({
     db,
     operations: operationsService,
+    customDshHome: dshDeploymentConfig?.dshHome ?? options.dshHome,
   });
 
   // 6c. Tenant Runtime File Provider wired to real Docker User Containers & Host Runtimes
@@ -1858,7 +1860,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       operations: operationsService,
       onAutonomousTurnCompleted,
     });
-    const dshDeploymentConfig = loadDshDeploymentConfig();
+    const dshDeploymentConfig = loadDshDeploymentConfig(options.dshHome);
     const isLlmEnabled = Boolean(
       process.env.ENKEEP_LLM_ENABLED === '1' ||
       process.env.ENKEEP_LLM_ENABLED === 'true' ||
@@ -2111,7 +2113,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         }
       }
       if (!expectedModelProvider) {
-        const dshConfig = loadDshDeploymentConfig();
+        const dshConfig = loadDshDeploymentConfig(options.dshHome);
         expectedModelProvider = dshConfig?.defaultModel?.provider || process.env.ENKEEP_LLM_PROVIDER || null;
       }
 
