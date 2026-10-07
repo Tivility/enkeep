@@ -160,11 +160,13 @@ describe('Chat Slash Commands (/model and /effort)', () => {
 
       const resetParsed = parseChatCommand('/reset');
       expect(resetParsed).not.toBeNull();
-      expect(resetParsed?.command).toBe('new');
+      expect(resetParsed?.command).toBe('session');
+      expect(resetParsed?.subcommand).toBe('clear');
 
       const clearParsed = parseChatCommand('/clear');
       expect(clearParsed).not.toBeNull();
-      expect(clearParsed?.command).toBe('new');
+      expect(clearParsed?.command).toBe('session');
+      expect(clearParsed?.subcommand).toBe('clear');
 
       const wsParsed = parseChatCommand('   /new   ');
       expect(wsParsed).not.toBeNull();
@@ -587,20 +589,12 @@ describe('Chat Slash Commands (/model and /effort)', () => {
         userId,
         sessionId,
         spaceId,
-        content: '/new',
+        content: '/reset',
       });
       expect(activeRes.replyText).toBe('a turn is active, use /stop first');
       expect(stubPlatformApi.resetSession).not.toHaveBeenCalled();
 
-      // Same rejection on /reset and /clear aliases
-      const resetAliasRes = await chatCommandService.execute({
-        userId,
-        sessionId,
-        spaceId,
-        content: '/reset',
-      });
-      expect(resetAliasRes.replyText).toBe('a turn is active, use /stop first');
-
+      // Same rejection on /clear alias
       const clearAliasRes = await chatCommandService.execute({
         userId,
         sessionId,
@@ -609,13 +603,22 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       });
       expect(clearAliasRes.replyText).toBe('a turn is active, use /stop first');
 
+      // /new returns hint and changes nothing
+      const newRes = await chatCommandService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/new',
+      });
+      expect(newRes.replyText).toBe('新会话请使用 /session new，新建工作区请使用 /ws new');
+
       // 2. When idle
       turnActive = false;
       const idleRes = await chatCommandService.execute({
         userId,
         sessionId,
         spaceId,
-        content: '/new',
+        content: '/reset',
         idempotencyKey: '00000000-0000-4000-8000-000000000001',
       });
       expect(idleRes.replyText).toBe('Started generation 2 (was 1)');
@@ -1025,7 +1028,7 @@ describe('Chat Slash Commands (/model and /effort)', () => {
         channel: 'web',
         userId,
         sessionId,
-        content: '/new',
+        content: '/session clear',
         timestamp: new Date().toISOString(),
       });
 

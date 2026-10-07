@@ -87,7 +87,8 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         },
       });
 
-      expect(result.replyText).toBe('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
 
       // 1. Inbound chat binding created/updated to target space
       const inboundBinding = db
@@ -124,7 +125,8 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         },
       });
 
-      expect(result.replyText).toBe('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
 
       const binding = db
         .prepare('SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
@@ -198,7 +200,8 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         },
       });
 
-      expect(result.replyText).toBe('已绑定到工作区: Default Space。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('已绑定到工作区: Default Space。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
 
       const binding = db
         .prepare('SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
@@ -219,7 +222,8 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         },
       });
 
-      expect(result.replyText).toBe('已绑定到工作区: Default Space。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('已绑定到工作区: Default Space。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
     });
   });
 
@@ -238,7 +242,8 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         },
       });
 
-      expect(result.replyText).toBe('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
 
       const binding = db
         .prepare('SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?')
@@ -260,7 +265,8 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         },
       });
 
-      expect(result.replyText).toBe('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('已绑定到工作区: Target Workspace。之后本聊天的消息会进入该工作区的会话。');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
     });
 
     it('replies with hint to use /list when workspace is not found', async () => {
@@ -276,7 +282,8 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         },
       });
 
-      expect(result.replyText).toBe('未找到工作区 "non-existent-space"。请使用 /list 查看可用工作区。');
+      expect(result.replyText).toContain('未找到工作区 "non-existent-space"。请使用 /ws list 查看可用工作区。');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
     });
   });
 
@@ -325,7 +332,7 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         content: `/bind ${targetSpaceId}`,
       });
 
-      expect(result.replyText).toBe('Web 会话工作区绑定固定，请在目标工作区新建会话。');
+      expect(result.replyText).toContain('Web 会话工作区绑定固定，请在目标工作区新建会话。');
 
       const routeRow = db
         .prepare('SELECT space_id FROM session_routes WHERE id = ?')
@@ -341,7 +348,7 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         content: '/unbind',
       });
 
-      expect(result.replyText).toBe('Web 会话工作区绑定固定，无需解除绑定。');
+      expect(result.replyText).toContain('Web 会话工作区绑定固定，无需解除绑定。');
     });
 
     it('/newws in web session creates space without changing binding', async () => {
@@ -352,7 +359,7 @@ describe('ChatCommandService /bind, /unbind, /newws Channel Context Resolution (
         content: '/newws Synthetic Web Created Space',
       });
 
-      expect(result.replyText).toBe('工作区 "Synthetic Web Created Space" 已创建。Web 会话工作区绑定固定，请从工作区列表切换打开。');
+      expect(result.replyText).toContain('工作区 "Synthetic Web Created Space" 已创建。Web 会话工作区绑定固定，请从工作区列表切换打开。');
 
       const routeRow = db
         .prepare('SELECT space_id FROM session_routes WHERE id = ?')

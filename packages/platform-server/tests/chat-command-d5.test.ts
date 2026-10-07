@@ -223,7 +223,8 @@ describe('D5 Chat Slash Commands & Telemetry Metrics', () => {
           content: '/bind spc-target-folder',
         });
 
-        expect(result.replyText).toBe('已绑定到工作区: Target Space。之后本聊天的消息会进入该工作区的会话。');
+        expect(result.replyText).toContain('已绑定到工作区: Target Space。之后本聊天的消息会进入该工作区的会话。');
+        expect(result.replyText).toContain('提示: 建议使用新指令 /ws use');
 
         // Check session_routes NOT modified (canonical route unchanged)
         const routeRow = db.prepare('SELECT space_id, execution_mode FROM session_routes WHERE id = ?').get(larkSessionId) as { space_id: string; execution_mode: string };

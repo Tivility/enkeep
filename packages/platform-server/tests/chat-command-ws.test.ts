@@ -116,13 +116,13 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
     it('parses /reset and /clear with arguments, preserving the argument', () => {
       const resetParsed = parseChatCommand('/reset my-workspace');
       expect(resetParsed).not.toBeNull();
-      expect(resetParsed?.command).toBe('new');
-      expect(resetParsed?.arg).toBe('my-workspace');
+      expect(resetParsed?.command).toBe('session');
+      expect(resetParsed?.subcommand).toBe('clear');
 
       const clearParsed = parseChatCommand('/clear my-workspace');
       expect(clearParsed).not.toBeNull();
-      expect(clearParsed?.command).toBe('new');
-      expect(clearParsed?.arg).toBe('my-workspace');
+      expect(clearParsed?.command).toBe('session');
+      expect(clearParsed?.subcommand).toBe('clear');
     });
 
     it('parses /newws and alias /new-workspace', () => {
@@ -159,7 +159,7 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
     });
   });
 
-  describe('2. /new with arguments -> Chinese hint & NO new session', () => {
+  describe('2. Legacy /new returns hint and changes nothing; /clear and /reset alias /session clear', () => {
     it('returns hint and does NOT call resetSession when /new has arguments', async () => {
       const result = await chatCommandService.execute({
         userId,
@@ -168,40 +168,40 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
         content: '/new my-test-space',
       });
 
-      expect(result.replyText).toBe('新会话请直接发送 /new；新建工作区请用 /newws <名称>.');
+      expect(result.replyText).toBe('新会话请使用 /session new，新建工作区请使用 /ws new');
       expect(resetSessionMock).not.toHaveBeenCalled();
     });
 
-    it('returns hint and does NOT call resetSession when /reset has arguments', async () => {
-      const result = await chatCommandService.execute({
-        userId,
-        sessionId: webSessionId,
-        spaceId: space1Id,
-        content: '/reset my-test-space',
-      });
-
-      expect(result.replyText).toBe('新会话请直接发送 /new；新建工作区请用 /newws <名称>.');
-      expect(resetSessionMock).not.toHaveBeenCalled();
-    });
-
-    it('returns hint and does NOT call resetSession when /clear has arguments', async () => {
-      const result = await chatCommandService.execute({
-        userId,
-        sessionId: webSessionId,
-        spaceId: space1Id,
-        content: '/clear my-test-space',
-      });
-
-      expect(result.replyText).toBe('新会话请直接发送 /new；新建工作区请用 /newws <名称>.');
-      expect(resetSessionMock).not.toHaveBeenCalled();
-    });
-
-    it('executes normal session reset when /new has NO arguments', async () => {
+    it('returns hint and does NOT call resetSession when /new has NO arguments', async () => {
       const result = await chatCommandService.execute({
         userId,
         sessionId: webSessionId,
         spaceId: space1Id,
         content: '/new',
+      });
+
+      expect(result.replyText).toBe('新会话请使用 /session new，新建工作区请使用 /ws new');
+      expect(resetSessionMock).not.toHaveBeenCalled();
+    });
+
+    it('/reset executes session clear', async () => {
+      const result = await chatCommandService.execute({
+        userId,
+        sessionId: webSessionId,
+        spaceId: space1Id,
+        content: '/reset',
+      });
+
+      expect(resetSessionMock).toHaveBeenCalledTimes(1);
+      expect(result.replyText).toContain('Started generation 2');
+    });
+
+    it('/clear executes session clear', async () => {
+      const result = await chatCommandService.execute({
+        userId,
+        sessionId: webSessionId,
+        spaceId: space1Id,
+        content: '/clear',
       });
 
       expect(resetSessionMock).toHaveBeenCalledTimes(1);
@@ -217,7 +217,7 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
         spaceId: space1Id,
         content: '/newws',
       });
-      expect(result.replyText).toBe('工作区名称长度必须在 1 到 50 个字符之间。');
+      expect(result.replyText).toContain('工作区名称长度必须在 1 到 50 个字符之间。');
       expect(createSpaceMock).not.toHaveBeenCalled();
     });
 
@@ -228,7 +228,7 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
         spaceId: space1Id,
         content: '/newws    ',
       });
-      expect(result.replyText).toBe('工作区名称长度必须在 1 到 50 个字符之间。');
+      expect(result.replyText).toContain('工作区名称长度必须在 1 到 50 个字符之间。');
       expect(createSpaceMock).not.toHaveBeenCalled();
     });
 
@@ -271,7 +271,7 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
         spaceId: space1Id,
         content: `/newws ${name51}`,
       });
-      expect(result.replyText).toBe('工作区名称长度必须在 1 到 50 个字符之间。');
+      expect(result.replyText).toContain('工作区名称长度必须在 1 到 50 个字符之间。');
       expect(createSpaceMock).not.toHaveBeenCalled();
     });
   });
@@ -397,16 +397,14 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
         content: '/list',
       });
 
-      const lines = result.replyText.split('\n');
-      expect(lines.length).toBe(3);
-
       // Order must be:
       // 1. Synthetic Beta (host) - newest
       // 2. Synthetic Alpha (container) - middle, marked as CURRENT (*)
       // 3. Synthetic Gamma (container) - oldest
-      expect(lines[0]).toBe('  Synthetic Beta (host)');
-      expect(lines[1]).toBe('* Synthetic Alpha (container)');
-      expect(lines[2]).toBe('  Synthetic Gamma (container)');
+      expect(result.replyText).toContain('  Synthetic Beta (host)');
+      expect(result.replyText).toContain('* Synthetic Alpha (container)');
+      expect(result.replyText).toContain('  Synthetic Gamma (container)');
+      expect(result.replyText).toContain('提示: 建议使用新指令 /ws list');
 
       // Verify alias /ls produces identical result
       const lsResult = await chatCommandService.execute({

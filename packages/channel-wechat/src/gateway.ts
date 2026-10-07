@@ -7,6 +7,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { resolveInboundRoute } from '@enkeep/platform-core';
 import type { WeChatParsedMessage, WeChatTransport } from './types.js';
 import { ContextTokenStore } from './context-token-store.js';
 import { downloadAndDecryptMedia } from './crypto.js';
@@ -267,46 +268,25 @@ export class WeChatChannelGateway {
       inboxItem = claimed || item;
     }
 
-    // 3. Resolve Session Route (binding.spaceId -> Canonical/Imported SessionRoute)
+    // 3. Resolve Session Route (binding.spaceId -> Canonical/Pinned SessionRoute)
+    let fallbackNotice: string | undefined;
     let route: WeChatSessionRoute;
-    if (typeof this.sessionRouteRepo.getOrCreateCanonicalSession === 'function') {
-      route = await this.sessionRouteRepo.getOrCreateCanonicalSession(binding.spaceId, {
+    const resolved = await resolveInboundRoute<WeChatSessionRoute>({
+      userId: this.userId,
+      binding,
+      sessionRouteRepo: this.sessionRouteRepo,
+      channelRepo: this.channelRepo,
+      canonicalOptions: {
         channel: 'wechat',
         accountId: this.accountId,
         nativeContextId,
+        fallbackNativeContextId: bareSenderId !== nativeContextId ? bareSenderId : undefined,
         peerId: msg.senderId || nativeContextId,
         title: `WeChat ${msg.senderName || msg.senderId}`,
-      });
-    } else {
-      let existingRoute = await this.sessionRouteRepo.findByRouteIdentity(
-        'wechat',
-        this.accountId,
-        nativeContextId
-      );
-      if (!existingRoute && bareSenderId !== nativeContextId) {
-        existingRoute = await this.sessionRouteRepo.findByRouteIdentity(
-          'wechat',
-          this.accountId,
-          bareSenderId
-        );
-      }
-      if (existingRoute) {
-        route = existingRoute;
-      } else {
-        const newSessionId = `ses_${randomBytes(16).toString('hex')}`;
-        const dshSessionId = `ses_${randomBytes(16).toString('hex')}`;
-        route = await this.sessionRouteRepo.create({
-          id: newSessionId,
-          spaceId: binding.spaceId,
-          channel: 'wechat',
-          accountId: this.accountId,
-          nativeContextId,
-          peerId: msg.senderId || nativeContextId,
-          dshSessionId,
-          title: `WeChat ${msg.senderName || msg.senderId}`,
-        });
-      }
-    }
+      },
+    });
+    route = resolved.route;
+    fallbackNotice = resolved.fallbackNotice;
 
     // 4. Inbound Media Download + Decrypt & Attachment Ingestion (Mirror Lark & HappyClaw)
     const envelopeAttachments: WeChatIngestedAttachment[] = [];
@@ -434,6 +414,9 @@ export class WeChatChannelGateway {
         nativeContextId,
         nativeEventId,
         replyToMessageId: msg.messageId,
+        senderId: msg.senderId,
+        chatType: (msg as any).chatType || 'p2p',
+        ...(fallbackNotice ? { fallbackNotice } : {}),
       },
       ...(envelopeAttachments.length > 0 ? { attachments: envelopeAttachments } : {}),
     };

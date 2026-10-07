@@ -559,6 +559,7 @@ export function parseChannelBindingRow(row: DbRow): ChannelBinding {
     nativeContextId: getString(row, 'native_context_id'),
     activationMode: getString(row, 'activation_mode') as ChannelBinding['activationMode'],
     chatType: getNullableString(row, 'chat_type'),
+    sessionRouteId: getNullableString(row, 'session_route_id'),
     createdAt: getString(row, 'created_at'),
     updatedAt: getString(row, 'updated_at'),
   };

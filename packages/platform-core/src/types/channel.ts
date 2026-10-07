@@ -45,6 +45,7 @@ export interface ChannelBinding {
   nativeContextId: string;
   activationMode: ChannelActivationMode;
   chatType?: string | null;
+  sessionRouteId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -57,12 +58,14 @@ export interface CreateChannelBindingInput {
   nativeContextId: string;
   activationMode?: ChannelActivationMode;
   chatType?: string | null;
+  sessionRouteId?: string | null;
 }
 
 export interface UpdateChannelBindingInput {
   spaceId?: string;
   activationMode?: ChannelActivationMode;
   chatType?: string | null;
+  sessionRouteId?: string | null;
 }
 
 export interface ChannelInboxItem {
