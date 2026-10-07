@@ -477,6 +477,22 @@ export interface DeliveryRuntimeGatewayOptions {
       userId: string,
       options?: any
     ) => Promise<any>;
+    createSession?: (
+      userId: string,
+      input: {
+        spaceId: string;
+        title?: string | null;
+        executionMode?: 'container' | 'host';
+        forceNew?: boolean;
+      }
+    ) => Promise<any>;
+    checkChatAdmin?: (params: {
+      channel: string;
+      accountId?: string | null;
+      chatId?: string | null;
+      senderId?: string | null;
+      userId?: string;
+    }) => Promise<boolean> | boolean;
     taskOperations?: (userId: string) => {
       createTask: (input: any) => Promise<any>;
     };
@@ -484,6 +500,13 @@ export interface DeliveryRuntimeGatewayOptions {
   taskOperations?: (userId: string) => {
     createTask: (input: any) => Promise<any>;
   };
+  checkChatAdmin?: (params: {
+    channel: string;
+    accountId?: string | null;
+    chatId?: string | null;
+    senderId?: string | null;
+    userId?: string;
+  }) => Promise<boolean> | boolean;
   externalInteractionService?: {
     listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
@@ -647,20 +670,24 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     const createTaskFn = options.chatCommandDeps?.createTask ?? (options as any).platformApi?.createTask;
     const createSpaceFn = options.chatCommandDeps?.createSpace ?? (options as any).platformApi?.createSpace;
     const listSpacesFn = options.chatCommandDeps?.listSpaces ?? (options as any).platformApi?.listSpaces;
+    const createSessionFn = options.chatCommandDeps?.createSession ?? (options as any).platformApi?.createSession;
+    const checkChatAdminFn = options.chatCommandDeps?.checkChatAdmin ?? options.checkChatAdmin;
     const taskOps = options.chatCommandDeps?.taskOperations ?? options.taskOperations;
     this.chatCommandService =
       options.chatCommandService ??
       (this.modelSelectionService
         ? new ChatCommandService({
             modelSelectionService: this.modelSelectionService,
-            platformApi: (resetSessionFn || compactSessionFn || createTaskFn || createSpaceFn || listSpacesFn) ? {
+            platformApi: (resetSessionFn || compactSessionFn || createTaskFn || createSpaceFn || listSpacesFn || createSessionFn) ? {
               resetSession: resetSessionFn,
               compactSession: compactSessionFn,
               createTask: createTaskFn,
               createSpace: createSpaceFn,
               listSpaces: listSpacesFn,
+              createSession: createSessionFn,
             } : undefined,
             taskOperations: taskOps,
+            checkChatAdmin: checkChatAdminFn,
             gateway: this,
             db: this.db,
           })
@@ -744,6 +771,22 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       userId: string,
       options?: any
     ) => Promise<any>;
+    createSession?: (
+      userId: string,
+      input: {
+        spaceId: string;
+        title?: string | null;
+        executionMode?: 'container' | 'host';
+        forceNew?: boolean;
+      }
+    ) => Promise<any>;
+    checkChatAdmin?: (params: {
+      channel: string;
+      accountId?: string | null;
+      chatId?: string | null;
+      senderId?: string | null;
+      userId?: string;
+    }) => Promise<boolean> | boolean;
     taskOperations?: (userId: string) => {
       createTask: (input: any) => Promise<any>;
     };
@@ -757,10 +800,26 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         ...(deps.createTask ? { createTask: deps.createTask } : {}),
         ...(deps.createSpace ? { createSpace: deps.createSpace } : {}),
         ...(deps.listSpaces ? { listSpaces: deps.listSpaces } : {}),
+        ...(deps.createSession ? { createSession: deps.createSession } : {}),
       });
       if (deps.taskOperations) {
         this.chatCommandService.setTaskOperations(deps.taskOperations);
       }
+      if (deps.checkChatAdmin) {
+        this.chatCommandService.setCheckChatAdmin(deps.checkChatAdmin);
+      }
+    }
+  }
+
+  public setCheckChatAdmin(fn: (params: {
+    channel: string;
+    accountId?: string | null;
+    chatId?: string | null;
+    senderId?: string | null;
+    userId?: string;
+  }) => Promise<boolean> | boolean): void {
+    if (this.chatCommandService) {
+      this.chatCommandService.setCheckChatAdmin(fn);
     }
   }
 
@@ -1303,7 +1362,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     }
 
     // 2. Execute command
-    const { replyText } = await this.chatCommandService!.execute({
+    const commandRes = await this.chatCommandService!.execute({
       userId,
       sessionId,
       spaceId,
@@ -1311,6 +1370,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       idempotencyKey,
       channelContext: envelope.channelContext,
     });
+    let replyText = commandRes.replyText;
+    if (envelope.channelContext?.fallbackNotice) {
+      replyText = `${envelope.channelContext.fallbackNotice}\n\n${replyText}`;
+    }
 
     // 3. Atomically persist synthetic turn in SQLite transaction
     const turnId = generate32HexId('turn');

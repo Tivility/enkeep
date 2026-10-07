@@ -195,12 +195,13 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
 
     const activationMode = input.activationMode ?? 'mention';
     const chatType = input.chatType ?? null;
+    const sessionRouteId = input.sessionRouteId ?? null;
 
     const insertStmt = this.db.prepare(`
-      INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, chat_type, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, chat_type, session_route_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
-    insertStmt.run(id, this.userId, accountId, spaceId, nativeContextId, activationMode, chatType);
+    insertStmt.run(id, this.userId, accountId, spaceId, nativeContextId, activationMode, chatType, sessionRouteId);
 
     const created = await this.findBindingById(id);
     if (!created) {
@@ -233,6 +234,16 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
     if (input.chatType !== undefined) {
       updates.push('chat_type = ?');
       params.push(input.chatType);
+    }
+    if (input.sessionRouteId !== undefined) {
+      if (input.sessionRouteId !== null) {
+        const checkSession = this.db.prepare('SELECT 1 FROM session_routes WHERE id = ? AND user_id = ?').get(input.sessionRouteId, this.userId);
+        if (!checkSession) {
+          throw new NotFoundError(`Session "${input.sessionRouteId}" not found`);
+        }
+      }
+      updates.push('session_route_id = ?');
+      params.push(input.sessionRouteId);
     }
 
     if (updates.length > 0) {

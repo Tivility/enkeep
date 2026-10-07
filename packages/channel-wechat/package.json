@@ -18,7 +18,9 @@
     "test": "vitest run",
     "test:wechat": "vitest run tests/wechat-parser-and-fake-transport.test.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@enkeep/platform-core": "workspace:*"
+  },
   "devDependencies": {
     "@types/node": "^26.2.0",
     "typescript": "^5.9.0",

@@ -7,6 +7,7 @@
  */
 
 import { randomBytes, createHash } from 'node:crypto';
+import { resolveInboundRoute } from '@enkeep/platform-core';
 import type {
   ChannelAccount,
   ChannelActivationMode,
@@ -557,32 +558,24 @@ export class LarkChannelGateway {
       }
     }
 
-    // 5. Session Route Resolution (binding.spaceId -> Canonical SessionRoute)
+    // 5. Session Route Resolution (binding.spaceId -> Canonical/Pinned SessionRoute)
+    let fallbackNotice: string | undefined;
     let route: SessionRoute;
-    if (typeof this.sessionRouteRepo.getOrCreateCanonicalSession === 'function') {
-      route = await this.sessionRouteRepo.getOrCreateCanonicalSession(binding.spaceId, {
+    const resolved = await resolveInboundRoute<SessionRoute>({
+      userId: this.userId,
+      binding,
+      sessionRouteRepo: this.sessionRouteRepo,
+      channelRepo: this.channelRepo,
+      canonicalOptions: {
         channel: 'lark',
         accountId: this.accountId,
         nativeContextId,
         peerId: parsed.senderId || nativeContextId,
         title: `Lark ${parsed.chatType === 'p2p' ? 'Direct' : 'Chat'} ${parsed.chatId}`,
-      });
-    } else {
-      let existingRoute = await this.sessionRouteRepo.findByRouteIdentity('lark', this.accountId, nativeContextId);
-      if (!existingRoute) {
-        const dshSessionId = `ses_${randomBytes(16).toString('hex')}`;
-        existingRoute = await this.sessionRouteRepo.create({
-          spaceId: binding.spaceId,
-          channel: 'lark',
-          accountId: this.accountId,
-          nativeContextId,
-          peerId: parsed.senderId || nativeContextId,
-          dshSessionId,
-          title: `Lark ${parsed.chatType === 'p2p' ? 'Direct' : 'Chat'} ${parsed.chatId}`,
-        });
-      }
-      route = existingRoute;
-    }
+      },
+    });
+    route = resolved.route;
+    fallbackNotice = resolved.fallbackNotice;
 
     // 6. Clean Text & Dispatch to Enkeep Agent via RuntimeGateway
     const cleanedText = stripBotMentions(parsed.text, parsed.mentions, this.botOpenId);
@@ -1171,6 +1164,9 @@ export class LarkChannelGateway {
         replyToMessageId: parsed.messageId,
         rootId: parsed.rootId,
         threadId: parsed.threadId,
+        senderId: parsed.senderId,
+        chatType: parsed.chatType,
+        ...(fallbackNotice ? { fallbackNotice } : {}),
       },
       // Do NOT pass native message ID into replyToMessageId because Platform expects internal web_messages.id
     };
@@ -1338,6 +1334,10 @@ export class LarkChannelGateway {
     }
 
     return undefined;
+  }
+
+  async isChatOwnerOrAdmin(chatId: string, operatorId: string): Promise<boolean> {
+    return this.checkChatOwnerOrAdmin(chatId, operatorId);
   }
 
   private async checkChatOwnerOrAdmin(chatId: string, operatorId: string): Promise<boolean> {

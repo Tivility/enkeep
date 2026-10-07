@@ -1576,6 +1576,14 @@ CREATE INDEX IF NOT EXISTS idx_session_child_origins_turn ON session_child_origi
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL = `
+-- Migration 38: Channel binding session route pointer for session pinning
+ALTER TABLE channel_bindings ADD COLUMN session_route_id TEXT REFERENCES session_routes(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_channel_bindings_session_route ON channel_bindings(session_route_id);
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

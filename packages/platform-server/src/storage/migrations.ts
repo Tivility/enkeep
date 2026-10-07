@@ -50,6 +50,7 @@ import {
   MIGRATION_035_QUOTA_DEFAULT_UNLIMITED_SQL,
   MIGRATION_036_SPACE_CANONICAL_SESSION_SQL,
   MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL,
+  MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL,
 } from '@enkeep/platform-storage-sqlite';
 
 export {
@@ -97,6 +98,7 @@ export {
   MIGRATION_035_QUOTA_DEFAULT_UNLIMITED_SQL,
   MIGRATION_036_SPACE_CANONICAL_SESSION_SQL,
   MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL,
+  MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL,
 };
 
 function isSqliteBusyOrLocked(err: unknown): boolean {
@@ -310,6 +312,12 @@ export const ALL_PLATFORM_MIGRATIONS: MigrationDefinition[] = [
     name: '037_channel_turn_origins',
     upSql: MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL,
     checksum: computeChecksum(MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL),
+  },
+  {
+    version: 38,
+    name: '038_channel_binding_session_route',
+    upSql: MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL,
+    checksum: computeChecksum(MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL),
   },
 ];
 

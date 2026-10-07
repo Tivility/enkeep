@@ -27,6 +27,7 @@ export interface WeChatChannelBinding {
   readonly nativeContextId: string;
   readonly activationMode: 'mention' | 'always';
   readonly chatType?: string | null;
+  readonly sessionRouteId?: string | null;
 }
 
 export interface WeChatChannelInboxItem {
@@ -105,6 +106,10 @@ export interface WeChatChannelRepo {
     status: 'pending' | 'sending' | 'delivered' | 'failed',
     incrementAttempt?: boolean
   ): Promise<WeChatChannelOutboxItem>;
+  updateBinding?(
+    id: string,
+    input: { sessionRouteId?: string | null; spaceId?: string; activationMode?: string; chatType?: string | null }
+  ): Promise<any>;
 }
 
 export interface WeChatSessionRouteRepo {
@@ -153,6 +158,9 @@ export interface WeChatInboundEnvelope {
     readonly nativeContextId: string;
     readonly nativeEventId: string;
     readonly replyToMessageId?: string;
+    readonly senderId?: string;
+    readonly chatType?: string;
+    readonly fallbackNotice?: string;
   };
   readonly attachments?: WeChatInboundEnvelopeAttachmentItem[];
 }

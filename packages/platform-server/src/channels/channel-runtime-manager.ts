@@ -145,6 +145,21 @@ export class ChannelRuntimeManager {
     };
     this.deliveryGateway.onTurnFailed(this.turnFailedListener);
 
+    if (typeof (this.deliveryGateway as any).setCheckChatAdmin === 'function') {
+      (this.deliveryGateway as any).setCheckChatAdmin(async ({ channel, accountId, chatId, senderId }: any) => {
+        if (!chatId || !senderId) return false;
+        if (channel === 'lark') {
+          for (const gw of this.activeGateways.values()) {
+            if (typeof (gw as any).isChatOwnerOrAdmin === 'function') {
+              const res = await (gw as any).isChatOwnerOrAdmin(chatId, senderId);
+              if (res) return true;
+            }
+          }
+        }
+        return false;
+      });
+    }
+
     // 2. Reconcile and start active accounts
     await this.reconcileAllAccounts();
 
