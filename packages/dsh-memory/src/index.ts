@@ -15,6 +15,8 @@ import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 import { MemoryService } from './service.js';
 
+import type { MemoryPluginConfig } from './types.js';
+
 export * from './types.js';
 export * from './prompt.js';
 export * from './tools/memory-search.js';
@@ -26,10 +28,7 @@ export const name = 'enkeep-dsh-memory';
 
 export const inject = [];
 
-export interface Config {
-  defaultMaxGlobalBytes?: number;
-  injectGlobalMemory?: 'always' | 'never' | 'auto';
-}
+export type Config = MemoryPluginConfig;
 
 export const Config: Schema<Config> = Schema.object({
   defaultMaxGlobalBytes: Schema.natural().default(20_480).description('Default maximum global memory bytes to inject (20 KiB)'),
@@ -39,6 +38,6 @@ export const Config: Schema<Config> = Schema.object({
 /**
  * Functional Cordis plugin that registers the MemoryService.
  */
-export function apply(ctx: Context, _config: Config = {}): void {
-  ctx.plugin(MemoryService);
+export function apply(ctx: Context, config: Config = {}): void {
+  ctx.plugin(MemoryService, config);
 }
