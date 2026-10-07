@@ -282,12 +282,12 @@ export function isChildSession(agent: any, runtimeCtx?: Context): boolean {
 }
 
 /**
- * Resolves the deployment global memory injection setting for child/subagent sessions:
- * ENKEEP_SUBAGENT_GLOBAL_MEMORY = 'never' (default) | 'always'
+ * Resolves the deployment global memory injection setting for child/subagent sessions.
+ * Note: ENKEEP_SUBAGENT_GLOBAL_MEMORY env mechanism has been removed in favor of
+ * per-call global_memory (subagent tool) / globalMemory (workflow agent opts) flags.
  */
 export function resolveSubagentGlobalMemoryMode(): 'never' | 'always' {
-  const envVal = process.env.ENKEEP_SUBAGENT_GLOBAL_MEMORY?.trim().toLowerCase();
-  return envVal === 'always' ? 'always' : 'never';
+  return 'never';
 }
 
 export class PersistedSessionResumeError extends Error {
@@ -1060,7 +1060,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
   function resolveInjectGlobalMemoryForAgent(agentCandidate: any, runtimeCtx?: Context): 'never' | 'always' | undefined {
     if (isChildSession(agentCandidate, runtimeCtx)) {
-      return resolveSubagentGlobalMemoryMode();
+      const opts = agentCandidate?.options ?? (agentCandidate?.ctx?.get ? agentCandidate.ctx.get('agent')?.options : undefined);
+      const shouldInject = Boolean(
+        opts?.globalMemory ??
+        opts?.global_memory ??
+        agentCandidate?.globalMemory ??
+        agentCandidate?.global_memory
+      );
+      return shouldInject ? 'always' : 'never';
     }
     return undefined;
   }
