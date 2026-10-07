@@ -881,20 +881,22 @@ export class ChatCommandService {
   } {
     const ctx = this.resolveChannelContext(params);
     const rawNative = ctx.nativeContextId;
-    const rawChat = ctx.chatId;
 
     let chatNativeContextId: string | null = null;
-    if (rawChat && !rawChat.includes(':')) {
-      chatNativeContextId = rawChat;
-    } else if (rawNative) {
-      const colonIdx = rawNative.indexOf(':');
-      chatNativeContextId = colonIdx >= 0 ? rawNative.slice(0, colonIdx) : rawNative;
-    } else if (rawChat) {
-      const colonIdx = rawChat.indexOf(':');
-      chatNativeContextId = colonIdx >= 0 ? rawChat.slice(0, colonIdx) : rawChat;
-    }
+    let isTopic = false;
 
-    const isTopic = Boolean(rawNative && rawNative.includes(':'));
+    if (ctx.channel === 'lark') {
+      if (params.channelContext?.chatId) {
+        chatNativeContextId = params.channelContext.chatId;
+      } else if (rawNative) {
+        const colonIdx = rawNative.indexOf(':');
+        chatNativeContextId = colonIdx >= 0 ? rawNative.slice(0, colonIdx) : rawNative;
+      }
+      isTopic = Boolean(rawNative && chatNativeContextId && rawNative !== chatNativeContextId);
+    } else {
+      chatNativeContextId = rawNative;
+      isTopic = false;
+    }
 
     return {
       channel: ctx.channel,

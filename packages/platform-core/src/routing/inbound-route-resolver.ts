@@ -45,14 +45,26 @@ export const DEFAULT_TOPIC_SPACE_MISMATCH_NOTICE = '提示：该话题此前固�
 
 /**
  * Strips the thread part from a Lark nativeContextId ('chatId:threadId') to get the chat-level ID ('chatId').
- * For WeChat or contexts without colons, returns the nativeContextId unchanged.
+ * Topic semantics apply ONLY to channel 'lark'.
+ * For every other channel (wechat, qq, ...): chat-level id = nativeContextId unchanged.
  */
-export function getChatLevelNativeContextId(nativeContextId: string): string {
+export function getChatLevelNativeContextId(nativeContextId: string, channel: string = 'lark'): string {
+  if (channel !== 'lark') {
+    return nativeContextId;
+  }
   const colonIdx = nativeContextId.indexOf(':');
   return colonIdx >= 0 ? nativeContextId.slice(0, colonIdx) : nativeContextId;
 }
 
-export function isTopicNativeContextId(nativeContextId: string): boolean {
+/**
+ * Checks whether a nativeContextId represents a topic.
+ * Topic semantics apply ONLY to channel 'lark'.
+ * For every other channel (wechat, qq, ...): returns false.
+ */
+export function isTopicNativeContextId(nativeContextId: string, channel: string = 'lark'): boolean {
+  if (channel !== 'lark') {
+    return false;
+  }
   return nativeContextId.includes(':');
 }
 

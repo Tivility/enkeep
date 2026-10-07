@@ -740,4 +740,191 @@ describe('Topics and Mention Gating Contract (Section 4A)', () => {
       expect(fresh3NoMention.ignoredReason).toBe('not_mentioned');
     });
   });
+
+  describe('8. WeChat native context ids containing colons do not trigger topic semantics', () => {
+    const wechatAccountId = 'ca_test_wechat_acc_01';
+    const wechatNativeContext = 'wechat:test-peer-01@im.wechat';
+    const wechatSessionId = 'ses_wechat_00000000000000001';
+
+    beforeEach(() => {
+      db.prepare(
+        "INSERT INTO channel_accounts (id, user_id, type, default_space_id, status) VALUES (?, ?, 'wechat', ?, 'active')"
+      ).run(wechatAccountId, userId, space1Id);
+
+      db.prepare(
+        "INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation, title, status, created_at, updated_at) VALUES (?, ?, ?, 'wechat', ?, ?, 'p_wechat', 'dsh_wechat', 'container', 1, 'WeChat Session', 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')"
+      ).run(wechatSessionId, userId, space1Id, wechatAccountId, wechatNativeContext);
+
+      db.prepare(
+        "INSERT INTO session_generations (id, user_id, route_id, generation_number, dsh_session_id, reset_reason) VALUES ('gen_wechat', ?, ?, 1, 'dsh_wechat', 'initial')"
+      ).run(userId, wechatSessionId);
+    });
+
+    it('getChatAndTopicIds returns isTopic: false and chatNativeContextId unchanged for WeChat', () => {
+      const ids = (chatCommandService as any).getChatAndTopicIds({
+        sessionId: wechatSessionId,
+        channelContext: {
+          channel: 'wechat',
+          accountId: wechatAccountId,
+          nativeContextId: wechatNativeContext,
+          chatId: 'test-peer-01@im.wechat',
+        },
+      });
+      expect(ids.channel).toBe('wechat');
+      expect(ids.isTopic).toBe(false);
+      expect(ids.chatNativeContextId).toBe(wechatNativeContext);
+      expect(ids.nativeContextId).toBe(wechatNativeContext);
+    });
+
+    it('/ws use writes binding for exactly the WeChat context and not a truncated context', async () => {
+      const result = await chatCommandService.execute({
+        userId,
+        sessionId: wechatSessionId,
+        spaceId: space1Id,
+        content: '/ws use Beta Space',
+        channelContext: {
+          channel: 'wechat',
+          accountId: wechatAccountId,
+          nativeContextId: wechatNativeContext,
+          chatId: 'test-peer-01@im.wechat',
+          senderId: 'test-peer-01@im.wechat',
+          chatType: 'p2p',
+        },
+      });
+
+      expect(result.replyText).toContain('已切换到工作区: Beta Space');
+
+      // Verify the binding was written for exactly wechatNativeContext, not 'wechat'
+      const exactBinding = db.prepare(
+        'SELECT * FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, wechatAccountId, wechatNativeContext) as { space_id: string } | undefined;
+      expect(exactBinding).toBeDefined();
+      expect(exactBinding?.space_id).toBe(space2Id);
+
+      // Verify NO bogus binding was written for 'wechat'
+      const bogusBinding = db.prepare(
+        'SELECT * FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, wechatAccountId, 'wechat');
+      expect(bogusBinding).toBeUndefined();
+    });
+
+    it('/session new pins at chat level with isTopic false in WeChat', async () => {
+      const result = await chatCommandService.execute({
+        userId,
+        sessionId: wechatSessionId,
+        spaceId: space1Id,
+        content: '/session new Dedicated WeChat Chat',
+        channelContext: {
+          channel: 'wechat',
+          accountId: wechatAccountId,
+          nativeContextId: wechatNativeContext,
+          chatId: 'test-peer-01@im.wechat',
+          senderId: 'test-peer-01@im.wechat',
+          chatType: 'p2p',
+        },
+      });
+
+      expect(result.replyText).toContain('已新建会话并固定:');
+      expect(result.replyText).toContain('Dedicated WeChat Chat');
+
+      // The binding is updated/created directly for the chat-level context
+      const chatBinding = db.prepare(
+        'SELECT session_route_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, wechatAccountId, wechatNativeContext) as { session_route_id?: string | null };
+      expect(chatBinding).toBeDefined();
+      expect(chatBinding.session_route_id).toBeTruthy();
+
+      // No topic-level or bogus 'wechat' binding exists
+      const bogusBinding = db.prepare(
+        'SELECT * FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, wechatAccountId, 'wechat');
+      expect(bogusBinding).toBeUndefined();
+    });
+
+    it('Lark thread context still behaves as topic while main-stream context remains chat level', async () => {
+      const larkThreadContext = `${groupChatId}:om_thread_synth_check`;
+
+      // 1. Lark thread -> isTopic: true, chatNativeContextId: groupChatId
+      const threadIds = (chatCommandService as any).getChatAndTopicIds({
+        sessionId: mainSession1Id,
+        channelContext: {
+          channel: 'lark',
+          accountId,
+          chatId: groupChatId,
+          nativeContextId: larkThreadContext,
+        },
+      });
+      expect(threadIds.isTopic).toBe(true);
+      expect(threadIds.chatNativeContextId).toBe(groupChatId);
+      expect(threadIds.nativeContextId).toBe(larkThreadContext);
+
+      // Lark thread /session new pins at topic level (not chat level)
+      const threadRes = await chatCommandService.execute({
+        userId,
+        sessionId: mainSession1Id,
+        spaceId: space1Id,
+        content: '/session new Lark Thread Session',
+        channelContext: {
+          channel: 'lark',
+          accountId,
+          chatId: groupChatId,
+          nativeContextId: larkThreadContext,
+          senderId: adminSenderId,
+          chatType: 'group',
+        },
+      });
+      expect(threadRes.replyText).toContain('已新建会话并固定:');
+      expect(threadRes.replyText).toContain('Lark Thread Session');
+
+      // Verify topic-level binding was created for Lark thread context
+      const topicBinding = db.prepare(
+        'SELECT session_route_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, larkThreadContext) as { session_route_id?: string | null };
+      expect(topicBinding).toBeDefined();
+      expect(topicBinding.session_route_id).toBeTruthy();
+
+      // Verify chat-level binding remains unpinned
+      const chatBinding = db.prepare(
+        'SELECT session_route_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, groupChatId) as { session_route_id?: string | null };
+      expect(chatBinding.session_route_id).toBeNull();
+
+      // 2. Lark main-stream -> isTopic: false, chatNativeContextId: groupChatId
+      const mainIds = (chatCommandService as any).getChatAndTopicIds({
+        sessionId: mainSession1Id,
+        channelContext: {
+          channel: 'lark',
+          accountId,
+          chatId: groupChatId,
+          nativeContextId: groupChatId,
+        },
+      });
+      expect(mainIds.isTopic).toBe(false);
+      expect(mainIds.chatNativeContextId).toBe(groupChatId);
+      expect(mainIds.nativeContextId).toBe(groupChatId);
+
+      // Lark main-stream /session new pins directly at chat level
+      const mainRes = await chatCommandService.execute({
+        userId,
+        sessionId: mainSession1Id,
+        spaceId: space1Id,
+        content: '/session new Lark Main Session',
+        channelContext: {
+          channel: 'lark',
+          accountId,
+          chatId: groupChatId,
+          nativeContextId: groupChatId,
+          senderId: adminSenderId,
+          chatType: 'group',
+        },
+      });
+      expect(mainRes.replyText).toContain('已新建会话并固定:');
+      expect(mainRes.replyText).toContain('Lark Main Session');
+
+      const updatedChatBinding = db.prepare(
+        'SELECT session_route_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, groupChatId) as { session_route_id?: string | null };
+      expect(updatedChatBinding.session_route_id).toBeTruthy();
+    });
+  });
 });
