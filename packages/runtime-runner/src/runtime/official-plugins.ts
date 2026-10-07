@@ -93,6 +93,7 @@ import * as SubagentForkPlugin from '@deepseek-ai/dsh-subagent-fork-in-process';
 import * as ToolSubagentPlugin from '@deepseek-ai/dsh-tool-subagent';
 import SubagentModelSelectionConfig from '@deepseek-ai/dsh-tool-subagent/model-selection-settings';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
+import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite';
 import { SessionSeq, SessionId, type Session } from '@deepseek-ai/dsh-session';
 import * as ToolSubagentControlPlugin from '@deepseek-ai/dsh-tool-subagent-control';
 import * as ToolSubagentListAgentsPlugin from '@deepseek-ai/dsh-tool-subagent-control/list-agents';
@@ -1803,6 +1804,18 @@ export async function mountOfficialPlugins(
       const sessionProjFiber = await ctx.plugin(SessionProjectionRegistry);
       fibers.push(sessionProjFiber);
       mountedPlugins.set('session-projection', sessionProjFiber);
+    }
+
+    // 2.6 Session Query Subsystem (Host-global service: ctx.sessionQuery)
+    // openAt: 'never' preserves exact in-memory reads, parent lineage tracing,
+    // and continuable subagent cold-resume without opening disk SQLite databases.
+    if (!ctx.get('sessionQuery')) {
+      const sessionQueryFiber = await ctx.plugin(SqliteSessionQueryEngine, {
+        path: ':memory:',
+        openAt: 'never',
+      });
+      fibers.push(sessionQueryFiber);
+      mountedPlugins.set('session-query-sqlite', sessionQueryFiber);
     }
 
     // 3. Sandbox Policy Service
