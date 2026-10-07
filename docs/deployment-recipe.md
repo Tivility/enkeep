@@ -52,9 +52,9 @@
 ## 3. 标准受控发布八步法 (8-Step Controlled Release Procedure)
 
 ```
-[1. 隔离构建] ──> [2. 只读预检] ──> [3. 负载排空] ──> [4. 人工确认]
-                                                            │
-[8. 秒级回滚] <── [7. 拓扑验证] <── [6. Launchd重载] <── [5. 服务注销]
+[1. 隔离构建] ──> [2. 只读预检] ──> [3. 负载排空与全域预检] ──> [4. 人工确认]
+                                                                        │
+[8. 秒级回滚] <── [7. 拓扑验证] <── [6. LaunchAgent更新] <── [5. 预检停机重载]
 ```
 
 ### 步骤 1: 隔离工作树创建与产物构建 (Build & Image Packaging)
@@ -82,8 +82,22 @@ sqlite3 <workspace-root>/enkeep/.demo-data/platform.db \
   "VACUUM INTO '<enkeep-config-dir>/snapshots/platform.db.pre-batch5-vacuum';"
 ```
 
-### 步骤 3: 负载排空与在途状态核验 (Drain Gate & Quiescence Verification)
-在停机前查询 `platform.db`，确保无活跃轮次、排队任务或锁租约：
+### 步骤 3: 负载排空与全域运行时预检 (Drain Gate & Runtime-Aware Preflight)
+在停机前不仅需要核验 `platform.db`，还必须核验所有宿主守护进程（Host Daemon）及容器运行时（Container Runtime）内部的在途工作。
+历史故障教训表明：纯平台层 SQL 查询无法观察到宿主运行时内由于工作流作业结束所触发的**自主延续轮次（autonomous continuation turn）**、在途后台作业/工作流、实时子代理与会话待处理收件箱（inbox）。
+因此必须使用 `demo-runner preflight` 进行全域只读状态聚合：
+```bash
+# 全域只读负载与在途状态预检 (聚合平台数据库与所有宿主/容器运行时 Daemon RPC 活动)
+node <release-worktree>/packages/demo-runner/dist/demo-runner.js preflight \
+  --data-dir $ENKEEP_DATA_DIR \
+  --due-within-minutes 10
+```
+该命令会自动检查：
+1. 平台状态：活跃/排队轮次 (`turn_runs`, `turn_execution_queue`)、领取的任务与活跃租约 (`task_runs`, `session_execution_leases`)、未终态事务日志 (`file_transfer_journal`, `attachment_snapshot_journal`, `daemon-turns`)、N 分钟内到期的定时任务；
+2. 运行时状态：向每个常驻宿主守护进程与容器运行时发起 RPC 请求，核验活跃轮次（包括自主延续轮次）、运行中作业（包括 workflow 作业）、实时子代理、待处理收件箱项；
+3. 任一组件非空闲时立即输出明细并以非零状态码退出。
+
+辅助核验 SQL：
 ```sql
 SELECT count(*) FROM turn_runs WHERE status = 'running';              -- 必须为 0
 SELECT count(*) FROM turn_execution_queue;                            -- 必须为 0
@@ -94,10 +108,14 @@ SELECT count(*) FROM session_execution_leases WHERE status = 'active';-- 必须�
 ### 步骤 4: 人工操作员确认 (Operator Confirmation Gate)
 > **安全门禁**: 生产发布必须由人工操作员显式授权。严禁会话内子代理在无外部监督情况下擅自触发自身宿主重启。
 
-### 步骤 5: 服务注销与优雅停机 (Service Unload & Graceful Shutdown)
-通过 `launchctl bootout` 注销旧服务实例，让 launchd 优雅停止现有进程：
+### 步骤 5: 原子预检停机与重载启动 (Preflighted Shutdown & Service Switch)
+> **强一致性要求**: `demo-runner preflight` 必须在紧随 `stop`（`launchctl bootout`）之前、且**必须在与 stop/start 相同的单一命令调用行（同一 invocation）**中执行。若预检发现任何平台或运行时活动，命令链立即熔断非零退出，杜绝停机操作丢弃在途自主轮次或后台作业：
+
 ```bash
-launchctl bootout gui/$(id -u)/com.owner-user.enkeep
+# 原子预检停机与启动重载单行调用 (同一 invocation 中严格前置 preflight)
+node <release-worktree>/packages/demo-runner/dist/demo-runner.js preflight --data-dir $ENKEEP_DATA_DIR && \
+  launchctl bootout gui/$(id -u)/<launchd-label> && \
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<launchd-label>.plist
 ```
 
 ### 步骤 6: LaunchAgent 配置更新与重载启动 (LaunchAgent Switch & Bootstrap)

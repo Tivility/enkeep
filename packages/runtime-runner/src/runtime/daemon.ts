@@ -121,6 +121,13 @@ import {
   type ShutdownResponse,
   type CompactSessionRequest,
   type CompactSessionResponse,
+  type ActivityStatusRequest,
+  type ActivityStatusResponse,
+  type DaemonActivityStatus,
+  type ActiveTurnActivity,
+  type RunningJobActivity,
+  type LiveSubagentActivity,
+  type SessionActivityDetail,
   type DaemonErrorResponse,
   type DaemonEvictionReason,
 } from './daemon-protocol.js';
@@ -254,6 +261,8 @@ export class RuntimeDaemon extends EventEmitter {
   // Unhandled rejection / turn event listener cleanups
   private eventRelayCleanup?: () => void;
   private pendingApprovalsTracker = new Map<string, { sessionId: string; toolName: string; approvalId: string }>();
+  private readonly liveSubagentsTracker = new Map<string, LiveSubagentActivity>();
+  private readonly autonomousTurnsTracker = new Map<string, { sessionId: string; turnNumber?: number; startedAt: number }>();
   private readonly sessionMaintenanceLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly options: DaemonOptions) {
@@ -413,6 +422,23 @@ export class RuntimeDaemon extends EventEmitter {
         };
         this.emit('stream', decidedPush);
       }
+
+      // Track autonomous continuation turns
+      if (event.type === 'turn/start') {
+        const turnData = event.data as any;
+        const turnNum = typeof turnData?.turn === 'number' ? turnData.turn : undefined;
+        if (!this.currentTurns.has(sessionIdStr)) {
+          this.autonomousTurnsTracker.set(sessionIdStr, {
+            sessionId: sessionIdStr,
+            turnNumber: turnNum,
+            startedAt: Date.now(),
+          });
+        }
+      }
+
+      if (event.type === 'turn/end') {
+        this.autonomousTurnsTracker.delete(sessionIdStr);
+      }
     });
 
     // Chunk streaming push from new agent/assistant-stream event
@@ -439,9 +465,30 @@ export class RuntimeDaemon extends EventEmitter {
       }
     });
 
+    // Track live background subagents via lifecycle events
+    const disposeSubagentStart = ctx.on('subagent/start', (info: any) => {
+      if (info?.id) {
+        this.liveSubagentsTracker.set(String(info.id), {
+          id: String(info.id),
+          provider: info.provider ? String(info.provider) : undefined,
+          sessionId: info.sessionId ? String(info.sessionId) : undefined,
+          parentSession: info.parentSession ? String(info.parentSession) : undefined,
+          startedAt: Date.now(),
+        });
+      }
+    });
+
+    const disposeSubagentEnd = ctx.on('subagent/end', (info: any) => {
+      if (info?.id) {
+        this.liveSubagentsTracker.delete(String(info.id));
+      }
+    });
+
     this.eventRelayCleanup = () => {
       disposeSessionEvent();
       disposeAssistantStream();
+      disposeSubagentStart();
+      disposeSubagentEnd();
     };
   }
 
@@ -517,6 +564,12 @@ export class RuntimeDaemon extends EventEmitter {
 
         case DAEMON_OPS.COMPACT_SESSION:
           return await this.handleCompactSession(request as CompactSessionRequest);
+
+        case DAEMON_OPS.ACTIVITY_STATUS:
+        case 'activityStatus':
+        case 'activity':
+        case 'status':
+          return await this.handleActivityStatus(request as any);
 
         default: {
           const raw = request as any;
@@ -1040,6 +1093,8 @@ export class RuntimeDaemon extends EventEmitter {
       maxConcurrentSessions: this.maxConcurrentSessions,
     };
 
+    const activity = await this.getActivityStatus();
+
     return {
       id: request.id,
       op: 'health',
@@ -1050,6 +1105,228 @@ export class RuntimeDaemon extends EventEmitter {
         mountGeneration: 1,
       },
       stats,
+      activity,
+    };
+  }
+
+  public async handleActivityStatus(request: ActivityStatusRequest | DaemonRequest): Promise<ActivityStatusResponse> {
+    const activity = await this.getActivityStatus();
+    const op = (request.op === 'activity' || request.op === 'status') ? request.op : 'activityStatus';
+    return {
+      id: request.id,
+      op,
+      ok: true,
+      activity,
+    };
+  }
+
+  /**
+   * Returns current read-only daemon activity status.
+   * Alias for getActivityStatus.
+   */
+  public async getStatus(): Promise<DaemonActivityStatus> {
+    return this.getActivityStatus();
+  }
+
+  /**
+   * Gathers live activity status across all sessions, turns, background jobs, subagents, and inboxes.
+   */
+  public async getActivityStatus(): Promise<DaemonActivityStatus> {
+    const ctx = this.bootedRuntime?.context;
+    const sessionMap = new Map<string, SessionActivityDetail>();
+
+    // 1. Gather all candidate session IDs from multiple authoritative sources
+    const allSessionIds = new Set<string>();
+    for (const sid of this.agents.keys()) allSessionIds.add(sid);
+    for (const sid of this.sessionQueues.keys()) allSessionIds.add(sid);
+    for (const sid of this.currentTurns.keys()) allSessionIds.add(sid);
+    for (const sid of this.autonomousTurnsTracker.keys()) allSessionIds.add(sid);
+
+    const agentRegistry = ctx?.get('agents');
+    const liveAgents = typeof agentRegistry?.list === 'function' ? agentRegistry.list() : [];
+    for (const a of liveAgents) {
+      if (a?.id) allSessionIds.add(String(a.id));
+    }
+
+    const sessionRegistry = ctx?.get('sessions');
+    const registeredSessions = typeof sessionRegistry?.list === 'function' ? sessionRegistry.list() : [];
+    for (const s of registeredSessions) {
+      if (s?.id) allSessionIds.add(String(s.id));
+    }
+
+    // 2. Resolve per-session activity: active turn (submitted or autonomous), inbox items, queued turns
+    const activeTurns: ActiveTurnActivity[] = [];
+
+    for (const sessionId of allSessionIds) {
+      const entry = this.agents.get(sessionId);
+      const liveAgent = entry?.agent ?? (typeof agentRegistry?.get === 'function' ? agentRegistry.get(sessionId as any) : undefined);
+      const queue = this.sessionQueues.get(sessionId) ?? [];
+      const queuedTurnsCount = queue.filter((item) => !item.cancelled).length;
+
+      let activeTurn: ActiveTurnActivity | undefined;
+
+      // Check daemon-submitted in-flight turn
+      const curTurn = this.currentTurns.get(sessionId) ?? entry?.currentTurn;
+      if (curTurn && !curTurn.cancelRequested) {
+        activeTurn = {
+          sessionId,
+          turnId: curTurn.turnId,
+          autonomous: false,
+          startedAt: curTurn.startedAt,
+        };
+      } else if (this.autonomousTurnsTracker.has(sessionId)) {
+        // Autonomous continuation turn tracked via turn/start event
+        const auto = this.autonomousTurnsTracker.get(sessionId)!;
+        activeTurn = {
+          sessionId,
+          turnNumber: auto.turnNumber,
+          autonomous: true,
+          startedAt: auto.startedAt,
+        };
+      } else if (liveAgent) {
+        // Direct inspection of live agent status / phase / turnBoundary projection
+        const agentStatus = (liveAgent as any).status;
+        const agentPhase = (liveAgent as any).phase;
+        const sessionProjections = ctx?.get('sessionProjections');
+        const sessionObj = liveAgent.session ?? (typeof sessionRegistry?.get === 'function' ? sessionRegistry.get(sessionId as any) : undefined);
+        const turnBoundary = sessionObj && sessionProjections ? sessionProjections.stateOf(sessionObj, 'turnBoundary') : undefined;
+
+        const isRunning =
+          agentStatus === 'running' ||
+          agentPhase?.kind === 'running' ||
+          (turnBoundary && turnBoundary.openTurnStartSeq !== null && turnBoundary.openTurnStartSeq !== undefined);
+
+        if (isRunning) {
+          activeTurn = {
+            sessionId,
+            turnNumber: agentPhase?.turn ?? (typeof turnBoundary?.lastTurn === 'number' ? turnBoundary.lastTurn : undefined),
+            autonomous: true,
+            startedAt: Date.now(),
+          };
+        }
+      }
+
+      if (activeTurn) {
+        activeTurns.push(activeTurn);
+      }
+
+      // Check pending inbox items
+      let pendingNextTurnCount = 0;
+      let pendingNextStepCount = 0;
+
+      if (liveAgent) {
+        const inbox = (liveAgent as any).inbox;
+        if (inbox) {
+          if (Array.isArray(inbox.nextTurn)) pendingNextTurnCount = inbox.nextTurn.length;
+          if (Array.isArray(inbox.nextStep)) pendingNextStepCount = inbox.nextStep.length;
+        }
+
+        if (pendingNextTurnCount === 0 && pendingNextStepCount === 0 && liveAgent.session) {
+          const sessionProjections = ctx?.get('sessionProjections');
+          const projInbox = sessionProjections?.stateOf(liveAgent.session, 'inbox');
+          if (projInbox) {
+            if (Array.isArray(projInbox['next-turn'])) pendingNextTurnCount = projInbox['next-turn'].length;
+            if (Array.isArray(projInbox['next-step'])) pendingNextStepCount = projInbox['next-step'].length;
+          }
+        }
+      }
+
+      const pendingInboxItemsCount = pendingNextTurnCount + pendingNextStepCount;
+
+      sessionMap.set(sessionId, {
+        sessionId,
+        activeTurn,
+        pendingInboxItemsCount,
+        pendingNextTurnCount,
+        pendingNextStepCount,
+        queuedTurnsCount,
+      });
+    }
+
+    // 3. Running jobs (including workflow jobs)
+    const jobRegistry = ctx?.get('jobs');
+    const allJobs = typeof jobRegistry?.list === 'function' ? jobRegistry.list() : [];
+    const runningJobs: RunningJobActivity[] = [];
+    for (const job of allJobs) {
+      if (job.status === 'running' || job.status === 'stopping') {
+        runningJobs.push({
+          id: String(job.id),
+          kind: String(job.kind),
+          label: String(job.label || ''),
+          owner: job.owner ? String(job.owner) : undefined,
+          startedAt: job.startedAt || 0,
+        });
+      }
+    }
+    const runningWorkflowJobsCount = runningJobs.filter((j) => j.kind === 'workflow').length;
+
+    // 4. Live background subagents
+    const liveSubagents: LiveSubagentActivity[] = [];
+    const seenSubagentKeys = new Set<string>();
+
+    for (const sub of this.liveSubagentsTracker.values()) {
+      liveSubagents.push(sub);
+      seenSubagentKeys.add(sub.id);
+      if (sub.sessionId) seenSubagentKeys.add(sub.sessionId);
+    }
+
+    for (const agent of liveAgents) {
+      const aId = String(agent.id);
+      const isOriginSubagent =
+        (agent as any).session?.header?.origin === 'subagent' ||
+        (agent as any).session?.meta?.origin === 'subagent';
+
+      if (isOriginSubagent && !seenSubagentKeys.has(aId)) {
+        liveSubagents.push({
+          id: aId,
+          sessionId: aId,
+          parentSession: (agent as any).session?.header?.parentSession
+            ? String((agent as any).session.header.parentSession)
+            : undefined,
+          startedAt: (agent as any).session?.header?.createdAt
+            ? Number((agent as any).session.header.createdAt)
+            : undefined,
+        });
+        seenSubagentKeys.add(aId);
+      }
+    }
+
+    // 5. Aggregate totals
+    const activeTurnsCount = activeTurns.length;
+    const autonomousTurnsCount = activeTurns.filter((t) => t.autonomous).length;
+    const runningJobsCount = runningJobs.length;
+    const liveSubagentsCount = liveSubagents.length;
+
+    let totalPendingInboxItems = 0;
+    let totalQueuedTurns = 0;
+    const sessionsObj: Record<string, SessionActivityDetail> = {};
+
+    for (const [sid, detail] of sessionMap.entries()) {
+      sessionsObj[sid] = detail;
+      totalPendingInboxItems += detail.pendingInboxItemsCount;
+      totalQueuedTurns += detail.queuedTurnsCount;
+    }
+
+    const isIdle =
+      activeTurnsCount === 0 &&
+      runningJobsCount === 0 &&
+      liveSubagentsCount === 0 &&
+      totalPendingInboxItems === 0 &&
+      totalQueuedTurns === 0;
+
+    return {
+      isIdle,
+      activeTurnsCount,
+      autonomousTurnsCount,
+      runningJobsCount,
+      runningWorkflowJobsCount,
+      liveSubagentsCount,
+      pendingInboxItemsCount: totalPendingInboxItems,
+      queuedTurnsCount: totalQueuedTurns,
+      activeTurns,
+      runningJobs,
+      liveSubagents,
+      sessions: sessionsObj,
     };
   }
 

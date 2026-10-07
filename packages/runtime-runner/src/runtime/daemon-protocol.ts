@@ -54,6 +54,7 @@ export const DAEMON_OPS = {
   ANSWER_APPROVAL: 'answerApproval',
   LIST_APPROVALS: 'listApprovals',
   COMPACT_SESSION: 'compactSession',
+  ACTIVITY_STATUS: 'activityStatus',
 } as const;
 
 export type DaemonOp = (typeof DAEMON_OPS)[keyof typeof DAEMON_OPS];
@@ -287,6 +288,10 @@ export interface CompactSessionRequest extends DaemonRequestBase {
   readonly sessionId: string;
 }
 
+export interface ActivityStatusRequest extends DaemonRequestBase {
+  readonly op: 'activityStatus' | 'activity' | 'status';
+}
+
 export type DaemonRequest =
   | SubmitTurnRequest
   | CancelRequest
@@ -304,7 +309,8 @@ export type DaemonRequest =
   | AnswerApprovalRequest
   | ListApprovalsRequest
   | ShutdownRequest
-  | CompactSessionRequest;
+  | CompactSessionRequest
+  | ActivityStatusRequest;
 
 // ---------------------------------------------------------------------------
 // Response Envelopes
@@ -368,6 +374,7 @@ export interface HealthResponse extends DaemonResponseBase {
   readonly ok: true;
   readonly health: RuntimeHealthStatus;
   readonly stats: DaemonStats;
+  readonly activity?: DaemonActivityStatus;
 }
 
 export interface CapabilitiesResponse extends DaemonResponseBase {
@@ -483,6 +490,60 @@ export interface CompactSessionResponse extends DaemonResponseBase {
   readonly summaryChars: number;
 }
 
+export interface ActiveTurnActivity {
+  readonly sessionId: string;
+  readonly turnId?: string;
+  readonly turnNumber?: number;
+  readonly autonomous: boolean;
+  readonly startedAt?: number;
+}
+
+export interface RunningJobActivity {
+  readonly id: string;
+  readonly kind: string;
+  readonly label: string;
+  readonly owner?: string;
+  readonly startedAt: number;
+}
+
+export interface LiveSubagentActivity {
+  readonly id: string;
+  readonly provider?: string;
+  readonly sessionId?: string;
+  readonly parentSession?: string;
+  readonly startedAt?: number;
+}
+
+export interface SessionActivityDetail {
+  readonly sessionId: string;
+  readonly activeTurn?: ActiveTurnActivity;
+  readonly pendingInboxItemsCount: number;
+  readonly pendingNextTurnCount: number;
+  readonly pendingNextStepCount: number;
+  readonly queuedTurnsCount: number;
+}
+
+export interface DaemonActivityStatus {
+  readonly isIdle: boolean;
+  readonly activeTurnsCount: number;
+  readonly autonomousTurnsCount: number;
+  readonly runningJobsCount: number;
+  readonly runningWorkflowJobsCount: number;
+  readonly liveSubagentsCount: number;
+  readonly pendingInboxItemsCount: number;
+  readonly queuedTurnsCount: number;
+  readonly activeTurns: readonly ActiveTurnActivity[];
+  readonly runningJobs: readonly RunningJobActivity[];
+  readonly liveSubagents: readonly LiveSubagentActivity[];
+  readonly sessions: Readonly<Record<string, SessionActivityDetail>>;
+}
+
+export interface ActivityStatusResponse extends DaemonResponseBase {
+  readonly op: 'activityStatus' | 'activity' | 'status';
+  readonly ok: true;
+  readonly activity: DaemonActivityStatus;
+}
+
 export interface DaemonErrorResponse extends DaemonResponseBase {
   readonly ok: false;
   readonly error: {
@@ -510,6 +571,7 @@ export type DaemonResponse =
   | ListApprovalsResponse
   | ShutdownResponse
   | CompactSessionResponse
+  | ActivityStatusResponse
   | DaemonErrorResponse;
 
 // ---------------------------------------------------------------------------

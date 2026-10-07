@@ -15,4 +15,5 @@ export * from './reset/index.js';
 export * from './up/index.js';
 export * from './down/index.js';
 export * from './test/index.js';
+export * from './preflight/index.js';
 export * from './demo-runner.js';
