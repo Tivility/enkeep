@@ -1096,7 +1096,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     const currentGen = typeof route.current_generation === 'number' ? route.current_generation : 1;
 
     // Chat command interception hook (before profile resolution, attachments, idempotency, and runtime dispatch)
-    const chatCmd = parseChatCommand(envelope.content);
+    const chatCmd = parseChatCommand(envelope.content, { allowUnknown: true });
     if (chatCmd && this.chatCommandService) {
       return await this.dispatchChatCommand({
         envelope,
