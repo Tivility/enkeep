@@ -239,6 +239,18 @@ export class SqliteReceiptStore implements IReceiptStore {
       const migrationRunner = new SqliteReceiptStoreMigrationRunner(dbHandle);
       migrationRunner.run();
 
+      // Ensure session_child_origins table exists for compatibility
+      dbHandle.exec(`
+        CREATE TABLE IF NOT EXISTS session_child_origins (
+          session_id TEXT NOT NULL,
+          child_id TEXT NOT NULL,
+          origin_turn_id TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+          PRIMARY KEY (session_id, child_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_child_origins_turn ON session_child_origins(session_id, origin_turn_id);
+      `);
+
       this.db = dbHandle;
     } catch (err: unknown) {
       if (dbHandle) {
@@ -731,7 +743,7 @@ export class SqliteReceiptStore implements IReceiptStore {
     };
   }
 
-  async recordChildOrigin(sessionId: string, childId: string, originTurnId: string): Promise<void> {
+  recordChildOriginSync(sessionId: string, childId: string, originTurnId: string): void {
     const db = this.ensureOpen();
     if (!sessionId || typeof sessionId !== 'string') {
       throw new ReceiptStoreError('sessionId is required for recordChildOrigin');
@@ -749,18 +761,51 @@ export class SqliteReceiptStore implements IReceiptStore {
       VALUES (?, ?, ?, ?, ?)
     `);
     stmt.run(this.userId, sessionId, childId, originTurnId, nowIso);
+
+    try {
+      db.prepare(`
+        INSERT OR REPLACE INTO session_child_origins (session_id, child_id, origin_turn_id, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(sessionId, childId, originTurnId, nowIso);
+    } catch {
+      // ignore
+    }
+  }
+
+  async recordChildOrigin(sessionId: string, childId: string, originTurnId: string): Promise<void> {
+    this.recordChildOriginSync(sessionId, childId, originTurnId);
+  }
+
+  getChildOriginSync(sessionId: string, childId: string): string | null {
+    const db = this.ensureOpen();
+    if (!sessionId || !childId) return null;
+    try {
+      const stmt = db.prepare(`
+        SELECT origin_turn_id FROM dsh_child_origins
+        WHERE user_id = ? AND session_id = ? AND child_id = ?
+        LIMIT 1
+      `);
+      const row = stmt.get(this.userId, sessionId, childId) as { origin_turn_id?: unknown } | undefined;
+      if (typeof row?.origin_turn_id === 'string') return row.origin_turn_id;
+    } catch {
+      // ignore
+    }
+    try {
+      const stmt2 = db.prepare(`
+        SELECT origin_turn_id FROM session_child_origins
+        WHERE session_id = ? AND child_id = ?
+        LIMIT 1
+      `);
+      const row2 = stmt2.get(sessionId, childId) as { origin_turn_id?: unknown } | undefined;
+      if (typeof row2?.origin_turn_id === 'string') return row2.origin_turn_id;
+    } catch {
+      // ignore
+    }
+    return null;
   }
 
   async getChildOrigin(sessionId: string, childId: string): Promise<string | null> {
-    const db = this.ensureOpen();
-    if (!sessionId || !childId) return null;
-    const stmt = db.prepare(`
-      SELECT origin_turn_id FROM dsh_child_origins
-      WHERE user_id = ? AND session_id = ? AND child_id = ?
-      LIMIT 1
-    `);
-    const row = stmt.get(this.userId, sessionId, childId) as { origin_turn_id?: unknown } | undefined;
-    return typeof row?.origin_turn_id === 'string' ? row.origin_turn_id : null;
+    return this.getChildOriginSync(sessionId, childId);
   }
 
   async listChildOrigins(sessionId: string): Promise<readonly import('./types.js').ChildOriginRecord[]> {

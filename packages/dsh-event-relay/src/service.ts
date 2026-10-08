@@ -59,6 +59,7 @@ export class EventRelayService implements IEventRelayService {
   private readonly sessionStreams = new Map<string, SessionStreamState>();
   private readonly sessionLastMappedSeq = new Map<string, number>();
   private readonly activeTurnContexts = new Map<string, { platformTurnId: string; originTurnId?: string; causeChildId?: string; dshIntTurn?: number }>();
+  private readonly activeAutonomousContexts = new Map<string, { platformTurnId: string; originTurnId?: string; causeChildId?: string; dshIntTurn?: number }>();
   private readonly dshIntTurnMap = new Map<string, { platformTurnId: string; originTurnId?: string; causeChildId?: string }>();
   private readonly pendingAutonomousOrigins = new Map<string, Array<{ originTurnId: string; causeChildId: string }>>();
   private readonly activeTurnSessions = new Set<string>();
@@ -234,7 +235,41 @@ export class EventRelayService implements IEventRelayService {
 
   resolveOriginTurnId(childId: string): string | undefined {
     if (!childId) return undefined;
-    return this.childOriginMap.get(childId);
+    const inMem = this.childOriginMap.get(childId);
+    if (inMem) return inMem;
+    const colonIdx = childId.indexOf(':');
+    if (colonIdx !== -1) {
+      const sessionId = childId.slice(0, colonIdx);
+      const rawChildId = childId.slice(colonIdx + 1);
+      const fromStore = this.lookupOriginFromReceiptStore(sessionId, rawChildId);
+      if (fromStore) {
+        this.childOriginMap.set(childId, fromStore);
+        return fromStore;
+      }
+    }
+    return undefined;
+  }
+
+  private lookupOriginFromReceiptStore(sessionId: string, childId: string): string | undefined {
+    const store = this.receiptStore as any;
+    if (!store) return undefined;
+    try {
+      if (typeof store.getChildOriginSync === 'function') {
+        const res = store.getChildOriginSync(sessionId, childId);
+        if (res) return res;
+      }
+    } catch {}
+    if (store.db && typeof store.db.prepare === 'function') {
+      try {
+        const row = (store.db.prepare(
+          'SELECT origin_turn_id FROM session_child_origins WHERE session_id = ? AND child_id = ? LIMIT 1'
+        ).get(sessionId, childId) as any) ?? (store.db.prepare(
+          'SELECT origin_turn_id FROM dsh_child_origins WHERE session_id = ? AND child_id = ? LIMIT 1'
+        ).get(sessionId, childId) as any);
+        if (row?.origin_turn_id) return String(row.origin_turn_id);
+      } catch {}
+    }
+    return undefined;
   }
 
   private extractStructuredJob(data: any): { jobId: string; jobName?: string } | undefined {
@@ -296,6 +331,10 @@ export class EventRelayService implements IEventRelayService {
       if (!c || typeof c !== 'object') continue;
       const subId = typeof c.subagentId === 'string' && c.subagentId.trim().length > 0 ? c.subagentId.trim()
         : typeof c.subagent_id === 'string' && c.subagent_id.trim().length > 0 ? c.subagent_id.trim()
+        : typeof c.childId === 'string' && c.childId.trim().length > 0 ? c.childId.trim()
+        : typeof c.child_id === 'string' && c.child_id.trim().length > 0 ? c.child_id.trim()
+        : typeof c.sessionId === 'string' && c.sessionId.trim().length > 0 ? c.sessionId.trim()
+        : typeof c.senderSessionId === 'string' && c.senderSessionId.trim().length > 0 ? c.senderSessionId.trim()
         : undefined;
       if (subId) return subId;
     }
@@ -304,6 +343,10 @@ export class EventRelayService implements IEventRelayService {
         if (!block || typeof block !== 'object') continue;
         const subId = typeof block.subagentId === 'string' && block.subagentId.trim().length > 0 ? block.subagentId.trim()
           : typeof block.meta?.subagentId === 'string' && block.meta.subagentId.trim().length > 0 ? block.meta.subagentId.trim()
+          : typeof block.childId === 'string' && block.childId.trim().length > 0 ? block.childId.trim()
+          : typeof block.child_id === 'string' && block.child_id.trim().length > 0 ? block.child_id.trim()
+          : typeof block.meta?.childId === 'string' && block.meta.childId.trim().length > 0 ? block.meta.childId.trim()
+          : typeof block.meta?.child_id === 'string' && block.meta.child_id.trim().length > 0 ? block.meta.child_id.trim()
           : undefined;
         if (subId) return subId;
       }
@@ -396,7 +439,7 @@ export class EventRelayService implements IEventRelayService {
   private extractChildIdFromStructuredSource(source: unknown, sessionId?: string, itemOrData?: unknown): string | undefined {
     if (!source || typeof source !== 'object') return undefined;
     const s = source as Record<string, unknown>;
-    if ((s.kind === 'subagent-settled' || s.kind === 'agent-message') && typeof s.senderSessionId === 'string' && s.senderSessionId.trim().length > 0) {
+    if (typeof s.senderSessionId === 'string' && s.senderSessionId.trim().length > 0) {
       return s.senderSessionId.trim();
     }
     if (s.kind === 'tool-jobs' || (s.kind === 'plugin' && s.plugin === 'tool-jobs')) {
@@ -584,6 +627,37 @@ export class EventRelayService implements IEventRelayService {
     if (!originTurnId) {
       originTurnId = this.resolveOriginTurnId(childId);
     }
+    if (!originTurnId) {
+      originTurnId = this.lookupOriginFromReceiptStore(sessionId, childId);
+      if (originTurnId) {
+        this.recordChildInitiation(`${sessionId}:${childId}`, originTurnId);
+        this.recordChildInitiation(childId, originTurnId);
+      }
+    }
+    if (!originTurnId) {
+      const store = this.receiptStore as any;
+      if (store && typeof store.getChildOrigin === 'function') {
+        try {
+          const res = store.getChildOrigin(sessionId, childId);
+          if (res && typeof res.then === 'function') {
+            res.then((found: string | null) => {
+              if (found) {
+                this.recordChildInitiation(`${sessionId}:${childId}`, found);
+                this.recordChildInitiation(childId, found);
+                let list = this.pendingAutonomousOrigins.get(sessionId);
+                if (!list) {
+                  list = [];
+                  this.pendingAutonomousOrigins.set(sessionId, list);
+                }
+                if (!list.some(p => p.causeChildId === childId)) {
+                  list.push({ originTurnId: found, causeChildId: childId });
+                }
+              }
+            }).catch(() => {});
+          }
+        } catch {}
+      }
+    }
     if (originTurnId) {
       let list = this.pendingAutonomousOrigins.get(sessionId);
       if (!list) {
@@ -653,24 +727,15 @@ export class EventRelayService implements IEventRelayService {
 
   private stampAndEnqueueFrames(sessionId: string, frames: ContainerStreamingEventFrame[], currentTurn?: number): void {
     if (frames.length === 0) return;
-    let scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+    let scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined)
+      ?? this.activeTurnContexts.get(sessionId)
+      ?? this.activeAutonomousContexts.get(sessionId);
     let turnId = scopedCtx?.platformTurnId ?? (scopedCtx as any)?.turnId;
     let originTurnId = scopedCtx?.originTurnId;
     let causeChildId = scopedCtx?.causeChildId;
 
     if (!turnId) {
-      const autoTurnId = `turn_auto_${sessionId.slice(0, 8)}_${currentTurn ?? 1}_${randomBytes(4).toString('hex')}`;
-      const autoCtx = {
-        platformTurnId: autoTurnId,
-        originTurnId: undefined,
-        causeChildId: undefined,
-        dshIntTurn: currentTurn,
-      };
-      if (currentTurn !== undefined) {
-        this.dshIntTurnMap.set(`${sessionId}:${currentTurn}`, autoCtx);
-      }
-      this.activeTurnContexts.set(sessionId, autoCtx);
-      turnId = autoTurnId;
+      turnId = `turn_auto_${sessionId.slice(0, 8)}_${currentTurn ?? 1}_${randomBytes(4).toString('hex')}`;
     }
 
     for (const f of frames) {
@@ -777,6 +842,40 @@ export class EventRelayService implements IEventRelayService {
     const frames: ContainerStreamingEventFrame[] = [];
 
     // 1. Tool result: associate returned child ID with initiating platform turn from exact DSH integer turn
+    const rawEventType = event.type as string;
+    if (rawEventType === 'subagent/catalog' || rawEventType === 'subagent/descriptor') {
+      const intTurn = (event as any).data?.turn;
+      const turnCtx = (intTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${intTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+      const childId = (event as any).data?.childId
+        ?? (event as any).data?.child_id
+        ?? (event as any).data?.id
+        ?? (event as any).data?.sessionId
+        ?? (event as any).data?.subagentId
+        ?? (event as any).data?.subagent_id;
+      if (childId && turnCtx?.platformTurnId) {
+        this.recordChildInitiation(`${sessionId}:${childId}`, turnCtx.platformTurnId);
+        this.recordChildInitiation(childId, turnCtx.platformTurnId);
+        const store = this.receiptStore;
+        if (store && typeof (store as any).recordChildOrigin === 'function') {
+          void (store as any).recordChildOrigin(sessionId, childId, turnCtx.platformTurnId).catch(() => {});
+        }
+      }
+    }
+
+    if (rawEventType === 'tool-workflow/agent-start') {
+      const intTurn = (event as any).data?.turn;
+      const turnCtx = (intTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${intTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+      const childId = (event as any).data?.childId ?? (event as any).data?.child_id;
+      if (childId && turnCtx?.platformTurnId) {
+        this.recordChildInitiation(`${sessionId}:${childId}`, turnCtx.platformTurnId);
+        this.recordChildInitiation(childId, turnCtx.platformTurnId);
+        const store = this.receiptStore;
+        if (store && typeof (store as any).recordChildOrigin === 'function') {
+          void (store as any).recordChildOrigin(sessionId, childId, turnCtx.platformTurnId).catch(() => {});
+        }
+      }
+    }
+
     if (event.type === 'tool/result') {
       const intTurn = (event.data as any)?.turn;
       const turnCtx = (intTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${intTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
@@ -853,12 +952,14 @@ export class EventRelayService implements IEventRelayService {
         if (intTurn !== undefined) {
           this.dshIntTurnMap.set(`${sessionId}:${intTurn}`, autoCtx);
         }
-        this.activeTurnContexts.set(sessionId, autoCtx);
+        this.activeAutonomousContexts.set(sessionId, autoCtx);
       }
     }
 
     const currentTurn = (event.data as any)?.turn;
-    const scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+    const scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined)
+      ?? this.activeTurnContexts.get(sessionId)
+      ?? this.activeAutonomousContexts.get(sessionId);
     const turnId = scopedCtx?.platformTurnId ?? (scopedCtx as any)?.turnId;
     const originTurnId = scopedCtx?.originTurnId;
     const causeChildId = scopedCtx?.causeChildId;
@@ -1082,15 +1183,19 @@ export class EventRelayService implements IEventRelayService {
         this.activeTurnSessions.delete(sessionId);
         this.sessionToolCalls.delete(sessionId);
         this.sessionPendingToolCalls.delete(sessionId);
-        if (scopedCtx?.platformTurnId && this.activeTurnContexts.get(sessionId)?.platformTurnId === scopedCtx.platformTurnId) {
-          this.activeTurnContexts.delete(sessionId);
-        }
         break;
       }
     }
 
     if (frames.length > 0) {
       this.stampAndEnqueueFrames(sessionId, frames, currentTurn);
+    }
+
+    if (event.type === 'turn/end') {
+      this.activeAutonomousContexts.delete(sessionId);
+      if (scopedCtx?.platformTurnId && this.activeTurnContexts.get(sessionId)?.platformTurnId === scopedCtx.platformTurnId) {
+        this.activeTurnContexts.delete(sessionId);
+      }
     }
   }
 
@@ -1337,6 +1442,7 @@ export class EventRelayService implements IEventRelayService {
     this.sessionJobs.clear();
     this.pendingAutonomousOrigins.clear();
     this.activeTurnContexts.clear();
+    this.activeAutonomousContexts.clear();
     this.dshIntTurnMap.clear();
     this.childOriginMap.clear();
     this.buffer.clear();

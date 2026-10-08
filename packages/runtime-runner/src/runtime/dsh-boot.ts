@@ -3728,14 +3728,43 @@ function logWarn(agentCtx: Context, message: string): void {
     const eventRelay = ctx.eventRelay ?? (ctx.get ? ctx.get('eventRelay') : undefined);
     let unbindTurnCtx: (() => void) | undefined;
     if (eventRelay && typeof eventRelay.bindTurnContext === 'function') {
-      const currentIntTurn = typeof (currentAgent.session as any)?.turnCount === 'number'
-        ? (currentAgent.session as any).turnCount + 1
-        : undefined;
+      const agentPhase = (currentAgent as any)?.phase;
+      let currentIntTurn = typeof agentPhase?.turn === 'number'
+        ? agentPhase.turn
+        : typeof agentPhase?.lastTurn === 'number'
+          ? agentPhase.lastTurn + 1
+          : undefined;
       unbindTurnCtx = eventRelay.bindTurnContext(effSessionId, {
         turnId: assignedTurnId,
         originTurnId: (requestOrPrompt as any)?.originTurnId,
         dshIntTurn: currentIntTurn,
       });
+
+      if (typeof ctx?.on === 'function') {
+        const unsubTurnStart = ctx.on('session/event', (s: any, ev: any) => {
+          if (
+            (s?.id === effSessionId || s?.header?.id === effSessionId) &&
+            ev?.type === 'turn/start' &&
+            typeof ev.data?.turn === 'number'
+          ) {
+            if (ev.data.turn !== currentIntTurn) {
+              currentIntTurn = ev.data.turn;
+              eventRelay.bindTurnContext(effSessionId, {
+                turnId: assignedTurnId,
+                originTurnId: (requestOrPrompt as any)?.originTurnId,
+                dshIntTurn: currentIntTurn,
+              });
+            }
+          }
+        });
+        if (typeof unsubTurnStart === 'function') {
+          const originalUnbind = unbindTurnCtx;
+          unbindTurnCtx = () => {
+            unsubTurnStart();
+            originalUnbind?.();
+          };
+        }
+      }
     }
 
     try {

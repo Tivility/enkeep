@@ -129,7 +129,9 @@ export interface IReceiptStore {
   recordSeedImportReceipt(input: RecordSeedImportReceiptInput): Promise<SeedImportReceipt>;
 
   recordChildOrigin(sessionId: string, childId: string, originTurnId: string): Promise<void>;
+  recordChildOriginSync?(sessionId: string, childId: string, originTurnId: string): void;
   getChildOrigin(sessionId: string, childId: string): Promise<string | null>;
+  getChildOriginSync?(sessionId: string, childId: string): string | null;
   listChildOrigins(sessionId: string): Promise<readonly ChildOriginRecord[]>;
 
   recoverAfterRestart(): Promise<RestartRecoverySummary>;
