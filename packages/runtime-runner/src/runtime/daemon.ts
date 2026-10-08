@@ -314,6 +314,7 @@ export class RuntimeDaemon extends EventEmitter {
   private pendingApprovalsTracker = new Map<string, { sessionId: string; toolName: string; approvalId: string }>();
   private readonly liveSubagentsTracker = new Map<string, LiveSubagentActivity>();
   private readonly backgroundTasksTracker = new Map<string, BackgroundTaskRecord>();
+  private readonly stoppedTaskIds = new Set<string>();
   private readonly autonomousTurnsTracker = new Map<string, { sessionId: string; turnNumber?: number; startedAt: number }>();
   private readonly sessionMaintenanceLocks = new Map<string, Promise<void>>();
 
@@ -578,10 +579,14 @@ export class RuntimeDaemon extends EventEmitter {
           const nowIso = new Date().toISOString();
           task.finishedAt = nowIso;
           task.lastActivityAt = nowIso;
-          const stopReason = rawEvent.data.stopReason;
-          if (stopReason === 'failed' || stopReason === 'error') {
+          const rawReason = rawEvent.data.stopReason || rawEvent.data.outcome;
+          const stopReason = typeof rawReason === 'string' ? rawReason.toLowerCase() : '';
+          const isExplicitlyStopped = this.stoppedTaskIds.has(runId);
+          if (isExplicitlyStopped || task.status === 'cancelled') {
+            task.status = 'cancelled';
+          } else if (stopReason === 'failed' || stopReason === 'error') {
             task.status = 'failed';
-          } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed') {
+          } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed' || stopReason === 'aborted') {
             task.status = 'cancelled';
           } else {
             task.status = 'completed';
@@ -679,7 +684,7 @@ export class RuntimeDaemon extends EventEmitter {
             parentSessionId: parentSession || '',
             kind: 'subagent',
             name: String(info.label || info.description || info.provider || 'subagent').slice(0, 60),
-            status: 'running',
+            status: daemon.stoppedTaskIds.has(idStr) ? 'cancelled' : 'running',
             startedAt: nowIso,
             lastActivityAt: nowIso,
             mode: isContinuable ? 'continuable' : (info.mode === 'one-shot' ? 'one-shot' : undefined),
@@ -689,7 +694,9 @@ export class RuntimeDaemon extends EventEmitter {
           if (parentSession && !existing.parentSessionId) {
             existing.parentSessionId = parentSession;
           }
-          existing.status = 'running';
+          if (!daemon.stoppedTaskIds.has(idStr) && existing.status !== 'cancelled') {
+            existing.status = 'running';
+          }
           existing.lastActivityAt = nowIso;
           if (isContinuable) existing.mode = 'continuable';
           if (isBg) existing.isBackground = true;
@@ -705,6 +712,21 @@ export class RuntimeDaemon extends EventEmitter {
         const idStr = String(info.id);
         daemon.liveSubagentsTracker.delete(idStr);
         let existing = daemon.backgroundTasksTracker.get(idStr);
+        const rawReason = info.outcome || info.stopReason || (info.reason?.kind ? info.reason.kind : (typeof info.reason === 'string' ? info.reason : undefined));
+        const stopReason = typeof rawReason === 'string' ? rawReason.toLowerCase() : '';
+        const isExplicitlyStopped = daemon.stoppedTaskIds.has(idStr) || (info.runId && daemon.stoppedTaskIds.has(String(info.runId)));
+
+        let targetStatus: 'running' | 'completed' | 'failed' | 'cancelled' = 'completed';
+        if (isExplicitlyStopped) {
+          targetStatus = 'cancelled';
+        } else if (stopReason === 'failed' || stopReason === 'error') {
+          targetStatus = 'failed';
+        } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed' || stopReason === 'aborted') {
+          targetStatus = 'cancelled';
+        } else {
+          targetStatus = 'completed';
+        }
+
         if (!existing) {
           let parentSession: string | undefined = undefined;
           try {
@@ -725,24 +747,20 @@ export class RuntimeDaemon extends EventEmitter {
             parentSessionId: parentSession || '',
             kind: 'subagent',
             name: String(info.label || info.description || info.provider || 'subagent').slice(0, 60),
-            status: 'completed',
+            status: targetStatus,
             startedAt: nowIso,
             finishedAt: nowIso,
             lastActivityAt: nowIso,
           };
           daemon.backgroundTasksTracker.set(idStr, existing);
-        }
-        if (existing) {
+        } else {
           const nowIso = new Date().toISOString();
           existing.finishedAt = nowIso;
           existing.lastActivityAt = nowIso;
-          const outcome = info.outcome || info.stopReason;
-          if (outcome === 'failed' || outcome === 'error') {
-            existing.status = 'failed';
-          } else if (outcome === 'cancelled' || outcome === 'interrupted' || outcome === 'killed') {
+          if (existing.status === 'cancelled' || isExplicitlyStopped) {
             existing.status = 'cancelled';
           } else {
-            existing.status = 'completed';
+            existing.status = targetStatus;
           }
         }
       }
@@ -760,7 +778,7 @@ export class RuntimeDaemon extends EventEmitter {
             parentSessionId: parentSid,
             kind: 'workflow',
             name: String(info?.meta?.name || info?.name || 'workflow').slice(0, 60),
-            status: 'running',
+            status: this.stoppedTaskIds.has(runId) ? 'cancelled' : 'running',
             startedAt: nowIso,
             lastActivityAt: nowIso,
             progress: { agentsDone: 0, agentsTotal: 0 },
@@ -796,10 +814,15 @@ export class RuntimeDaemon extends EventEmitter {
         const nowIso = new Date().toISOString();
         task.finishedAt = nowIso;
         task.lastActivityAt = nowIso;
-        const stopReason = result?.stopReason;
-        if (stopReason === 'failed' || stopReason === 'error') {
+        const rawReason = result?.stopReason || result?.outcome || info?.stopReason || info?.outcome || (result?.reason?.kind ? result.reason.kind : undefined);
+        const stopReason = typeof rawReason === 'string' ? rawReason.toLowerCase() : '';
+        const isExplicitlyStopped = this.stoppedTaskIds.has(runId);
+
+        if (isExplicitlyStopped || task.status === 'cancelled') {
+          task.status = 'cancelled';
+        } else if (stopReason === 'failed' || stopReason === 'error') {
           task.status = 'failed';
-        } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed') {
+        } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed' || stopReason === 'aborted') {
           task.status = 'cancelled';
         } else {
           task.status = 'completed';
@@ -1512,16 +1535,20 @@ export class RuntimeDaemon extends EventEmitter {
       const jobId = String(job.id);
       const owner = job.owner ? String(job.owner) : '';
       if (owner === sessionId) {
+        const isStopped = this.stoppedTaskIds.has(jobId);
         let task = this.backgroundTasksTracker.get(jobId);
         if (!task) {
           const startedIso = new Date(job.startedAt || now).toISOString();
           const kind: 'workflow' | 'job' = job.kind === 'workflow' ? 'workflow' : 'job';
+          const jobStatus = String(job.status || '').toLowerCase();
           const status =
-            job.status === 'running' || job.status === 'stopping'
+            isStopped || jobStatus === 'killed' || jobStatus === 'cancelled' || jobStatus === 'aborted'
+              ? 'cancelled'
+              : jobStatus === 'running' || jobStatus === 'stopping'
               ? 'running'
-              : job.status === 'completed'
+              : jobStatus === 'completed'
               ? 'completed'
-              : job.status === 'failed'
+              : jobStatus === 'failed' || jobStatus === 'error'
               ? 'failed'
               : 'cancelled';
           task = {
@@ -1531,18 +1558,22 @@ export class RuntimeDaemon extends EventEmitter {
             name: String(job.label || job.kind || 'job').slice(0, 60),
             status,
             startedAt: startedIso,
-            finishedAt: job.finishedAt ? new Date(job.finishedAt).toISOString() : undefined,
+            finishedAt: job.finishedAt ? new Date(job.finishedAt).toISOString() : (status !== 'running' ? startedIso : undefined),
             lastActivityAt: startedIso,
           };
           this.backgroundTasksTracker.set(jobId, task);
         } else {
-          if (job.status === 'completed') {
+          const jobStatus = String(job.status || '').toLowerCase();
+          if (isStopped || task.status === 'cancelled') {
+            task.status = 'cancelled';
+            if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+          } else if (jobStatus === 'completed') {
             task.status = 'completed';
             if (!task.finishedAt) task.finishedAt = new Date().toISOString();
-          } else if (job.status === 'failed') {
+          } else if (jobStatus === 'failed' || jobStatus === 'error') {
             task.status = 'failed';
             if (!task.finishedAt) task.finishedAt = new Date().toISOString();
-          } else if (job.status === 'killed') {
+          } else if (jobStatus === 'killed' || jobStatus === 'cancelled' || jobStatus === 'aborted') {
             task.status = 'cancelled';
             if (!task.finishedAt) task.finishedAt = new Date().toISOString();
           }
@@ -1562,6 +1593,7 @@ export class RuntimeDaemon extends EventEmitter {
           const isLive = this.liveSubagentsTracker.has(childId) || this.agents.has(childId);
           const mode = child.mode === 'continuable' ? 'continuable' : child.mode === 'one-shot' ? 'one-shot' : undefined;
           const isBg = mode === 'continuable';
+          const isStopped = this.stoppedTaskIds.has(childId);
           if (!task) {
             const nowIso = new Date(child.createdAt || now).toISOString();
             task = {
@@ -1569,8 +1601,9 @@ export class RuntimeDaemon extends EventEmitter {
               parentSessionId: sessionId,
               kind: 'subagent',
               name: String(child.label || 'subagent').slice(0, 60),
-              status: isLive ? 'running' : 'completed',
+              status: isStopped ? 'cancelled' : isLive ? 'running' : 'completed',
               startedAt: nowIso,
+              finishedAt: isStopped ? nowIso : (!isLive ? nowIso : undefined),
               lastActivityAt: nowIso,
               mode,
               isBackground: isBg,
@@ -1585,7 +1618,10 @@ export class RuntimeDaemon extends EventEmitter {
               task.mode = mode;
               if (mode === 'continuable') task.isBackground = true;
             }
-            if (task.status === 'running' && !isLive) {
+            if (isStopped || task.status === 'cancelled') {
+              task.status = 'cancelled';
+              if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+            } else if (task.status === 'running' && !isLive) {
               task.status = 'completed';
               if (!task.finishedAt) task.finishedAt = new Date().toISOString();
             }
@@ -1606,17 +1642,22 @@ export class RuntimeDaemon extends EventEmitter {
           if (origin === 'subagent' && String(parent) === sessionId) {
             let task = this.backgroundTasksTracker.get(sId);
             const startedIso = new Date(sRec.header.createdAt || now).toISOString();
+            const isStopped = this.stoppedTaskIds.has(sId);
             if (!task) {
               task = {
                 id: sId,
                 parentSessionId: sessionId,
                 kind: 'subagent',
                 name: String((sRec.header as any)?.label || 'subagent').slice(0, 60),
-                status: (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
+                status: isStopped ? 'cancelled' : (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
                 startedAt: startedIso,
+                finishedAt: isStopped ? startedIso : undefined,
                 lastActivityAt: startedIso,
               };
               this.backgroundTasksTracker.set(sId, task);
+            } else if (isStopped || task.status === 'cancelled') {
+              task.status = 'cancelled';
+              if (!task.finishedAt) task.finishedAt = new Date().toISOString();
             }
           }
         }
@@ -1641,17 +1682,22 @@ export class RuntimeDaemon extends EventEmitter {
             lastActIso = new Date(lastEv.time).toISOString();
           }
         }
+        const isStopped = this.stoppedTaskIds.has(sId);
         if (!task) {
           task = {
             id: sId,
             parentSessionId: sessionId,
             kind: 'subagent',
             name: String((s.header as any)?.label || (s as any).meta?.label || 'subagent').slice(0, 60),
-            status: (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
+            status: isStopped ? 'cancelled' : (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
             startedAt: startedIso,
+            finishedAt: isStopped ? startedIso : undefined,
             lastActivityAt: lastActIso,
           };
           this.backgroundTasksTracker.set(sId, task);
+        } else if (isStopped || task.status === 'cancelled') {
+          task.status = 'cancelled';
+          if (!task.finishedAt) task.finishedAt = new Date().toISOString();
         }
       }
     }
@@ -1724,6 +1770,7 @@ export class RuntimeDaemon extends EventEmitter {
           const finishedTime = Date.parse(task.finishedAt);
           if (!isNaN(finishedTime) && now - finishedTime > RETENTION_MS) {
             this.backgroundTasksTracker.delete(id);
+            this.stoppedTaskIds.delete(id);
             continue;
           }
         }
@@ -1787,6 +1834,13 @@ export class RuntimeDaemon extends EventEmitter {
 
     let stopped = false;
     const targetSessionId = foundTask ? foundTask.id : taskId;
+
+    // Track as stopped so subsequent lifecycle events or sync do not override status to completed
+    this.stoppedTaskIds.add(targetSessionId);
+    this.stoppedTaskIds.add(taskId);
+    if (foundTask) {
+      this.stoppedTaskIds.add(foundTask.id);
+    }
 
     // 1. If it's a subagent
     const subagentsService = ctx?.get('subagents');

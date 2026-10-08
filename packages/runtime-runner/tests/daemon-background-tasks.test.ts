@@ -519,4 +519,188 @@ describe('RuntimeDaemon Background Tasks RPC & Tracking', () => {
 
     await daemon.shutdown();
   });
+
+  it('preserves cancelled status when subagent/end fires after stopBackgroundTask', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000070';
+    const childSessionId = 'ses_00000000000000000000000000000071';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    const parentAgentStub = {
+      id: parentSessionId,
+      session: { id: parentSessionId },
+    };
+    const carrier = scopeTarget(ctx.subagents || {}, parentAgentStub as any);
+
+    // 1. Subagent starts
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-stop-sa-001',
+      provider: 'spawn',
+      id: childSessionId,
+      local: true,
+      label: 'Synthetic Worker to Stop',
+    });
+
+    const tasksBefore = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasksBefore).toHaveLength(1);
+    expect(tasksBefore[0].status).toBe('running');
+
+    // 2. User stops subagent via stopBackgroundTask
+    const stopResult = await daemon.stopBackgroundTask(parentSessionId, tasksBefore[0].shortId);
+    expect(stopResult.stopped).toBe(true);
+
+    const tasksAfterStop = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasksAfterStop[0].status).toBe('cancelled');
+
+    // 3. Subagent process terminates and emits subagent/end (DSH 0.2 may emit aborted, completed, or no stopReason)
+    ctx.emit(carrier, 'subagent/end', {
+      runId: 'run-stop-sa-001',
+      provider: 'spawn',
+      id: childSessionId,
+      local: true,
+      stopReason: 'completed', // e.g. daemon maps every subagent/end to completed bug reproduction
+    });
+
+    const tasksAfterEnd = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasksAfterEnd[0].status).toBe('cancelled');
+    expect(tasksAfterEnd[0].finishedAt).toBeDefined();
+
+    await daemon.shutdown();
+  });
+
+  it('maps DSH 0.2 subagent stopReasons correctly: aborted/interrupted/cancelled -> cancelled, error/failed -> failed', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000080';
+    const childAbortedId = 'ses_00000000000000000000000000000081';
+    const childErrorId = 'ses_00000000000000000000000000000082';
+    const childCompletedId = 'ses_00000000000000000000000000000083';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    const parentAgentStub = {
+      id: parentSessionId,
+      session: { id: parentSessionId },
+    };
+    const carrier = scopeTarget(ctx.subagents || {}, parentAgentStub as any);
+
+    // 1. Aborted subagent
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-abort-001',
+      provider: 'spawn',
+      id: childAbortedId,
+      local: true,
+      label: 'Aborted Worker',
+    });
+    ctx.emit(carrier, 'subagent/end', {
+      runId: 'run-abort-001',
+      provider: 'spawn',
+      id: childAbortedId,
+      local: true,
+      stopReason: 'aborted',
+    });
+
+    // 2. Errored subagent
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-err-001',
+      provider: 'spawn',
+      id: childErrorId,
+      local: true,
+      label: 'Error Worker',
+    });
+    ctx.emit(carrier, 'subagent/end', {
+      runId: 'run-err-001',
+      provider: 'spawn',
+      id: childErrorId,
+      local: true,
+      stopReason: 'error',
+    });
+
+    // 3. Completed subagent
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-comp-001',
+      provider: 'spawn',
+      id: childCompletedId,
+      local: true,
+      label: 'Completed Worker',
+    });
+    ctx.emit(carrier, 'subagent/end', {
+      runId: 'run-comp-001',
+      provider: 'spawn',
+      id: childCompletedId,
+      local: true,
+      stopReason: 'completed',
+    });
+
+    const tasks = await daemon.listBackgroundTasks(parentSessionId);
+    const abortedTask = tasks.find((t) => t.id === childAbortedId);
+    const errorTask = tasks.find((t) => t.id === childErrorId);
+    const completedTask = tasks.find((t) => t.id === childCompletedId);
+
+    expect(abortedTask?.status).toBe('cancelled');
+    expect(errorTask?.status).toBe('failed');
+    expect(completedTask?.status).toBe('completed');
+
+    await daemon.shutdown();
+  });
+
+  it('maps workflow jobs stopped via stopBackgroundTask or killed to cancelled and errors to failed', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000090';
+    const wfKilledRunId = 'wf_00000000000000000000000000000091';
+    const wfFailedRunId = 'wf_00000000000000000000000000000092';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // 1. Workflow stopped via stopBackgroundTask
+    ctx.emit('workflow/start', {
+      runId: wfKilledRunId,
+      parentSession: parentSessionId,
+      meta: { name: 'workflow-to-kill' },
+    });
+
+    const tasksBefore = await daemon.listBackgroundTasks(parentSessionId);
+    const wfTask = tasksBefore.find((t) => t.id === wfKilledRunId);
+    expect(wfTask?.status).toBe('running');
+
+    await daemon.stopBackgroundTask(parentSessionId, wfTask!.shortId);
+
+    // Later workflow/end fires with completed or killed
+    ctx.emit('workflow/end', { runId: wfKilledRunId }, { stopReason: 'completed' });
+
+    // 2. Workflow failing with error
+    ctx.emit('workflow/start', {
+      runId: wfFailedRunId,
+      parentSession: parentSessionId,
+      meta: { name: 'workflow-failing' },
+    });
+    ctx.emit('workflow/end', { runId: wfFailedRunId }, { stopReason: 'failed' });
+
+    const tasksAfter = await daemon.listBackgroundTasks(parentSessionId);
+    const killedTask = tasksAfter.find((t) => t.id === wfKilledRunId);
+    const failedTask = tasksAfter.find((t) => t.id === wfFailedRunId);
+
+    expect(killedTask?.status).toBe('cancelled');
+    expect(failedTask?.status).toBe('failed');
+
+    await daemon.shutdown();
+  });
 });
