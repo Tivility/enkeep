@@ -1053,4 +1053,632 @@ describe('Item B: Structured Subagent Cause Child ID Contract', () => {
       expect(frame.originTurnId).toBe(parentPlatformTurnId);
     }
   });
+
+  describe('DSH 0.2 Workflow & Background Jobs Continuation Provenance', () => {
+    it('workflow started in turn T -> completion notice -> autonomous turn frames carry originTurnId=T and turnId', async () => {
+      const service = new EventRelayService(ctx);
+      const session = { id: 'ses_parent_synth_wf_000001' } as Session;
+      const turnTId = 'turn_synth_platform_wf_00001';
+      const jobId = 'workflow-1';
+      const workflowName = 'data-sync-pipeline';
+
+      // 1. Initial turn T launches workflow
+      service.bindTurnContext(session.id, {
+        turnId: turnTId,
+        dshIntTurn: 1,
+      });
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 1,
+        time: 500,
+        data: { turn: 1 },
+      });
+      service.ingest(session, {
+        type: 'tool/result',
+        seq: 2,
+        time: 501,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool-result',
+                content: [
+                  {
+                    type: 'text',
+                    text: `workflow "${workflowName}" started in the background as job ${jobId}. Its return value arrives with the completion notice; check on it with job_output, stop it with job_kill.`,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 3,
+        time: 502,
+        data: { turn: 1, reason: { kind: 'completed' } },
+      });
+
+      // 2. DSH 0.2 tool-jobs completion notice arrives without jobId in source
+      service.ingest(session, {
+        type: 'agent/inbox/spliced' as any,
+        seq: 4,
+        time: 503,
+        data: {
+          target: 'next-turn',
+          inserted: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: `background job ${jobId} finished.` }],
+              source: {
+                kind: 'tool-jobs',
+                form: 'notice',
+                summary: `workflow ${workflowName} [status: completed, 1 agent]`,
+              },
+            },
+          ],
+        },
+      });
+
+      // 3. Autonomous continuation turn starts in DSH
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 5,
+        time: 504,
+        data: { turn: 2 },
+      });
+      service.ingest(session, {
+        type: 'assistant/chunk',
+        seq: 6,
+        time: 505,
+        data: {
+          turn: 2,
+          step: 1,
+          chunk: { type: 'text-delta', text: 'Workflow execution succeeded with 1 agent.' },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 7,
+        time: 506,
+        data: { turn: 2, reason: { kind: 'completed' } },
+      });
+
+      await service.flush();
+
+      // Verify all autonomous frames carry originTurnId=T, causeChildId=workflow-1, and valid turnId
+      const autoFrames = dispatchedFrames.filter((f) => f.originTurnId === turnTId);
+      expect(autoFrames.length).toBeGreaterThan(0);
+      for (const frame of autoFrames) {
+        expect(frame.turnId).toBeDefined();
+        expect(typeof frame.turnId).toBe('string');
+        expect(frame.turnId.length).toBeGreaterThan(0);
+        expect(frame.originTurnId).toBe(turnTId);
+        expect(frame.causeChildId).toBe(jobId);
+        expect(frame.payload.causeChildId).toBe(jobId);
+      }
+    });
+
+    it('two parallel workflows in one session map correctly', async () => {
+      const service = new EventRelayService(ctx);
+      const session = { id: 'ses_parent_synth_wf_parallel_002' } as Session;
+      const turnAId = 'turn_synth_platform_parallel_a';
+      const turnBId = 'turn_synth_platform_parallel_b';
+      const job1Id = 'workflow-1';
+      const job2Id = 'workflow-2';
+      const wf1Name = 'flow-alpha';
+      const wf2Name = 'flow-beta';
+
+      // 1. Turn A starts flow-alpha (workflow-1)
+      service.bindTurnContext(session.id, {
+        turnId: turnAId,
+        dshIntTurn: 1,
+      });
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 1,
+        time: 600,
+        data: { turn: 1 },
+      });
+      service.ingest(session, {
+        type: 'tool/result',
+        seq: 2,
+        time: 601,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool-result',
+                content: [
+                  {
+                    type: 'text',
+                    text: `workflow "${wf1Name}" started in the background as job ${job1Id}. Its return value arrives with the completion notice; check on it with job_output, stop it with job_kill.`,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 3,
+        time: 602,
+        data: { turn: 1, reason: { kind: 'completed' } },
+      });
+
+      // 2. Turn B starts flow-beta (workflow-2)
+      service.bindTurnContext(session.id, {
+        turnId: turnBId,
+        dshIntTurn: 2,
+      });
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 4,
+        time: 603,
+        data: { turn: 2 },
+      });
+      service.ingest(session, {
+        type: 'tool/result',
+        seq: 5,
+        time: 604,
+        data: {
+          turn: 2,
+          step: 1,
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool-result',
+                content: [
+                  {
+                    type: 'text',
+                    text: `workflow "${wf2Name}" started in the background as job ${job2Id}. Its return value arrives with the completion notice; check on it with job_output, stop it with job_kill.`,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 6,
+        time: 605,
+        data: { turn: 2, reason: { kind: 'completed' } },
+      });
+
+      // 3. flow-beta finishes FIRST
+      service.ingest(session, {
+        type: 'agent/inbox/spliced' as any,
+        seq: 7,
+        time: 606,
+        data: {
+          target: 'next-turn',
+          inserted: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: 'flow-beta finished' }],
+              source: {
+                kind: 'tool-jobs',
+                form: 'notice',
+                summary: `workflow ${wf2Name} [status: completed, 2 agents]`,
+              },
+            },
+          ],
+        },
+      });
+
+      // Turn 3: Autonomous continuation for flow-beta
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 8,
+        time: 607,
+        data: { turn: 3 },
+      });
+      service.ingest(session, {
+        type: 'assistant/chunk',
+        seq: 9,
+        time: 608,
+        data: {
+          turn: 3,
+          step: 1,
+          chunk: { type: 'text-delta', text: 'Result of beta workflow.' },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 10,
+        time: 609,
+        data: { turn: 3, reason: { kind: 'completed' } },
+      });
+
+      // 4. flow-alpha finishes SECOND
+      service.ingest(session, {
+        type: 'agent/inbox/spliced' as any,
+        seq: 11,
+        time: 610,
+        data: {
+          target: 'next-turn',
+          inserted: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: 'flow-alpha finished' }],
+              source: {
+                kind: 'tool-jobs',
+                form: 'notice',
+                summary: `workflow ${wf1Name} [status: completed, 1 agent]`,
+              },
+            },
+          ],
+        },
+      });
+
+      // Turn 4: Autonomous continuation for flow-alpha
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 12,
+        time: 611,
+        data: { turn: 4 },
+      });
+      service.ingest(session, {
+        type: 'assistant/chunk',
+        seq: 13,
+        time: 612,
+        data: {
+          turn: 4,
+          step: 1,
+          chunk: { type: 'text-delta', text: 'Result of alpha workflow.' },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 14,
+        time: 613,
+        data: { turn: 4, reason: { kind: 'completed' } },
+      });
+
+      await service.flush();
+
+      // Assert flow-beta continuation frames mapped to turn B
+      const betaFrames = dispatchedFrames.filter((f) => f.originTurnId === turnBId);
+      expect(betaFrames.length).toBeGreaterThan(0);
+      for (const frame of betaFrames) {
+        expect(frame.turnId).toBeDefined();
+        expect(frame.causeChildId).toBe(job2Id);
+        expect(frame.payload.causeChildId).toBe(job2Id);
+      }
+
+      // Assert flow-alpha continuation frames mapped to turn A
+      const alphaFrames = dispatchedFrames.filter((f) => f.originTurnId === turnAId);
+      expect(alphaFrames.length).toBeGreaterThan(0);
+      for (const frame of alphaFrames) {
+        expect(frame.turnId).toBeDefined();
+        expect(frame.causeChildId).toBe(job1Id);
+        expect(frame.payload.causeChildId).toBe(job1Id);
+      }
+    });
+
+    it('bash background job maps correctly to origin turn via unmatched fallback', async () => {
+      const service = new EventRelayService(ctx);
+      const session = { id: 'ses_parent_synth_bash_000003' } as Session;
+      const turnBashPlatformId = 'turn_synth_platform_bash_001';
+      const jobId = 'bash-1';
+
+      // 1. Initial turn launches bash background job
+      service.bindTurnContext(session.id, {
+        turnId: turnBashPlatformId,
+        dshIntTurn: 1,
+      });
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 1,
+        time: 700,
+        data: { turn: 1 },
+      });
+      service.ingest(session, {
+        type: 'tool/result',
+        seq: 2,
+        time: 701,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool-result',
+                content: [{ type: 'text', text: `started background job ${jobId}` }],
+              },
+            ],
+          },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 3,
+        time: 702,
+        data: { turn: 1, reason: { kind: 'completed' } },
+      });
+
+      // 2. tool-jobs notice arrives with summary that has no job id (falls back to unmatched job)
+      service.ingest(session, {
+        type: 'agent/inbox/spliced' as any,
+        seq: 4,
+        time: 703,
+        data: {
+          target: 'next-turn',
+          inserted: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: 'Command execution finished.' }],
+              source: {
+                kind: 'tool-jobs',
+                form: 'notice',
+                summary: 'bash run synthetic build [status: completed, exit code 0]',
+              },
+            },
+          ],
+        },
+      });
+
+      // 3. Autonomous continuation turn starts
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 5,
+        time: 704,
+        data: { turn: 2 },
+      });
+      service.ingest(session, {
+        type: 'assistant/chunk',
+        seq: 6,
+        time: 705,
+        data: {
+          turn: 2,
+          step: 1,
+          chunk: { type: 'text-delta', text: 'Build completed with exit code 0.' },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 7,
+        time: 706,
+        data: { turn: 2, reason: { kind: 'completed' } },
+      });
+
+      await service.flush();
+
+      // Assert bash continuation frames mapped to turnBashPlatformId
+      const bashFrames = dispatchedFrames.filter((f) => f.originTurnId === turnBashPlatformId);
+      expect(bashFrames.length).toBeGreaterThan(0);
+      for (const frame of bashFrames) {
+        expect(frame.turnId).toBeDefined();
+        expect(frame.causeChildId).toBe(jobId);
+        expect(frame.payload.causeChildId).toBe(jobId);
+      }
+    });
+
+    it('subagent path remains unchanged and isolates across sessions', async () => {
+      const service = new EventRelayService(ctx);
+      const session = { id: 'ses_parent_synth_sub_000004' } as Session;
+      const turnSubPlatformId = 'turn_synth_platform_sub_001';
+      const subagentId = 'ses_child_synth_isolated_000042';
+
+      // 1. Initial turn launches subagent
+      service.bindTurnContext(session.id, {
+        turnId: turnSubPlatformId,
+        dshIntTurn: 1,
+      });
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 1,
+        time: 800,
+        data: { turn: 1 },
+      });
+      service.ingest(session, {
+        type: 'tool/result',
+        seq: 2,
+        time: 801,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'user',
+            content: [{ type: 'tool-result', content: [{ type: 'text', text: `started subagent ${subagentId}` }] }],
+          },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 3,
+        time: 802,
+        data: { turn: 1, reason: { kind: 'completed' } },
+      });
+
+      // 2. subagent-settled notice arrives
+      service.ingest(session, {
+        type: 'agent/inbox/spliced' as any,
+        seq: 4,
+        time: 803,
+        data: {
+          target: 'next-turn',
+          inserted: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: 'Subagent completed.' }],
+              source: {
+                kind: 'subagent-settled',
+                form: 'notice',
+                senderSessionId: subagentId,
+              },
+            },
+          ],
+        },
+      });
+
+      // 3. Autonomous continuation turn starts
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 5,
+        time: 804,
+        data: { turn: 2 },
+      });
+      service.ingest(session, {
+        type: 'assistant/chunk',
+        seq: 6,
+        time: 805,
+        data: {
+          turn: 2,
+          step: 1,
+          chunk: { type: 'text-delta', text: 'Subagent answer.' },
+        },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 7,
+        time: 806,
+        data: { turn: 2, reason: { kind: 'completed' } },
+      });
+
+      await service.flush();
+
+      // Assert subagent continuation frames mapped correctly
+      const subFrames = dispatchedFrames.filter((f) => f.originTurnId === turnSubPlatformId);
+      expect(subFrames.length).toBeGreaterThan(0);
+      for (const frame of subFrames) {
+        expect(frame.turnId).toBeDefined();
+        expect(frame.causeChildId).toBe(subagentId);
+        expect(frame.payload.causeChildId).toBe(subagentId);
+      }
+    });
+
+    it('job mappings do not leak across sessions with identical per-session job IDs', async () => {
+      const service = new EventRelayService(ctx);
+      const sessionA = { id: 'ses_parent_synth_iso_a' } as Session;
+      const sessionB = { id: 'ses_parent_synth_iso_b' } as Session;
+      const turnAId = 'turn_platform_iso_a';
+      const turnBId = 'turn_platform_iso_b';
+      const identicalJobId = 'workflow-1';
+
+      // Session A starts workflow-1
+      service.bindTurnContext(sessionA.id, { turnId: turnAId, dshIntTurn: 1 });
+      service.ingest(sessionA, { type: 'turn/start', seq: 1, time: 900, data: { turn: 1 } });
+      service.ingest(sessionA, {
+        type: 'tool/result',
+        seq: 2,
+        time: 901,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'user',
+            content: [{ type: 'tool-result', content: [{ type: 'text', text: `workflow "iso-flow" started in the background as job ${identicalJobId}.` }] }],
+          },
+        },
+      });
+      service.ingest(sessionA, { type: 'turn/end', seq: 3, time: 902, data: { turn: 1, reason: { kind: 'completed' } } });
+
+      // Session B starts workflow-1
+      service.bindTurnContext(sessionB.id, { turnId: turnBId, dshIntTurn: 1 });
+      service.ingest(sessionB, { type: 'turn/start', seq: 1, time: 903, data: { turn: 1 } });
+      service.ingest(sessionB, {
+        type: 'tool/result',
+        seq: 2,
+        time: 904,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'user',
+            content: [{ type: 'tool-result', content: [{ type: 'text', text: `workflow "iso-flow" started in the background as job ${identicalJobId}.` }] }],
+          },
+        },
+      });
+      service.ingest(sessionB, { type: 'turn/end', seq: 3, time: 905, data: { turn: 1, reason: { kind: 'completed' } } });
+
+      // Completion notice arrives for Session B only
+      service.ingest(sessionB, {
+        type: 'agent/inbox/spliced' as any,
+        seq: 4,
+        time: 906,
+        data: {
+          target: 'next-turn',
+          inserted: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: 'Finished.' }],
+              source: {
+                kind: 'tool-jobs',
+                form: 'notice',
+                summary: 'workflow iso-flow [status: completed, 1 agent]',
+              },
+            },
+          ],
+        },
+      });
+
+      // Autonomous turn starts in Session B
+      service.ingest(sessionB, { type: 'turn/start', seq: 5, time: 907, data: { turn: 2 } });
+      service.ingest(sessionB, {
+        type: 'assistant/chunk',
+        seq: 6,
+        time: 908,
+        data: { turn: 2, step: 1, chunk: { type: 'text-delta', text: 'Iso answer.' } },
+      });
+      service.ingest(sessionB, { type: 'turn/end', seq: 7, time: 909, data: { turn: 2, reason: { kind: 'completed' } } });
+
+      await service.flush();
+
+      // Session B frames MUST map to turnBId and NEVER turnAId
+      const bFrames = dispatchedFrames.filter((f) => f.sessionId === sessionB.id && f.originTurnId !== undefined);
+      expect(bFrames.length).toBeGreaterThan(0);
+      for (const frame of bFrames) {
+        expect(frame.originTurnId).toBe(turnBId);
+        expect(frame.originTurnId).not.toBe(turnAId);
+        expect(frame.causeChildId).toBe(identicalJobId);
+      }
+    });
+
+    it('autonomous frames always carry a turnId even without prior origin mapping', async () => {
+      const service = new EventRelayService(ctx);
+      const session = { id: 'ses_synth_orphan_00005' } as Session;
+
+      // An unmapped autonomous turn starts directly
+      service.ingest(session, {
+        type: 'turn/start',
+        seq: 1,
+        time: 1000,
+        data: { turn: 1 },
+      });
+      service.ingest(session, {
+        type: 'assistant/chunk',
+        seq: 2,
+        time: 1001,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', text: 'Unmapped continuation answer.' } },
+      });
+      service.ingest(session, {
+        type: 'turn/end',
+        seq: 3,
+        time: 1002,
+        data: { turn: 1, reason: { kind: 'completed' } },
+      });
+
+      await service.flush();
+
+      const frames = dispatchedFrames.filter((f) => f.sessionId === session.id);
+      expect(frames.length).toBeGreaterThan(0);
+      for (const frame of frames) {
+        expect(frame.turnId).toBeDefined();
+        expect(typeof frame.turnId).toBe('string');
+        expect(frame.turnId.startsWith('turn_auto_')).toBe(true);
+      }
+    });
+  });
 });

@@ -37,6 +37,14 @@ interface SessionStreamState {
   outcome?: unknown;
 }
 
+interface SessionJobRecord {
+  jobId: string;
+  jobName?: string;
+  originTurnId: string;
+  matched: boolean;
+  createdAt: number;
+}
+
 export class EventRelayService implements IEventRelayService {
   readonly consumer: string;
   readonly batchIntervalMs: number;
@@ -52,11 +60,12 @@ export class EventRelayService implements IEventRelayService {
   private readonly sessionLastMappedSeq = new Map<string, number>();
   private readonly activeTurnContexts = new Map<string, { platformTurnId: string; originTurnId?: string; causeChildId?: string; dshIntTurn?: number }>();
   private readonly dshIntTurnMap = new Map<string, { platformTurnId: string; originTurnId?: string; causeChildId?: string }>();
-  private readonly pendingAutonomousOrigins = new Map<string, { originTurnId: string; causeChildId: string }>();
+  private readonly pendingAutonomousOrigins = new Map<string, Array<{ originTurnId: string; causeChildId: string }>>();
   private readonly activeTurnSessions = new Set<string>();
   private readonly childOriginMap = new Map<string, string>();
   private readonly sessionToolCalls = new Map<string, Map<string, string>>();
-  private readonly sessionPendingToolCalls = new Map<string, Array<{ callId?: string; toolName: string }>>();
+  private readonly sessionPendingToolCalls = new Map<string, Array<{ callId?: string; toolName: string; jobName?: string }>>();
+  private readonly sessionJobs = new Map<string, SessionJobRecord[]>();
   private pendingOutboundFrames: ContainerStreamingEventFrame[] = [];
   private pendingOutboundBytes = 0;
   private batchTimer: NodeJS.Timeout | null = null;
@@ -228,35 +237,151 @@ export class EventRelayService implements IEventRelayService {
     return this.childOriginMap.get(childId);
   }
 
-  private extractChildIdFromToolResult(event: SessionEvent): string | undefined {
-    try {
-      const msg = (event.data as any)?.message;
-      if (!msg) return undefined;
-      const content = msg.content;
-      if (typeof content === 'string') {
-        const subMatch = content.match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
-        if (subMatch) return subMatch[1];
-        const jobMatch = content.match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
-        if (jobMatch) return jobMatch[1];
+  private extractStructuredJob(data: any): { jobId: string; jobName?: string } | undefined {
+    if (!data || typeof data !== 'object') return undefined;
+    const candidates = [
+      data,
+      data.meta,
+      data.result,
+      data.value,
+      data.data,
+      data.message?.meta,
+      data.message?.data,
+    ];
+    for (const c of candidates) {
+      if (!c || typeof c !== 'object') continue;
+      const jobId = typeof c.jobId === 'string' && c.jobId.trim().length > 0 ? c.jobId.trim()
+        : typeof c.job_id === 'string' && c.job_id.trim().length > 0 ? c.job_id.trim()
+        : undefined;
+      if (jobId) {
+        const jobName = typeof c.jobName === 'string' && c.jobName.trim().length > 0 ? c.jobName.trim()
+          : typeof c.workflowName === 'string' && c.workflowName.trim().length > 0 ? c.workflowName.trim()
+          : typeof c.name === 'string' && c.name.trim().length > 0 ? c.name.trim()
+          : typeof c.label === 'string' && c.label.trim().length > 0 ? c.label.trim()
+          : undefined;
+        return { jobId, jobName };
       }
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (!block) continue;
-          if (typeof block === 'string') {
-            const subMatch = (block as string).match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
-            if (subMatch) return subMatch[1];
-            const jobMatch = (block as string).match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
-            if (jobMatch) return jobMatch[1];
-            continue;
+    }
+    if (Array.isArray(data.message?.content)) {
+      for (const block of data.message.content) {
+        if (!block || typeof block !== 'object') continue;
+        const jobId = typeof block.jobId === 'string' && block.jobId.trim().length > 0 ? block.jobId.trim()
+          : typeof block.job_id === 'string' && block.job_id.trim().length > 0 ? block.job_id.trim()
+          : typeof block.meta?.jobId === 'string' && block.meta.jobId.trim().length > 0 ? block.meta.jobId.trim()
+          : undefined;
+        if (jobId) {
+          const jobName = typeof block.jobName === 'string' && block.jobName.trim().length > 0 ? block.jobName.trim()
+            : typeof block.label === 'string' && block.label.trim().length > 0 ? block.label.trim()
+            : typeof block.meta?.name === 'string' && block.meta.name.trim().length > 0 ? block.meta.name.trim()
+            : undefined;
+          return { jobId, jobName };
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private extractStructuredSubagent(data: any): string | undefined {
+    if (!data || typeof data !== 'object') return undefined;
+    const candidates = [
+      data,
+      data.meta,
+      data.result,
+      data.value,
+      data.data,
+      data.message?.meta,
+      data.message?.data,
+    ];
+    for (const c of candidates) {
+      if (!c || typeof c !== 'object') continue;
+      const subId = typeof c.subagentId === 'string' && c.subagentId.trim().length > 0 ? c.subagentId.trim()
+        : typeof c.subagent_id === 'string' && c.subagent_id.trim().length > 0 ? c.subagent_id.trim()
+        : undefined;
+      if (subId) return subId;
+    }
+    if (Array.isArray(data.message?.content)) {
+      for (const block of data.message.content) {
+        if (!block || typeof block !== 'object') continue;
+        const subId = typeof block.subagentId === 'string' && block.subagentId.trim().length > 0 ? block.subagentId.trim()
+          : typeof block.meta?.subagentId === 'string' && block.meta.subagentId.trim().length > 0 ? block.meta.subagentId.trim()
+          : undefined;
+        if (subId) return subId;
+      }
+    }
+    return undefined;
+  }
+
+  private extractChildInfoFromToolResult(event: SessionEvent, sessionId?: string): { childId: string; jobName?: string; isJob: boolean } | undefined {
+    try {
+      const data = event.data as any;
+      if (!data || typeof data !== 'object') return undefined;
+
+      // 1. Structured fields prefer
+      const structuredJob = this.extractStructuredJob(data);
+      if (structuredJob) {
+        return { childId: structuredJob.jobId, jobName: structuredJob.jobName, isJob: true };
+      }
+      const structuredSubagent = this.extractStructuredSubagent(data);
+      if (structuredSubagent) {
+        return { childId: structuredSubagent, isJob: false };
+      }
+
+      // 2. Text patterns from message content
+      const cleanId = (id: string) => id.replace(/[.,;:\s]+$/, '').trim();
+      const msg = data.message;
+      if (msg) {
+        const texts: string[] = [];
+        const collect = (val: unknown) => {
+          if (!val) return;
+          if (typeof val === 'string') {
+            texts.push(val);
+          } else if (Array.isArray(val)) {
+            for (const item of val) collect(item);
+          } else if (typeof val === 'object') {
+            if (typeof (val as any).text === 'string') texts.push((val as any).text);
+            if ((val as any).content) collect((val as any).content);
           }
-          if (typeof block !== 'object') continue;
-          const nested = Array.isArray(block.content) ? block.content : [block];
-          for (const item of nested) {
-            const txt = typeof item === 'string' ? item : (typeof item?.text === 'string' ? item.text : '');
-            const subMatch = txt.match(/started subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
-            if (subMatch) return subMatch[1];
-            const jobMatch = txt.match(/started background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
-            if (jobMatch) return jobMatch[1];
+        };
+        collect(msg.content);
+
+        for (const txt of texts) {
+          // (a) Workflow tool pattern: workflow "<name>" started in the background as job <jobId>
+          const wfMatch = txt.match(/workflow\s+["']([^"']+)["']\s+started\s+in\s+the\s+background\s+as\s+job\s+([A-Za-z0-9_\-:.]{1,128})/i)
+            ?? txt.match(/workflow\s+([^\s]+)\s+started\s+in\s+the\s+background\s+as\s+job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+          if (wfMatch) {
+            return { childId: cleanId(wfMatch[2]), jobName: wfMatch[1].trim(), isJob: true };
+          }
+
+          // (b) Generic "started in the background as job <id>"
+          const bgAsJobMatch = txt.match(/started\s+in\s+the\s+background\s+as\s+job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+          if (bgAsJobMatch) {
+            let jobName: string | undefined;
+            if (sessionId) {
+              const callId = this.extractCallIdFromToolResult(event);
+              const pending = this.sessionPendingToolCalls.get(sessionId);
+              const matched = callId && pending ? pending.find(p => p.callId === callId) : pending?.[0];
+              jobName = matched?.jobName;
+            }
+            return { childId: cleanId(bgAsJobMatch[1]), jobName, isJob: true };
+          }
+
+          // (c) "started background [subagent] job <id>"
+          const bgJobMatch = txt.match(/started\s+background\s+(?:subagent\s+)?job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+          if (bgJobMatch) {
+            let jobName: string | undefined;
+            if (sessionId) {
+              const callId = this.extractCallIdFromToolResult(event);
+              const pending = this.sessionPendingToolCalls.get(sessionId);
+              const matched = callId && pending ? pending.find(p => p.callId === callId) : pending?.[0];
+              jobName = matched?.jobName;
+            }
+            return { childId: cleanId(bgJobMatch[1]), jobName, isJob: true };
+          }
+
+          // (d) "started subagent <id>"
+          const subMatch = txt.match(/started\s+subagent\s+([A-Za-z0-9_\-:.]{1,128})/i);
+          if (subMatch) {
+            return { childId: cleanId(subMatch[1]), isJob: false };
           }
         }
       }
@@ -264,19 +389,98 @@ export class EventRelayService implements IEventRelayService {
     return undefined;
   }
 
-  private extractChildIdFromStructuredSource(source: unknown): string | undefined {
+  private extractChildIdFromToolResult(event: SessionEvent): string | undefined {
+    return this.extractChildInfoFromToolResult(event)?.childId;
+  }
+
+  private extractChildIdFromStructuredSource(source: unknown, sessionId?: string, itemOrData?: unknown): string | undefined {
     if (!source || typeof source !== 'object') return undefined;
     const s = source as Record<string, unknown>;
     if ((s.kind === 'subagent-settled' || s.kind === 'agent-message') && typeof s.senderSessionId === 'string' && s.senderSessionId.trim().length > 0) {
       return s.senderSessionId.trim();
     }
     if (s.kind === 'tool-jobs' || (s.kind === 'plugin' && s.plugin === 'tool-jobs')) {
-      if (typeof s.jobId === 'string' && s.jobId.trim().length > 0) {
-        return s.jobId.trim();
+      // (1) Resolve from structured fields if present
+      const structuredJobId = typeof s.jobId === 'string' && s.jobId.trim().length > 0 ? s.jobId.trim()
+        : typeof s.job_id === 'string' && s.job_id.trim().length > 0 ? s.job_id.trim()
+        : typeof s.id === 'string' && s.id.trim().length > 0 ? s.id.trim()
+        : (itemOrData && typeof itemOrData === 'object') ? (
+            typeof (itemOrData as any).jobId === 'string' && (itemOrData as any).jobId.trim().length > 0 ? (itemOrData as any).jobId.trim()
+            : typeof (itemOrData as any).job_id === 'string' && (itemOrData as any).job_id.trim().length > 0 ? (itemOrData as any).job_id.trim()
+            : typeof (itemOrData as any).meta?.jobId === 'string' && (itemOrData as any).meta.jobId.trim().length > 0 ? (itemOrData as any).meta.jobId.trim()
+            : undefined
+          ) : undefined;
+
+      if (structuredJobId) {
+        if (sessionId) {
+          const jobs = this.sessionJobs.get(sessionId);
+          if (jobs) {
+            const match = jobs.find(j => !j.matched && j.jobId === structuredJobId);
+            if (match) match.matched = true;
+          }
+        }
+        return structuredJobId;
       }
-      const summary = typeof s.summary === 'string' ? s.summary : '';
-      const match = summary.match(/(?:job\s+)?([a-zA-Z0-9_\-]+-\d+)/i);
-      if (match) return match[1];
+
+      // (2) Resolve from summary by matching the job NAME recorded at start (workflow name) within the same session
+      const summary = typeof s.summary === 'string' ? s.summary
+        : (itemOrData && typeof itemOrData === 'object' && typeof (itemOrData as any).summary === 'string') ? (itemOrData as any).summary
+        : '';
+
+      if (sessionId && summary) {
+        const jobs = this.sessionJobs.get(sessionId);
+        if (jobs && jobs.length > 0) {
+          const unmatchedWithNames = jobs.filter(j => !j.matched && typeof j.jobName === 'string' && j.jobName.trim().length > 0);
+          unmatchedWithNames.sort((a, b) => (b.jobName?.length ?? 0) - (a.jobName?.length ?? 0));
+          for (const candidate of unmatchedWithNames) {
+            const name = candidate.jobName!.trim();
+            const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const nameRegex = new RegExp(`(?:^|[\\s"':,])${escaped}(?:[\\s"'\\],:]|$)`, 'i');
+            if (nameRegex.test(summary) || summary.includes(name)) {
+              candidate.matched = true;
+              return candidate.jobId;
+            }
+          }
+        }
+      }
+
+      // (3) Fall back to the most recent unmatched job mapping of that session
+      if (sessionId) {
+        const jobs = this.sessionJobs.get(sessionId);
+        if (jobs && jobs.length > 0) {
+          const unmatched = jobs.filter(j => !j.matched);
+          if (unmatched.length > 0) {
+            const fallbackJob = unmatched[unmatched.length - 1];
+            fallbackJob.matched = true;
+            return fallbackJob.jobId;
+          }
+        }
+      }
+
+      // (4) Fallback: match from summary regex or content text for standalone/legacy events
+      if (summary) {
+        const match = summary.match(/(?:job\s+)?([a-zA-Z0-9_\-]+-\d+)/i);
+        if (match) return match[1].replace(/[.,;:\s]+$/, '').trim();
+      }
+
+      if (itemOrData && typeof itemOrData === 'object') {
+        const msg = (itemOrData as any).message ?? itemOrData;
+        const texts: string[] = [];
+        const collect = (val: any) => {
+          if (!val) return;
+          if (typeof val === 'string') texts.push(val);
+          else if (Array.isArray(val)) for (const item of val) collect(item);
+          else if (typeof val === 'object') {
+            if (typeof val.text === 'string') texts.push(val.text);
+            if (val.content) collect(val.content);
+          }
+        };
+        collect(msg.content ?? (itemOrData as any).content);
+        for (const txt of texts) {
+          const textMatch = txt.match(/background\s+job\s+([A-Za-z0-9_\-:.]{1,128})/i);
+          if (textMatch) return textMatch[1].replace(/[.,;:\s]+$/, '').trim();
+        }
+      }
     }
     return undefined;
   }
@@ -371,9 +575,22 @@ export class EventRelayService implements IEventRelayService {
   }
 
   private recordPendingAutonomousOrigin(sessionId: string, childId: string): void {
-    const originTurnId = this.resolveOriginTurnId(`${sessionId}:${childId}`) ?? this.resolveOriginTurnId(childId);
+    let originTurnId = this.resolveOriginTurnId(`${sessionId}:${childId}`);
+    if (!originTurnId) {
+      const jobs = this.sessionJobs.get(sessionId);
+      const j = jobs?.find((x) => x.jobId === childId);
+      if (j) originTurnId = j.originTurnId;
+    }
+    if (!originTurnId) {
+      originTurnId = this.resolveOriginTurnId(childId);
+    }
     if (originTurnId) {
-      this.pendingAutonomousOrigins.set(sessionId, { originTurnId, causeChildId: childId });
+      let list = this.pendingAutonomousOrigins.get(sessionId);
+      if (!list) {
+        list = [];
+        this.pendingAutonomousOrigins.set(sessionId, list);
+      }
+      list.push({ originTurnId, causeChildId: childId });
     }
   }
 
@@ -436,10 +653,25 @@ export class EventRelayService implements IEventRelayService {
 
   private stampAndEnqueueFrames(sessionId: string, frames: ContainerStreamingEventFrame[], currentTurn?: number): void {
     if (frames.length === 0) return;
-    const scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
-    const turnId = scopedCtx?.platformTurnId ?? (scopedCtx as any)?.turnId;
-    const originTurnId = scopedCtx?.originTurnId;
-    const causeChildId = scopedCtx?.causeChildId;
+    let scopedCtx = (currentTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${currentTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+    let turnId = scopedCtx?.platformTurnId ?? (scopedCtx as any)?.turnId;
+    let originTurnId = scopedCtx?.originTurnId;
+    let causeChildId = scopedCtx?.causeChildId;
+
+    if (!turnId) {
+      const autoTurnId = `turn_auto_${sessionId.slice(0, 8)}_${currentTurn ?? 1}_${randomBytes(4).toString('hex')}`;
+      const autoCtx = {
+        platformTurnId: autoTurnId,
+        originTurnId: undefined,
+        causeChildId: undefined,
+        dshIntTurn: currentTurn,
+      };
+      if (currentTurn !== undefined) {
+        this.dshIntTurnMap.set(`${sessionId}:${currentTurn}`, autoCtx);
+      }
+      this.activeTurnContexts.set(sessionId, autoCtx);
+      turnId = autoTurnId;
+    }
 
     for (const f of frames) {
       if (turnId && !f.turnId) (f as any).turnId = turnId;
@@ -548,10 +780,27 @@ export class EventRelayService implements IEventRelayService {
     if (event.type === 'tool/result') {
       const intTurn = (event.data as any)?.turn;
       const turnCtx = (intTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${intTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
-      const childId = this.extractChildIdFromToolResult(event);
-      if (childId && turnCtx?.platformTurnId) {
+      const childInfo = this.extractChildInfoFromToolResult(event, sessionId);
+      if (childInfo && turnCtx?.platformTurnId) {
+        const { childId, jobName, isJob } = childInfo;
+        if (isJob) {
+          let jobs = this.sessionJobs.get(sessionId);
+          if (!jobs) {
+            jobs = [];
+            this.sessionJobs.set(sessionId, jobs);
+          }
+          jobs.push({
+            jobId: childId,
+            jobName,
+            originTurnId: turnCtx.platformTurnId,
+            matched: false,
+            createdAt: Date.now(),
+          });
+        }
         this.recordChildInitiation(`${sessionId}:${childId}`, turnCtx.platformTurnId);
-        this.recordChildInitiation(childId, turnCtx.platformTurnId);
+        if (!isJob) {
+          this.recordChildInitiation(childId, turnCtx.platformTurnId);
+        }
         const store = this.receiptStore;
         if (store && typeof (store as any).recordChildOrigin === 'function') {
           void (store as any).recordChildOrigin(sessionId, childId, turnCtx.platformTurnId).catch(() => {});
@@ -566,12 +815,20 @@ export class EventRelayService implements IEventRelayService {
         const inserted = (event.data as any)?.inserted;
         if (Array.isArray(inserted)) {
           for (const item of inserted) {
-            const childId = this.extractChildIdFromStructuredSource(item?.source);
+            const childId = this.extractChildIdFromStructuredSource(
+              item?.source ?? item?.message?.source,
+              sessionId,
+              item
+            );
             if (childId) this.recordPendingAutonomousOrigin(sessionId, childId);
           }
         }
       } else if (eventType === 'user/message') {
-        const childId = this.extractChildIdFromStructuredSource((event.data as any)?.source);
+        const childId = this.extractChildIdFromStructuredSource(
+          (event.data as any)?.source ?? (event.data as any)?.message?.source,
+          sessionId,
+          event.data
+        );
         if (childId) this.recordPendingAutonomousOrigin(sessionId, childId);
       }
     }
@@ -579,14 +836,19 @@ export class EventRelayService implements IEventRelayService {
     // 3. Autonomous turn start
     if (event.type === 'turn/start') {
       const intTurn = (event.data as any)?.turn;
-      if (this.pendingAutonomousOrigins.has(sessionId)) {
-        const pending = this.pendingAutonomousOrigins.get(sessionId)!;
-        this.pendingAutonomousOrigins.delete(sessionId);
+      const existing = (intTurn !== undefined ? this.dshIntTurnMap.get(`${sessionId}:${intTurn}`) : undefined) ?? this.activeTurnContexts.get(sessionId);
+      if (!existing?.platformTurnId) {
+        const pendingList = this.pendingAutonomousOrigins.get(sessionId);
+        const pending = (pendingList && pendingList.length > 0) ? pendingList.shift() : undefined;
+        if (pendingList && pendingList.length === 0) {
+          this.pendingAutonomousOrigins.delete(sessionId);
+        }
         const autoTurnId = `turn_auto_${sessionId.slice(0, 8)}_${intTurn ?? 1}_${randomBytes(4).toString('hex')}`;
         const autoCtx = {
           platformTurnId: autoTurnId,
-          originTurnId: pending.originTurnId,
-          causeChildId: pending.causeChildId,
+          originTurnId: pending?.originTurnId,
+          causeChildId: pending?.causeChildId,
+          dshIntTurn: intTurn,
         };
         if (intTurn !== undefined) {
           this.dshIntTurnMap.set(`${sessionId}:${intTurn}`, autoCtx);
@@ -622,6 +884,11 @@ export class EventRelayService implements IEventRelayService {
         const streamState = this.getOrCreateStreamState(sessionId);
         const toolName = typeof event.data.name === 'string' && event.data.name.length > 0 ? event.data.name : 'tool';
         const callId = this.extractCallIdFromToolCall(event);
+        const args = (event.data as any).arguments ?? (event.data as any).args;
+        const jobName = typeof args?.meta?.name === 'string' ? args.meta.name
+          : typeof args?.label === 'string' ? args.label
+          : typeof args?.description === 'string' ? args.description
+          : undefined;
         streamState.activeToolName = toolName;
 
         if (callId) {
@@ -638,7 +905,7 @@ export class EventRelayService implements IEventRelayService {
           pendingList = [];
           this.sessionPendingToolCalls.set(sessionId, pendingList);
         }
-        pendingList.push({ callId, toolName });
+        pendingList.push({ callId, toolName, jobName });
 
         const payload: Record<string, unknown> = {
           toolName,
@@ -1067,6 +1334,11 @@ export class EventRelayService implements IEventRelayService {
     this.activeTurnSessions.clear();
     this.sessionToolCalls.clear();
     this.sessionPendingToolCalls.clear();
+    this.sessionJobs.clear();
+    this.pendingAutonomousOrigins.clear();
+    this.activeTurnContexts.clear();
+    this.dshIntTurnMap.clear();
+    this.childOriginMap.clear();
     this.buffer.clear();
     this.subscribers.clear();
   }
