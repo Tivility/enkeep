@@ -14,6 +14,7 @@ import type {
   StreamAssistantEvent,
   StreamEventSource,
 } from './types.js';
+import type { LarkBackgroundPanelManager } from './background-panel.js';
 import {
   formatToolStatusMarkdown,
   formatThinkingContent,
@@ -99,6 +100,7 @@ export interface StreamingReplyTrackerOptions {
   enableCot?: boolean;
   cotEnabled?: boolean;
   isCotEnabled?: (chatId?: string) => boolean;
+  backgroundPanelManager?: LarkBackgroundPanelManager;
 }
 
 /**
@@ -344,6 +346,8 @@ export class StreamingReplyTracker {
   private finalizedResult: { handled: boolean; messageId?: string; degraded?: boolean } | null = null;
   private seenOwnRunning = false;
 
+  private readonly backgroundPanelManager?: LarkBackgroundPanelManager;
+
   constructor(options: StreamingReplyTrackerOptions) {
     this.transport = options.transport;
     this.streamEventSource = options.streamEventSource;
@@ -358,6 +362,7 @@ export class StreamingReplyTracker {
     this.initialMetadata = options.metadata;
     this.withStopButton = options.withStopButton ?? options.cardParams?.withStopButton;
     this.senderId = options.senderId;
+    this.backgroundPanelManager = options.backgroundPanelManager;
     this.startTime = Date.now();
     this.lastActivityAt = this.startTime;
     this.lastPushedStatusBucket = Math.floor(this.startTime / 5000);
@@ -471,6 +476,14 @@ export class StreamingReplyTracker {
       this.cardSessionPromise = this.transport.createStreamingCard(cardParams).then(
         (session) => {
           this.cardSession = session;
+          if (session && this.backgroundPanelManager) {
+            void this.backgroundPanelManager.registerCard(
+              this.sessionRouteId,
+              this.cardParams.chatId,
+              session,
+              this.turnId
+            );
+          }
           return session;
         },
         () => {
@@ -1092,6 +1105,13 @@ export class StreamingReplyTracker {
       await session.finalize(textToFinalize, status, finalMetadata, finalToolStatus, finalThinking);
       const res = { handled: true, messageId: session.messageId };
       this.finalizedResult = res;
+      if (this.backgroundPanelManager) {
+        void this.backgroundPanelManager.onTurnFinalized(
+          this.sessionRouteId,
+          this.cardParams.chatId,
+          this.turnId
+        );
+      }
       if (this.detached) {
         console.info('[lark-cont] detached finalize exit', {
           routeId: this.sessionRouteId,

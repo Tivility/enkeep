@@ -414,6 +414,16 @@ export interface RuntimeGateway {
     readonly error?: string;
   } | null>;
   cancelTurn?(userId: string, turnId: string): Promise<boolean>;
+  getBackgroundTasks?(
+    userId: string,
+    sessionId: string,
+    options?: { chatContextId?: string }
+  ): Promise<{ items: any[]; updatedAt: string }>;
+  stopBackgroundTask?(
+    userId: string,
+    sessionId: string,
+    taskId: string
+  ): Promise<{ stopped: boolean }>;
 }
 
 export type { LifecycleStatus, AuthContext, PublicMessageAttachment, CanonicalAttachment };

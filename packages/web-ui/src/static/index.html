@@ -232,6 +232,7 @@
                   <span id="session-generation-badge" class="badge badge-generation hidden">Gen 1</span>
                   <span id="session-turn-status-badge" class="badge badge-running hidden" data-i18n="chat.statusThinking">Thinking...</span>
                   <span id="session-model-badge" class="badge badge-info hidden" title="Current effective model" data-i18n-title="models.kpiRouting">⚡ Model</span>
+                  <button id="btn-session-bg" class="badge badge-info hidden" title="Background tasks" data-i18n-title="tasks.bgHeaderTitle">0 Background</button>
                 </div>
                 <span id="current-session-meta" class="session-meta">Active Session: -</span>
               </div>
@@ -508,6 +509,22 @@
       </div>
       <div class="modal-actions">
         <button type="button" class="btn btn-secondary" data-close="modal-turns-history" data-i18n="modal.close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Background Tasks Modal -->
+  <div id="modal-background-tasks" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-bg-tasks-title">
+    <div class="modal-card modal-card-large">
+      <div class="modal-header">
+        <h3 id="modal-bg-tasks-title" data-i18n="tasks.bgModalTitle">Background Tasks</h3>
+        <button class="modal-close" data-close="modal-background-tasks" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <div id="bg-tasks-content" class="modal-body turns-history-container">
+        <!-- Dynamically rendered background tasks table -->
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-close="modal-background-tasks" data-i18n="modal.close">Close</button>
       </div>
     </div>
   </div>

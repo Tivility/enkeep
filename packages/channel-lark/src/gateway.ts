@@ -48,6 +48,7 @@ import type {
 import { StreamingReplyTracker } from './streaming-tracker.js';
 import { ContinuationWatcher, type ContinuationTarget } from './continuation-watcher.js';
 import { LarkCotManager, type LarkCotApiClient, type CotEntry } from './cot.js';
+import { LarkBackgroundPanelManager } from './background-panel.js';
 import { isReasoningModelOrEffort } from './transport.js';
 
 export interface LarkChannelGatewayOptions {
@@ -120,6 +121,7 @@ export class LarkChannelGateway {
   private readonly stoppedTurns = new Set<string>();
   private readonly finalizedStopTurns = new Set<string>();
   readonly cotManager: LarkCotManager;
+  readonly backgroundPanelManager: LarkBackgroundPanelManager;
   private readonly configuredWithThinkingPanel?: boolean;
   private readonly isOperatorAllowedCallback?: (params: {
     operatorId: string;
@@ -146,6 +148,18 @@ export class LarkChannelGateway {
       enabled: options.enableCot ?? false,
       apiClient: options.cotApiClient ?? ((this.transport as any).apiClient || (this.transport as any).getApiClient?.()),
       noCotChats: options.noCotChats,
+    });
+    this.backgroundPanelManager = new LarkBackgroundPanelManager({
+      getBackgroundTasks: async (sessionId, opts) => {
+        if (typeof this.runtimeGateway.getBackgroundTasks === 'function') {
+          const userId = this.account.userId || '';
+          return this.runtimeGateway.getBackgroundTasks(userId, sessionId, opts);
+        }
+        if (typeof this.streamEventSource?.getBackgroundTasks === 'function') {
+          return this.streamEventSource.getBackgroundTasks(sessionId, opts);
+        }
+        return { items: [], updatedAt: new Date().toISOString() };
+      },
     });
 
     // Register event listener with transport
@@ -253,6 +267,7 @@ export class LarkChannelGateway {
       initialCursor,
       hasActiveInboundTracker: (rId) => this.hasActiveTrackerForRoute(rId),
       deriveOutboxId: (tId) => this.deriveOutboxId(tId),
+      backgroundPanelManager: this.backgroundPanelManager,
       onStopped: () => {
         this.continuationWatchers.delete(routeId);
       },
@@ -1250,6 +1265,7 @@ export class LarkChannelGateway {
           withStatusPanel: true,
           withThinkingPanel: hasThinking,
           withStatusBar: true,
+          backgroundPanelManager: this.backgroundPanelManager,
           cardParams: {
             chatId: parsed.chatId,
             replyToMessageId: parsed.messageId,
@@ -2303,6 +2319,7 @@ export class LarkChannelGateway {
   async dispose(): Promise<void> {
     this.isDisposed = true;
     this.cotManager.dispose();
+    this.backgroundPanelManager.dispose();
     for (const tracker of this.activeTrackers.values()) {
       tracker.stop();
     }

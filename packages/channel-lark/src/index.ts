@@ -21,3 +21,4 @@ export * from './onboarding/automation.js';
 export * from './onboarding/qr-generator.js';
 export * from './cli-credential-bridge.js';
 export * from './cot.js';
+export * from './background-panel.js';

@@ -128,6 +128,8 @@ export {
   type TurnExecutionResult,
   type DrainableRuntimeGateway,
   isDrainableRuntimeGateway,
+  type BackgroundTask,
+  type BackgroundTaskProgress,
   type QuotaMode,
   type QuotaReservationBundle,
   type QuotaReservationRequest,

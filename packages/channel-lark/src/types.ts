@@ -221,6 +221,29 @@ export interface StreamEventSource {
     sessionRouteId: string,
     turnId: string
   ): Promise<CardFinalMetadata | null>;
+  getBackgroundTasks?(
+    sessionId: string,
+    options?: { chatContextId?: string }
+  ): Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+}
+
+export interface BackgroundTask {
+  id: string;
+  shortId: string;
+  kind: 'subagent' | 'workflow' | 'job';
+  name: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  startedAt: string;
+  finishedAt?: string;
+  lastActivityAt: string;
+  stalled: boolean;
+  progress?: {
+    agentsDone?: number;
+    agentsTotal?: number;
+    step?: number;
+  };
+  originTurnId?: string;
+  originChatContextId?: string;
 }
 
 export interface OutboundReplyResult {
@@ -232,7 +255,7 @@ export interface OutboundReplyResult {
 export interface LarkStreamingCardSession {
   readonly cardId: string;
   readonly messageId: string;
-  pushText(accumulatedText: string, toolStatus?: string, thinkingText?: string, statusLine?: string): Promise<void>;
+  pushText(accumulatedText: string, toolStatus?: string, thinkingText?: string, statusLine?: string, backgroundPanel?: string | null): Promise<void>;
   pushToolStatus?(statusText: string): Promise<void>;
   pushThinking?(thinkingText: string): Promise<void>;
   pushStatusLine?(statusText: string): Promise<void>;
@@ -241,8 +264,10 @@ export interface LarkStreamingCardSession {
     status: 'completed' | 'failed' | 'stopped',
     metadata?: CardFinalMetadata,
     toolStatus?: string | readonly CardToolStatusEntry[],
-    thinkingText?: string
+    thinkingText?: string,
+    backgroundPanel?: string | null
   ): Promise<void>;
+  updateBackgroundPanel?(panelText: string | null): Promise<void>;
 }
 
 export type LarkEventHandler = (event: LarkRawEvent) => Promise<any>;

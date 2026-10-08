@@ -2990,6 +2990,46 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           return;
         }
 
+        // 6.1.7e /api/sessions/:sessionId/background
+        if (subPath === "/background") {
+          if (method !== "GET") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          const chatContextId = parsedUrl.searchParams.get("chatContextId") || undefined;
+          let bgRes: { items: unknown[]; updatedAt: string };
+          if (typeof runtimeGateway.getBackgroundTasks === "function") {
+            bgRes = await runtimeGateway.getBackgroundTasks(user.id, sessionId, { chatContextId });
+          } else {
+            bgRes = { items: [], updatedAt: new Date().toISOString() };
+          }
+          sendJsonResponse(res, 200, createSuccessEnvelope(bgRes));
+          return;
+        }
+
+        // 6.1.7f /api/sessions/:sessionId/background/:taskId/stop
+        const bgStopMatch = subPath.match(/^\/background\/([^/]+)\/stop$/);
+        if (bgStopMatch) {
+          if (method !== "POST") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          validateCsrf(req, { csrfToken });
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          const taskId = decodeURIComponent(bgStopMatch[1]);
+          let stopRes = { stopped: false };
+          if (typeof runtimeGateway.stopBackgroundTask === "function") {
+            stopRes = await runtimeGateway.stopBackgroundTask(user.id, sessionId, taskId);
+          }
+          sendJsonResponse(res, 200, createSuccessEnvelope(stopRes));
+          return;
+        }
+
         // 6.1.8 /api/sessions/:sessionId/messages
         if (subPath === "/messages") {
           if (method === "GET") {

@@ -39,6 +39,7 @@ import type {
   DeliveryExecutionRequest,
   TurnExecutionResult,
   InspectedTurnResult,
+  BackgroundTask,
 } from './delivery-gateway.js';
 import type {
   TenantRuntimeFileProvider,
@@ -198,6 +199,63 @@ export class CompositeDeliveryTurnExecutor implements DeliveryTurnExecutor {
       }
     }
     return { status: 'absent' };
+  }
+
+  async listBackgroundTasks(req: {
+    userId: string;
+    platformSpaceId: string;
+    dshSessionId: string;
+  }): Promise<BackgroundTask[]> {
+    let mode: ExecutionMode = 'container';
+    if (this.db && req.platformSpaceId && req.userId) {
+      const spaceRow = this.db
+        .prepare('SELECT execution_mode FROM spaces WHERE id = ? AND user_id = ?')
+        .get(req.platformSpaceId, req.userId) as { execution_mode?: string } | undefined;
+      if (spaceRow?.execution_mode) {
+        mode = spaceRow.execution_mode as ExecutionMode;
+      }
+    }
+    const provider = this.registry.getProvider(mode);
+    if (provider?.turnExecutor && typeof provider.turnExecutor.listBackgroundTasks === 'function') {
+      try {
+        const res = await provider.turnExecutor.listBackgroundTasks(req);
+        if (Array.isArray(res)) {
+          return res;
+        }
+      } catch {
+        // continue
+      }
+    }
+    return [];
+  }
+
+  async stopBackgroundTask(req: {
+    userId: string;
+    platformSpaceId: string;
+    dshSessionId: string;
+    taskId: string;
+  }): Promise<{ stopped: boolean }> {
+    let mode: ExecutionMode = 'container';
+    if (this.db && req.platformSpaceId && req.userId) {
+      const spaceRow = this.db
+        .prepare('SELECT execution_mode FROM spaces WHERE id = ? AND user_id = ?')
+        .get(req.platformSpaceId, req.userId) as { execution_mode?: string } | undefined;
+      if (spaceRow?.execution_mode) {
+        mode = spaceRow.execution_mode as ExecutionMode;
+      }
+    }
+    const provider = this.registry.getProvider(mode);
+    if (provider?.turnExecutor && typeof provider.turnExecutor.stopBackgroundTask === 'function') {
+      try {
+        const res = await provider.turnExecutor.stopBackgroundTask(req);
+        if (res?.stopped) {
+          return { stopped: true };
+        }
+      } catch {
+        // continue
+      }
+    }
+    return { stopped: false };
   }
 }
 

@@ -1552,25 +1552,51 @@ function logWarn(agentCtx: Context, message: string): void {
 }
 
   /**
-   * Installs agent-scoped fallback router and telemetry recorder onto agentCtx.
+   * Installs Host-scoped fallback router and telemetry recorder onto Host ctx.
+   * Intercepts LLM request failures for EVERY agent (top-level sessions, subagents,
+   * fork children, and workflow children) with bounded retry & backoff.
    */
-  function installAgentFallbackRouter(
-    agentCtx: Context,
-    sid: string,
-    selectionRef: { current: { provider: string; model: string; reasoningEffort?: any } | undefined }
+  function installHostFallbackRouter(
+    hostCtx: Context,
   ): () => void {
-    const disposeSession = agentCtx.on('session/event', (_subject, event) => {
+    const disposeSession = hostCtx.on('session/event', (session: any, event: any) => {
+      const sid = String(session?.id ?? '');
+      if (!sid) return;
       const fbCtx = activeFallbackContexts.get(sid);
-      if (!fbCtx || !fbCtx.active) return;
-      if (event.type === 'step/start') {
-        fbCtx.stepChunksCount = 0;
-        fbCtx.currentAttemptStart = Date.now();
+      if (event?.type === 'step/start') {
+        if (fbCtx && fbCtx.active) {
+          fbCtx.stepChunksCount = 0;
+          fbCtx.currentAttemptStart = Date.now();
+        }
+      } else if (event?.type === 'turn/end') {
+        if (fbCtx && !agentSelectionRefs.has(sid)) {
+          activeFallbackContexts.delete(sid);
+        }
       }
     });
 
-    const disposeStream = agentCtx.on('agent/assistant-stream', (payload: any) => {
-      const fbCtx = activeFallbackContexts.get(sid);
-      if (!fbCtx || !fbCtx.active) return;
+    const disposeStream = hostCtx.on('agent/assistant-stream', (payload: any) => {
+      const sid = String(payload?.agent?.id ?? '');
+      if (!sid) return;
+      let fbCtx = activeFallbackContexts.get(sid);
+      if (!fbCtx) {
+        const childCandidate: AgentFallbackCandidate = {
+          provider: (payload.agent?.options as any)?.provider || provider,
+          model: (payload.agent?.options as any)?.model || model || '',
+          reasoningEffort: (payload.agent?.options as any)?.reasoningEffort ?? undefined,
+        };
+        fbCtx = {
+          candidates: [childCandidate],
+          candidateIndex: 0,
+          candidateRetries: 0,
+          routeAttempts: [],
+          currentAttemptStart: Date.now(),
+          stepChunksCount: 0,
+          active: true,
+        };
+        activeFallbackContexts.set(sid, fbCtx);
+      }
+      if (!fbCtx.active) return;
       const frame = payload?.frame;
       if (frame && frame.type === 'chunk') {
         const chunk = frame.chunk;
@@ -1586,16 +1612,39 @@ function logWarn(agentCtx: Context, message: string): void {
       }
     });
 
-    const disposeRequestError = agentCtx.on('agent/request-error', async (payload, next) => {
-      const fbCtx = activeFallbackContexts.get(sid);
-      if (!fbCtx || !fbCtx.active || fbCtx.candidates.length === 0) {
+    const disposeRequestError = hostCtx.on('agent/request-error', async (payload: any, next: any) => {
+      const sid = String(payload?.agent?.id ?? '');
+      const selectionRef = sid ? agentSelectionRefs.get(sid) : undefined;
+
+      let fbCtx = sid ? activeFallbackContexts.get(sid) : undefined;
+      if (!fbCtx) {
+        const childCandidate: AgentFallbackCandidate = {
+          provider: payload.provider,
+          model: selectionRef?.current?.model || (payload.agent?.options as any)?.model || model || '',
+          reasoningEffort: selectionRef?.current?.reasoningEffort ?? (payload.agent?.options as any)?.reasoningEffort ?? undefined,
+        };
+        fbCtx = {
+          candidates: [childCandidate],
+          candidateIndex: 0,
+          candidateRetries: 0,
+          routeAttempts: [],
+          currentAttemptStart: Date.now(),
+          stepChunksCount: 0,
+          active: true,
+        };
+        if (sid) {
+          activeFallbackContexts.set(sid, fbCtx);
+        }
+      }
+
+      if (!fbCtx.active || fbCtx.candidates.length === 0) {
         return next();
       }
 
       const currentCand = fbCtx.candidates[fbCtx.candidateIndex] || {
         provider: payload.provider,
-        model: selectionRef.current?.model || '',
-        reasoningEffort: selectionRef.current?.reasoningEffort,
+        model: selectionRef?.current?.model || (payload.agent?.options as any)?.model || model || '',
+        reasoningEffort: selectionRef?.current?.reasoningEffort || (payload.agent?.options as any)?.reasoningEffort,
       };
       const latencyMs = Math.max(1, Date.now() - fbCtx.currentAttemptStart);
       const classification = classifyError(payload.failure);
@@ -1645,7 +1694,7 @@ function logWarn(agentCtx: Context, message: string): void {
 
       if (is4xxValidationError) {
         logWarn(
-          agentCtx,
+          payload.agent?.ctx ?? hostCtx,
           `[dsh-boot] LLM request failed with non-retryable 4xx validation/client error (status: ${effectiveStatusCode ?? 'unknown'}, code: ${failureCode || 'none'}): ${failureMsg}. Skipping retry.`
         );
         return next();
@@ -1678,7 +1727,7 @@ function logWarn(agentCtx: Context, message: string): void {
 
       if (!isTransientClass) {
         logWarn(
-          agentCtx,
+          payload.agent?.ctx ?? hostCtx,
           `[dsh-boot] LLM request failed with non-transient error (status: ${effectiveStatusCode ?? 'unknown'}, code: ${failureCode || 'none'}): ${failureMsg}. Skipping retry.`
         );
         return next();
@@ -1712,14 +1761,14 @@ function logWarn(agentCtx: Context, message: string): void {
 
         const retryAttempt = fbCtx.candidateRetries + 1;
         logInfo(
-          agentCtx,
+          payload.agent?.ctx ?? hostCtx,
           `[dsh-boot] LLM transient error retry attempt ${retryAttempt}/${maxRetries} for ${currentCand.provider}/${currentCand.model} after ${delayMs}ms backoff (${isRetryAfter ? 'Retry-After' : 'backoff schedule'}) (status: ${effectiveStatusCode ?? 'unknown'}, code: ${failureCode || 'none'}): ${failureMsg}`
         );
 
         const ok = await abortableSleep(delayMs, payload.signal);
         if (!ok || payload.signal?.aborted) {
           logWarn(
-            agentCtx,
+            payload.agent?.ctx ?? hostCtx,
             `[dsh-boot] LLM retry cancelled by abort signal during ${delayMs}ms backoff delay.`
           );
           return;
@@ -1731,7 +1780,7 @@ function logWarn(agentCtx: Context, message: string): void {
       }
 
       logWarn(
-        agentCtx,
+        payload.agent?.ctx ?? hostCtx,
         `[dsh-boot] LLM transient error retries exhausted (${maxRetries}/${maxRetries}) for candidate ${currentCand.provider}/${currentCand.model}. Checking fallback chain.`
       );
 
@@ -1744,14 +1793,16 @@ function logWarn(agentCtx: Context, message: string): void {
           fbCtx.candidateIndex = nextIdx;
           fbCtx.candidateRetries = 0;
           fbCtx.currentAttemptStart = Date.now();
-          selectionRef.current = {
-            provider: nextCand.provider,
-            model: nextCand.model,
-            reasoningEffort: nextCand.reasoningEffort || undefined,
-          };
-          (selectionRef as any).assembled = selectionRef.current;
+          if (selectionRef) {
+            selectionRef.current = {
+              provider: nextCand.provider,
+              model: nextCand.model,
+              reasoningEffort: nextCand.reasoningEffort || undefined,
+            };
+            (selectionRef as any).assembled = selectionRef.current;
+          }
           logInfo(
-            agentCtx,
+            payload.agent?.ctx ?? hostCtx,
             `[dsh-boot] LLM fallback advancing to candidate ${nextIdx} (${nextCand.provider}/${nextCand.model}).`
           );
           return { kind: 'retry' };
@@ -1761,18 +1812,28 @@ function logWarn(agentCtx: Context, message: string): void {
 
       // All candidates exhausted or non-retryable error
       logWarn(
-        agentCtx,
+        payload.agent?.ctx ?? hostCtx,
         `[dsh-boot] All LLM candidates exhausted or circuit-broken for session ${sid}. Failing turn.`
       );
       return next();
+    });
+
+    const disposeDisposed = hostCtx.on('agent/disposed', (payload: any) => {
+      const sid = String(payload?.agent?.id ?? '');
+      if (sid) {
+        activeFallbackContexts.delete(sid);
+      }
     });
 
     return () => {
       disposeSession();
       disposeStream();
       disposeRequestError();
+      disposeDisposed();
     };
   }
+
+  const disposeHostFallbackRouter = installHostFallbackRouter(ctx);
 
   // Map to track active profile hash by session id
   const sessionProfileHashes = new Map<string, string>();
@@ -2243,7 +2304,6 @@ function logWarn(agentCtx: Context, message: string): void {
         if (validatedProfile) {
           installAgentProfile(agentCtx, validatedProfile);
         }
-        installAgentFallbackRouter(agentCtx, sessionIdStr, selectionRef);
         agentCtx.effect(() => {
           const eventRelay = ctx.eventRelay ?? (ctx.get ? ctx.get('eventRelay') : undefined);
           if (eventRelay && typeof eventRelay.attachAgent === 'function') {
@@ -3493,7 +3553,6 @@ function logWarn(agentCtx: Context, message: string): void {
           if (validatedProfile) {
             installAgentProfile(agentCtx, validatedProfile);
           }
-          installAgentFallbackRouter(agentCtx, sessionIdStr, selectionRef!);
           agentCtx.effect(() => {
             const eventRelay = ctx.eventRelay ?? (ctx.get ? ctx.get('eventRelay') : undefined);
             if (eventRelay && typeof eventRelay.attachAgent === 'function') {
@@ -4279,6 +4338,14 @@ function logWarn(agentCtx: Context, message: string): void {
           err instanceof Error ? err : new Error('Disposal failure', { cause: err })
         );
       }
+    }
+
+    try {
+      disposeHostFallbackRouter();
+    } catch (err: unknown) {
+      disposalErrors.push(
+        err instanceof Error ? err : new Error('Fallback router disposal failure', { cause: err })
+      );
     }
 
     try {

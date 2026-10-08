@@ -1294,6 +1294,30 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           };
         }
       },
+      listBackgroundTasks: async (sessionId: string) => {
+        try {
+          const transport = await getOrStartTransport();
+          if (!transport.listBackgroundTasks) {
+            return [];
+          }
+          const res = await transport.listBackgroundTasks(sessionId);
+          return res.items ?? [];
+        } catch {
+          return [];
+        }
+      },
+      stopBackgroundTask: async (sessionId: string, taskId: string) => {
+        try {
+          const transport = await getOrStartTransport();
+          if (!transport.stopBackgroundTask) {
+            return { stopped: false };
+          }
+          const res = await transport.stopBackgroundTask(sessionId, taskId);
+          return { stopped: Boolean(res?.stopped) };
+        } catch {
+          return { stopped: false };
+        }
+      },
       fileOperation: async (request: FileOperationRequest): Promise<ExecCliEnvelope> => {
         try {
           const transport = await getOrStartTransport();

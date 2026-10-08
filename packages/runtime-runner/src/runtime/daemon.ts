@@ -22,6 +22,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import EventEmitter from 'node:events';
 import { type Context } from '@deepseek-ai/cordis';
+import { carrierKeyOf } from '@deepseek-ai/dsh-scope';
 import {
   createUserMessage,
 } from '@deepseek-ai/dsh-llm';
@@ -130,6 +131,11 @@ import {
   type SessionActivityDetail,
   type DaemonErrorResponse,
   type DaemonEvictionReason,
+  type BackgroundTask,
+  type ListBackgroundTasksRequest,
+  type ListBackgroundTasksResponse,
+  type StopBackgroundTaskRequest,
+  type StopBackgroundTaskResponse,
 } from './daemon-protocol.js';
 import type {
   AgentFollowupResponse,
@@ -225,6 +231,51 @@ export interface ManagedAgentEntry {
   };
 }
 
+export function computeTaskShortId(taskId: string, allTaskIds: string[]): string {
+  const stripPrefix = (id: string) => {
+    if (id.startsWith('ses_') || id.startsWith('ses-')) return id.slice(4);
+    if (id.startsWith('job_') || id.startsWith('job-')) return id.slice(4);
+    if (id.startsWith('wf_') || id.startsWith('wf-')) return id.slice(3);
+    const idx = id.indexOf('_');
+    return idx >= 0 ? id.slice(idx + 1) : id;
+  };
+  const stripped = stripPrefix(taskId).replace(/[^a-zA-Z0-9]/g, '');
+  const cleanId = stripped.length >= 4 ? stripped : taskId.replace(/[^a-zA-Z0-9]/g, '');
+  const base = cleanId.length >= 4 ? cleanId : (taskId.replace(/[^a-zA-Z0-9]/g, '') + '0000').slice(0, 4);
+  const otherStripped = allTaskIds
+    .filter((id) => id !== taskId)
+    .map(stripPrefix)
+    .map((s) => s.replace(/[^a-zA-Z0-9]/g, '').toLowerCase());
+
+  for (let len = 4; len <= base.length; len++) {
+    const candidate = base.slice(0, len).toLowerCase();
+    if (!otherStripped.some((other) => other.startsWith(candidate))) {
+      return candidate;
+    }
+  }
+  return base.slice(0, Math.max(4, Math.min(base.length, 8))).toLowerCase();
+}
+
+interface BackgroundTaskRecord {
+  id: string;
+  parentSessionId: string;
+  kind: 'subagent' | 'workflow' | 'job';
+  name: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  startedAt: string;
+  finishedAt?: string;
+  lastActivityAt: string;
+  progress?: {
+    agentsDone?: number;
+    agentsTotal?: number;
+    step?: number;
+  };
+  originTurnId?: string;
+  originChatContextId?: string;
+  mode?: 'one-shot' | 'continuable';
+  isBackground?: boolean;
+}
+
 /**
  * Production Resident DSH Runtime Runner Daemon.
  */
@@ -262,6 +313,8 @@ export class RuntimeDaemon extends EventEmitter {
   private eventRelayCleanup?: () => void;
   private pendingApprovalsTracker = new Map<string, { sessionId: string; toolName: string; approvalId: string }>();
   private readonly liveSubagentsTracker = new Map<string, LiveSubagentActivity>();
+  private readonly backgroundTasksTracker = new Map<string, BackgroundTaskRecord>();
+  private readonly stoppedTaskIds = new Set<string>();
   private readonly autonomousTurnsTracker = new Map<string, { sessionId: string; turnNumber?: number; startedAt: number }>();
   private readonly sessionMaintenanceLocks = new Map<string, Promise<void>>();
 
@@ -360,6 +413,7 @@ export class RuntimeDaemon extends EventEmitter {
    * Subscribes to Cordis events to stream approval and session events in real time.
    */
   private attachCordisListeners(ctx: Context): void {
+    const daemon = this;
     const disposeSessionEvent = ctx.on('session/event', (subject: any, event: SessionEvent) => {
       const sessionIdStr = typeof subject?.id === 'string' ? subject.id : undefined;
       if (!sessionIdStr) return;
@@ -439,6 +493,106 @@ export class RuntimeDaemon extends EventEmitter {
       if (event.type === 'turn/end') {
         this.autonomousTurnsTracker.delete(sessionIdStr);
       }
+
+      // Track child session activity for background tasks
+      if (sessionIdStr) {
+        let task = this.backgroundTasksTracker.get(sessionIdStr);
+        const parentSid = (subject as any)?.header?.parentSession
+          ? String((subject as any).header.parentSession)
+          : undefined;
+
+        if (task) {
+          task.lastActivityAt = new Date(event.time || Date.now()).toISOString();
+          if (parentSid && !task.parentSessionId) {
+            task.parentSessionId = parentSid;
+          }
+          if (event.type === 'step/start') {
+            task.progress = task.progress || {};
+            task.progress.step = (task.progress.step || 0) + 1;
+          }
+          if (event.type === 'subagent/descriptor' && (event as any).data) {
+            const data = (event as any).data;
+            if (data.label) task.name = String(data.label).slice(0, 60);
+            if (data.mode) task.mode = data.mode;
+            if (data.mode === 'continuable') task.isBackground = true;
+          }
+        } else if (parentSid && ((subject as any)?.header?.origin === 'subagent' || (subject as any)?.meta?.origin === 'subagent')) {
+          const nowIso = new Date(event.time || Date.now()).toISOString();
+          task = {
+            id: sessionIdStr,
+            parentSessionId: parentSid,
+            kind: 'subagent',
+            name: String((subject as any)?.header?.label || (subject as any)?.meta?.label || 'subagent').slice(0, 60),
+            status: 'running',
+            startedAt: nowIso,
+            lastActivityAt: nowIso,
+          };
+          if (event.type === 'step/start') {
+            task.progress = { step: 1 };
+          }
+          if (event.type === 'subagent/descriptor' && (event as any).data) {
+            const data = (event as any).data;
+            if (data.label) task.name = String(data.label).slice(0, 60);
+            if (data.mode) task.mode = data.mode;
+            if (data.mode === 'continuable') task.isBackground = true;
+          }
+          this.backgroundTasksTracker.set(sessionIdStr, task);
+        }
+      }
+
+      // Track tool-workflow events on session
+      const rawEvent = event as any;
+      if (rawEvent?.type === 'tool-workflow/run-start' && rawEvent.data) {
+        const runId = String(rawEvent.data.runId);
+        const parentSid = sessionIdStr || '';
+        const nowIso = new Date().toISOString();
+        this.backgroundTasksTracker.set(runId, {
+          id: runId,
+          parentSessionId: parentSid,
+          kind: 'workflow',
+          name: String(rawEvent.data.name || 'workflow').slice(0, 60),
+          status: 'running',
+          startedAt: nowIso,
+          lastActivityAt: nowIso,
+          progress: { agentsDone: 0, agentsTotal: 0 },
+        });
+      } else if (rawEvent?.type === 'tool-workflow/agent-start' && rawEvent.data) {
+        const runId = String(rawEvent.data.runId);
+        const task = this.backgroundTasksTracker.get(runId);
+        if (task) {
+          task.lastActivityAt = new Date().toISOString();
+          task.progress = task.progress || { agentsDone: 0, agentsTotal: 0 };
+          task.progress.agentsTotal = (task.progress.agentsTotal || 0) + 1;
+        }
+      } else if (rawEvent?.type === 'tool-workflow/agent-end' && rawEvent.data) {
+        const runId = String(rawEvent.data.runId);
+        const task = this.backgroundTasksTracker.get(runId);
+        if (task) {
+          task.lastActivityAt = new Date().toISOString();
+          task.progress = task.progress || { agentsDone: 0, agentsTotal: 0 };
+          task.progress.agentsDone = (task.progress.agentsDone || 0) + 1;
+        }
+      } else if (rawEvent?.type === 'tool-workflow/run-end' && rawEvent.data) {
+        const runId = String(rawEvent.data.runId);
+        const task = this.backgroundTasksTracker.get(runId);
+        if (task) {
+          const nowIso = new Date().toISOString();
+          task.finishedAt = nowIso;
+          task.lastActivityAt = nowIso;
+          const rawReason = rawEvent.data.stopReason || rawEvent.data.outcome;
+          const stopReason = typeof rawReason === 'string' ? rawReason.toLowerCase() : '';
+          const isExplicitlyStopped = this.stoppedTaskIds.has(runId);
+          if (isExplicitlyStopped || task.status === 'cancelled') {
+            task.status = 'cancelled';
+          } else if (stopReason === 'failed' || stopReason === 'error') {
+            task.status = 'failed';
+          } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed' || stopReason === 'aborted') {
+            task.status = 'cancelled';
+          } else {
+            task.status = 'completed';
+          }
+        }
+      }
     });
 
     // Chunk streaming push from new agent/assistant-stream event
@@ -466,21 +620,213 @@ export class RuntimeDaemon extends EventEmitter {
     });
 
     // Track live background subagents via lifecycle events
-    const disposeSubagentStart = ctx.on('subagent/start', (info: any) => {
+    const disposeSubagentStart = ctx.on('subagent/start', function (this: any, info: any, maybeParent?: any) {
       if (info?.id) {
-        this.liveSubagentsTracker.set(String(info.id), {
-          id: String(info.id),
+        const idStr = String(info.id);
+        let parentSession: string | undefined = undefined;
+
+        // 1. From listener context / carrierKeyOf(this)
+        try {
+          const carrierAgent = carrierKeyOf(this) as any;
+          if (carrierAgent?.session?.id) {
+            parentSession = String(carrierAgent.session.id);
+          } else if (carrierAgent?.id) {
+            parentSession = String(carrierAgent.id);
+          }
+        } catch {}
+
+        if (!parentSession && this?.session?.id) {
+          parentSession = String(this.session.id);
+        }
+
+        // 2. From maybeParent argument
+        if (!parentSession && maybeParent) {
+          if (typeof maybeParent === 'string') {
+            parentSession = maybeParent;
+          } else if (maybeParent?.session?.id) {
+            parentSession = String(maybeParent.session.id);
+          } else if (maybeParent?.id) {
+            parentSession = String(maybeParent.id);
+          }
+        }
+
+        // 3. From payload fields
+        if (!parentSession && info) {
+          if (info.parentSession) parentSession = String(info.parentSession);
+          else if (info.parentSessionId) parentSession = String(info.parentSessionId);
+          else if (info.parent?.session?.id) parentSession = String(info.parent.session.id);
+          else if (typeof info.parent === 'string') parentSession = info.parent;
+        }
+
+        // 4. From session registry
+        if (!parentSession) {
+          const s = ctx.get('sessions')?.get(info.id);
+          if (s?.header?.parentSession) {
+            parentSession = String(s.header.parentSession);
+          }
+        }
+
+        const isContinuable = info.mode === 'continuable' || info.continuable === true;
+        const isBg = info.runInBackground === true || info.background === true || isContinuable;
+
+        daemon.liveSubagentsTracker.set(idStr, {
+          id: idStr,
           provider: info.provider ? String(info.provider) : undefined,
-          sessionId: info.sessionId ? String(info.sessionId) : undefined,
-          parentSession: info.parentSession ? String(info.parentSession) : undefined,
+          sessionId: info.sessionId ? String(info.sessionId) : idStr,
+          parentSession,
           startedAt: Date.now(),
         });
+        const nowIso = new Date().toISOString();
+        const existing = daemon.backgroundTasksTracker.get(idStr);
+        if (!existing) {
+          daemon.backgroundTasksTracker.set(idStr, {
+            id: idStr,
+            parentSessionId: parentSession || '',
+            kind: 'subagent',
+            name: String(info.label || info.description || info.provider || 'subagent').slice(0, 60),
+            status: daemon.stoppedTaskIds.has(idStr) ? 'cancelled' : 'running',
+            startedAt: nowIso,
+            lastActivityAt: nowIso,
+            mode: isContinuable ? 'continuable' : (info.mode === 'one-shot' ? 'one-shot' : undefined),
+            isBackground: isBg,
+          });
+        } else {
+          if (parentSession && !existing.parentSessionId) {
+            existing.parentSessionId = parentSession;
+          }
+          if (!daemon.stoppedTaskIds.has(idStr) && existing.status !== 'cancelled') {
+            existing.status = 'running';
+          }
+          existing.lastActivityAt = nowIso;
+          if (isContinuable) existing.mode = 'continuable';
+          if (isBg) existing.isBackground = true;
+          if (info.label || info.description) {
+            existing.name = String(info.label || info.description).slice(0, 60);
+          }
+        }
       }
     });
 
-    const disposeSubagentEnd = ctx.on('subagent/end', (info: any) => {
+    const disposeSubagentEnd = ctx.on('subagent/end', function (this: any, info: any, maybeParent?: any) {
       if (info?.id) {
-        this.liveSubagentsTracker.delete(String(info.id));
+        const idStr = String(info.id);
+        daemon.liveSubagentsTracker.delete(idStr);
+        let existing = daemon.backgroundTasksTracker.get(idStr);
+        const rawReason = info.outcome || info.stopReason || (info.reason?.kind ? info.reason.kind : (typeof info.reason === 'string' ? info.reason : undefined));
+        const stopReason = typeof rawReason === 'string' ? rawReason.toLowerCase() : '';
+        const isExplicitlyStopped = daemon.stoppedTaskIds.has(idStr) || (info.runId && daemon.stoppedTaskIds.has(String(info.runId)));
+
+        let targetStatus: 'running' | 'completed' | 'failed' | 'cancelled' = 'completed';
+        if (isExplicitlyStopped) {
+          targetStatus = 'cancelled';
+        } else if (stopReason === 'failed' || stopReason === 'error') {
+          targetStatus = 'failed';
+        } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed' || stopReason === 'aborted') {
+          targetStatus = 'cancelled';
+        } else {
+          targetStatus = 'completed';
+        }
+
+        if (!existing) {
+          let parentSession: string | undefined = undefined;
+          try {
+            const carrierAgent = carrierKeyOf(this) as any;
+            if (carrierAgent?.session?.id) parentSession = String(carrierAgent.session.id);
+          } catch {}
+          if (!parentSession && maybeParent) {
+            parentSession = typeof maybeParent === 'string' ? maybeParent : String(maybeParent?.session?.id || maybeParent?.id || '');
+          }
+          if (!parentSession && info.parentSession) parentSession = String(info.parentSession);
+          if (!parentSession) {
+            const s = ctx.get('sessions')?.get(info.id);
+            if (s?.header?.parentSession) parentSession = String(s.header.parentSession);
+          }
+          const nowIso = new Date().toISOString();
+          existing = {
+            id: idStr,
+            parentSessionId: parentSession || '',
+            kind: 'subagent',
+            name: String(info.label || info.description || info.provider || 'subagent').slice(0, 60),
+            status: targetStatus,
+            startedAt: nowIso,
+            finishedAt: nowIso,
+            lastActivityAt: nowIso,
+          };
+          daemon.backgroundTasksTracker.set(idStr, existing);
+        } else {
+          const nowIso = new Date().toISOString();
+          existing.finishedAt = nowIso;
+          existing.lastActivityAt = nowIso;
+          if (existing.status === 'cancelled' || isExplicitlyStopped) {
+            existing.status = 'cancelled';
+          } else {
+            existing.status = targetStatus;
+          }
+        }
+      }
+    });
+
+    // Track Cordis workflow lifecycle events
+    const disposeWorkflowStart = ctx.on('workflow/start' as any, (info: any) => {
+      const runId = String(info?.runId || info?.id || '');
+      if (runId) {
+        const parentSid = String(info?.parentSession || info?.sessionId || '');
+        const nowIso = new Date().toISOString();
+        if (!this.backgroundTasksTracker.has(runId)) {
+          this.backgroundTasksTracker.set(runId, {
+            id: runId,
+            parentSessionId: parentSid,
+            kind: 'workflow',
+            name: String(info?.meta?.name || info?.name || 'workflow').slice(0, 60),
+            status: this.stoppedTaskIds.has(runId) ? 'cancelled' : 'running',
+            startedAt: nowIso,
+            lastActivityAt: nowIso,
+            progress: { agentsDone: 0, agentsTotal: 0 },
+          });
+        }
+      }
+    });
+
+    const disposeWorkflowAgentStart = ctx.on('workflow/agent-start' as any, (info: any) => {
+      const runId = String(info?.runId || info?.id || '');
+      const task = this.backgroundTasksTracker.get(runId);
+      if (task) {
+        task.lastActivityAt = new Date().toISOString();
+        task.progress = task.progress || { agentsDone: 0, agentsTotal: 0 };
+        task.progress.agentsTotal = (task.progress.agentsTotal || 0) + 1;
+      }
+    });
+
+    const disposeWorkflowAgentEnd = ctx.on('workflow/agent-end' as any, (info: any) => {
+      const runId = String(info?.runId || info?.id || '');
+      const task = this.backgroundTasksTracker.get(runId);
+      if (task) {
+        task.lastActivityAt = new Date().toISOString();
+        task.progress = task.progress || { agentsDone: 0, agentsTotal: 0 };
+        task.progress.agentsDone = (task.progress.agentsDone || 0) + 1;
+      }
+    });
+
+    const disposeWorkflowEnd = ctx.on('workflow/end' as any, (info: any, result: any) => {
+      const runId = String(info?.runId || info?.id || '');
+      const task = this.backgroundTasksTracker.get(runId);
+      if (task) {
+        const nowIso = new Date().toISOString();
+        task.finishedAt = nowIso;
+        task.lastActivityAt = nowIso;
+        const rawReason = result?.stopReason || result?.outcome || info?.stopReason || info?.outcome || (result?.reason?.kind ? result.reason.kind : undefined);
+        const stopReason = typeof rawReason === 'string' ? rawReason.toLowerCase() : '';
+        const isExplicitlyStopped = this.stoppedTaskIds.has(runId);
+
+        if (isExplicitlyStopped || task.status === 'cancelled') {
+          task.status = 'cancelled';
+        } else if (stopReason === 'failed' || stopReason === 'error') {
+          task.status = 'failed';
+        } else if (stopReason === 'cancelled' || stopReason === 'interrupted' || stopReason === 'killed' || stopReason === 'aborted') {
+          task.status = 'cancelled';
+        } else {
+          task.status = 'completed';
+        }
       }
     });
 
@@ -489,6 +835,10 @@ export class RuntimeDaemon extends EventEmitter {
       disposeAssistantStream();
       disposeSubagentStart();
       disposeSubagentEnd();
+      disposeWorkflowStart();
+      disposeWorkflowAgentStart();
+      disposeWorkflowAgentEnd();
+      disposeWorkflowEnd();
     };
   }
 
@@ -564,6 +914,16 @@ export class RuntimeDaemon extends EventEmitter {
 
         case DAEMON_OPS.COMPACT_SESSION:
           return await this.handleCompactSession(request as CompactSessionRequest);
+
+        case DAEMON_OPS.BACKGROUND_TASKS:
+        case DAEMON_OPS.LIST_BACKGROUND_TASKS:
+        case 'backgroundTasks':
+        case 'listBackgroundTasks':
+          return await this.handleListBackgroundTasks(request as ListBackgroundTasksRequest);
+
+        case DAEMON_OPS.STOP_BACKGROUND_TASK:
+        case 'stopBackgroundTask':
+          return await this.handleStopBackgroundTask(request as StopBackgroundTaskRequest);
 
         case DAEMON_OPS.ACTIVITY_STATUS:
         case 'activityStatus':
@@ -1118,6 +1478,412 @@ export class RuntimeDaemon extends EventEmitter {
       ok: true,
       activity,
     };
+  }
+
+  public async handleListBackgroundTasks(request: ListBackgroundTasksRequest | DaemonRequest): Promise<ListBackgroundTasksResponse> {
+    const sessionId = (request as ListBackgroundTasksRequest).sessionId;
+    if (!sessionId) {
+      throw new DaemonProtocolError(
+        DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+        'Field "sessionId" is required for listBackgroundTasks'
+      );
+    }
+    const items = await this.listBackgroundTasks(sessionId);
+    return {
+      id: request.id,
+      op: (request.op === 'backgroundTasks' ? 'backgroundTasks' : 'listBackgroundTasks'),
+      ok: true,
+      items,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  public async handleStopBackgroundTask(request: StopBackgroundTaskRequest | DaemonRequest): Promise<StopBackgroundTaskResponse> {
+    const { sessionId, taskId } = request as StopBackgroundTaskRequest;
+    if (!sessionId || !taskId) {
+      throw new DaemonProtocolError(
+        DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+        'Fields "sessionId" and "taskId" are required for stopBackgroundTask'
+      );
+    }
+    const result = await this.stopBackgroundTask(sessionId, taskId);
+    return {
+      id: request.id,
+      op: 'stopBackgroundTask',
+      ok: true,
+      stopped: result.stopped,
+    };
+  }
+
+  /**
+   * Returns per-session background tasks meeting the visibility contract:
+   * - subagents from DSH subagents / sessions registry
+   * - workflow jobs with progress (agentsDone/agentsTotal) from events
+   * - other background jobs from ctx.jobs
+   * - lastActivityAt from latest child event
+   * - completed tasks retained for 2h
+   */
+  public async listBackgroundTasks(sessionId: string): Promise<BackgroundTask[]> {
+    const ctx = this.bootedRuntime?.context;
+    const now = Date.now();
+    const RETENTION_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+    // 1. Sync jobs from ctx.jobs
+    const jobRegistry = ctx?.get('jobs');
+    const allJobs = typeof jobRegistry?.list === 'function' ? jobRegistry.list() : [];
+    for (const job of allJobs) {
+      const jobId = String(job.id);
+      const owner = job.owner ? String(job.owner) : '';
+      if (owner === sessionId) {
+        const isStopped = this.stoppedTaskIds.has(jobId);
+        let task = this.backgroundTasksTracker.get(jobId);
+        if (!task) {
+          const startedIso = new Date(job.startedAt || now).toISOString();
+          const kind: 'workflow' | 'job' = job.kind === 'workflow' ? 'workflow' : 'job';
+          const jobStatus = String(job.status || '').toLowerCase();
+          const status =
+            isStopped || jobStatus === 'killed' || jobStatus === 'cancelled' || jobStatus === 'aborted'
+              ? 'cancelled'
+              : jobStatus === 'running' || jobStatus === 'stopping'
+              ? 'running'
+              : jobStatus === 'completed'
+              ? 'completed'
+              : jobStatus === 'failed' || jobStatus === 'error'
+              ? 'failed'
+              : 'cancelled';
+          task = {
+            id: jobId,
+            parentSessionId: owner,
+            kind,
+            name: String(job.label || job.kind || 'job').slice(0, 60),
+            status,
+            startedAt: startedIso,
+            finishedAt: job.finishedAt ? new Date(job.finishedAt).toISOString() : (status !== 'running' ? startedIso : undefined),
+            lastActivityAt: startedIso,
+          };
+          this.backgroundTasksTracker.set(jobId, task);
+        } else {
+          const jobStatus = String(job.status || '').toLowerCase();
+          if (isStopped || task.status === 'cancelled') {
+            task.status = 'cancelled';
+            if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+          } else if (jobStatus === 'completed') {
+            task.status = 'completed';
+            if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+          } else if (jobStatus === 'failed' || jobStatus === 'error') {
+            task.status = 'failed';
+            if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+          } else if (jobStatus === 'killed' || jobStatus === 'cancelled' || jobStatus === 'aborted') {
+            task.status = 'cancelled';
+            if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+          }
+        }
+      }
+    }
+
+    // 2. Sync subagent children using DSH 0.2 APIs: subagents service, sessionQuery service, and session registry
+    // 2a. Sync from ctx.subagents.listChildren
+    const subagentsService = ctx?.get('subagents');
+    if (subagentsService && typeof subagentsService.listChildren === 'function') {
+      try {
+        const children = await subagentsService.listChildren(sessionId as any);
+        for (const child of children) {
+          const childId = String(child.id);
+          let task = this.backgroundTasksTracker.get(childId);
+          const isLive = this.liveSubagentsTracker.has(childId) || this.agents.has(childId);
+          const mode = child.mode === 'continuable' ? 'continuable' : child.mode === 'one-shot' ? 'one-shot' : undefined;
+          const isBg = mode === 'continuable';
+          const isStopped = this.stoppedTaskIds.has(childId);
+          if (!task) {
+            const nowIso = new Date(child.createdAt || now).toISOString();
+            task = {
+              id: childId,
+              parentSessionId: sessionId,
+              kind: 'subagent',
+              name: String(child.label || 'subagent').slice(0, 60),
+              status: isStopped ? 'cancelled' : isLive ? 'running' : 'completed',
+              startedAt: nowIso,
+              finishedAt: isStopped ? nowIso : (!isLive ? nowIso : undefined),
+              lastActivityAt: nowIso,
+              mode,
+              isBackground: isBg,
+            };
+            this.backgroundTasksTracker.set(childId, task);
+          } else {
+            task.parentSessionId = sessionId;
+            if (child.label && (!task.name || task.name === 'subagent')) {
+              task.name = String(child.label).slice(0, 60);
+            }
+            if (mode) {
+              task.mode = mode;
+              if (mode === 'continuable') task.isBackground = true;
+            }
+            if (isStopped || task.status === 'cancelled') {
+              task.status = 'cancelled';
+              if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+            } else if (task.status === 'running' && !isLive) {
+              task.status = 'completed';
+              if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // 2b. Sync from ctx.sessionQuery
+    const sessionQuery = ctx?.get('sessionQuery');
+    if (sessionQuery && typeof sessionQuery.listSessions === 'function') {
+      try {
+        const querySessions = await sessionQuery.listSessions();
+        for (const sRec of querySessions) {
+          const sId = String(sRec.header.id);
+          const origin = sRec.header.origin;
+          const parent = sRec.header.parentSession;
+          if (origin === 'subagent' && String(parent) === sessionId) {
+            let task = this.backgroundTasksTracker.get(sId);
+            const startedIso = new Date(sRec.header.createdAt || now).toISOString();
+            const isStopped = this.stoppedTaskIds.has(sId);
+            if (!task) {
+              task = {
+                id: sId,
+                parentSessionId: sessionId,
+                kind: 'subagent',
+                name: String((sRec.header as any)?.label || 'subagent').slice(0, 60),
+                status: isStopped ? 'cancelled' : (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
+                startedAt: startedIso,
+                finishedAt: isStopped ? startedIso : undefined,
+                lastActivityAt: startedIso,
+              };
+              this.backgroundTasksTracker.set(sId, task);
+            } else if (isStopped || task.status === 'cancelled') {
+              task.status = 'cancelled';
+              if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // 2c. Sync from ctx.sessions
+    const sessionRegistry = ctx?.get('sessions');
+    const registeredSessions = typeof sessionRegistry?.list === 'function' ? sessionRegistry.list() : [];
+    for (const s of registeredSessions) {
+      const sId = String(s.id);
+      const origin = s.header?.origin ?? (s as any).meta?.origin;
+      const parent = s.header?.parentSession ?? (s as any).meta?.parentSession;
+      if (origin === 'subagent' && String(parent) === sessionId) {
+        let task = this.backgroundTasksTracker.get(sId);
+        const startedIso = new Date(s.header?.createdAt || now).toISOString();
+        let lastActIso = startedIso;
+        const rawS = s as any;
+        if (Array.isArray(rawS.events) && rawS.events.length > 0) {
+          const lastEv = rawS.events[rawS.events.length - 1];
+          if (lastEv?.time) {
+            lastActIso = new Date(lastEv.time).toISOString();
+          }
+        }
+        const isStopped = this.stoppedTaskIds.has(sId);
+        if (!task) {
+          task = {
+            id: sId,
+            parentSessionId: sessionId,
+            kind: 'subagent',
+            name: String((s.header as any)?.label || (s as any).meta?.label || 'subagent').slice(0, 60),
+            status: isStopped ? 'cancelled' : (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
+            startedAt: startedIso,
+            finishedAt: isStopped ? startedIso : undefined,
+            lastActivityAt: lastActIso,
+          };
+          this.backgroundTasksTracker.set(sId, task);
+        } else if (isStopped || task.status === 'cancelled') {
+          task.status = 'cancelled';
+          if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+        }
+      }
+    }
+
+    // 2d. Enrich all subagent tasks with step count & descriptor metadata from events
+    for (const [id, task] of this.backgroundTasksTracker.entries()) {
+      if (task.parentSessionId === sessionId && task.kind === 'subagent') {
+        const liveSession = sessionRegistry?.get?.(id as any) as any;
+        let events = liveSession?.events;
+        if ((!events || events.length === 0) && sessionQuery && typeof sessionQuery.readSession === 'function') {
+          try {
+            const loaded = await sessionQuery.readSession(id as any);
+            events = loaded.events;
+          } catch {}
+        }
+        if (Array.isArray(events) && events.length > 0) {
+          const stepEvents = events.filter((e: any) => e.type === 'step/start');
+          const stepCount = stepEvents.length;
+          if (stepCount > 0) {
+            task.progress = task.progress || {};
+            task.progress.step = Math.max(task.progress.step || 0, stepCount);
+          }
+          const descriptorEv = events.find((e: any) => e.type === 'subagent/descriptor');
+          if (descriptorEv?.data) {
+            if (descriptorEv.data.label && (!task.name || task.name === 'subagent')) {
+              task.name = String(descriptorEv.data.label).slice(0, 60);
+            }
+            if (descriptorEv.data.mode) {
+              task.mode = descriptorEv.data.mode;
+              if (descriptorEv.data.mode === 'continuable') task.isBackground = true;
+            }
+          }
+          // If name is still generic 'subagent', check user message prompt
+          if (!task.name || task.name === 'subagent') {
+            for (const ev of events) {
+              if (ev.type === 'message/content' && ev.data?.content) {
+                const textBlock = Array.isArray(ev.data.content)
+                  ? ev.data.content.find((b: any) => b.type === 'text')
+                  : undefined;
+                if (textBlock?.text) {
+                  task.name = String(textBlock.text).trim().slice(0, 60);
+                  break;
+                }
+              }
+            }
+          }
+          const lastEv = events[events.length - 1];
+          if (lastEv?.time) {
+            const evTimeIso = new Date(lastEv.time).toISOString();
+            if (Date.parse(evTimeIso) > Date.parse(task.lastActivityAt || '1970-01-01')) {
+              task.lastActivityAt = evTimeIso;
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Filter tasks belonging to sessionId, exclude finished foreground one-shots, & apply 2h retention
+    const sessionTasks: BackgroundTaskRecord[] = [];
+    for (const [id, task] of this.backgroundTasksTracker.entries()) {
+      if (task.parentSessionId === sessionId) {
+        // Exclude finished foreground one-shots (not continuable, not run_in_background)
+        if (task.kind === 'subagent' && task.status !== 'running') {
+          if (task.mode === 'one-shot' && !task.isBackground) {
+            continue;
+          }
+        }
+
+        if (task.finishedAt) {
+          const finishedTime = Date.parse(task.finishedAt);
+          if (!isNaN(finishedTime) && now - finishedTime > RETENTION_MS) {
+            this.backgroundTasksTracker.delete(id);
+            this.stoppedTaskIds.delete(id);
+            continue;
+          }
+        }
+        sessionTasks.push(task);
+      }
+    }
+
+    const allTaskIds = sessionTasks.map((t) => t.id);
+
+    return sessionTasks.map((task) => {
+      const shortId = computeTaskShortId(task.id, allTaskIds);
+      const lastActTime = Date.parse(task.lastActivityAt);
+      const stalled =
+        task.status === 'running' &&
+        !isNaN(lastActTime) &&
+        now - lastActTime > 10 * 60 * 1000;
+
+      return {
+        id: task.id,
+        shortId,
+        kind: task.kind,
+        name: task.name,
+        status: task.status,
+        startedAt: task.startedAt,
+        finishedAt: task.finishedAt,
+        lastActivityAt: task.lastActivityAt,
+        stalled,
+        progress: task.progress,
+        originTurnId: task.originTurnId,
+        originChatContextId: task.originChatContextId,
+      };
+    });
+  }
+
+  /**
+   * Stops a running background task (subagent interrupt or job kill).
+   */
+  public async stopBackgroundTask(
+    sessionId: string,
+    taskId: string
+  ): Promise<{ stopped: boolean }> {
+    const ctx = this.bootedRuntime?.context;
+    let foundTask: BackgroundTaskRecord | undefined;
+
+    // Match by exact id or shortId
+    const allSessionTasks = Array.from(this.backgroundTasksTracker.values()).filter(
+      (t) => t.parentSessionId === sessionId
+    );
+    const allTaskIds = allSessionTasks.map((t) => t.id);
+
+    for (const task of allSessionTasks) {
+      if (
+        task.id === taskId ||
+        computeTaskShortId(task.id, allTaskIds) === taskId.toLowerCase() ||
+        task.id.toLowerCase().startsWith(taskId.toLowerCase())
+      ) {
+        foundTask = task;
+        break;
+      }
+    }
+
+    let stopped = false;
+    const targetSessionId = foundTask ? foundTask.id : taskId;
+
+    // Track as stopped so subsequent lifecycle events or sync do not override status to completed
+    this.stoppedTaskIds.add(targetSessionId);
+    this.stoppedTaskIds.add(taskId);
+    if (foundTask) {
+      this.stoppedTaskIds.add(foundTask.id);
+    }
+
+    // 1. If it's a subagent
+    const subagentsService = ctx?.get('subagents');
+    if (subagentsService && typeof subagentsService.interrupt === 'function') {
+      try {
+        subagentsService.interrupt(targetSessionId as any, {
+          kind: 'user',
+          parentSessionId: sessionId as any,
+        });
+        stopped = true;
+      } catch {}
+    }
+
+    const agentRegistry = ctx?.get('agents');
+    if (agentRegistry && typeof agentRegistry.get === 'function') {
+      try {
+        const ag = agentRegistry.get(targetSessionId as any);
+        if (ag && typeof (ag as any).cancel === 'function') {
+          (ag as any).cancel('user stopped');
+          stopped = true;
+        }
+      } catch {}
+    }
+
+    // 2. If it's a job or workflow
+    const jobRegistry = ctx?.get('jobs');
+    if (jobRegistry && typeof jobRegistry.kill === 'function') {
+      try {
+        const killRes = jobRegistry.kill(targetSessionId as any, sessionId as any, 'user stopped');
+        if (killRes === 'requested' || killRes === 'already-finished') {
+          stopped = true;
+        }
+      } catch {}
+    }
+
+    if (foundTask) {
+      foundTask.status = 'cancelled';
+      foundTask.finishedAt = new Date().toISOString();
+      foundTask.lastActivityAt = new Date().toISOString();
+      stopped = true;
+    }
+
+    return { stopped };
   }
 
   /**

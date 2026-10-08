@@ -125,6 +125,11 @@ import {
   resolveSiblingExtraReadableRoots,
   type ResolveSiblingRootsOptions,
 } from './sibling-roots.js';
+import {
+  createBackgroundTaskDelegates,
+  type BackgroundTaskDelegates,
+  type RuntimeSpaceResolver,
+} from './background-delegates.js';
 import type {
   DemoUpOptions,
   DemoUpResult,
@@ -156,6 +161,9 @@ export interface RunningDemoSystem {
 export {
   resolveSiblingExtraReadableRoots,
   type ResolveSiblingRootsOptions,
+  createBackgroundTaskDelegates,
+  type BackgroundTaskDelegates,
+  type RuntimeSpaceResolver,
 };
 
 export async function upDemo(options: DemoUpOptions = {}): Promise<RunningDemoSystem> {
@@ -937,6 +945,8 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     return { handle, isHost, spaceFolder };
   }
 
+  const bgDelegates = createBackgroundTaskDelegates(resolveRuntimeForSpace);
+
   // 6. Production DeliveryTurnExecutor wired to real Docker User Containers
   const dockerTurnExecutor: DeliveryTurnExecutor = {
     async execute(request: DeliveryExecutionRequest) {
@@ -1190,6 +1200,12 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       return {
         status: 'absent' as const,
       };
+    },
+    async listBackgroundTasks(req) {
+      return bgDelegates.listBackgroundTasks(req);
+    },
+    async stopBackgroundTask(req) {
+      return bgDelegates.stopBackgroundTask(req);
     },
   };
 

@@ -55,6 +55,9 @@ export const DAEMON_OPS = {
   LIST_APPROVALS: 'listApprovals',
   COMPACT_SESSION: 'compactSession',
   ACTIVITY_STATUS: 'activityStatus',
+  BACKGROUND_TASKS: 'backgroundTasks',
+  LIST_BACKGROUND_TASKS: 'listBackgroundTasks',
+  STOP_BACKGROUND_TASK: 'stopBackgroundTask',
 } as const;
 
 export type DaemonOp = (typeof DAEMON_OPS)[keyof typeof DAEMON_OPS];
@@ -292,6 +295,38 @@ export interface ActivityStatusRequest extends DaemonRequestBase {
   readonly op: 'activityStatus' | 'activity' | 'status';
 }
 
+export interface BackgroundTaskProgress {
+  agentsDone?: number;
+  agentsTotal?: number;
+  step?: number;
+}
+
+export interface BackgroundTask {
+  id: string;                // DSH child session id / job id
+  shortId: string;           // 4+ chars, unique within session
+  kind: 'subagent' | 'workflow' | 'job';
+  name: string;              // workflow name / subagent label / job title (truncated 60)
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  startedAt: string;         // ISO
+  finishedAt?: string;       // ISO
+  lastActivityAt: string;    // ISO
+  stalled: boolean;          // running && now - lastActivityAt > 10 min
+  progress?: BackgroundTaskProgress;
+  originTurnId?: string;     // platform turn that launched it (from durable child-origin mapping)
+  originChatContextId?: string; // chat-level native context of the origin turn (from channel_turn_origins)
+}
+
+export interface ListBackgroundTasksRequest extends DaemonRequestBase {
+  readonly op: 'listBackgroundTasks' | 'backgroundTasks';
+  readonly sessionId: string;
+}
+
+export interface StopBackgroundTaskRequest extends DaemonRequestBase {
+  readonly op: 'stopBackgroundTask';
+  readonly sessionId: string;
+  readonly taskId: string;
+}
+
 export type DaemonRequest =
   | SubmitTurnRequest
   | CancelRequest
@@ -310,7 +345,9 @@ export type DaemonRequest =
   | ListApprovalsRequest
   | ShutdownRequest
   | CompactSessionRequest
-  | ActivityStatusRequest;
+  | ActivityStatusRequest
+  | ListBackgroundTasksRequest
+  | StopBackgroundTaskRequest;
 
 // ---------------------------------------------------------------------------
 // Response Envelopes
@@ -544,6 +581,19 @@ export interface ActivityStatusResponse extends DaemonResponseBase {
   readonly activity: DaemonActivityStatus;
 }
 
+export interface ListBackgroundTasksResponse extends DaemonResponseBase {
+  readonly op: 'listBackgroundTasks' | 'backgroundTasks';
+  readonly ok: boolean;
+  readonly items: BackgroundTask[];
+  readonly updatedAt: string;
+}
+
+export interface StopBackgroundTaskResponse extends DaemonResponseBase {
+  readonly op: 'stopBackgroundTask';
+  readonly ok: boolean;
+  readonly stopped: boolean;
+}
+
 export interface DaemonErrorResponse extends DaemonResponseBase {
   readonly ok: false;
   readonly error: {
@@ -572,6 +622,8 @@ export type DaemonResponse =
   | ShutdownResponse
   | CompactSessionResponse
   | ActivityStatusResponse
+  | ListBackgroundTasksResponse
+  | StopBackgroundTaskResponse
   | DaemonErrorResponse;
 
 // ---------------------------------------------------------------------------
