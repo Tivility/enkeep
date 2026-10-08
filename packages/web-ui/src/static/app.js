@@ -15370,6 +15370,7 @@ function selectSpace(spaceId) {
 
 function updateSpaceLifecycleControls() {
   const renameBtn = document.getElementById("btn-rename-space");
+  const cacheBtn = document.getElementById("btn-space-cache");
   const mountsBtn = document.getElementById("btn-manage-mounts");
   const archiveBtn = document.getElementById("btn-archive-space");
   const restoreBtn = document.getElementById("btn-restore-space");
@@ -15382,6 +15383,11 @@ function updateSpaceLifecycleControls() {
     renameBtn.disabled = !hasSpace || isArchived;
     if (isArchived) renameBtn.classList.add("hidden");
     else renameBtn.classList.remove("hidden");
+  }
+  if (cacheBtn) {
+    cacheBtn.disabled = !hasSpace || isArchived;
+    if (isArchived) cacheBtn.classList.add("hidden");
+    else cacheBtn.classList.remove("hidden");
   }
   if (mountsBtn) {
     if (isAdmin && hasSpace && !isArchived) {
@@ -15501,6 +15507,96 @@ function handleArchiveSpace() {
       }
     }
   );
+}
+
+let activeCacheSpaceId = null;
+
+async function openSpaceCacheModal(spaceId = state.currentSpaceId) {
+  if (!spaceId) return;
+  activeCacheSpaceId = spaceId;
+  const effEl = document.getElementById("space-cache-effective");
+  const selEl = document.getElementById("space-cache-select");
+
+  if (effEl) effEl.textContent = t("common.loading", null, "Loading...");
+
+  try {
+    const res = await apiRequest(`/api/spaces/${encodeURIComponent(spaceId)}/cache-override`);
+    if (res && res.data) {
+      if (effEl) {
+        effEl.textContent = `${res.data.effective} (Source: ${res.data.source})`;
+      }
+      if (selEl) {
+        selEl.value = res.data.override || "default";
+      }
+    }
+  } catch (err) {
+    if (effEl) effEl.textContent = getSafeErrorMessage(err, "Failed to load cache override");
+  }
+
+  openModal("modal-space-cache");
+}
+
+async function handleSaveSpaceCache(e) {
+  e.preventDefault();
+  if (!activeCacheSpaceId) return;
+  const selEl = document.getElementById("space-cache-select");
+  const val = selEl ? selEl.value : "default";
+
+  try {
+    const res = await apiRequest(`/api/spaces/${encodeURIComponent(activeCacheSpaceId)}/cache-override`, {
+      method: "PUT",
+      body: { cacheRetention: val },
+    });
+    showToast(t("toast.cacheSavedSuccess", null, "Cache retention override updated"), "success");
+    closeModal("modal-space-cache");
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, "Failed to update cache override"), "error");
+  }
+}
+
+let activeCacheSessionId = null;
+
+async function openSessionCacheModal(sessionId = state.currentSessionId) {
+  if (!sessionId) return;
+  activeCacheSessionId = sessionId;
+  const effEl = document.getElementById("session-cache-effective");
+  const selEl = document.getElementById("session-cache-select");
+
+  if (effEl) effEl.textContent = t("common.loading", null, "Loading...");
+
+  try {
+    const res = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/cache-override`);
+    if (res && res.data) {
+      if (effEl) {
+        effEl.textContent = `${res.data.effective} (Source: ${res.data.source})`;
+      }
+      if (selEl) {
+        selEl.value = res.data.override || "default";
+      }
+    }
+  } catch (err) {
+    if (effEl) effEl.textContent = getSafeErrorMessage(err, "Failed to load cache override");
+  }
+
+  openModal("modal-session-cache");
+}
+
+async function handleSaveSessionCache(e) {
+  e.preventDefault();
+  if (!activeCacheSessionId) return;
+  const selEl = document.getElementById("session-cache-select");
+  const val = selEl ? selEl.value : "default";
+
+  try {
+    const res = await apiRequest(`/api/sessions/${encodeURIComponent(activeCacheSessionId)}/cache-override`, {
+      method: "PUT",
+      body: { cacheRetention: val },
+    });
+    showToast(t("toast.cacheSavedSuccess", null, "Cache retention override updated"), "success");
+    closeModal("modal-session-cache");
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, "Failed to update cache override"), "error");
+  }
 }
 
 let activeMountsSpaceId = null;
@@ -16175,6 +16271,11 @@ async function selectSession(sessionId) {
   const forkBtn = document.getElementById("btn-fork-session");
   if (forkBtn) {
     forkBtn.classList.remove("hidden");
+  }
+
+  const sessionCacheBtn = document.getElementById("btn-session-cache");
+  if (sessionCacheBtn) {
+    sessionCacheBtn.classList.remove("hidden");
   }
 
   const renameBtn = document.getElementById("btn-rename-session");
@@ -20439,6 +20540,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const renameSpaceBtn = document.getElementById('btn-rename-space');
   if (renameSpaceBtn) renameSpaceBtn.addEventListener('click', openRenameSpaceModal);
 
+  const spaceCacheBtn = document.getElementById('btn-space-cache');
+  if (spaceCacheBtn) spaceCacheBtn.addEventListener('click', () => openSpaceCacheModal(state.currentSpaceId));
+
+  const spaceCacheForm = document.getElementById('form-space-cache');
+  if (spaceCacheForm) spaceCacheForm.addEventListener('submit', handleSaveSpaceCache);
+
   const manageMountsBtn = document.getElementById('btn-manage-mounts');
   if (manageMountsBtn) manageMountsBtn.addEventListener('click', openSpaceMountsModal);
 
@@ -20523,6 +20630,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const renameSessionBtn = document.getElementById('btn-rename-session');
   if (renameSessionBtn) renameSessionBtn.addEventListener('click', openRenameSessionModal);
+
+  const sessionCacheBtn = document.getElementById('btn-session-cache');
+  if (sessionCacheBtn) sessionCacheBtn.addEventListener('click', () => openSessionCacheModal(state.currentSessionId));
+
+  const sessionCacheForm = document.getElementById('form-session-cache');
+  if (sessionCacheForm) sessionCacheForm.addEventListener('submit', handleSaveSessionCache);
 
   const renameSessionForm = document.getElementById('rename-session-form');
   if (renameSessionForm) renameSessionForm.addEventListener('submit', handleRenameSession);

@@ -51,6 +51,7 @@ import {
   MIGRATION_036_SPACE_CANONICAL_SESSION_SQL,
   MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL,
   MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL,
+  MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL,
 } from '@enkeep/platform-storage-sqlite';
 
 export {
@@ -99,6 +100,7 @@ export {
   MIGRATION_036_SPACE_CANONICAL_SESSION_SQL,
   MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL,
   MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL,
+  MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL,
 };
 
 function isSqliteBusyOrLocked(err: unknown): boolean {
@@ -318,6 +320,12 @@ export const ALL_PLATFORM_MIGRATIONS: MigrationDefinition[] = [
     name: '038_channel_binding_session_route',
     upSql: MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL,
     checksum: computeChecksum(MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL),
+  },
+  {
+    version: 39,
+    name: '039_cache_retention_overrides',
+    upSql: MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL,
+    checksum: computeChecksum(MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL),
   },
 ];
 

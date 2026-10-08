@@ -90,16 +90,39 @@ export class SqliteTenantScopedSpaceRepository implements TenantScopedSpaceRepos
       }
     }
 
+    const hasCacheCol = (() => {
+      try {
+        const cols = this.db.prepare('PRAGMA table_info(spaces)').all() as Array<{ name: string }>;
+        return cols.some((c) => c.name === 'cache_retention');
+      } catch {
+        return false;
+      }
+    })();
+
     if (input.canonicalSessionId) {
-      this.db.prepare(`
-        INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId);
+      if (hasCacheCol) {
+        this.db.prepare(`
+          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, cache_retention, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId, input.cacheRetention ?? null);
+      } else {
+        this.db.prepare(`
+          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId);
+      }
     } else {
-      this.db.prepare(`
-        INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      `).run(id, this.userId, name, folder, executionMode, status, agentProfileId, agentProfileSnapshotId);
+      if (hasCacheCol) {
+        this.db.prepare(`
+          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, cache_retention, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(id, this.userId, name, folder, executionMode, status, agentProfileId, agentProfileSnapshotId, input.cacheRetention ?? null);
+      } else {
+        this.db.prepare(`
+          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(id, this.userId, name, folder, executionMode, status, agentProfileId, agentProfileSnapshotId);
+      }
     }
 
     const space = await this.findById(id);
@@ -173,6 +196,19 @@ export class SqliteTenantScopedSpaceRepository implements TenantScopedSpaceRepos
         updates.push('agent_profile_snapshot_id = ?');
         params.push(null);
       }
+    }
+    const hasCacheCol = (() => {
+      try {
+        const cols = this.db.prepare('PRAGMA table_info(spaces)').all() as Array<{ name: string }>;
+        return cols.some((c) => c.name === 'cache_retention');
+      } catch {
+        return false;
+      }
+    })();
+
+    if (input.cacheRetention !== undefined && hasCacheCol) {
+      updates.push('cache_retention = ?');
+      params.push(input.cacheRetention);
     }
 
     params.push(id, this.userId);

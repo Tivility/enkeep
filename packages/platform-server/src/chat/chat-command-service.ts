@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { ValidationError, PlatformError } from '@enkeep/platform-core';
+import { ValidationError, PlatformError, resolveTopLevelCacheRetention, isValidCacheRetention } from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 import type { BackgroundTask } from '../runtime/delivery-gateway.js';
 
@@ -32,6 +32,7 @@ export const HELP_USAGE = `Available commands:
   /ws use <名称/目录/ID/main> - 切换到工作区主会话并清除固定会话
   /ws new <名称> - 新建工作区并切换
   /ws home - 回到账号默认工作区
+  /ws cache [long|short|none|default] - 查看或设置工作区 Prompt 缓存保留策略
 
 会话指令 (/session, 别名 /ses):
   /session - 查看当前会话 (短ID、标题、主会话、代际、最后活跃)
@@ -39,6 +40,7 @@ export const HELP_USAGE = `Available commands:
   /session use <短ID/标题/main> - 固定到会话 (main 跟随主会话)
   /session new [标题] - 新建会话并固定
   /session clear - 清空当前会话 (主会话被共享时需 /session clear confirm)
+  /session cache [long|short|none|default] - 查看或设置当前会话 Prompt 缓存保留策略
 
 运行与控制指令:
   /status - 查看当前工作区、会话、模型与排队状态
@@ -65,7 +67,8 @@ export const WS_USAGE = `用法:
   /ws list - 列出活跃工作区 (别名: /ws ls)
   /ws use <名称/目录/ID/main> - 切换到工作区主会话并清除固定会话
   /ws new <名称> - 新建工作区并切换
-  /ws home - 回到账号默认工作区`;
+  /ws home - 回到账号默认工作区
+  /ws cache [long|short|none|default] - 查看或设置工作区 Prompt 缓存保留策略`;
 
 export const SESSION_USAGE = `用法:
   /session - 查看当前会话 (别名: /ses)
@@ -73,7 +76,8 @@ export const SESSION_USAGE = `用法:
   /session use <短ID/标题/main> - 固定到会话 (main 跟随主会话)
   /session new [标题] - 新建会话并固定
   /session clear - 清空当前会话
-  /session clear confirm - 确认清空共享主会话`;
+  /session clear confirm - 确认清空共享主会话
+  /session cache [long|short|none|default] - 查看或设置当前会话 Prompt 缓存保留策略`;
 
 /**
  * Computes deterministic short session ID:
@@ -396,6 +400,17 @@ export function parseChatCommand(
         raw: trimmed,
       };
     }
+    if (sub === 'cache') {
+      return {
+        command: 'ws',
+        type: 'ws',
+        subcommand: 'cache',
+        action: 'cache',
+        target: subRest || undefined,
+        arg: subRest || undefined,
+        raw: trimmed,
+      };
+    }
     return {
       command: 'ws',
       type: 'ws',
@@ -463,6 +478,17 @@ export function parseChatCommand(
         subcommand: 'clear',
         action: 'clear',
         isConfirm,
+        raw: trimmed,
+      };
+    }
+    if (sub === 'cache') {
+      return {
+        command: 'session',
+        type: 'session',
+        subcommand: 'cache',
+        action: 'cache',
+        target: subRest || undefined,
+        arg: subRest || undefined,
         raw: trimmed,
       };
     }
@@ -1224,10 +1250,10 @@ export class ChatCommandService {
 
   private isMutatingCommand(parsed: ParsedChatCommand): boolean {
     if (parsed.command === 'ws') {
-      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'home';
+      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'home' || (parsed.subcommand === 'cache' && Boolean(parsed.target || parsed.arg));
     }
     if (parsed.command === 'session' || parsed.command === 'ses') {
-      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'clear';
+      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'clear' || (parsed.subcommand === 'cache' && Boolean(parsed.target || parsed.arg));
     }
     if (parsed.command === 'bg') {
       return parsed.subcommand === 'stop';
@@ -1559,9 +1585,64 @@ export class ChatCommandService {
         return await this.executeWsNewCommand(params, parsed);
       case 'home':
         return await this.executeWsHomeCommand(params, parsed);
+      case 'cache':
+        return await this.executeWsCacheCommand(params, parsed);
       default:
         return { replyText: WS_USAGE };
     }
+  }
+
+  private async executeWsCacheCommand(
+    params: { userId: string; sessionId: string; spaceId: string; channelContext?: ChatCommandChannelContext },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, spaceId } = params;
+    const targetArg = (parsed.target || parsed.arg || '').trim().toLowerCase();
+
+    let targetSpaceId = spaceId;
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT space_id FROM session_routes WHERE id = ?')
+          .get(params.sessionId) as { space_id?: string } | undefined;
+        if (routeRow?.space_id) targetSpaceId = routeRow.space_id;
+      } catch {}
+    }
+
+    let currentOverride: string | null = null;
+    if (this.db) {
+      try {
+        const spaceRow = this.db
+          .prepare('SELECT cache_retention FROM spaces WHERE id = ?')
+          .get(targetSpaceId) as { cache_retention?: string | null } | undefined;
+        if (spaceRow?.cache_retention) {
+          currentOverride = spaceRow.cache_retention;
+        }
+      } catch {}
+    }
+
+    if (!targetArg) {
+      const resolution = resolveTopLevelCacheRetention({ spaceRetention: currentOverride });
+      const source = currentOverride ? 'space' : 'platform';
+      return { replyText: `当前工作区 Prompt Cache Retention: ${resolution.retention} (来源: ${source})` };
+    }
+
+    if (targetArg === 'default') {
+      if (this.db) {
+        this.db.prepare('UPDATE spaces SET cache_retention = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(targetSpaceId);
+      }
+      const resolution = resolveTopLevelCacheRetention({ spaceRetention: null });
+      return { replyText: `已清除当前工作区 Cache Retention 覆盖，恢复平台默认值 (${resolution.retention}).` };
+    }
+
+    if (targetArg === 'long' || targetArg === 'short' || targetArg === 'none') {
+      if (this.db) {
+        this.db.prepare('UPDATE spaces SET cache_retention = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(targetArg, targetSpaceId);
+      }
+      return { replyText: `已设置当前工作区 Cache Retention 为 ${targetArg}.` };
+    }
+
+    return { replyText: '用法: /ws cache [long|short|none|default]' };
   }
 
   private async executeWsShowCommand(
@@ -2002,9 +2083,70 @@ export class ChatCommandService {
         return await this.executeSessionNewCommand(params, parsed);
       case 'clear':
         return await this.executeSessionClearCommand(params, parsed);
+      case 'cache':
+        return await this.executeSessionCacheCommand(params, parsed);
       default:
         return { replyText: SESSION_USAGE };
     }
+  }
+
+  private async executeSessionCacheCommand(
+    params: { userId: string; sessionId: string; spaceId: string; channelContext?: ChatCommandChannelContext },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId, spaceId } = params;
+    const targetArg = (parsed.target || parsed.arg || '').trim().toLowerCase();
+
+    let targetSpaceId = spaceId;
+    let sessionOverride: string | null = null;
+    let spaceOverride: string | null = null;
+
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT space_id, cache_retention FROM session_routes WHERE id = ? AND user_id = ?')
+          .get(sessionId, userId) as { space_id?: string; cache_retention?: string | null } | undefined;
+        if (routeRow) {
+          if (routeRow.space_id) targetSpaceId = routeRow.space_id;
+          if (routeRow.cache_retention) sessionOverride = routeRow.cache_retention;
+        }
+
+        const spaceRow = this.db
+          .prepare('SELECT cache_retention FROM spaces WHERE id = ?')
+          .get(targetSpaceId) as { cache_retention?: string | null } | undefined;
+        if (spaceRow?.cache_retention) {
+          spaceOverride = spaceRow.cache_retention;
+        }
+      } catch {}
+    }
+
+    if (!targetArg) {
+      const resolution = resolveTopLevelCacheRetention({
+        sessionRetention: sessionOverride,
+        spaceRetention: spaceOverride,
+      });
+      return { replyText: `当前会话 Prompt Cache Retention: ${resolution.retention} (来源: ${resolution.source})` };
+    }
+
+    if (targetArg === 'default') {
+      if (this.db) {
+        this.db.prepare('UPDATE session_routes SET cache_retention = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?').run(sessionId, userId);
+      }
+      const resolution = resolveTopLevelCacheRetention({
+        sessionRetention: null,
+        spaceRetention: spaceOverride,
+      });
+      return { replyText: `已清除当前会话 Cache Retention 覆盖，生效值: ${resolution.retention} (来源: ${resolution.source}).` };
+    }
+
+    if (targetArg === 'long' || targetArg === 'short' || targetArg === 'none') {
+      if (this.db) {
+        this.db.prepare('UPDATE session_routes SET cache_retention = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?').run(targetArg, sessionId, userId);
+      }
+      return { replyText: `已设置当前会话 Cache Retention 为 ${targetArg}.` };
+    }
+
+    return { replyText: '用法: /session cache [long|short|none|default]' };
   }
 
   private async executeSessionShowCommand(

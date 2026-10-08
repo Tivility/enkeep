@@ -1584,6 +1584,14 @@ CREATE INDEX IF NOT EXISTS idx_channel_bindings_session_route ON channel_binding
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL = `
+-- Migration 39: Layered prompt cache retention override on spaces and session_routes
+ALTER TABLE spaces ADD COLUMN cache_retention TEXT;
+ALTER TABLE session_routes ADD COLUMN cache_retention TEXT;
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

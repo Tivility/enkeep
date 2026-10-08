@@ -715,6 +715,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       workspaceFolder: typeof request.workspaceFolder === 'string' ? request.workspaceFolder : (request.spaceId ?? undefined),
       attachments: request.attachments,
       modelSelection: request.modelSelection,
+      cacheRetention: request.cacheRetention,
       replyReference: request.replyReference ?? null,
       timeoutMs: request.timeoutMs,
       idleTimeoutMs: request.idleTimeoutMs,

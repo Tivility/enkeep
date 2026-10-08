@@ -899,6 +899,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           timeoutMs,
           attachments,
           modelSelection,
+          cacheRetention,
         } = request;
         const replyReference = (request as {
           replyReference?: {
@@ -940,6 +941,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
             workspaceFolder: effWorkspaceFolder,
             attachments,
             modelSelection: modelSelection ?? undefined,
+            cacheRetention: cacheRetention ?? undefined,
             replyReference: replyReference ?? null,
             timeoutMs: effTimeout,
             mounts: inContainerMounts,

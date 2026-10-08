@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Context, type Fiber } from '@deepseek-ai/cordis';
 import LlmRuntime, {
   createUserMessage,
@@ -56,6 +57,9 @@ import type { EventRelayService } from '@enkeep/dsh-event-relay';
 import {
   classifyError,
   ModelCircuitBreakerRegistry,
+  getPlatformTopLevelCacheRetention,
+  getPlatformChildCacheRetention,
+  isValidCacheRetention,
   type CircuitBreakerState,
 } from '@enkeep/platform-core';
 import {
@@ -1085,6 +1089,36 @@ export function validateDshRuntimeBootConfig(rawConfig: unknown): ValidatedDshRu
   };
 }
 
+const activeRetentionScope = new AsyncLocalStorage<string>();
+
+function pullInRetentionScope<T>(
+  inner: AsyncIterable<T>,
+  retention: string,
+): AsyncIterable<T> {
+  const iterator = inner[Symbol.asyncIterator]();
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          return await activeRetentionScope.run(retention, () => iterator.next());
+        },
+        async return(value?: any) {
+          return await activeRetentionScope.run(retention, async () => {
+            if (iterator.return) return await iterator.return(value);
+            return { done: true, value };
+          });
+        },
+        async throw(error?: any) {
+          return await activeRetentionScope.run(retention, async () => {
+            if (iterator.throw) return await iterator.throw(error);
+            throw error;
+          });
+        },
+      };
+    },
+  };
+}
+
 /**
  * Boots a genuine DSH runtime instance using official ESM package plugins
  * and applies the official Enkeep bundle plugins via @enkeep/dsh-enkeep-bundle.
@@ -1119,8 +1153,34 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
   const ctx = new Context();
 
+  // Install per-request cache retention fetch decorator for LLM calls
+  const originalFetch = globalThis.fetch;
+  const patchedFetch: typeof globalThis.fetch = (input, init) => {
+    const retention = activeRetentionScope.getStore();
+    if (retention) {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      headers.set('x-enkeep-cache-retention', retention);
+      const nextInit = { ...init, headers };
+      return originalFetch(input, nextInit);
+    }
+    return originalFetch(input, init);
+  };
+  globalThis.fetch = patchedFetch;
+
   // 1. Mount official core DSH plugins with zero `as any`
   await ctx.plugin(LlmRuntime);
+
+  // Hook LLM stream waterfall to pull requests in active agent retention scope
+  ctx.on('llm/stream', (options, next) => {
+    const sid = options.sessionId ? String(options.sessionId) : '';
+    let retention: 'short' | 'long' | 'none' = getPlatformChildCacheRetention();
+    if (sid && agentRetentionRefs.has(sid)) {
+      retention = agentRetentionRefs.get(sid)!.current;
+    } else if (sid && isValidSessionId(sid)) {
+      retention = getPlatformTopLevelCacheRetention();
+    }
+    return pullInRetentionScope(next(), retention);
+  });
   await ctx.plugin(SessionStore);
   await ctx.plugin(SessionProjectionRegistry);
   await ctx.plugin(SystemPromptRegistry);
@@ -1239,6 +1299,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       userId,
       injectGlobalMemory,
     }, agent);
+    agent.ctx.on('agent/request', async (payload: any, next: any) => {
+      const targetRetention = getPlatformChildCacheRetention();
+      if (agent?.id) {
+        agentRetentionRefs.set(agent.id, { current: targetRetention });
+      }
+      return await next();
+    }, { prepend: true });
+
     agent.ctx.effect(() => {
       return () => {
         try {
@@ -1506,6 +1574,11 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   const agentSelectionRefs = new Map<string, {
     current: { provider: string; model: string; reasoningEffort?: any } | undefined;
     assembled: { provider: string; model: string; reasoningEffort?: any } | undefined;
+  }>();
+
+  // Map to hold live agent cache retention refs for dynamic per-turn updates
+  const agentRetentionRefs = new Map<string, {
+    current: 'short' | 'long' | 'none';
   }>();
 
   // Active fallback context by session ID for in-container request-level routing & telemetry
@@ -2257,8 +2330,17 @@ function logWarn(agentCtx: Context, message: string): void {
     const createAgentSetup = (spacePath: string, selectionRef: { current: any; assembled: any }) => {
       return async (agentCtx: Context, _agent?: Agent) => {
         installModelSelection(agentCtx, selectionRef);
-        // Ensure child/subagent instances created under this context preserve their own explicit model selection
+        // Ensure child/subagent instances created under this context preserve their own explicit model selection and layered cache retention
         agentCtx.on('agent/request', async (payload: any, next: any) => {
+          const isChild = Boolean(payload?.agent && payload.agent.id !== sessionIdStr);
+          const targetRetention = isChild
+            ? getPlatformChildCacheRetention()
+            : (agentRetentionRefs.get(sessionIdStr)?.current ?? getPlatformTopLevelCacheRetention());
+
+          if (isChild && payload?.agent?.id) {
+            agentRetentionRefs.set(payload.agent.id, { current: targetRetention });
+          }
+
           const res = await next();
           if (payload?.agent && payload.agent.id !== sessionIdStr && payload.agent.options) {
             const childOpts = payload.agent.options;
@@ -3506,8 +3588,17 @@ function logWarn(agentCtx: Context, message: string): void {
         agentOptions: { provider, model },
         setup: async (agentCtx: Context, _agent?: Agent) => {
           installModelSelection(agentCtx, selectionRef!);
-          // Ensure child/subagent instances created under this context preserve their own explicit model selection
+          // Ensure child/subagent instances created under this context preserve their own explicit model selection and layered cache retention
           agentCtx.on('agent/request', async (payload: any, next: any) => {
+            const isChild = Boolean(payload?.agent && payload.agent.id !== sessionIdStr);
+            const targetRetention = isChild
+              ? getPlatformChildCacheRetention()
+              : (agentRetentionRefs.get(sessionIdStr)?.current ?? getPlatformTopLevelCacheRetention());
+
+            if (isChild && payload?.agent?.id) {
+              agentRetentionRefs.set(payload.agent.id, { current: targetRetention });
+            }
+
             const res = await next();
             if (payload?.agent && payload.agent.id !== sessionIdStr && payload.agent.options) {
               const childOpts = payload.agent.options;
@@ -3694,6 +3785,7 @@ function logWarn(agentCtx: Context, message: string): void {
       source?: string;
       fallbackChain?: readonly any[];
     } | null | undefined;
+    let effCacheRetention: 'short' | 'long' | 'none';
 
     let effReplyReference: {
       replyToMessageId: string;
@@ -3714,6 +3806,9 @@ function logWarn(agentCtx: Context, message: string): void {
       effWorkspaceFolder = req.workspaceFolder ?? req.spaceId;
       effAttachments = req.attachments;
       effModelSelection = req.modelSelection;
+      effCacheRetention = (req.cacheRetention && isValidCacheRetention(req.cacheRetention))
+        ? req.cacheRetention
+        : getPlatformTopLevelCacheRetention();
       effReplyReference = req.replyReference;
       effMounts = req.mounts ?? undefined;
       effExtensionPlan = req.extensionPlan !== undefined ? req.extensionPlan : undefined;
@@ -3726,6 +3821,7 @@ function logWarn(agentCtx: Context, message: string): void {
       effWorkspaceFolder = workspaceFolder;
       effAttachments = attachments;
       effModelSelection = undefined;
+      effCacheRetention = getPlatformTopLevelCacheRetention();
       effReplyReference = undefined;
       effMounts = undefined;
       effExtensionPlan = undefined;
@@ -3827,6 +3923,15 @@ function logWarn(agentCtx: Context, message: string): void {
     }
 
     try {
+      // Update dynamic per-turn cache retention
+      let retentionRef = agentRetentionRefs.get(effSessionId);
+      if (!retentionRef) {
+        retentionRef = { current: effCacheRetention };
+        agentRetentionRefs.set(effSessionId, retentionRef);
+      } else {
+        retentionRef.current = effCacheRetention;
+      }
+
       // 0. Update dynamic per-turn model selection on live agent if specified
       if (effModelSelection && effModelSelection.provider && effModelSelection.model) {
         const effCandidates: AgentFallbackCandidate[] = [
@@ -4372,6 +4477,10 @@ function logWarn(agentCtx: Context, message: string): void {
       );
     }
 
+    if (globalThis.fetch === patchedFetch) {
+      globalThis.fetch = originalFetch;
+    }
+
     if (disposalErrors.length > 0) {
       throw new AggregateError(disposalErrors, 'Runtime disposal failed');
     }
@@ -4395,6 +4504,7 @@ function logWarn(agentCtx: Context, message: string): void {
     agentHandles.delete(sessionIdStr);
     sessionProfileHashes.delete(sessionIdStr);
     agentSelectionRefs.delete(sessionIdStr);
+    agentRetentionRefs.delete(sessionIdStr);
     activeFallbackContexts.delete(sessionIdStr);
     sessionMountHashes.delete(sessionIdStr);
     sessionMounts.delete(sessionIdStr);

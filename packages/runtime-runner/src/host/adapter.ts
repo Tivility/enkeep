@@ -516,6 +516,7 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
           timeoutMs,
           attachments,
           modelSelection,
+          cacheRetention,
         } = request;
         const replyReference = (request as any).replyReference;
 
@@ -539,6 +540,7 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
             workspaceFolder: typeof workspaceFolder === 'string' ? workspaceFolder : undefined,
             attachments,
             modelSelection: modelSelection ?? undefined,
+            cacheRetention: cacheRetention ?? undefined,
             replyReference: replyReference ?? null,
             timeoutMs,
             mounts: request.mounts,
