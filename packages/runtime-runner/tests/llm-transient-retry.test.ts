@@ -397,4 +397,209 @@ describe('LLM Transient Error Retry & Backoff Engine', () => {
       await runtime.dispose();
     }
   });
+
+  it('7. Subagent child agent (spawn & fork) gets 502 then success -> completes with 2 attempts', async () => {
+    process.env.ENKEEP_LLM_RETRY_BACKOFF_MS = '20,50,150';
+
+    const runtime = await bootDshRuntime({
+      userId: 'user-alice',
+      dshHome: testHomeDir,
+      spacesDir: testSpacesDir,
+      llmEnabled: false,
+      provider: 'cpa-claude',
+      model: 'claude-fable-5',
+    });
+
+    try {
+      let callCount = 0;
+      const childAdapter = new MockStreamAdapter(async function* () {
+        callCount++;
+        if (callCount === 1) {
+          // Attempt 1 fails with 502 upstream_transient_error
+          throw new LlmError(
+            'Upstream returned status 502 (upstream_transient_error)',
+            'SERVER_ERROR',
+            { status: 502 }
+          );
+        }
+        // Attempt 2 succeeds
+        yield {
+          type: 'block-start',
+          index: 0,
+          blockType: 'text',
+        };
+        yield {
+          type: 'text-delta',
+          index: 0,
+          text: 'Child subagent successfully recovered after 502.',
+        };
+      });
+
+      runtime.context.llm.registerAdapter(['synthetic-subagent-502-provider'], childAdapter);
+
+      const parentSessionId = 'ses_00000000000000000000000000000007';
+      const parentAgent = await runtime.getOrCreateAgent(parentSessionId, null, 'space-synthetic-01');
+
+      const subagentsService = parentAgent.ctx.get('subagents');
+      expect(subagentsService).toBeDefined();
+
+      // Test spawn child retry
+      const childRun = await subagentsService.start('spawn', {
+        label: 'child-502-task',
+        prompt: [{ type: 'text', text: 'Execute delegated task' }],
+        parent: parentAgent,
+        agentOptions: {
+          provider: 'synthetic-subagent-502-provider',
+          model: 'demo-model',
+        },
+        signal: new AbortController().signal,
+      });
+
+      const subagentResult = await childRun.result;
+      expect(subagentResult.stopReason).toBe('completed');
+      expect(subagentResult.output[0].text).toContain('Child subagent successfully recovered after 502.');
+      expect(callCount).toBe(2);
+
+      // Test fork child retry
+      callCount = 0;
+      const forkRun = await subagentsService.start('fork', {
+        label: 'child-fork-task',
+        prompt: [{ type: 'text', text: 'Execute delegated fork task' }],
+        parent: parentAgent,
+        agentOptions: {
+          provider: 'synthetic-subagent-502-provider',
+          model: 'demo-model',
+        },
+        signal: new AbortController().signal,
+      });
+
+      const forkResult = await forkRun.result;
+      expect(forkResult.stopReason).toBe('completed');
+      expect(forkResult.output[0].text).toContain('Child subagent successfully recovered after 502.');
+      expect(callCount).toBe(2);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('8. Workflow child agent gets 502 then success -> completes with 2 attempts', async () => {
+    process.env.ENKEEP_LLM_RETRY_BACKOFF_MS = '20,50,150';
+
+    const runtime = await bootDshRuntime({
+      userId: 'user-alice',
+      dshHome: testHomeDir,
+      spacesDir: testSpacesDir,
+      llmEnabled: false,
+      provider: 'cpa-claude',
+      model: 'claude-fable-5',
+    });
+
+    try {
+      let callCount = 0;
+      const wfChildAdapter = new MockStreamAdapter(async function* () {
+        callCount++;
+        if (callCount === 1) {
+          throw new LlmError(
+            'Upstream returned status 502 (upstream_transient_error)',
+            'SERVER_ERROR',
+            { status: 502 }
+          );
+        }
+        yield {
+          type: 'block-start',
+          index: 0,
+          blockType: 'text',
+        };
+        yield {
+          type: 'text-delta',
+          index: 0,
+          text: 'Workflow child recovered after 502 retry.',
+        };
+      });
+
+      runtime.context.llm.registerAdapter(['synthetic-wf-502-provider'], wfChildAdapter);
+
+      const parentSessionId = 'ses_00000000000000000000000000000008';
+      const parentAgent = await runtime.getOrCreateAgent(parentSessionId, null, 'space-synthetic-01');
+
+      const engine = parentAgent.ctx.get('workflowEngine');
+      expect(engine).toBeDefined();
+
+      const meta = {
+        name: 'synthetic-retry-wf',
+        description: 'Test workflow child transient error retry',
+      };
+      const script = `
+        const childResult = await agent("Synthesize workflow task", { provider: "synthetic-wf-502-provider", model: "demo-model" });
+        return { ok: true, childResult };
+      `;
+
+      const run = engine.start({
+        script,
+        meta,
+        parent: parentAgent,
+      });
+
+      const outcome = await run.result;
+      expect(outcome.stopReason).toBe('completed');
+      expect(outcome.value).toBeDefined();
+      expect((outcome.value as any).ok).toBe(true);
+      expect((outcome.value as any).childResult).toContain('Workflow child recovered after 502 retry.');
+      expect(callCount).toBe(2);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('9. Child agent non-transient 400 validation error is not retried (fails fast with 1 attempt)', async () => {
+    process.env.ENKEEP_LLM_RETRY_BACKOFF_MS = '20,50,150';
+
+    const runtime = await bootDshRuntime({
+      userId: 'user-alice',
+      dshHome: testHomeDir,
+      spacesDir: testSpacesDir,
+      llmEnabled: false,
+      provider: 'cpa-claude',
+      model: 'claude-fable-5',
+    });
+
+    try {
+      let callCount = 0;
+      const childAdapter = new MockStreamAdapter(async function* () {
+        callCount++;
+        throw new LlmError(
+          'Invalid request payload: bad prompt (validation error)',
+          'INVALID_REQUEST',
+          { status: 400 }
+        );
+      });
+
+      runtime.context.llm.registerAdapter(['synthetic-subagent-400-provider'], childAdapter);
+
+      const parentSessionId = 'ses_00000000000000000000000000000009';
+      const parentAgent = await runtime.getOrCreateAgent(parentSessionId, null, 'space-synthetic-01');
+
+      const subagentsService = parentAgent.ctx.get('subagents');
+      expect(subagentsService).toBeDefined();
+
+      const childRun = await subagentsService.start('spawn', {
+        label: 'child-400-task',
+        prompt: [{ type: 'text', text: 'Invalid prompt' }],
+        parent: parentAgent,
+        agentOptions: {
+          provider: 'synthetic-subagent-400-provider',
+          model: 'demo-model',
+        },
+        signal: new AbortController().signal,
+      });
+
+      const result = await childRun.result;
+      expect(result.stopReason).toBe('error');
+
+      // Exactly 1 call was made; no retry was attempted for child agent 400 error
+      expect(callCount).toBe(1);
+    } finally {
+      await runtime.dispose();
+    }
+  });
 });
