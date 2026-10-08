@@ -435,4 +435,173 @@ describe('Layered Prompt Cache Retention in Runtime (Synthetic End-to-End Tests)
     expect(foundChildCacheControl).toBe(true);
     expect(foundChildTtl).toBe(false);
   });
+
+  it('4. Real subagent and workflow child agents run through composition, complete step 1 with JSON-serializable request/header, and use short retention', async () => {
+    process.env.ENKEEP_LLM_PROXY_TOKEN = proxyServer.getAuthToken();
+
+    runtime = await bootDshRuntime({
+      userId: 'alice_synth',
+      dshHome,
+      spacesDir,
+      provider: 'cpa-claude',
+      model: 'claude-3-7-sonnet-20250219',
+      llmEnabled: true,
+      llmBaseUrl: proxyBaseUrl,
+      providers: {
+        'cpa-claude': {
+          id: 'cpa-claude',
+          displayName: 'Claude',
+          api: 'anthropic-messages',
+          apiKeyEnv: 'CPA_TOKEN',
+          baseURL: `${proxyBaseUrl}/cpa-claude`,
+          models: [{ id: 'claude-3-7-sonnet-20250219' }],
+        },
+      },
+    });
+
+    const parentSessionId = 'ses_00000000000000000000000000000004';
+
+    // Step A: Top-level turn with long cache retention
+    const turn1Id = 'turn_00000000000000000000000000000001';
+    await runtime.sendFollowup({
+      prompt: 'Top-level turn with long cache retention',
+      sessionId: parentSessionId,
+      turnId: turn1Id,
+      profile: null,
+      cacheRetention: 'long',
+    });
+    expect(capturedRequests.length).toBe(1);
+
+    // Verify parent outgoing request had ttl: '1h'
+    const parentBody = capturedRequests[0]!.body;
+    let foundParentTtl = false;
+    const inspectTtl = (obj: any) => {
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj)) {
+        for (const item of obj) inspectTtl(item);
+        return;
+      }
+      if (obj.cache_control && typeof obj.cache_control === 'object') {
+        if (obj.cache_control.ttl === '1h') foundParentTtl = true;
+      }
+      for (const val of Object.values(obj)) inspectTtl(val);
+    };
+    inspectTtl(parentBody);
+    expect(foundParentTtl).toBe(true);
+
+    // Step B: Dispatch real subagent tool execution under parent agent
+    capturedRequests.length = 0;
+    const parentAgent = await runtime.getOrCreateAgent(parentSessionId, null, 'space-synthetic-01');
+    const toolsRegistry = parentAgent.ctx.get('tools');
+    const subagentTool = toolsRegistry.get('subagent', parentAgent);
+    expect(subagentTool).toBeDefined();
+
+    const subagentResult = await subagentTool.execute(
+      {
+        description: 'verify-child-delegation',
+        prompt: 'Say CHILD_PONG in one word',
+        run_in_background: false,
+      },
+      { agent: parentAgent, signal: new AbortController().signal } as any
+    );
+
+    expect(subagentResult).toBeDefined();
+    expect(subagentResult.kind).toBe('foreground');
+    expect(subagentResult.output?.[0]?.text).toBe('Synthetic Anthropic response');
+
+    // Verify subagent child session jsonl has valid JSON-serializable request/header
+    const sessionsDir = path.join(dshHome, 'sessions');
+    const sessionFiles: string[] = [];
+    if (fs.existsSync(sessionsDir)) {
+      const entries = fs.readdirSync(sessionsDir, { recursive: true });
+      for (const e of entries) {
+        const full = path.join(sessionsDir, String(e));
+        if (fs.statSync(full).isFile() && (full.endsWith('.jsonl') || full.endsWith('.v4.jsonl'))) {
+          sessionFiles.push(full);
+        }
+      }
+    }
+
+    const subagentSessionFile = sessionFiles.find((f) => !f.includes(parentSessionId));
+    expect(subagentSessionFile).toBeDefined();
+
+    const subLines = fs.readFileSync(subagentSessionFile!, 'utf8').trim().split('\n');
+    const subEvents = subLines.map((l) => JSON.parse(l));
+
+    const requestHeaderEvent = subEvents.find((e) => e.type === 'request/header');
+    expect(requestHeaderEvent).toBeDefined();
+    expect(requestHeaderEvent.data.header.config.provider).toBe('cpa-claude');
+    expect(requestHeaderEvent.data.header.config.model).toBe('claude-3-7-sonnet-20250219');
+    // Ensure no undefined keys exist in serialized event
+    expect(JSON.stringify(requestHeaderEvent.data)).not.toContain('undefined');
+
+    // Verify child outgoing Anthropic request has short retention (ephemeral, no ttl 1h)
+    expect(capturedRequests.length).toBeGreaterThanOrEqual(1);
+    const childReqBody = capturedRequests[0]!.body;
+    let foundChildReqTtl = false;
+    let foundChildReqCacheControl = false;
+    const inspectChildReq = (obj: any) => {
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj)) {
+        for (const item of obj) inspectChildReq(item);
+        return;
+      }
+      if (obj.cache_control && typeof obj.cache_control === 'object') {
+        foundChildReqCacheControl = true;
+        if (obj.cache_control.ttl) foundChildReqTtl = true;
+      }
+      for (const val of Object.values(obj)) inspectChildReq(val);
+    };
+    inspectChildReq(childReqBody);
+    expect(foundChildReqCacheControl).toBe(true);
+    expect(foundChildReqTtl).toBe(false);
+
+    // Step C: Dispatch real workflow tool execution with child agent under parent agent
+    capturedRequests.length = 0;
+    const workflowTool = toolsRegistry.get('workflow', parentAgent);
+    expect(workflowTool).toBeDefined();
+
+    const meta = {
+      name: 'synthetic-subagent-wf-test',
+      description: 'Run workflow with child agent',
+    };
+    const script = `
+      const childRes = await agent("Synthesize test response");
+      return { ok: true, childRes };
+    `;
+
+    const wfResult = await workflowTool.execute(
+      { meta, script },
+      { agent: parentAgent, signal: new AbortController().signal } as any
+    );
+
+    expect(wfResult).toBeDefined();
+    expect(wfResult.kind).toBe('foreground');
+    expect(wfResult.result?.ok).toBe(true);
+    expect(wfResult.result?.childRes).toBe('Synthetic Anthropic response');
+
+    // Verify workflow child session also has valid request/header
+    const updatedSessionFiles: string[] = [];
+    if (fs.existsSync(sessionsDir)) {
+      const entries = fs.readdirSync(sessionsDir, { recursive: true });
+      for (const e of entries) {
+        const full = path.join(sessionsDir, String(e));
+        if (fs.statSync(full).isFile() && (full.endsWith('.jsonl') || full.endsWith('.v4.jsonl'))) {
+          updatedSessionFiles.push(full);
+        }
+      }
+    }
+
+    const wfSessionFiles = updatedSessionFiles.filter((f) => !f.includes(parentSessionId) && f !== subagentSessionFile);
+    expect(wfSessionFiles.length).toBeGreaterThanOrEqual(1);
+
+    const wfChildLines = fs.readFileSync(wfSessionFiles[0]!, 'utf8').trim().split('\n');
+    const wfChildEvents = wfChildLines.map((l) => JSON.parse(l));
+
+    const wfRequestHeader = wfChildEvents.find((e) => e.type === 'request/header');
+    expect(wfRequestHeader).toBeDefined();
+    expect(wfRequestHeader.data.header.config.provider).toBe('cpa-claude');
+    expect(wfRequestHeader.data.header.config.model).toBe('claude-3-7-sonnet-20250219');
+    expect(JSON.stringify(wfRequestHeader.data)).not.toContain('undefined');
+  });
 });

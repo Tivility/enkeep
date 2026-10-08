@@ -1299,13 +1299,10 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       userId,
       injectGlobalMemory,
     }, agent);
-    agent.ctx.on('agent/request', async (payload: any, next: any) => {
-      const targetRetention = getPlatformChildCacheRetention();
-      if (agent?.id) {
-        agentRetentionRefs.set(agent.id, { current: targetRetention });
-      }
-      return await next();
-    }, { prepend: true });
+
+    if (agent?.id && isChildSession(agent, ctx)) {
+      agentRetentionRefs.set(agent.id, { current: getPlatformChildCacheRetention() });
+    }
 
     agent.ctx.effect(() => {
       return () => {
@@ -1313,6 +1310,9 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           memHandle.dispose();
         } catch (err: unknown) {
           ctx.logger?.warn?.(`Memory disposer failed on agent ${agent.id}:`, err);
+        }
+        if (agent?.id) {
+          agentRetentionRefs.delete(agent.id);
         }
       };
     }, 'memory.agentCreatedScope()');
@@ -2345,12 +2345,18 @@ function logWarn(agentCtx: Context, message: string): void {
           if (payload?.agent && payload.agent.id !== sessionIdStr && payload.agent.options) {
             const childOpts = payload.agent.options;
             if (childOpts.provider && childOpts.model) {
-              return {
+              const effReasoningEffort = childOpts.reasoningEffort ?? res?.reasoningEffort;
+              const nextConfig: any = {
                 ...res,
                 provider: childOpts.provider,
                 model: childOpts.model,
-                reasoningEffort: childOpts.reasoningEffort ?? res.reasoningEffort,
               };
+              if (effReasoningEffort !== undefined) {
+                nextConfig.reasoningEffort = effReasoningEffort;
+              } else {
+                delete nextConfig.reasoningEffort;
+              }
+              return nextConfig;
             }
           }
           return res;
@@ -3603,12 +3609,18 @@ function logWarn(agentCtx: Context, message: string): void {
             if (payload?.agent && payload.agent.id !== sessionIdStr && payload.agent.options) {
               const childOpts = payload.agent.options;
               if (childOpts.provider && childOpts.model) {
-                return {
+                const effReasoningEffort = childOpts.reasoningEffort ?? res?.reasoningEffort;
+                const nextConfig: any = {
                   ...res,
                   provider: childOpts.provider,
                   model: childOpts.model,
-                  reasoningEffort: childOpts.reasoningEffort ?? res.reasoningEffort,
                 };
+                if (effReasoningEffort !== undefined) {
+                  nextConfig.reasoningEffort = effReasoningEffort;
+                } else {
+                  delete nextConfig.reasoningEffort;
+                }
+                return nextConfig;
               }
             }
             return res;
