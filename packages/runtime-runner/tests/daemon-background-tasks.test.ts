@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { scopeTarget } from '@deepseek-ai/dsh-scope';
 import { RuntimeDaemon } from '../src/runtime/daemon.js';
 import { DAEMON_OPS } from '../src/runtime/daemon-protocol.js';
 
@@ -78,6 +79,311 @@ describe('RuntimeDaemon Background Tasks RPC & Tracking', () => {
     const postStopTasks = await daemon.listBackgroundTasks(parentSessionId);
     expect(postStopTasks[0].status).toBe('cancelled');
     expect(postStopTasks[0].finishedAt).toBeDefined();
+
+    await daemon.shutdown();
+  });
+
+  it('determines parent of subagent using DSH 0.2 listener context (carrierKeyOf / scopeTarget) with payload identity only', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000005';
+    const childSessionId = 'ses_00000000000000000000000000000006';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+      contextWindow: 2000,
+      maxTokens: 512,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // DSH 0.2 event shape: payload has { runId, provider, id, local } (no parentSession field in payload)
+    // and parent is passed in scope carrier
+    const parentAgentStub = {
+      id: parentSessionId,
+      session: { id: parentSessionId },
+    };
+    const carrier = scopeTarget(ctx.subagents || {}, parentAgentStub as any);
+
+    // Emit subagent/start with carrier as `this`
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-dsh02-001',
+      provider: 'spawn',
+      id: childSessionId,
+      local: true,
+    });
+
+    const tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe(childSessionId);
+    expect(tasks[0].kind).toBe('subagent');
+    expect(tasks[0].status).toBe('running');
+
+    // Emit subagent/end with carrier
+    ctx.emit(carrier, 'subagent/end', {
+      runId: 'run-dsh02-001',
+      provider: 'spawn',
+      id: childSessionId,
+      local: true,
+      stopReason: 'completed',
+    });
+
+    await daemon.shutdown();
+  });
+
+  it('indexes and lists continuable background subagents with step count and lastActivityAt from session events', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000040';
+    const childSessionId = 'ses_00000000000000000000000000000041';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+      contextWindow: 2000,
+      maxTokens: 512,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    const parentAgentStub = {
+      id: parentSessionId,
+      session: { id: parentSessionId },
+    };
+    const carrier = scopeTarget(ctx.subagents || {}, parentAgentStub as any);
+
+    // Emit start with DSH 0.2 payload
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-bg-sub-001',
+      provider: 'spawn',
+      id: childSessionId,
+      local: true,
+    });
+
+    // Simulate session events on child session: descriptor event and multiple step/start events
+    const childSessionStub = {
+      id: childSessionId,
+      header: {
+        id: childSessionId,
+        origin: 'subagent',
+        parentSession: parentSessionId,
+        createdAt: Date.now() - 5000,
+      },
+      events: [] as any[],
+      snapshotEvents() {
+        return this.events;
+      },
+      eventAt(seq: number) {
+        return this.events.find((e: any) => e.seq === seq);
+      },
+    };
+
+    const ev1 = {
+      type: 'subagent/descriptor',
+      seq: 0,
+      time: Date.now() - 4000,
+      data: {
+        version: 3,
+        mode: 'continuable',
+        provider: 'spawn',
+        label: 'Background Analysis Worker',
+      },
+    };
+    childSessionStub.events.push(ev1);
+    ctx.emit('session/event', childSessionStub, ev1);
+
+    const ev2 = {
+      type: 'step/start',
+      seq: 1,
+      time: Date.now() - 3000,
+      data: { turn: 1, step: 1 },
+    };
+    childSessionStub.events.push(ev2);
+    ctx.emit('session/event', childSessionStub, ev2);
+
+    const ev3 = {
+      type: 'step/start',
+      seq: 2,
+      time: Date.now() - 1000,
+      data: { turn: 1, step: 2 },
+    };
+    childSessionStub.events.push(ev3);
+    ctx.emit('session/event', childSessionStub, ev3);
+
+    const tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe(childSessionId);
+    expect(tasks[0].name).toBe('Background Analysis Worker');
+    expect(tasks[0].progress?.step).toBe(2);
+    expect(tasks[0].status).toBe('running');
+
+    // Emit subagent/end (epoch settlement)
+    ctx.emit(carrier, 'subagent/end', {
+      runId: 'run-bg-sub-001',
+      provider: 'spawn',
+      id: childSessionId,
+      local: true,
+      stopReason: 'completed',
+    });
+
+    // Continuable background subagent remains in list after completion (2h retention)
+    const postEndTasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(postEndTasks).toHaveLength(1);
+    expect(postEndTasks[0].status).toBe('completed');
+    expect(postEndTasks[0].progress?.step).toBe(2);
+
+    await daemon.shutdown();
+  });
+
+  it('excludes finished foreground one-shot subagents while keeping running one-shots and continuable background subagents', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000050';
+    const fgChildSessionId = 'ses_00000000000000000000000000000051';
+    const bgChildSessionId = 'ses_00000000000000000000000000000052';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+      contextWindow: 2000,
+      maxTokens: 512,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    const parentAgentStub = {
+      id: parentSessionId,
+      session: { id: parentSessionId },
+    };
+    const carrier = scopeTarget(ctx.subagents || {}, parentAgentStub as any);
+
+    // 1. Start foreground one-shot child
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-fg-001',
+      provider: 'spawn',
+      id: fgChildSessionId,
+      local: true,
+    });
+
+    const fgSessionStub = {
+      id: fgChildSessionId,
+      header: { id: fgChildSessionId, origin: 'subagent', parentSession: parentSessionId },
+      events: [] as any[],
+      snapshotEvents() {
+        return this.events;
+      },
+      eventAt(seq: number) {
+        return this.events.find((e: any) => e.seq === seq);
+      },
+    };
+    const fgDesc = {
+      type: 'subagent/descriptor',
+      seq: 0,
+      time: Date.now() - 2000,
+      data: {
+        version: 3,
+        mode: 'one-shot',
+        provider: 'spawn',
+        label: 'Foreground One-Shot Task',
+      },
+    };
+    fgSessionStub.events.push(fgDesc);
+    ctx.emit('session/event', fgSessionStub, fgDesc);
+
+    // 2. Start background continuable child
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-bg-001',
+      provider: 'spawn',
+      id: bgChildSessionId,
+      local: true,
+    });
+
+    const bgSessionStub = {
+      id: bgChildSessionId,
+      header: { id: bgChildSessionId, origin: 'subagent', parentSession: parentSessionId },
+      events: [] as any[],
+      snapshotEvents() {
+        return this.events;
+      },
+      eventAt(seq: number) {
+        return this.events.find((e: any) => e.seq === seq);
+      },
+    };
+    const bgDesc = {
+      type: 'subagent/descriptor',
+      seq: 0,
+      time: Date.now() - 1000,
+      data: {
+        version: 3,
+        mode: 'continuable',
+        provider: 'spawn',
+        label: 'Background Long-Running Task',
+      },
+    };
+    bgSessionStub.events.push(bgDesc);
+    ctx.emit('session/event', bgSessionStub, bgDesc);
+
+    // Both are running -> both in background task list
+    let tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasks).toHaveLength(2);
+
+    // Foreground one-shot finishes
+    ctx.emit(carrier, 'subagent/end', {
+      runId: 'run-fg-001',
+      provider: 'spawn',
+      id: fgChildSessionId,
+      local: true,
+      stopReason: 'completed',
+    });
+
+    // After foreground one-shot finishes, it must be excluded; background continuable is kept
+    tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe(bgChildSessionId);
+    expect(tasks[0].name).toBe('Background Long-Running Task');
+
+    await daemon.shutdown();
+  });
+
+  it('discovers subagents via sessionQuery and ctx.subagents.listChildren lineage', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000060';
+    const subagentSessionId = 'ses_00000000000000000000000000000061';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+      contextWindow: 2000,
+      maxTokens: 512,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // Mock subagents.listChildren to return a continuable subagent child
+    const subagentsService = ctx.get('subagents');
+    if (subagentsService) {
+      subagentsService.listChildren = async (parentSid: any) => {
+        if (String(parentSid) === parentSessionId) {
+          return [
+            {
+              id: subagentSessionId,
+              createdAt: Date.now() - 10000,
+              mode: 'continuable',
+              label: 'Lineage Discovered Worker',
+            },
+          ];
+        }
+        return [];
+      };
+    }
+
+    const tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe(subagentSessionId);
+    expect(tasks[0].name).toBe('Lineage Discovered Worker');
+    expect(tasks[0].kind).toBe('subagent');
 
     await daemon.shutdown();
   });

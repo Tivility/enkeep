@@ -22,6 +22,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import EventEmitter from 'node:events';
 import { type Context } from '@deepseek-ai/cordis';
+import { carrierKeyOf } from '@deepseek-ai/dsh-scope';
 import {
   createUserMessage,
 } from '@deepseek-ai/dsh-llm';
@@ -271,6 +272,8 @@ interface BackgroundTaskRecord {
   };
   originTurnId?: string;
   originChatContextId?: string;
+  mode?: 'one-shot' | 'continuable';
+  isBackground?: boolean;
 }
 
 /**
@@ -409,6 +412,7 @@ export class RuntimeDaemon extends EventEmitter {
    * Subscribes to Cordis events to stream approval and session events in real time.
    */
   private attachCordisListeners(ctx: Context): void {
+    const daemon = this;
     const disposeSessionEvent = ctx.on('session/event', (subject: any, event: SessionEvent) => {
       const sessionIdStr = typeof subject?.id === 'string' ? subject.id : undefined;
       if (!sessionIdStr) return;
@@ -490,9 +494,49 @@ export class RuntimeDaemon extends EventEmitter {
       }
 
       // Track child session activity for background tasks
-      if (sessionIdStr && this.backgroundTasksTracker.has(sessionIdStr)) {
-        const t = this.backgroundTasksTracker.get(sessionIdStr)!;
-        t.lastActivityAt = new Date().toISOString();
+      if (sessionIdStr) {
+        let task = this.backgroundTasksTracker.get(sessionIdStr);
+        const parentSid = (subject as any)?.header?.parentSession
+          ? String((subject as any).header.parentSession)
+          : undefined;
+
+        if (task) {
+          task.lastActivityAt = new Date(event.time || Date.now()).toISOString();
+          if (parentSid && !task.parentSessionId) {
+            task.parentSessionId = parentSid;
+          }
+          if (event.type === 'step/start') {
+            task.progress = task.progress || {};
+            task.progress.step = (task.progress.step || 0) + 1;
+          }
+          if (event.type === 'subagent/descriptor' && (event as any).data) {
+            const data = (event as any).data;
+            if (data.label) task.name = String(data.label).slice(0, 60);
+            if (data.mode) task.mode = data.mode;
+            if (data.mode === 'continuable') task.isBackground = true;
+          }
+        } else if (parentSid && ((subject as any)?.header?.origin === 'subagent' || (subject as any)?.meta?.origin === 'subagent')) {
+          const nowIso = new Date(event.time || Date.now()).toISOString();
+          task = {
+            id: sessionIdStr,
+            parentSessionId: parentSid,
+            kind: 'subagent',
+            name: String((subject as any)?.header?.label || (subject as any)?.meta?.label || 'subagent').slice(0, 60),
+            status: 'running',
+            startedAt: nowIso,
+            lastActivityAt: nowIso,
+          };
+          if (event.type === 'step/start') {
+            task.progress = { step: 1 };
+          }
+          if (event.type === 'subagent/descriptor' && (event as any).data) {
+            const data = (event as any).data;
+            if (data.label) task.name = String(data.label).slice(0, 60);
+            if (data.mode) task.mode = data.mode;
+            if (data.mode === 'continuable') task.isBackground = true;
+          }
+          this.backgroundTasksTracker.set(sessionIdStr, task);
+        }
       }
 
       // Track tool-workflow events on session
@@ -571,35 +615,123 @@ export class RuntimeDaemon extends EventEmitter {
     });
 
     // Track live background subagents via lifecycle events
-    const disposeSubagentStart = ctx.on('subagent/start', (info: any) => {
+    const disposeSubagentStart = ctx.on('subagent/start', function (this: any, info: any, maybeParent?: any) {
       if (info?.id) {
         const idStr = String(info.id);
-        const parentSession = info.parentSession ? String(info.parentSession) : undefined;
-        this.liveSubagentsTracker.set(idStr, {
+        let parentSession: string | undefined = undefined;
+
+        // 1. From listener context / carrierKeyOf(this)
+        try {
+          const carrierAgent = carrierKeyOf(this) as any;
+          if (carrierAgent?.session?.id) {
+            parentSession = String(carrierAgent.session.id);
+          } else if (carrierAgent?.id) {
+            parentSession = String(carrierAgent.id);
+          }
+        } catch {}
+
+        if (!parentSession && this?.session?.id) {
+          parentSession = String(this.session.id);
+        }
+
+        // 2. From maybeParent argument
+        if (!parentSession && maybeParent) {
+          if (typeof maybeParent === 'string') {
+            parentSession = maybeParent;
+          } else if (maybeParent?.session?.id) {
+            parentSession = String(maybeParent.session.id);
+          } else if (maybeParent?.id) {
+            parentSession = String(maybeParent.id);
+          }
+        }
+
+        // 3. From payload fields
+        if (!parentSession && info) {
+          if (info.parentSession) parentSession = String(info.parentSession);
+          else if (info.parentSessionId) parentSession = String(info.parentSessionId);
+          else if (info.parent?.session?.id) parentSession = String(info.parent.session.id);
+          else if (typeof info.parent === 'string') parentSession = info.parent;
+        }
+
+        // 4. From session registry
+        if (!parentSession) {
+          const s = ctx.get('sessions')?.get(info.id);
+          if (s?.header?.parentSession) {
+            parentSession = String(s.header.parentSession);
+          }
+        }
+
+        const isContinuable = info.mode === 'continuable' || info.continuable === true;
+        const isBg = info.runInBackground === true || info.background === true || isContinuable;
+
+        daemon.liveSubagentsTracker.set(idStr, {
           id: idStr,
           provider: info.provider ? String(info.provider) : undefined,
-          sessionId: info.sessionId ? String(info.sessionId) : undefined,
+          sessionId: info.sessionId ? String(info.sessionId) : idStr,
           parentSession,
           startedAt: Date.now(),
         });
         const nowIso = new Date().toISOString();
-        this.backgroundTasksTracker.set(idStr, {
-          id: idStr,
-          parentSessionId: parentSession || '',
-          kind: 'subagent',
-          name: String(info.label || info.description || info.provider || 'subagent').slice(0, 60),
-          status: 'running',
-          startedAt: nowIso,
-          lastActivityAt: nowIso,
-        });
+        const existing = daemon.backgroundTasksTracker.get(idStr);
+        if (!existing) {
+          daemon.backgroundTasksTracker.set(idStr, {
+            id: idStr,
+            parentSessionId: parentSession || '',
+            kind: 'subagent',
+            name: String(info.label || info.description || info.provider || 'subagent').slice(0, 60),
+            status: 'running',
+            startedAt: nowIso,
+            lastActivityAt: nowIso,
+            mode: isContinuable ? 'continuable' : (info.mode === 'one-shot' ? 'one-shot' : undefined),
+            isBackground: isBg,
+          });
+        } else {
+          if (parentSession && !existing.parentSessionId) {
+            existing.parentSessionId = parentSession;
+          }
+          existing.status = 'running';
+          existing.lastActivityAt = nowIso;
+          if (isContinuable) existing.mode = 'continuable';
+          if (isBg) existing.isBackground = true;
+          if (info.label || info.description) {
+            existing.name = String(info.label || info.description).slice(0, 60);
+          }
+        }
       }
     });
 
-    const disposeSubagentEnd = ctx.on('subagent/end', (info: any) => {
+    const disposeSubagentEnd = ctx.on('subagent/end', function (this: any, info: any, maybeParent?: any) {
       if (info?.id) {
         const idStr = String(info.id);
-        this.liveSubagentsTracker.delete(idStr);
-        const existing = this.backgroundTasksTracker.get(idStr);
+        daemon.liveSubagentsTracker.delete(idStr);
+        let existing = daemon.backgroundTasksTracker.get(idStr);
+        if (!existing) {
+          let parentSession: string | undefined = undefined;
+          try {
+            const carrierAgent = carrierKeyOf(this) as any;
+            if (carrierAgent?.session?.id) parentSession = String(carrierAgent.session.id);
+          } catch {}
+          if (!parentSession && maybeParent) {
+            parentSession = typeof maybeParent === 'string' ? maybeParent : String(maybeParent?.session?.id || maybeParent?.id || '');
+          }
+          if (!parentSession && info.parentSession) parentSession = String(info.parentSession);
+          if (!parentSession) {
+            const s = ctx.get('sessions')?.get(info.id);
+            if (s?.header?.parentSession) parentSession = String(s.header.parentSession);
+          }
+          const nowIso = new Date().toISOString();
+          existing = {
+            id: idStr,
+            parentSessionId: parentSession || '',
+            kind: 'subagent',
+            name: String(info.label || info.description || info.provider || 'subagent').slice(0, 60),
+            status: 'completed',
+            startedAt: nowIso,
+            finishedAt: nowIso,
+            lastActivityAt: nowIso,
+          };
+          daemon.backgroundTasksTracker.set(idStr, existing);
+        }
         if (existing) {
           const nowIso = new Date().toISOString();
           existing.finishedAt = nowIso;
@@ -1418,7 +1550,80 @@ export class RuntimeDaemon extends EventEmitter {
       }
     }
 
-    // 2. Sync registered sessions with origin === 'subagent' and parentSession === sessionId
+    // 2. Sync subagent children using DSH 0.2 APIs: subagents service, sessionQuery service, and session registry
+    // 2a. Sync from ctx.subagents.listChildren
+    const subagentsService = ctx?.get('subagents');
+    if (subagentsService && typeof subagentsService.listChildren === 'function') {
+      try {
+        const children = await subagentsService.listChildren(sessionId as any);
+        for (const child of children) {
+          const childId = String(child.id);
+          let task = this.backgroundTasksTracker.get(childId);
+          const isLive = this.liveSubagentsTracker.has(childId) || this.agents.has(childId);
+          const mode = child.mode === 'continuable' ? 'continuable' : child.mode === 'one-shot' ? 'one-shot' : undefined;
+          const isBg = mode === 'continuable';
+          if (!task) {
+            const nowIso = new Date(child.createdAt || now).toISOString();
+            task = {
+              id: childId,
+              parentSessionId: sessionId,
+              kind: 'subagent',
+              name: String(child.label || 'subagent').slice(0, 60),
+              status: isLive ? 'running' : 'completed',
+              startedAt: nowIso,
+              lastActivityAt: nowIso,
+              mode,
+              isBackground: isBg,
+            };
+            this.backgroundTasksTracker.set(childId, task);
+          } else {
+            task.parentSessionId = sessionId;
+            if (child.label && (!task.name || task.name === 'subagent')) {
+              task.name = String(child.label).slice(0, 60);
+            }
+            if (mode) {
+              task.mode = mode;
+              if (mode === 'continuable') task.isBackground = true;
+            }
+            if (task.status === 'running' && !isLive) {
+              task.status = 'completed';
+              if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // 2b. Sync from ctx.sessionQuery
+    const sessionQuery = ctx?.get('sessionQuery');
+    if (sessionQuery && typeof sessionQuery.listSessions === 'function') {
+      try {
+        const querySessions = await sessionQuery.listSessions();
+        for (const sRec of querySessions) {
+          const sId = String(sRec.header.id);
+          const origin = sRec.header.origin;
+          const parent = sRec.header.parentSession;
+          if (origin === 'subagent' && String(parent) === sessionId) {
+            let task = this.backgroundTasksTracker.get(sId);
+            const startedIso = new Date(sRec.header.createdAt || now).toISOString();
+            if (!task) {
+              task = {
+                id: sId,
+                parentSessionId: sessionId,
+                kind: 'subagent',
+                name: String((sRec.header as any)?.label || 'subagent').slice(0, 60),
+                status: (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
+                startedAt: startedIso,
+                lastActivityAt: startedIso,
+              };
+              this.backgroundTasksTracker.set(sId, task);
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // 2c. Sync from ctx.sessions
     const sessionRegistry = ctx?.get('sessions');
     const registeredSessions = typeof sessionRegistry?.list === 'function' ? sessionRegistry.list() : [];
     for (const s of registeredSessions) {
@@ -1427,22 +1632,22 @@ export class RuntimeDaemon extends EventEmitter {
       const parent = s.header?.parentSession ?? (s as any).meta?.parentSession;
       if (origin === 'subagent' && String(parent) === sessionId) {
         let task = this.backgroundTasksTracker.get(sId);
-        if (!task) {
-          const startedIso = new Date(s.header?.createdAt || now).toISOString();
-          let lastActIso = startedIso;
-          const rawS = s as any;
-          if (Array.isArray(rawS.events) && rawS.events.length > 0) {
-            const lastEv = rawS.events[rawS.events.length - 1];
-            if (lastEv?.time) {
-              lastActIso = new Date(lastEv.time).toISOString();
-            }
+        const startedIso = new Date(s.header?.createdAt || now).toISOString();
+        let lastActIso = startedIso;
+        const rawS = s as any;
+        if (Array.isArray(rawS.events) && rawS.events.length > 0) {
+          const lastEv = rawS.events[rawS.events.length - 1];
+          if (lastEv?.time) {
+            lastActIso = new Date(lastEv.time).toISOString();
           }
+        }
+        if (!task) {
           task = {
             id: sId,
             parentSessionId: sessionId,
             kind: 'subagent',
             name: String((s.header as any)?.label || (s as any).meta?.label || 'subagent').slice(0, 60),
-            status: 'running',
+            status: (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
             startedAt: startedIso,
             lastActivityAt: lastActIso,
           };
@@ -1451,10 +1656,70 @@ export class RuntimeDaemon extends EventEmitter {
       }
     }
 
-    // 3. Filter tasks belonging to sessionId & apply 2h retention
+    // 2d. Enrich all subagent tasks with step count & descriptor metadata from events
+    for (const [id, task] of this.backgroundTasksTracker.entries()) {
+      if (task.parentSessionId === sessionId && task.kind === 'subagent') {
+        const liveSession = sessionRegistry?.get?.(id as any) as any;
+        let events = liveSession?.events;
+        if ((!events || events.length === 0) && sessionQuery && typeof sessionQuery.readSession === 'function') {
+          try {
+            const loaded = await sessionQuery.readSession(id as any);
+            events = loaded.events;
+          } catch {}
+        }
+        if (Array.isArray(events) && events.length > 0) {
+          const stepEvents = events.filter((e: any) => e.type === 'step/start');
+          const stepCount = stepEvents.length;
+          if (stepCount > 0) {
+            task.progress = task.progress || {};
+            task.progress.step = Math.max(task.progress.step || 0, stepCount);
+          }
+          const descriptorEv = events.find((e: any) => e.type === 'subagent/descriptor');
+          if (descriptorEv?.data) {
+            if (descriptorEv.data.label && (!task.name || task.name === 'subagent')) {
+              task.name = String(descriptorEv.data.label).slice(0, 60);
+            }
+            if (descriptorEv.data.mode) {
+              task.mode = descriptorEv.data.mode;
+              if (descriptorEv.data.mode === 'continuable') task.isBackground = true;
+            }
+          }
+          // If name is still generic 'subagent', check user message prompt
+          if (!task.name || task.name === 'subagent') {
+            for (const ev of events) {
+              if (ev.type === 'message/content' && ev.data?.content) {
+                const textBlock = Array.isArray(ev.data.content)
+                  ? ev.data.content.find((b: any) => b.type === 'text')
+                  : undefined;
+                if (textBlock?.text) {
+                  task.name = String(textBlock.text).trim().slice(0, 60);
+                  break;
+                }
+              }
+            }
+          }
+          const lastEv = events[events.length - 1];
+          if (lastEv?.time) {
+            const evTimeIso = new Date(lastEv.time).toISOString();
+            if (Date.parse(evTimeIso) > Date.parse(task.lastActivityAt || '1970-01-01')) {
+              task.lastActivityAt = evTimeIso;
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Filter tasks belonging to sessionId, exclude finished foreground one-shots, & apply 2h retention
     const sessionTasks: BackgroundTaskRecord[] = [];
     for (const [id, task] of this.backgroundTasksTracker.entries()) {
       if (task.parentSessionId === sessionId) {
+        // Exclude finished foreground one-shots (not continuable, not run_in_background)
+        if (task.kind === 'subagent' && task.status !== 'running') {
+          if (task.mode === 'one-shot' && !task.isBackground) {
+            continue;
+          }
+        }
+
         if (task.finishedAt) {
           const finishedTime = Date.parse(task.finishedAt);
           if (!isNaN(finishedTime) && now - finishedTime > RETENTION_MS) {
