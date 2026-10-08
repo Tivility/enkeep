@@ -10,6 +10,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import type { TenantScopedChannelRepository } from '@enkeep/platform-core';
 import type { LarkTransport, OutboundReplyPayload, StreamEventSource } from './types.js';
+import type { LarkBackgroundPanelManager } from './background-panel.js';
 import { StreamingReplyTracker } from './streaming-tracker.js';
 
 export interface ContinuationTarget {
@@ -35,6 +36,7 @@ export interface ContinuationWatcherOptions {
   pollIntervalMs?: number;
   inactivityTimeoutMs?: number;
   onStopped?: () => void;
+  backgroundPanelManager?: LarkBackgroundPanelManager;
 }
 
 const envBudget =
@@ -59,6 +61,7 @@ export class ContinuationWatcher {
   private readonly pollIntervalMs: number;
   private readonly inactivityTimeoutMs: number;
   private readonly onStopped?: () => void;
+  private readonly backgroundPanelManager?: LarkBackgroundPanelManager;
 
   private cursor = 0;
   private cursorInitialized = false;
@@ -82,6 +85,7 @@ export class ContinuationWatcher {
     this.pollIntervalMs = options.pollIntervalMs ?? 500;
     this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? DEFAULT_CONTINUATION_INACTIVITY_TIMEOUT_MS;
     this.onStopped = options.onStopped;
+    this.backgroundPanelManager = options.backgroundPanelManager;
     this.lastActivityTime = Date.now();
 
     if (options.initialCursor !== undefined) {
@@ -340,6 +344,8 @@ export class ContinuationWatcher {
           initialCursor: this.cursor,
           pollIntervalMs: this.pollIntervalMs,
           detached: true,
+          turnId: runningEvt.turnId,
+          backgroundPanelManager: this.backgroundPanelManager,
           onFinalized: async (finalText: string, status: 'completed' | 'failed', messageId?: string) => {
             console.info('[lark-cont] tracker finalize result', {
               routeId: this.sessionRouteId,

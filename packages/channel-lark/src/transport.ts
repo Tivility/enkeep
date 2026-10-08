@@ -284,7 +284,7 @@ export interface FakeRemovedReactionRecord {
 }
 
 export interface FakeStreamingCallRecord {
-  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'push_status_line' | 'finalize';
+  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'push_status_line' | 'finalize' | 'update_background_panel';
   readonly cardId?: string;
   readonly messageId?: string;
   readonly content?: string;
@@ -295,6 +295,7 @@ export interface FakeStreamingCallRecord {
   readonly metadata?: CardFinalMetadata;
   readonly card?: any;
   readonly params?: any;
+  readonly panelText?: string | null;
   readonly timestamp: string;
 }
 
@@ -1222,6 +1223,123 @@ export class FakeLarkTransport implements LarkTransport {
       timestamp: new Date().toISOString(),
     });
 
+    let lastFinalText = '';
+    let lastStatus: 'completed' | 'failed' | 'stopped' = 'completed';
+    let lastMetadata: CardFinalMetadata | undefined;
+    let lastToolStatus: string | readonly CardToolStatusEntry[] | undefined;
+    let lastThinkingText: string | undefined;
+    let currentBackgroundPanel: string | null = null;
+
+    const buildFinalCardJson = () => {
+      let cleanFinalText = lastFinalText;
+      let cleanThinking = lastThinkingText?.trim();
+      if (cleanFinalText && cleanFinalText.includes('<think>')) {
+        const extracted = extractThinkingFromText(cleanFinalText);
+        cleanFinalText = extracted.text;
+        if (!cleanThinking && extracted.thinking) {
+          cleanThinking = extracted.thinking;
+        }
+      }
+
+      const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
+      let hasProcessArea = false;
+
+      // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
+      if (cleanThinking) {
+        const guardedThinking = applyThinkingLengthGuard(cleanThinking);
+        bodyElements.push(
+          buildCollapsibleThinkingPanel({
+            content: guardedThinking,
+            expanded: false, // collapsed on completion
+            title: '**💭 思考过程**',
+            backgroundColor: 'blue-50',
+          })
+        );
+        hasProcessArea = true;
+      }
+
+      // 2. Process panel (tool status panel)
+      const formattedToolStatus = formatToolStatusMarkdown(lastToolStatus);
+      if (formattedToolStatus) {
+        bodyElements.push(
+          buildCollapsibleStatusPanel({
+            content: formattedToolStatus,
+            expanded: false, // collapsed on completion
+            title: params.statusPanelTitle ?? '**🔧 执行过程**',
+            backgroundColor: 'wathet-50',
+          })
+        );
+        hasProcessArea = true;
+      }
+
+      if (hasProcessArea) {
+        bodyElements.push({ tag: 'hr' });
+      }
+
+      const emptyFallback = lastStatus === 'stopped' ? '(已停止回复)' : '(空回复)';
+      const contentElements = markdownToCardElements(cleanFinalText, {
+        maxChunkLen: 4000,
+        emptyFallback,
+      });
+      if (contentElements.length === 0) {
+        bodyElements.push({
+          tag: 'markdown',
+          content: emptyFallback,
+        });
+      } else {
+        for (const el of contentElements) {
+          bodyElements.push(el);
+        }
+      }
+
+      // 3. Background tasks panel
+      if (currentBackgroundPanel) {
+        bodyElements.push({
+          tag: 'markdown',
+          content: currentBackgroundPanel,
+          element_id: 'background_tasks_panel',
+        });
+      }
+
+      const footer = formatCardUsageFooter(lastMetadata);
+      if (footer) {
+        bodyElements.push({
+          tag: 'markdown',
+          text_size: 'notation',
+          content: footer,
+        });
+      }
+
+      return {
+        schema: '2.0',
+        header:
+          lastStatus === 'completed'
+            ? {
+                title: { tag: 'plain_text', content: params.title ?? '已完成' },
+                template: 'violet',
+              }
+            : lastStatus === 'stopped'
+              ? {
+                  title: {
+                    tag: 'plain_text',
+                    content: params.title ? `${params.title} (已中止)` : '已中止',
+                  },
+                  template: 'orange',
+                }
+              : {
+                  title: {
+                    tag: 'plain_text',
+                    content: params.title ? `${params.title} (处理失败)` : '处理失败',
+                  },
+                  template: 'red',
+                },
+        body: {
+          direction: 'vertical',
+          elements: bodyElements,
+        },
+      };
+    };
+
     const session: LarkStreamingCardSession = {
       cardId,
       messageId,
@@ -1269,119 +1387,23 @@ export class FakeLarkTransport implements LarkTransport {
         status: 'completed' | 'failed' | 'stopped',
         metadata?: CardFinalMetadata,
         toolStatus?: string | readonly CardToolStatusEntry[],
-        thinkingText?: string
+        thinkingText?: string,
+        backgroundPanel?: string | null
       ): Promise<void> => {
         if (this.finalizeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, this.finalizeDelayMs));
         }
 
-        let cleanFinalText = finalText;
-        let cleanThinking = thinkingText?.trim();
-        if (cleanFinalText && cleanFinalText.includes('<think>')) {
-          const extracted = extractThinkingFromText(cleanFinalText);
-          cleanFinalText = extracted.text;
-          if (!cleanThinking && extracted.thinking) {
-            cleanThinking = extracted.thinking;
-          }
+        lastFinalText = finalText;
+        lastStatus = status;
+        lastMetadata = metadata;
+        lastToolStatus = toolStatus;
+        lastThinkingText = thinkingText;
+        if (backgroundPanel !== undefined) {
+          currentBackgroundPanel = backgroundPanel;
         }
 
-        const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
-        let hasProcessArea = false;
-
-        // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
-        if (cleanThinking) {
-          const guardedThinking = applyThinkingLengthGuard(cleanThinking);
-          bodyElements.push(
-            buildCollapsibleThinkingPanel({
-              content: guardedThinking,
-              expanded: false, // collapsed on completion
-              title: '**💭 思考过程**',
-              backgroundColor: 'blue-50',
-            })
-          );
-          hasProcessArea = true;
-        }
-
-        // 2. Process panel (tool status panel)
-        const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
-        if (formattedToolStatus) {
-          bodyElements.push(
-            buildCollapsibleStatusPanel({
-              content: formattedToolStatus,
-              expanded: false, // collapsed on completion
-              title: params.statusPanelTitle ?? '**🔧 执行过程**',
-              backgroundColor: 'wathet-50',
-            })
-          );
-          hasProcessArea = true;
-        }
-
-        if (hasProcessArea) {
-          bodyElements.push({ tag: 'hr' });
-        }
-
-        const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
-        const contentElements = markdownToCardElements(cleanFinalText, {
-          maxChunkLen: 4000,
-          emptyFallback,
-        });
-        if (contentElements.length === 0) {
-          bodyElements.push({
-            tag: 'markdown',
-            content: emptyFallback,
-          });
-        } else {
-          for (const el of contentElements) {
-            bodyElements.push(el);
-          }
-        }
-
-        if (status === 'stopped') {
-          bodyElements.push({
-            tag: 'markdown',
-            element_id: 'streaming_status_bar',
-            text_size: 'notation',
-            content: "<font color='grey'>⏹ 已停止</font>",
-          });
-        }
-
-        const footer = formatCardUsageFooter(metadata);
-        if (footer) {
-          bodyElements.push({
-            tag: 'markdown',
-            text_size: 'notation',
-            content: footer,
-          });
-        }
-
-        const card = {
-          schema: '2.0',
-          header:
-            status === 'completed'
-              ? {
-                  title: { tag: 'plain_text', content: params.title ?? '已完成' },
-                  template: 'violet',
-                }
-              : status === 'stopped'
-                ? {
-                    title: {
-                      tag: 'plain_text',
-                      content: params.title ? `${params.title} (已中止)` : '已中止',
-                    },
-                    template: 'orange',
-                  }
-                : {
-                    title: {
-                      tag: 'plain_text',
-                      content: params.title ? `${params.title} (处理失败)` : '处理失败',
-                    },
-                    template: 'red',
-                  },
-          body: {
-            direction: 'vertical',
-            elements: bodyElements,
-          },
-        };
+        const card = buildFinalCardJson();
 
         this._streamingCalls.push({
           type: 'finalize',
@@ -1391,6 +1413,20 @@ export class FakeLarkTransport implements LarkTransport {
           status,
           metadata,
           toolStatus,
+          panelText: currentBackgroundPanel,
+          card,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      updateBackgroundPanel: async (panelText: string | null): Promise<void> => {
+        currentBackgroundPanel = panelText;
+        const card = buildFinalCardJson();
+
+        this._streamingCalls.push({
+          type: 'update_background_panel',
+          cardId,
+          messageId,
+          panelText,
           card,
           timestamp: new Date().toISOString(),
         });
@@ -2684,6 +2720,203 @@ export class CredentialedLarkTransport implements LarkTransport {
       const logger = this.logger;
       const client = this.apiClient;
 
+      let lastFinalText = '';
+      let lastStatus: 'completed' | 'failed' | 'stopped' = 'completed';
+      let lastMetadata: CardFinalMetadata | undefined;
+      let lastToolStatus: string | readonly CardToolStatusEntry[] | undefined;
+      let lastThinkingText: string | undefined;
+      let currentBackgroundPanel: string | null = null;
+
+      const buildFinalCard = () => {
+        let cleanFinalText = lastFinalText;
+        let cleanThinking = lastThinkingText?.trim();
+        if (cleanFinalText && cleanFinalText.includes('<think>')) {
+          const extracted = extractThinkingFromText(cleanFinalText);
+          cleanFinalText = extracted.text;
+          if (!cleanThinking && extracted.thinking) {
+            cleanThinking = extracted.thinking;
+          }
+        }
+
+        // Build final card JSON
+        const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
+        let hasProcessArea = false;
+
+        // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
+        if (cleanThinking) {
+          const guardedThinking = applyThinkingLengthGuard(cleanThinking);
+          bodyElements.push(
+            buildCollapsibleThinkingPanel({
+              content: guardedThinking,
+              expanded: false, // collapsed on completion
+              title: '**💭 思考过程**',
+              backgroundColor: 'blue-50',
+            })
+          );
+          hasProcessArea = true;
+        }
+
+        // 2. Process panel (tool status panel)
+        const formattedToolStatus = formatToolStatusMarkdown(lastToolStatus);
+        if (formattedToolStatus) {
+          bodyElements.push(
+            buildCollapsibleStatusPanel({
+              content: formattedToolStatus,
+              expanded: false, // collapsed on completion
+              title: params.statusPanelTitle ?? '**🔧 执行过程**',
+              backgroundColor: 'wathet-50',
+            })
+          );
+          hasProcessArea = true;
+        }
+
+        if (hasProcessArea) {
+          bodyElements.push({ tag: 'hr' });
+        }
+
+        const emptyFallback = lastStatus === 'stopped' ? '(已停止回复)' : '(空回复)';
+        const contentElements = markdownToCardElements(cleanFinalText, {
+          maxChunkLen: 4000,
+          emptyFallback,
+        });
+        if (contentElements.length === 0) {
+          bodyElements.push({
+            tag: 'markdown',
+            content: emptyFallback,
+          });
+        } else {
+          for (const el of contentElements) {
+            bodyElements.push(el);
+          }
+        }
+
+        // 3. Background tasks panel
+        if (currentBackgroundPanel) {
+          bodyElements.push({
+            tag: 'markdown',
+            content: currentBackgroundPanel,
+            element_id: 'background_tasks_panel',
+          });
+        }
+
+        const footer = formatCardUsageFooter(lastMetadata);
+        if (footer) {
+          bodyElements.push({
+            tag: 'markdown',
+            text_size: 'notation',
+            content: footer,
+          });
+        }
+
+        return {
+          schema: '2.0',
+          header:
+            lastStatus === 'completed'
+              ? {
+                  title: { tag: 'plain_text', content: params.title ?? '已完成' },
+                  template: 'violet',
+                }
+              : lastStatus === 'stopped'
+                ? {
+                    title: {
+                      tag: 'plain_text',
+                      content: params.title ? `${params.title} (已中止)` : '已中止',
+                    },
+                    template: 'orange',
+                  }
+                : {
+                    title: {
+                      tag: 'plain_text',
+                      content: params.title ? `${params.title} (处理失败)` : '处理失败',
+                    },
+                    template: 'red',
+                  },
+          body: {
+            direction: 'vertical',
+            elements: bodyElements,
+          },
+        };
+      };
+
+      const pushFullCardUpdate = async (finalCard: any): Promise<void> => {
+        const finalCardJson = JSON.stringify(finalCard);
+        let updateSuccess = false;
+        let updateError: any;
+
+        try {
+          const cardUpdateFn = client.cardkit?.v1?.card?.update;
+          if (typeof cardUpdateFn === 'function') {
+            seq += 1;
+            const updateRes = await cardUpdateFn({
+              path: { card_id: cardId },
+              data: {
+                card: {
+                  type: 'card_json',
+                  data: finalCardJson,
+                },
+                sequence: seq,
+              },
+            });
+            if (updateRes?.code === 0 || (!updateRes?.code && !updateRes?.msg)) {
+              updateSuccess = true;
+            } else {
+              updateError = new Error(
+                updateRes?.msg || `card.update returned code ${updateRes?.code}`
+              );
+              (updateError as any).code = updateRes?.code;
+            }
+          } else {
+            updateError = new Error('cardkit.v1.card.update is not available');
+          }
+        } catch (err) {
+          updateError = err;
+        }
+
+        if (updateSuccess) {
+          return;
+        }
+
+        logger.warn('[lark-stream] session card.update failed, falling back to message.patch', {
+          code: updateError?.code ?? (updateError as any)?.status,
+          message: updateError instanceof Error ? updateError.message : String(updateError),
+        });
+
+        // Fallback to im.v1.message.patch
+        try {
+          const patchFn =
+            client.im?.v1?.message?.patch || client.im?.message?.patch;
+          if (typeof patchFn === 'function') {
+            const patchRes = await patchFn({
+              path: { message_id: boundMessageId },
+              data: {
+                content: finalCardJson,
+              },
+            });
+            if (patchRes?.code === 0 || (!patchRes?.code && !patchRes?.msg)) {
+              return;
+            }
+            const err = new Error(
+              patchRes?.msg || `message.patch returned code ${patchRes?.code}`
+            );
+            (err as any).code = patchRes?.code;
+            throw err;
+          } else {
+            throw new Error('im.message.patch is not available');
+          }
+        } catch (patchErr) {
+          logger.warn('[lark-stream] session message.patch failed', {
+            code: (patchErr as any)?.code,
+            message: patchErr instanceof Error ? patchErr.message : String(patchErr),
+          });
+          logger.error(
+            `Failed to finalize/update streaming card via card.update and message.patch: ${
+              patchErr instanceof Error ? patchErr.message : String(patchErr)
+            }`
+          );
+          throw patchErr;
+        }
+      };
+
       // 4. Return streaming card session
       const session: LarkStreamingCardSession = {
         cardId,
@@ -2904,7 +3137,8 @@ export class CredentialedLarkTransport implements LarkTransport {
           status: 'completed' | 'failed' | 'stopped',
           metadata?: CardFinalMetadata,
           toolStatus?: string | readonly CardToolStatusEntry[],
-          thinkingText?: string
+          thinkingText?: string,
+          backgroundPanel?: string | null
         ): Promise<void> => {
           // Close streaming mode via card.settings (swallow errors)
           try {
@@ -2926,193 +3160,22 @@ export class CredentialedLarkTransport implements LarkTransport {
             });
           }
 
-          let cleanFinalText = finalText;
-          let cleanThinking = thinkingText?.trim();
-          if (cleanFinalText && cleanFinalText.includes('<think>')) {
-            const extracted = extractThinkingFromText(cleanFinalText);
-            cleanFinalText = extracted.text;
-            if (!cleanThinking && extracted.thinking) {
-              cleanThinking = extracted.thinking;
-            }
+          lastFinalText = finalText;
+          lastStatus = status;
+          lastMetadata = metadata;
+          lastToolStatus = toolStatus;
+          lastThinkingText = thinkingText;
+          if (backgroundPanel !== undefined) {
+            currentBackgroundPanel = backgroundPanel;
           }
 
-          // Build final card JSON
-          const bodyElements: Array<Record<string, unknown> | LarkCardBodyElement> = [];
-          let hasProcessArea = false;
-
-          // 1. Thinking panel: placed ABOVE process panel/body; collapsed in final card (expanded: false)
-          if (cleanThinking) {
-            const guardedThinking = applyThinkingLengthGuard(cleanThinking);
-            bodyElements.push(
-              buildCollapsibleThinkingPanel({
-                content: guardedThinking,
-                expanded: false, // collapsed on completion
-                title: '**💭 思考过程**',
-                backgroundColor: 'blue-50',
-              })
-            );
-            hasProcessArea = true;
-          }
-
-          // 2. Process panel (tool status panel)
-          const formattedToolStatus = formatToolStatusMarkdown(toolStatus);
-          if (formattedToolStatus) {
-            bodyElements.push(
-              buildCollapsibleStatusPanel({
-                content: formattedToolStatus,
-                expanded: false, // collapsed on completion
-                title: params.statusPanelTitle ?? '**🔧 执行过程**',
-                backgroundColor: 'wathet-50',
-              })
-            );
-            hasProcessArea = true;
-          }
-
-          if (hasProcessArea) {
-            bodyElements.push({ tag: 'hr' });
-          }
-
-          const emptyFallback = status === 'stopped' ? '(已停止回复)' : '(空回复)';
-          const contentElements = markdownToCardElements(cleanFinalText, {
-            maxChunkLen: 4000,
-            emptyFallback,
-          });
-          if (contentElements.length === 0) {
-            bodyElements.push({
-              tag: 'markdown',
-              content: emptyFallback,
-            });
-          } else {
-            for (const el of contentElements) {
-              bodyElements.push(el);
-            }
-          }
-
-          if (status === 'stopped') {
-            bodyElements.push({
-              tag: 'markdown',
-              element_id: 'streaming_status_bar',
-              text_size: 'notation',
-              content: "<font color='grey'>⏹ 已停止</font>",
-            });
-          }
-
-          const footer = formatCardUsageFooter(metadata);
-          if (footer) {
-            bodyElements.push({
-              tag: 'markdown',
-              text_size: 'notation',
-              content: footer,
-            });
-          }
-
-          const finalCard = {
-            schema: '2.0',
-            header:
-              status === 'completed'
-                ? {
-                    title: { tag: 'plain_text', content: params.title ?? '已完成' },
-                    template: 'violet',
-                  }
-                : status === 'stopped'
-                  ? {
-                      title: {
-                        tag: 'plain_text',
-                        content: params.title ? `${params.title} (已中止)` : '已中止',
-                      },
-                      template: 'orange',
-                    }
-                  : {
-                      title: {
-                        tag: 'plain_text',
-                        content: params.title ? `${params.title} (处理失败)` : '处理失败',
-                      },
-                      template: 'red',
-                    },
-            body: {
-              direction: 'vertical',
-              elements: bodyElements,
-            },
-          };
-
-          const finalCardJson = JSON.stringify(finalCard);
-
-          // Full card update via cardkit.v1.card.update
-          let updateSuccess = false;
-          let updateError: any;
-
-          try {
-            const cardUpdateFn = client.cardkit?.v1?.card?.update;
-            if (typeof cardUpdateFn === 'function') {
-              seq += 1;
-              const updateRes = await cardUpdateFn({
-                path: { card_id: cardId },
-                data: {
-                  card: {
-                    type: 'card_json',
-                    data: finalCardJson,
-                  },
-                  sequence: seq,
-                },
-              });
-              if (updateRes?.code === 0 || (!updateRes?.code && !updateRes?.msg)) {
-                updateSuccess = true;
-              } else {
-                updateError = new Error(
-                  updateRes?.msg || `card.update returned code ${updateRes?.code}`
-                );
-                (updateError as any).code = updateRes?.code;
-              }
-            } else {
-              updateError = new Error('cardkit.v1.card.update is not available');
-            }
-          } catch (err) {
-            updateError = err;
-          }
-
-          if (updateSuccess) {
-            return;
-          }
-
-          logger.warn('[lark-stream] session.finalize card.update failed, falling back to message.patch', {
-            code: updateError?.code ?? (updateError as any)?.status,
-            message: updateError instanceof Error ? updateError.message : String(updateError),
-          });
-
-          // Fallback to im.v1.message.patch
-          try {
-            const patchFn =
-              client.im?.v1?.message?.patch || client.im?.message?.patch;
-            if (typeof patchFn === 'function') {
-              const patchRes = await patchFn({
-                path: { message_id: boundMessageId },
-                data: {
-                  content: finalCardJson,
-                },
-              });
-              if (patchRes?.code === 0 || (!patchRes?.code && !patchRes?.msg)) {
-                return;
-              }
-              const err = new Error(
-                patchRes?.msg || `message.patch returned code ${patchRes?.code}`
-              );
-              (err as any).code = patchRes?.code;
-              throw err;
-            } else {
-              throw new Error('im.message.patch is not available');
-            }
-          } catch (patchErr) {
-            logger.warn('[lark-stream] session.finalize message.patch failed', {
-              code: (patchErr as any)?.code,
-              message: patchErr instanceof Error ? patchErr.message : String(patchErr),
-            });
-            logger.error(
-              `Failed to finalize streaming card via card.update and message.patch: ${
-                patchErr instanceof Error ? patchErr.message : String(patchErr)
-              }`
-            );
-            throw patchErr;
-          }
+          const finalCard = buildFinalCard();
+          await pushFullCardUpdate(finalCard);
+        },
+        updateBackgroundPanel: async (panelText: string | null): Promise<void> => {
+          currentBackgroundPanel = panelText;
+          const finalCard = buildFinalCard();
+          await pushFullCardUpdate(finalCard);
         },
       };
 

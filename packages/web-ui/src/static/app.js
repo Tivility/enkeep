@@ -1502,6 +1502,13 @@ function closeModal(modalId) {
     }
   }
 
+  if (fullId === 'modal-background-tasks') {
+    if (bgModalRefreshTimer) {
+      clearInterval(bgModalRefreshTimer);
+      bgModalRefreshTimer = null;
+    }
+  }
+
   state.activeModals = state.activeModals.filter((id) => id !== fullId);
 
   // Restore focus if all modals are closed
@@ -14628,16 +14635,14 @@ function formatTime(dateVal) {
   if (!dateVal) return tr('chat.timestampUnavailable', null, 'Timestamp unavailable');
   const d = dateVal instanceof Date ? dateVal : new Date(dateVal);
   if (isNaN(d.getTime())) return tr('chat.timestampUnavailable', null, 'Timestamp unavailable');
-  try {
-    const loc = typeof getLocale === 'function' ? getLocale() : 'en';
-    return new Intl.DateTimeFormat(loc, {
-      hour: 'numeric',
-      minute: 'numeric',
-      second: 'numeric',
-    }).format(d);
-  } catch {
-    return d.toLocaleTimeString();
-  }
+  const pad = (n) => String(n).padStart(2, '0');
+  const year = d.getFullYear();
+  const month = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hours = pad(d.getHours());
+  const minutes = pad(d.getMinutes());
+  const seconds = pad(d.getSeconds());
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
 const KNOWN_STATUS_KEYS = {
@@ -14899,6 +14904,229 @@ async function openSessionTurnsModal(sessionId) {
       )
     );
   }
+}
+
+// ----------------------------------------------------
+// Session Background Tasks Modal & Badge
+// (GET /api/sessions/:id/background, POST /api/sessions/:id/background/:taskId/stop)
+// ----------------------------------------------------
+
+let bgModalRefreshTimer = null;
+
+function updateSessionBackgroundBadge(tasks = state.backgroundTasks) {
+  const bgBadge = document.getElementById('btn-session-bg');
+  if (!bgBadge) return;
+  const runningCount = Array.isArray(tasks)
+    ? tasks.filter((t) => t && t.status === 'running').length
+    : 0;
+  if (runningCount > 0 && state.currentSessionId) {
+    bgBadge.textContent = tr('tasks.bgRunningCount', { count: formatNumber(runningCount) }, `${runningCount} Background`);
+    bgBadge.classList.remove('hidden');
+  } else {
+    bgBadge.classList.add('hidden');
+  }
+}
+
+async function loadSessionBackgroundTasks(sessionId = state.currentSessionId) {
+  if (!sessionId || state.currentSessionId !== sessionId) {
+    state.backgroundTasks = [];
+    updateSessionBackgroundBadge([]);
+    return [];
+  }
+  try {
+    const res = await apiRequest(`/api/sessions/${sessionId}/background`);
+    const tasks = (res && res.data && Array.isArray(res.data.items)) ? res.data.items : [];
+    if (state.currentSessionId === sessionId) {
+      state.backgroundTasks = tasks;
+      updateSessionBackgroundBadge(tasks);
+    }
+    return tasks;
+  } catch {
+    return [];
+  }
+}
+
+async function openBackgroundTasksModal(sessionId = state.currentSessionId) {
+  if (!sessionId) {
+    showToast(tr('chat.noSessionSelected', null, 'Select or create a session first'), 'info');
+    return;
+  }
+
+  const titleEl = document.getElementById('modal-bg-tasks-title');
+  const contentEl = document.getElementById('bg-tasks-content');
+
+  if (titleEl) {
+    titleEl.textContent = tr('tasks.bgModalTitle', null, 'Background Tasks');
+  }
+
+  if (contentEl) {
+    contentEl.replaceChildren(createSkeletonLoader());
+  }
+
+  openModal('modal-background-tasks');
+
+  const renderTasks = async () => {
+    try {
+      const res = await apiRequest(`/api/sessions/${sessionId}/background`);
+      const raw = res && res.data;
+      const tasks = (raw && Array.isArray(raw.items)) ? raw.items : null;
+
+      if (!contentEl) return;
+      contentEl.replaceChildren();
+
+      if (!tasks) {
+        contentEl.appendChild(
+          createStateCard(
+            tr('tasks.bgUnavailableTitle', null, 'Background Tasks Unavailable'),
+            tr('tasks.bgUnavailableSubtitle', null, 'Failed to load background tasks for this session.'),
+            true
+          )
+        );
+        return;
+      }
+
+      state.backgroundTasks = tasks;
+      updateSessionBackgroundBadge(tasks);
+
+      if (tasks.length === 0) {
+        contentEl.appendChild(
+          createStateCard(
+            tr('tasks.bgNoTasksTitle', null, 'No Background Tasks'),
+            tr('tasks.bgNoTasksSubtitle', null, 'No background tasks found for this session.')
+          )
+        );
+        return;
+      }
+
+      const tableContainer = document.createElement('div');
+      tableContainer.className = 'data-table-container';
+      const table = document.createElement('table');
+      table.className = 'data-table';
+
+      const thead = document.createElement('thead');
+      const trHead = document.createElement('tr');
+      [
+        tr('tasks.bgColKind', null, 'Type'),
+        tr('tasks.bgColId', null, 'ID'),
+        tr('tasks.bgColName', null, 'Name'),
+        tr('tasks.bgColStatus', null, 'Status'),
+        tr('tasks.bgColProgress', null, 'Progress'),
+        tr('tasks.bgColStarted', null, 'Started'),
+        tr('tasks.bgColActions', null, 'Actions'),
+      ].forEach((col) => {
+        const th = document.createElement('th');
+        th.textContent = col;
+        trHead.appendChild(th);
+      });
+      thead.appendChild(trHead);
+      table.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      tasks.forEach((task) => {
+        const trEl = document.createElement('tr');
+
+        // Type / Kind
+        const tdKind = document.createElement('td');
+        tdKind.textContent = task.kind || 'task';
+        trEl.appendChild(tdKind);
+
+        // ID
+        const tdId = document.createElement('td');
+        tdId.textContent = task.shortId || task.id?.slice(0, 6) || '-';
+        trEl.appendChild(tdId);
+
+        // Name
+        const tdName = document.createElement('td');
+        tdName.textContent = task.name || '-';
+        trEl.appendChild(tdName);
+
+        // Status
+        const tdStatus = document.createElement('td');
+        const st = task.status;
+        const badgeType = st === 'completed' ? 'success' : (st === 'running' ? 'warning' : 'danger');
+        let statusLabel = formatStatus(st);
+        if (task.stalled && st === 'running') {
+          statusLabel += ` · ${tr('tasks.bgStalledTag', null, '⚠️ 可能卡住')}`;
+        }
+        tdStatus.appendChild(createBadgeElement(statusLabel, badgeType));
+        trEl.appendChild(tdStatus);
+
+        // Progress
+        const tdProgress = document.createElement('td');
+        let progStr = '-';
+        if (task.progress) {
+          if (typeof task.progress.agentsTotal === 'number' && task.progress.agentsTotal > 0) {
+            progStr = `${task.progress.agentsDone ?? 0}/${task.progress.agentsTotal} agents`;
+          } else if (typeof task.progress.step === 'number') {
+            progStr = `Step ${task.progress.step}`;
+          }
+        }
+        tdProgress.textContent = progStr;
+        trEl.appendChild(tdProgress);
+
+        // Started
+        const tdStart = document.createElement('td');
+        tdStart.textContent = task.startedAt ? formatDateTime(task.startedAt) : '-';
+        trEl.appendChild(tdStart);
+
+        // Actions
+        const tdActions = document.createElement('td');
+        if (st === 'running') {
+          const btnStop = document.createElement('button');
+          btnStop.className = 'btn btn-danger btn-xs';
+          btnStop.textContent = tr('tasks.bgBtnStop', null, 'Stop');
+          const targetTaskId = task.id || task.shortId;
+          btnStop.addEventListener('click', async () => {
+            btnStop.disabled = true;
+            btnStop.textContent = tr('tasks.bgStopping', null, 'Stopping...');
+            try {
+              const stopRes = await apiRequest(`/api/sessions/${sessionId}/background/${encodeURIComponent(targetTaskId)}/stop`, {
+                method: 'POST',
+              });
+              if (stopRes && stopRes.data && stopRes.data.stopped) {
+                showToast(tr('tasks.bgStopSuccess', { id: task.shortId || targetTaskId }, `Background task ${task.shortId || targetTaskId} stopped successfully.`), 'success');
+              } else {
+                showToast(tr('tasks.bgStopSuccess', { id: task.shortId || targetTaskId }, `Background task ${task.shortId || targetTaskId} stopped.`), 'info');
+              }
+              await renderTasks();
+            } catch (err) {
+              showToast(tr('tasks.bgStopFailed', { error: err instanceof Error ? err.message : String(err) }, 'Failed to stop background task.'), 'error');
+              btnStop.disabled = false;
+              btnStop.textContent = tr('tasks.bgBtnStop', null, 'Stop');
+            }
+          });
+          tdActions.appendChild(btnStop);
+        } else {
+          tdActions.textContent = '-';
+        }
+        trEl.appendChild(tdActions);
+
+        tbody.appendChild(trEl);
+      });
+
+      table.appendChild(tbody);
+      tableContainer.appendChild(table);
+      contentEl.appendChild(tableContainer);
+    } catch {
+      if (!contentEl) return;
+      contentEl.replaceChildren(
+        createStateCard(
+          tr('tasks.bgUnavailableTitle', null, 'Background Tasks Unavailable'),
+          tr('tasks.bgUnavailableSubtitle', null, 'Failed to load background tasks for this session.'),
+          true
+        )
+      );
+    }
+  };
+
+  await renderTasks();
+
+  if (bgModalRefreshTimer) {
+    clearInterval(bgModalRefreshTimer);
+  }
+  bgModalRefreshTimer = setInterval(() => {
+    void renderTasks();
+  }, 30_000);
 }
 
 // ----------------------------------------------------
@@ -15852,6 +16080,9 @@ function deselectSession() {
   const turnBadge = document.getElementById("session-turn-status-badge");
   if (turnBadge) turnBadge.classList.add("hidden");
 
+  const bgBadge = document.getElementById("btn-session-bg");
+  if (bgBadge) bgBadge.classList.add("hidden");
+
   const chatInput = document.getElementById("chat-input");
   if (chatInput) {
     chatInput.disabled = true;
@@ -16002,6 +16233,10 @@ async function selectSession(sessionId) {
       } else {
         genBadge.classList.add("hidden");
       }
+    }
+
+    if (typeof loadSessionBackgroundTasks === 'function') {
+      void loadSessionBackgroundTasks(sessionId);
     }
 
     const isArchived = Boolean(res.data && res.data.status === "archived");
@@ -20323,6 +20558,15 @@ document.addEventListener('DOMContentLoaded', () => {
     inspectTurnsBtn.addEventListener('click', () => {
       if (state.currentSessionId) {
         openSessionTurnsModal(state.currentSessionId);
+      }
+    });
+  }
+
+  const btnSessionBg = document.getElementById('btn-session-bg');
+  if (btnSessionBg) {
+    btnSessionBg.addEventListener('click', () => {
+      if (state.currentSessionId) {
+        openBackgroundTasksModal(state.currentSessionId);
       }
     });
   }
