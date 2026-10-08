@@ -1,5 +1,6 @@
 import type { ExecutionMode } from './space.js';
 import type { LifecycleStatus } from './agent-profile.js';
+import type { CacheRetention } from './cache-retention.js';
 
 export interface SessionRoute {
   id: string;
@@ -18,6 +19,7 @@ export interface SessionRoute {
   currentGeneration: number;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
+  cacheRetention?: CacheRetention | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -36,6 +38,7 @@ export interface CreateSessionRouteInput {
   title?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
+  cacheRetention?: CacheRetention | null;
 }
 
 export interface UpdateSessionRouteInput {
@@ -45,6 +48,7 @@ export interface UpdateSessionRouteInput {
   title?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
+  cacheRetention?: CacheRetention | null;
 }
 
 export interface ResetSessionRouteInput {

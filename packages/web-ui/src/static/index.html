@@ -187,6 +187,7 @@
                   <button type="button" id="btn-space-kebab" class="btn btn-secondary btn-xs btn-icon" title="Space Actions" aria-label="Space Actions" aria-haspopup="true" aria-expanded="false" data-i18n-title="chat.spaceActions">⋯</button>
                   <div id="space-kebab-menu" class="space-kebab-menu hidden" role="menu">
                     <button id="btn-rename-space" class="btn btn-secondary btn-xs btn-block kebab-item" title="Rename current space" data-i18n-title="chat.renameSpaceTitle" data-i18n="chat.renameSpace">Rename</button>
+                    <button id="btn-space-cache" class="btn btn-secondary btn-xs btn-block kebab-item" title="Space Prompt Cache Retention" data-i18n-title="chat.spaceCacheTitle" data-i18n="chat.spaceCache">Cache Retention</button>
                     <button id="btn-manage-mounts" class="btn btn-secondary btn-xs btn-block kebab-item hidden" title="Manage Controlled Mounts" data-i18n-title="chat.mountsTitle" data-i18n="chat.mounts">Mounts</button>
                     <button id="btn-archive-space" class="btn btn-danger btn-xs btn-block kebab-item" title="Archive current space" data-i18n-title="chat.archiveSpaceTitle" data-i18n="chat.archiveSpace">Archive</button>
                     <button id="btn-restore-space" class="btn btn-success btn-xs btn-block kebab-item hidden" title="Restore current space" data-i18n-title="chat.restoreSpaceTitle" data-i18n="chat.restoreSpace">Restore</button>
@@ -241,6 +242,7 @@
                 <button id="btn-refresh-session" class="btn btn-secondary btn-sm" title="Refresh session messages" data-i18n-title="chat.refreshMessagesTitle" data-i18n="chat.refreshMessages">↻ Refresh</button>
                 <button id="btn-fork-session" class="btn btn-secondary btn-sm hidden" title="Fork session from current history" data-i18n-title="chat.forkSessionTitle" data-i18n="chat.forkSession">🍴 Fork</button>
                 <button id="btn-inspect-turns" class="btn btn-secondary btn-sm hidden" title="Inspect session turns history" data-i18n-title="chat.inspectTurnsTitle" data-i18n="chat.inspectTurns">🔍 Turns</button>
+                <button id="btn-session-cache" class="btn btn-secondary btn-sm hidden" title="Session Prompt Cache Retention" data-i18n-title="chat.sessionCacheTitle" data-i18n="chat.sessionCache">💾 Cache</button>
                 <button id="btn-session-generations" class="btn btn-secondary btn-sm hidden" title="Inspect session generation lifecycle history" data-i18n-title="chat.inspectGenerationsTitle" data-i18n="chat.inspectGenerations">📜 Generations</button>
                 <button id="btn-reset-session" class="btn btn-warning btn-sm hidden" title="Reset session context to start Generation N+1" data-i18n-title="chat.resetGenTitle" data-i18n="chat.resetGen">🔄 Reset Gen</button>
                 <button id="btn-rename-session" class="btn btn-secondary btn-sm hidden" title="Rename current session" data-i18n-title="chat.renameSessionTitle" data-i18n="chat.renameSession">✎ Rename</button>
@@ -587,6 +589,64 @@
         <div class="modal-actions">
           <button type="button" class="btn btn-secondary" data-close="modal-rename-session" data-i18n="modal.cancel">Cancel</button>
           <button type="submit" id="btn-submit-rename-session" class="btn btn-primary" data-i18n="modal.renameButton">Rename</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Space Cache Modal -->
+  <div id="modal-space-cache" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="space-cache-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="space-cache-modal-title" data-i18n="modal.spaceCacheTitle">Workspace Cache Retention</h3>
+        <button class="modal-close" data-close="modal-space-cache" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="form-space-cache">
+        <div class="form-group">
+          <label data-i18n="modal.cacheEffectiveLabel">Current Effective Policy</label>
+          <div id="space-cache-effective" class="text-sm font-semibold text-accent"></div>
+        </div>
+        <div class="form-group">
+          <label for="space-cache-select" data-i18n="modal.cacheOverrideLabel">Workspace Retention Override</label>
+          <select id="space-cache-select" class="form-select">
+            <option value="default" data-i18n="modal.cacheOptDefault">Inherit Platform Default</option>
+            <option value="long" data-i18n="modal.cacheOptLong">Long (1h Anthropic/Kimi, 24h OpenAI)</option>
+            <option value="short" data-i18n="modal.cacheOptShort">Short (5 min Ephemeral)</option>
+            <option value="none" data-i18n="modal.cacheOptNone">None (Disabled)</option>
+          </select>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-space-cache" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-space-cache" class="btn btn-primary" data-i18n="common.save">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Session Cache Modal -->
+  <div id="modal-session-cache" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="session-cache-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="session-cache-modal-title" data-i18n="modal.sessionCacheTitle">Session Cache Retention</h3>
+        <button class="modal-close" data-close="modal-session-cache" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="form-session-cache">
+        <div class="form-group">
+          <label data-i18n="modal.cacheEffectiveLabel">Current Effective Policy</label>
+          <div id="session-cache-effective" class="text-sm font-semibold text-accent"></div>
+        </div>
+        <div class="form-group">
+          <label for="session-cache-select" data-i18n="modal.cacheOverrideLabel">Session Retention Override</label>
+          <select id="session-cache-select" class="form-select">
+            <option value="default" data-i18n="modal.cacheOptDefault">Inherit Space/Platform Default</option>
+            <option value="long" data-i18n="modal.cacheOptLong">Long (1h Anthropic/Kimi, 24h OpenAI)</option>
+            <option value="short" data-i18n="modal.cacheOptShort">Short (5 min Ephemeral)</option>
+            <option value="none" data-i18n="modal.cacheOptNone">None (Disabled)</option>
+          </select>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close="modal-session-cache" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-session-cache" class="btn btn-primary" data-i18n="common.save">Save</button>
         </div>
       </form>
     </div>

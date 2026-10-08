@@ -1789,6 +1789,7 @@ export async function runExecCli(argv: string[] = process.argv.slice(2)): Promis
           workspaceFolder: effectiveWorkspaceFolder,
           attachments: (req as any).attachments,
           modelSelection: (req as any).modelSelection,
+          cacheRetention: (req as any).cacheRetention,
         });
       } catch (err: unknown) {
         if (err instanceof PersistedSessionResumeError) {

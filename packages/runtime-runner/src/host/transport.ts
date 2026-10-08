@@ -521,6 +521,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       workspaceFolder: typeof request.workspaceFolder === 'string' ? request.workspaceFolder : undefined,
       attachments: request.attachments as any,
       modelSelection: request.modelSelection ?? undefined,
+      cacheRetention: request.cacheRetention ?? undefined,
       replyReference: request.replyReference ?? null,
       timeoutMs: rawBudgetMs,
       idleTimeoutMs,

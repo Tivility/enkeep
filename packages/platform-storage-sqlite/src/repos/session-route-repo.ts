@@ -143,29 +143,64 @@ export class SqliteTenantScopedSessionRouteRepository implements TenantScopedSes
       }
     }
 
+    const hasCacheCol = (() => {
+      try {
+        const cols = this.db.prepare('PRAGMA table_info(session_routes)').all() as Array<{ name: string }>;
+        return cols.some((c) => c.name === 'cache_retention');
+      } catch {
+        return false;
+      }
+    })();
+
     return withImmediateTransactionSync(this.db, () => {
-      this.db.prepare(`
-        INSERT INTO session_routes (
-          id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode,
-          status, title, last_reset_at, reset_count, current_generation, agent_profile_id, agent_profile_snapshot_id,
-          created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      `).run(
-        id,
-        input.spaceId,
-        this.userId,
-        input.channel,
-        accountId,
-        nativeContextId,
-        peerId,
-        dshSessionId,
-        executionMode,
-        status,
-        title,
-        agentProfileId,
-        agentProfileSnapshotId
-      );
+      if (hasCacheCol) {
+        this.db.prepare(`
+          INSERT INTO session_routes (
+            id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode,
+            status, title, last_reset_at, reset_count, current_generation, agent_profile_id, agent_profile_snapshot_id,
+            cache_retention, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 1, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(
+          id,
+          input.spaceId,
+          this.userId,
+          input.channel,
+          accountId,
+          nativeContextId,
+          peerId,
+          dshSessionId,
+          executionMode,
+          status,
+          title,
+          agentProfileId,
+          agentProfileSnapshotId,
+          input.cacheRetention ?? null
+        );
+      } else {
+        this.db.prepare(`
+          INSERT INTO session_routes (
+            id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode,
+            status, title, last_reset_at, reset_count, current_generation, agent_profile_id, agent_profile_snapshot_id,
+            created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(
+          id,
+          input.spaceId,
+          this.userId,
+          input.channel,
+          accountId,
+          nativeContextId,
+          peerId,
+          dshSessionId,
+          executionMode,
+          status,
+          title,
+          agentProfileId,
+          agentProfileSnapshotId
+        );
+      }
 
       const genId = generateGenerationId();
       this.db.prepare(`
@@ -266,6 +301,19 @@ export class SqliteTenantScopedSessionRouteRepository implements TenantScopedSes
         updates.push('agent_profile_snapshot_id = ?');
         params.push(null);
       }
+    }
+    const hasCacheCol = (() => {
+      try {
+        const cols = this.db.prepare('PRAGMA table_info(session_routes)').all() as Array<{ name: string }>;
+        return cols.some((c) => c.name === 'cache_retention');
+      } catch {
+        return false;
+      }
+    })();
+
+    if (input.cacheRetention !== undefined && hasCacheCol) {
+      updates.push('cache_retention = ?');
+      params.push(input.cacheRetention);
     }
 
     params.push(id, this.userId);

@@ -28,6 +28,144 @@ export const DEEPSEEK_BASE_ORIGIN = 'https://api.deepseek.com';
 
 export type { FallbackTarget };
 
+/**
+ * Applies Anthropic prompt cache control retention transformations.
+ * - 'long': sets `cache_control: { type: 'ephemeral', ttl: '1h' }` on breakpoints / existing cache_control objects.
+ * - 'short': sets standard `cache_control: { type: 'ephemeral' }` without `ttl`.
+ * - 'none': strips all `cache_control` properties entirely.
+ */
+export function applyAnthropicCacheControl(body: any, retention: 'long' | 'short' | 'none'): void {
+  if (!body || typeof body !== 'object') return;
+
+  if (retention === 'none') {
+    const removeCacheControl = (obj: any) => {
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj)) {
+        for (const item of obj) removeCacheControl(item);
+        return;
+      }
+      if ('cache_control' in obj) {
+        delete obj.cache_control;
+      }
+      for (const val of Object.values(obj)) {
+        removeCacheControl(val);
+      }
+    };
+    removeCacheControl(body);
+    return;
+  }
+
+  const targetCacheControl = retention === 'long'
+    ? { type: 'ephemeral', ttl: '1h' }
+    : { type: 'ephemeral' };
+
+  let foundAny = false;
+  const updateExisting = (obj: any) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) {
+      for (const item of obj) updateExisting(item);
+      return;
+    }
+    if (obj.cache_control && typeof obj.cache_control === 'object') {
+      obj.cache_control = { ...targetCacheControl };
+      foundAny = true;
+    }
+    for (const val of Object.values(obj)) {
+      updateExisting(val);
+    }
+  };
+  updateExisting(body);
+
+  if (!foundAny) {
+    if (typeof body.system === 'string' && body.system.trim().length > 0) {
+      body.system = [
+        {
+          type: 'text',
+          text: body.system,
+          cache_control: { ...targetCacheControl },
+        },
+      ];
+    } else if (Array.isArray(body.system) && body.system.length > 0) {
+      const last = body.system[body.system.length - 1];
+      if (last && typeof last === 'object') {
+        last.cache_control = { ...targetCacheControl };
+      }
+    }
+
+    if (Array.isArray(body.tools) && body.tools.length > 0) {
+      const lastTool = body.tools[body.tools.length - 1];
+      if (lastTool && typeof lastTool === 'object') {
+        lastTool.cache_control = { ...targetCacheControl };
+      }
+    }
+
+    if (Array.isArray(body.messages) && body.messages.length > 0) {
+      const lastMsg = body.messages[body.messages.length - 1];
+      if (lastMsg) {
+        if (typeof lastMsg.content === 'string') {
+          lastMsg.content = [
+            {
+              type: 'text',
+              text: lastMsg.content,
+              cache_control: { ...targetCacheControl },
+            },
+          ];
+        } else if (Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
+          const lastBlock = lastMsg.content[lastMsg.content.length - 1];
+          if (lastBlock && typeof lastBlock === 'object') {
+            lastBlock.cache_control = { ...targetCacheControl };
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Applies OpenAI prompt cache retention transformations.
+ * - 'long': sets `prompt_cache_retention: '24h'`.
+ * - 'short': deletes `prompt_cache_retention`.
+ * - 'none': deletes `prompt_cache_retention` and `prompt_cache_key`.
+ */
+export function applyOpenAiCacheRetention(body: any, retention: 'long' | 'short' | 'none'): void {
+  if (!body || typeof body !== 'object') return;
+
+  if (retention === 'long') {
+    body.prompt_cache_retention = '24h';
+  } else {
+    delete body.prompt_cache_retention;
+    if (retention === 'none') {
+      delete body.prompt_cache_key;
+    }
+  }
+}
+
+/**
+ * Deterministically applies cache retention rules to the outgoing provider request body.
+ */
+export function applyCacheRetentionRewrite(
+  body: any,
+  api: string | undefined,
+  retention: 'long' | 'short' | 'none'
+): void {
+  if (!body || typeof body !== 'object') return;
+
+  const isAnthropic = api === 'anthropic-messages' || (!api && (body.system !== undefined || (Array.isArray(body.messages) && body.messages.some((m: any) => Array.isArray(m.content)))));
+  const isOpenAi = api === 'openai-completions' || api === 'openai-responses' || (typeof api === 'string' && api.includes('openai'));
+
+  if (isAnthropic) {
+    applyAnthropicCacheControl(body, retention);
+  }
+  if (isOpenAi) {
+    applyOpenAiCacheRetention(body, retention);
+    applyAnthropicCacheControl(body, retention);
+  }
+  if (!isAnthropic && !isOpenAi) {
+    applyAnthropicCacheControl(body, retention);
+    applyOpenAiCacheRetention(body, retention);
+  }
+}
+
 export interface ModelRoutingPort {
   canExecute(provider: string, model: string): { allowed: boolean; state: string; reason?: string };
   recordHealth(input: {
@@ -698,10 +836,20 @@ export class LlmProxyHandler implements StreamHandler {
         }
         upstreamHeaders.set('host', targetUrl.host);
 
-        // 4. Prepare request body
+        // 4. Prepare request body with deterministic cache retention rewrite
+        const rawRetentionHeader = req.headers['x-enkeep-cache-retention'];
+        const cacheRetention: 'long' | 'short' | 'none' =
+          rawRetentionHeader === 'long' || rawRetentionHeader === 'short' || rawRetentionHeader === 'none'
+            ? rawRetentionHeader
+            : 'short';
+
         let reqBody = req.body;
-        if (jsonBody && candidate.model) {
-          const updatedJson = { ...jsonBody, model: candidate.model };
+        if (jsonBody) {
+          const updatedJson = { ...jsonBody };
+          if (candidate.model) {
+            updatedJson.model = candidate.model;
+          }
+          applyCacheRetentionRewrite(updatedJson, candProvider.api, cacheRetention);
           reqBody = Buffer.from(JSON.stringify(updatedJson), 'utf8');
           upstreamHeaders.set('content-length', String(reqBody.length));
         }

@@ -24,6 +24,9 @@ import {
   UnauthorizedError,
   ConflictError,
   resolvePlatformDshHome,
+  resolveTopLevelCacheRetention,
+  isValidCacheRetention,
+  isValidCacheRetentionInput,
   type User,
   type PlatformStorage,
   type AuthService,
@@ -147,6 +150,10 @@ const ALLOWED_MODEL_OVERRIDE_KEYS = new Set([
   "reasoningEffort",
   "fallbackChain",
   "ifMatch",
+]);
+const ALLOWED_CACHE_OVERRIDE_KEYS = new Set([
+  "cacheRetention",
+  "retention",
 ]);
 const ALLOWED_MODEL_PROBE_KEYS = new Set([
   "provider",
@@ -1337,6 +1344,71 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             validateCsrf(req, { csrfToken });
             const deleted = await modelSelectionService.deleteOverride("space", spaceId, user.id);
             sendJsonResponse(res, 200, createSuccessEnvelope({ deleted }));
+            return;
+          }
+
+          throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+        }
+
+        // 5.1.4c /api/spaces/:spaceId/cache-override
+        if (subPath === "/cache-override") {
+          const space = await platformApi.getSpace(user.id, spaceId);
+          if (!space) {
+            throw new NotFoundError(`Space "${spaceId}" not found`);
+          }
+
+          if (method === "GET") {
+            const override = space.cacheRetention ?? null;
+            const resolution = resolveTopLevelCacheRetention({ spaceRetention: override });
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override,
+              effective: resolution.retention,
+              source: override ? "space" : "platform",
+            }));
+            return;
+          }
+
+          if (method === "PUT" || method === "PATCH") {
+            validateCsrf(req, { csrfToken });
+            const rawBody = await parseJsonBody(req, maxBodyBytes);
+            if (!isRecord(rawBody) || Object.keys(rawBody).length === 0) {
+              throw new ValidationError("Request body cannot be empty");
+            }
+            const unknownKeys = getUnknownKeys(rawBody, ALLOWED_CACHE_OVERRIDE_KEYS);
+            if (unknownKeys.length > 0) {
+              throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+            }
+
+            const rawVal = rawBody.cacheRetention !== undefined ? rawBody.cacheRetention : rawBody.retention;
+            if (rawVal === undefined || rawVal === null || rawVal === "default") {
+              const updated = await platformApi.updateSpace(user.id, spaceId, { cacheRetention: null });
+              const resolution = resolveTopLevelCacheRetention({ spaceRetention: null });
+              sendJsonResponse(res, 200, createSuccessEnvelope({
+                override: null,
+                effective: resolution.retention,
+                source: "platform",
+              }));
+              return;
+            }
+
+            if (typeof rawVal !== "string" || !isValidCacheRetention(rawVal)) {
+              throw new ValidationError('Field "cacheRetention" must be one of "short", "long", "none", or "default"');
+            }
+
+            const updated = await platformApi.updateSpace(user.id, spaceId, { cacheRetention: rawVal });
+            const resolution = resolveTopLevelCacheRetention({ spaceRetention: rawVal });
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override: rawVal,
+              effective: resolution.retention,
+              source: "space",
+            }));
+            return;
+          }
+
+          if (method === "DELETE") {
+            validateCsrf(req, { csrfToken });
+            await platformApi.updateSpace(user.id, spaceId, { cacheRetention: null });
+            sendJsonResponse(res, 200, createSuccessEnvelope({ deleted: true }));
             return;
           }
 
@@ -3198,6 +3270,84 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             validateCsrf(req, { csrfToken });
             const deleted = await modelSelectionService.deleteOverride("session", sessionId, user.id);
             sendJsonResponse(res, 200, createSuccessEnvelope({ deleted }));
+            return;
+          }
+
+          throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+        }
+
+        // 6.1.9c /api/sessions/:sessionId/cache-override
+        if (subPath === "/cache-override") {
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          const space = await platformApi.getSpace(user.id, session.spaceId);
+
+          if (method === "GET") {
+            const override = session.cacheRetention ?? null;
+            const spaceRetention = space?.cacheRetention ?? null;
+            const resolution = resolveTopLevelCacheRetention({
+              sessionRetention: override,
+              spaceRetention,
+            });
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override,
+              effective: resolution.retention,
+              source: resolution.source,
+            }));
+            return;
+          }
+
+          if (method === "PUT" || method === "PATCH") {
+            validateCsrf(req, { csrfToken });
+            const rawBody = await parseJsonBody(req, maxBodyBytes);
+            if (!isRecord(rawBody) || Object.keys(rawBody).length === 0) {
+              throw new ValidationError("Request body cannot be empty");
+            }
+            const unknownKeys = getUnknownKeys(rawBody, ALLOWED_CACHE_OVERRIDE_KEYS);
+            if (unknownKeys.length > 0) {
+              throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+            }
+
+            const rawVal = rawBody.cacheRetention !== undefined ? rawBody.cacheRetention : rawBody.retention;
+            const spaceRetention = space?.cacheRetention ?? null;
+
+            if (rawVal === undefined || rawVal === null || rawVal === "default") {
+              const updated = await platformApi.updateSession(user.id, sessionId, { cacheRetention: null });
+              const resolution = resolveTopLevelCacheRetention({
+                sessionRetention: null,
+                spaceRetention,
+              });
+              sendJsonResponse(res, 200, createSuccessEnvelope({
+                override: null,
+                effective: resolution.retention,
+                source: resolution.source,
+              }));
+              return;
+            }
+
+            if (typeof rawVal !== "string" || !isValidCacheRetention(rawVal)) {
+              throw new ValidationError('Field "cacheRetention" must be one of "short", "long", "none", or "default"');
+            }
+
+            const updated = await platformApi.updateSession(user.id, sessionId, { cacheRetention: rawVal });
+            const resolution = resolveTopLevelCacheRetention({
+              sessionRetention: rawVal,
+              spaceRetention,
+            });
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override: rawVal,
+              effective: resolution.retention,
+              source: "session",
+            }));
+            return;
+          }
+
+          if (method === "DELETE") {
+            validateCsrf(req, { csrfToken });
+            await platformApi.updateSession(user.id, sessionId, { cacheRetention: null });
+            sendJsonResponse(res, 200, createSuccessEnvelope({ deleted: true }));
             return;
           }
 

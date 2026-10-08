@@ -182,6 +182,7 @@ export interface SubmitTurnRequest extends DaemonRequestBase {
   readonly mounts?: readonly RuntimeMountSpec[] | null;
   readonly extensionPlan?: ExtensionActivationPlan | null;
   readonly extraReadableRoots?: readonly string[];
+  readonly cacheRetention?: 'short' | 'long' | 'none' | null;
 }
 
 export interface CancelRequest extends DaemonRequestBase {

@@ -233,6 +233,8 @@ export interface AgentFollowupRequest {
   extensionPlan?: ExtensionActivationPlan | null;
   /** Optional extra readable roots for sandbox boundary allowlist */
   extraReadableRoots?: readonly string[];
+  /** Optional effective prompt cache retention override ('short' | 'long' | 'none') */
+  cacheRetention?: 'short' | 'long' | 'none' | null;
 }
 
 export interface AgentFollowupCompletedResponse {

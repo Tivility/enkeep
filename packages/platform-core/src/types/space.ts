@@ -1,4 +1,5 @@
 import type { LifecycleStatus } from './agent-profile.js';
+import type { CacheRetention } from './cache-retention.js';
 
 export type ExecutionMode = 'container' | 'host';
 
@@ -12,6 +13,7 @@ export interface Space {
   canonicalSessionId?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
+  cacheRetention?: CacheRetention | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -26,6 +28,7 @@ export interface CreateSpaceInput {
   canonicalSessionId?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
+  cacheRetention?: CacheRetention | null;
 }
 
 export interface UpdateSpaceInput {
@@ -36,4 +39,5 @@ export interface UpdateSpaceInput {
   canonicalSessionId?: string | null;
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
+  cacheRetention?: CacheRetention | null;
 }

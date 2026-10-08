@@ -671,6 +671,8 @@ export interface RuntimeTurnRequest {
   readonly extensionPlan?: ExtensionActivationPlan | null;
   /** Optional extra readable roots for sandbox boundary allowlist (e.g. authorized sibling spaces) */
   readonly extraReadableRoots?: readonly string[];
+  /** Optional effective prompt cache retention for the top-level turn ('short' | 'long' | 'none') */
+  readonly cacheRetention?: 'short' | 'long' | 'none' | null;
 }
 
 

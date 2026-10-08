@@ -20,3 +20,4 @@ export * from './space-mount.js';
 export * from './browser.js';
 export * from './mcp.js';
 export * from './channel.js';
+export * from './cache-retention.js';

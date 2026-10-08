@@ -189,6 +189,7 @@ export function parseSpaceRow(row: DbRow): Space {
     canonicalSessionId: getNullableString(row, 'canonical_session_id'),
     agentProfileId: getNullableString(row, 'agent_profile_id'),
     agentProfileSnapshotId: getNullableString(row, 'agent_profile_snapshot_id'),
+    cacheRetention: (getNullableString(row, 'cache_retention') as import('@enkeep/platform-core').CacheRetention) ?? null,
     createdAt: getString(row, 'created_at'),
     updatedAt: getString(row, 'updated_at'),
   };
@@ -219,6 +220,7 @@ export function parseSessionRouteRow(row: DbRow): SessionRoute {
     currentGeneration: getNullableNumber(row, 'current_generation') ?? 1,
     agentProfileId: getNullableString(row, 'agent_profile_id'),
     agentProfileSnapshotId: getNullableString(row, 'agent_profile_snapshot_id'),
+    cacheRetention: (getNullableString(row, 'cache_retention') as import('@enkeep/platform-core').CacheRetention) ?? null,
     createdAt: getString(row, 'created_at'),
     updatedAt: getString(row, 'updated_at'),
   };

@@ -2839,6 +2839,7 @@ export class RuntimeDaemon extends EventEmitter {
           workspaceFolder: request.workspaceFolder ?? request.spaceId,
           attachments: request.attachments,
           modelSelection: request.modelSelection,
+          cacheRetention: request.cacheRetention,
           replyReference: request.replyReference ?? null,
           timeoutMs: request.timeoutMs,
           mounts: request.mounts ?? undefined,
