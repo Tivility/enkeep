@@ -3001,8 +3001,8 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           }
           const chatContextId = parsedUrl.searchParams.get("chatContextId") || undefined;
           let bgRes: { items: unknown[]; updatedAt: string };
-          if (typeof (runtimeGateway as any).getBackgroundTasks === "function") {
-            bgRes = await (runtimeGateway as any).getBackgroundTasks(user.id, sessionId, { chatContextId });
+          if (typeof runtimeGateway.getBackgroundTasks === "function") {
+            bgRes = await runtimeGateway.getBackgroundTasks(user.id, sessionId, { chatContextId });
           } else {
             bgRes = { items: [], updatedAt: new Date().toISOString() };
           }
@@ -3023,8 +3023,8 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           }
           const taskId = decodeURIComponent(bgStopMatch[1]);
           let stopRes = { stopped: false };
-          if (typeof (runtimeGateway as any).stopBackgroundTask === "function") {
-            stopRes = await (runtimeGateway as any).stopBackgroundTask(user.id, sessionId, taskId);
+          if (typeof runtimeGateway.stopBackgroundTask === "function") {
+            stopRes = await runtimeGateway.stopBackgroundTask(user.id, sessionId, taskId);
           }
           sendJsonResponse(res, 200, createSuccessEnvelope(stopRes));
           return;

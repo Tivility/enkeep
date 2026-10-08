@@ -901,6 +901,16 @@ export interface ChatCommandServiceOptions {
       userId: string,
       sessionId: string
     ) => Promise<{ status: string; code?: string; queuePosition?: number } | null>;
+    getBackgroundTasks?: (
+      userId: string,
+      sessionId: string,
+      options?: { chatContextId?: string }
+    ) => Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+    stopBackgroundTask?: (
+      userId: string,
+      sessionId: string,
+      taskId: string
+    ) => Promise<{ stopped: boolean }>;
   };
   db?: DatabaseSync;
   checkChatAdmin?: (params: {
@@ -1401,11 +1411,11 @@ export class ChatCommandService {
     }
 
     let bgRunningCount = 0;
-    if (this.gateway && typeof (this.gateway as any).getBackgroundTasks === 'function') {
+    if (this.gateway && typeof this.gateway.getBackgroundTasks === 'function') {
       try {
-        const bgRes = await (this.gateway as any).getBackgroundTasks(userId, sessionId);
+        const bgRes = await this.gateway.getBackgroundTasks(userId, sessionId);
         const bgItems = bgRes?.items ?? [];
-        bgRunningCount = bgItems.filter((t: any) => t.status === 'running').length;
+        bgRunningCount = bgItems.filter((t) => t.status === 'running').length;
       } catch {}
     }
 
@@ -1438,9 +1448,9 @@ export class ChatCommandService {
     const filterContext = (channel && channel !== 'web') ? (nativeContextId || chatId || undefined) : undefined;
 
     let items: BackgroundTask[] = [];
-    if (this.gateway && typeof (this.gateway as any).getBackgroundTasks === 'function') {
+    if (this.gateway && typeof this.gateway.getBackgroundTasks === 'function') {
       try {
-        const bgRes = await (this.gateway as any).getBackgroundTasks(userId, sessionId, {
+        const bgRes = await this.gateway.getBackgroundTasks(userId, sessionId, {
           chatContextId: filterContext ?? undefined,
         });
         items = bgRes?.items ?? [];
@@ -1486,9 +1496,9 @@ export class ChatCommandService {
     }
 
     let stopped = false;
-    if (this.gateway && typeof (this.gateway as any).stopBackgroundTask === 'function') {
+    if (this.gateway && typeof this.gateway.stopBackgroundTask === 'function') {
       try {
-        const res = await (this.gateway as any).stopBackgroundTask(userId, sessionId, targetId);
+        const res = await this.gateway.stopBackgroundTask(userId, sessionId, targetId);
         stopped = Boolean(res?.stopped);
       } catch {}
     }

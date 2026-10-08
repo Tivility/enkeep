@@ -201,11 +201,61 @@ export class CompositeDeliveryTurnExecutor implements DeliveryTurnExecutor {
     return { status: 'absent' };
   }
 
-  async listBackgroundTasks(userId: string, sessionId: string): Promise<BackgroundTask[]> {
-    for (const provider of this.registry.listProviders()) {
-      if (typeof (provider.turnExecutor as any).listBackgroundTasks === 'function') {
+  private resolveSessionMode(sessionId: string): ExecutionMode {
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT execution_mode, space_id, dsh_session_id FROM session_routes WHERE dsh_session_id = ? OR id = ? LIMIT 1')
+          .get(sessionId, sessionId) as { execution_mode?: string; space_id?: string; dsh_session_id?: string } | undefined;
+        if (routeRow?.space_id) {
+          const spaceRow = this.db
+            .prepare('SELECT execution_mode FROM spaces WHERE id = ?')
+            .get(routeRow.space_id) as { execution_mode?: string } | undefined;
+          if (spaceRow?.execution_mode) {
+            return spaceRow.execution_mode as ExecutionMode;
+          }
+        }
+        if (routeRow?.execution_mode) {
+          return routeRow.execution_mode as ExecutionMode;
+        }
+      } catch {}
+    }
+    return 'container';
+  }
+
+  private resolveDshSessionId(sessionId: string): string {
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT dsh_session_id FROM session_routes WHERE id = ? OR dsh_session_id = ? LIMIT 1')
+          .get(sessionId, sessionId) as { dsh_session_id?: string } | undefined;
+        if (routeRow?.dsh_session_id) {
+          return routeRow.dsh_session_id;
+        }
+      } catch {}
+    }
+    return sessionId;
+  }
+
+  async listBackgroundTasks(sessionId: string): Promise<BackgroundTask[]> {
+    const dshSessionId = this.resolveDshSessionId(sessionId);
+    const mode = this.resolveSessionMode(sessionId);
+    const provider = this.registry.getProvider(mode);
+    if (provider?.turnExecutor && typeof provider.turnExecutor.listBackgroundTasks === 'function') {
+      try {
+        const res = await provider.turnExecutor.listBackgroundTasks(dshSessionId);
+        if (Array.isArray(res)) {
+          return res;
+        }
+      } catch {
+        // continue checking
+      }
+    }
+
+    for (const p of this.registry.listProviders()) {
+      if (p !== provider && typeof p.turnExecutor?.listBackgroundTasks === 'function') {
         try {
-          const res = await (provider.turnExecutor as any).listBackgroundTasks(userId, sessionId);
+          const res = await p.turnExecutor.listBackgroundTasks(dshSessionId);
           if (Array.isArray(res) && res.length > 0) {
             return res;
           }
@@ -217,11 +267,25 @@ export class CompositeDeliveryTurnExecutor implements DeliveryTurnExecutor {
     return [];
   }
 
-  async stopBackgroundTask(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }> {
-    for (const provider of this.registry.listProviders()) {
-      if (typeof (provider.turnExecutor as any).stopBackgroundTask === 'function') {
+  async stopBackgroundTask(sessionId: string, taskId: string): Promise<{ stopped: boolean }> {
+    const dshSessionId = this.resolveDshSessionId(sessionId);
+    const mode = this.resolveSessionMode(sessionId);
+    const provider = this.registry.getProvider(mode);
+    if (provider?.turnExecutor && typeof provider.turnExecutor.stopBackgroundTask === 'function') {
+      try {
+        const res = await provider.turnExecutor.stopBackgroundTask(dshSessionId, taskId);
+        if (res?.stopped) {
+          return { stopped: true };
+        }
+      } catch {
+        // continue checking
+      }
+    }
+
+    for (const p of this.registry.listProviders()) {
+      if (p !== provider && typeof p.turnExecutor?.stopBackgroundTask === 'function') {
         try {
-          const res = await (provider.turnExecutor as any).stopBackgroundTask(userId, sessionId, taskId);
+          const res = await p.turnExecutor.stopBackgroundTask(dshSessionId, taskId);
           if (res?.stopped) {
             return { stopped: true };
           }

@@ -27,6 +27,7 @@ import type { DaemonDockerTransportOptions } from '../transport/daemon-transport
 import type { HostDaemonTransportOptions } from '../host/transport.js';
 import type { HostPlatformProxyPort } from '../host/types.js';
 import type { PlatformProxyHandler } from '../tunnel/platform-proxy.js';
+import type { BackgroundTask } from '../runtime/daemon-protocol.js';
 
 export type RuntimeExecutionMode = 'docker' | 'host';
 
@@ -152,7 +153,7 @@ export interface ActiveRuntimeHandle {
     expectedEtag?: string | null;
     requireAbsent?: boolean;
   }): Promise<ExecCliEnvelope>;
-  listBackgroundTasks?(sessionId: string): Promise<any>;
+  listBackgroundTasks?(sessionId: string): Promise<BackgroundTask[]>;
   stopBackgroundTask?(sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
   fileWriteStream?(
     options: {

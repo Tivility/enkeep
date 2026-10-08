@@ -65,7 +65,7 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
           progress: { agentsDone: 2, agentsTotal: 5 },
         },
       ],
-      stopBackgroundTask: async (_userId: string, _sessionId: string, _taskId: string) => ({
+      stopBackgroundTask: async (_sessionId: string, _taskId: string) => ({
         stopped: true,
       }),
     };

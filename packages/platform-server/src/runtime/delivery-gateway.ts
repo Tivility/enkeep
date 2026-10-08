@@ -111,8 +111,8 @@ export interface DeliveryTurnExecutor {
     turnId: string;
     dshSessionId: string;
   }): Promise<InspectedTurnResult>;
-  listBackgroundTasks?(userId: string, sessionId: string): Promise<BackgroundTask[]>;
-  stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
+  listBackgroundTasks?(sessionId: string): Promise<BackgroundTask[]>;
+  stopBackgroundTask?(sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
 }
 
 export type RuntimeTurnExecutor = DeliveryTurnExecutor;
@@ -3577,17 +3577,29 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     let items: BackgroundTask[] = [];
     let updatedAt = new Date().toISOString();
 
-    if (this.executor && typeof (this.executor as any).listBackgroundTasks === 'function') {
+    let dshSessionId = sessionId;
+    if (this.db) {
       try {
-        const res = await (this.executor as any).listBackgroundTasks(userId, sessionId);
+        const routeRow = this.db.prepare(
+          'SELECT dsh_session_id FROM session_routes WHERE (id = ? OR dsh_session_id = ?) AND user_id = ? LIMIT 1'
+        ).get(sessionId, sessionId, userId) as { dsh_session_id?: string } | undefined;
+        if (routeRow?.dsh_session_id) {
+          dshSessionId = routeRow.dsh_session_id;
+        }
+      } catch {}
+    }
+
+    if (this.executor && typeof this.executor.listBackgroundTasks === 'function') {
+      try {
+        const res = await this.executor.listBackgroundTasks(dshSessionId);
         if (Array.isArray(res)) {
           items = res;
-        } else if (res && Array.isArray(res.items)) {
-          items = res.items;
-          if (res.updatedAt) updatedAt = res.updatedAt;
+        } else if (res && Array.isArray((res as any).items)) {
+          items = (res as any).items;
+          if ((res as any).updatedAt) updatedAt = (res as any).updatedAt;
         }
       } catch (err) {
-        console.warn('[delivery-gateway] failed to list background tasks from executor', { userId, sessionId, error: err });
+        console.warn('[delivery-gateway] failed to list background tasks from executor', { userId, sessionId, dshSessionId, error: err });
       }
     }
 
@@ -3597,8 +3609,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         if (!item.originTurnId) {
           try {
             const originRow = this.db.prepare(
-              'SELECT origin_turn_id FROM session_child_origins WHERE session_id = ? AND child_id = ? LIMIT 1'
-            ).get(sessionId, item.id) as { origin_turn_id?: string } | undefined;
+              'SELECT origin_turn_id FROM session_child_origins WHERE (session_id = ? OR session_id = ?) AND child_id = ? LIMIT 1'
+            ).get(sessionId, dshSessionId, item.id) as { origin_turn_id?: string } | undefined;
             if (originRow?.origin_turn_id) {
               item.originTurnId = originRow.origin_turn_id;
             }
@@ -3629,12 +3641,23 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     sessionId: string,
     taskId: string
   ): Promise<{ stopped: boolean }> {
-    if (this.executor && typeof (this.executor as any).stopBackgroundTask === 'function') {
+    if (this.executor && typeof this.executor.stopBackgroundTask === 'function') {
+      let dshSessionId = sessionId;
       try {
-        const res = await (this.executor as any).stopBackgroundTask(userId, sessionId, taskId);
+        if (this.db) {
+          try {
+            const routeRow = this.db.prepare(
+              'SELECT dsh_session_id FROM session_routes WHERE (id = ? OR dsh_session_id = ?) AND user_id = ? LIMIT 1'
+            ).get(sessionId, sessionId, userId) as { dsh_session_id?: string } | undefined;
+            if (routeRow?.dsh_session_id) {
+              dshSessionId = routeRow.dsh_session_id;
+            }
+          } catch {}
+        }
+        const res = await this.executor.stopBackgroundTask(dshSessionId, taskId);
         return { stopped: Boolean(res?.stopped) };
       } catch (err) {
-        console.warn('[delivery-gateway] failed to stop background task from executor', { userId, sessionId, taskId, error: err });
+        console.warn('[delivery-gateway] failed to stop background task from executor', { userId, sessionId, dshSessionId, taskId, error: err });
       }
     }
     return { stopped: false };

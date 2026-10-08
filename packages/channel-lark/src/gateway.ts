@@ -151,9 +151,9 @@ export class LarkChannelGateway {
     });
     this.backgroundPanelManager = new LarkBackgroundPanelManager({
       getBackgroundTasks: async (sessionId, opts) => {
-        if (typeof (this.runtimeGateway as any)?.getBackgroundTasks === 'function') {
+        if (typeof this.runtimeGateway.getBackgroundTasks === 'function') {
           const userId = this.account.userId || '';
-          return (this.runtimeGateway as any).getBackgroundTasks(userId, sessionId, opts);
+          return this.runtimeGateway.getBackgroundTasks(userId, sessionId, opts);
         }
         if (typeof this.streamEventSource?.getBackgroundTasks === 'function') {
           return this.streamEventSource.getBackgroundTasks(sessionId, opts);
