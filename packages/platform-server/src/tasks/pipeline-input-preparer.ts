@@ -6,6 +6,7 @@ import {
   ValidationError,
   NotFoundError,
   PlatformError,
+  resolvePlatformDshHome,
 } from '@enkeep/platform-core';
 import { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS } from '@enkeep/web-channel';
 import type {
@@ -1229,7 +1230,7 @@ export class PipelineTaskInputPreparerService {
     const resolvedRoot =
       this.dataRoot ??
       this.dshHome ??
-      (process.env.ENKEEP_DATA_ROOT || process.env.DSH_HOME || path.join(process.cwd(), '.dsh'));
+      (process.env.ENKEEP_DATA_ROOT || resolvePlatformDshHome() || path.join(process.cwd(), '.dsh'));
 
     const memoryRoot = path.join(resolvedRoot, 'host-runtimes', username, '.dsh', 'memory');
     const targetFile = path.join(memoryRoot, logicalName);

@@ -29,6 +29,7 @@ import {
   createMemoryWriteTool,
   createMemorySearchTool,
   MemoryService,
+  Config,
   apply,
 } from '../src/index.js';
 
@@ -406,5 +407,90 @@ describe('dsh-memory: Cordis Service & Lifecycle', () => {
     mountHandle.dispose();
     expect(tools.length).toBe(0);
     expect(sections.length).toBe(0);
+  });
+
+  it('honors plugin Config when registered via apply (injectGlobalMemory: never and defaultMaxGlobalBytes)', async () => {
+    const ctx = new Context();
+    await ctx.plugin({ apply, Config }, { injectGlobalMemory: 'never', defaultMaxGlobalBytes: 15 });
+
+    const memoryService = ctx.get('memory') as MemoryService;
+    expect(memoryService).toBeDefined();
+    expect(memoryService.config.injectGlobalMemory).toBe('never');
+    expect(memoryService.config.defaultMaxGlobalBytes).toBe(15);
+
+    const dshHome = path.join(tmpDir, 'dsh-config-test');
+    fs.mkdirSync(path.join(dshHome, 'memory'), { recursive: true });
+    fs.writeFileSync(path.join(dshHome, 'memory', 'global.md'), 'Long global memory content exceeding limit', 'utf-8');
+
+    class MockToolsService extends Service {
+      public tools: any[] = [];
+      constructor(c: Context) { super(c, 'tools'); }
+      register(tool: any) { this.tools.push(tool); return () => {}; }
+    }
+    class MockSystemPromptService extends Service {
+      public sections: any[] = [];
+      constructor(c: Context) { super(c, 'systemPrompt'); }
+      section(sec: any) { this.sections.push(sec); return () => {}; }
+    }
+
+    await ctx.plugin(MockToolsService);
+    await ctx.plugin(MockSystemPromptService);
+
+    const agentCtx = ctx.isolate(['tools', 'systemPrompt']);
+    const mountHandle = memoryService.mountAgentMemory(agentCtx, {
+      dshHome,
+      spacePath: path.join(tmpDir, 'space'),
+      userId: 'usr_1',
+    });
+
+    // With injectGlobalMemory: 'never', globalMemory snapshot should be undefined
+    expect(mountHandle.snapshot.globalMemory).toBeUndefined();
+    const sections = (ctx.get('systemPrompt') as any).sections;
+    expect(sections.length).toBe(1);
+    expect(sections[0].text).not.toContain('<global_memory');
+    // Memory tools remain available
+    expect(mountHandle.registeredTools).toEqual(['memory_search', 'memory_read', 'memory_write']);
+  });
+
+  it('honors options.injectGlobalMemory override over default config', async () => {
+    const ctx = new Context();
+    await ctx.plugin(MemoryService); // default config (always)
+
+    const memoryService = ctx.get('memory') as MemoryService;
+    const dshHome = path.join(tmpDir, 'dsh-override-test');
+    ensureGlobalMemorySkeleton(dshHome);
+
+    class MockToolsService extends Service {
+      public tools: any[] = [];
+      constructor(c: Context) { super(c, 'tools'); }
+      register(tool: any) { this.tools.push(tool); return () => {}; }
+    }
+    class MockSystemPromptService extends Service {
+      public sections: any[] = [];
+      constructor(c: Context) { super(c, 'systemPrompt'); }
+      section(sec: any) { this.sections.push(sec); return () => {}; }
+    }
+    await ctx.plugin(MockToolsService);
+    await ctx.plugin(MockSystemPromptService);
+
+    // Test with injectGlobalMemory: 'never'
+    const agentCtx1 = ctx.isolate(['tools', 'systemPrompt']);
+    const mount1 = memoryService.mountAgentMemory(agentCtx1, {
+      dshHome,
+      userId: 'usr_1',
+      injectGlobalMemory: 'never',
+    });
+    expect(mount1.snapshot.globalMemory).toBeUndefined();
+    expect(mount1.registeredTools).toEqual(['memory_search', 'memory_read', 'memory_write']);
+
+    // Test with injectGlobalMemory: 'always'
+    const agentCtx2 = ctx.isolate(['tools', 'systemPrompt']);
+    const mount2 = memoryService.mountAgentMemory(agentCtx2, {
+      dshHome,
+      userId: 'usr_1',
+      injectGlobalMemory: 'always',
+    });
+    expect(mount2.snapshot.globalMemory).toBeDefined();
+    expect(mount2.registeredTools).toEqual(['memory_search', 'memory_read', 'memory_write']);
   });
 });

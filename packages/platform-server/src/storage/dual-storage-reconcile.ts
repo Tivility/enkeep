@@ -7,6 +7,7 @@ import {
   PlatformError,
   NotFoundError,
   ValidationError,
+  resolvePlatformDshHome,
   type ExecutionMode,
 } from '@enkeep/platform-core';
 import {
@@ -253,7 +254,7 @@ export class DualStorageReconcileService {
       throw new ValidationError('DatabaseSync db instance is required');
     }
     this.db = options.db;
-    this.dshHome = options.dshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    this.dshHome = resolvePlatformDshHome(options.dshHome) || '';
     this.sessionLogReader = options.sessionLogReader;
     this.runtimeArtifactPort = options.runtimeArtifactPort;
     this.fileProvider = options.fileProvider;

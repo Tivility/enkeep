@@ -132,6 +132,8 @@
     "@enkeep/dsh-receipt-store-sqlite": "workspace:*",
     "@enkeep/dsh-tool-browser": "workspace:*",
     "@enkeep/dsh-tool-cli": "workspace:*",
+    "@enkeep/dsh-tool-subagent-memory": "workspace:*",
+    "@enkeep/dsh-tool-workflow-memory": "workspace:*",
     "@enkeep/dsh-tools": "workspace:*",
     "@enkeep/platform-core": "workspace:*",
     "@enkeep/platform-operations": "workspace:*",

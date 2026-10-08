@@ -57,6 +57,7 @@ export interface ModelSelectionServiceOptions {
   circuitBreakerConfig?: Partial<CircuitBreakerConfig>;
   fetchImpl?: typeof fetch;
   operations?: any;
+  isProduction?: boolean;
 }
 
 export function computeOverrideRevision(row: {
@@ -131,6 +132,7 @@ interface DbLegacyModelConfigOverrideRow {
 export class ModelSelectionService {
   private readonly db: DatabaseSync;
   private readonly customDshHome?: string;
+  private readonly isProduction?: boolean;
   private readonly circuitBreakers: ModelCircuitBreakerRegistry;
   private readonly fetchFn: typeof fetch;
   private readonly operations?: any;
@@ -138,6 +140,7 @@ export class ModelSelectionService {
   constructor(options: ModelSelectionServiceOptions) {
     this.db = options.db;
     this.customDshHome = options.customDshHome;
+    this.isProduction = options.isProduction;
     this.circuitBreakers = new ModelCircuitBreakerRegistry(options.circuitBreakerConfig);
     this.fetchFn = options.fetchImpl ?? globalThis.fetch;
     this.operations = options.operations;
@@ -166,7 +169,7 @@ export class ModelSelectionService {
    * Loads safe DSH catalog.
    */
   getDshCatalog(): RawDshModelConfig {
-    return loadDshSafeModelConfig(this.customDshHome);
+    return loadDshSafeModelConfig(this.customDshHome, { isProduction: this.isProduction });
   }
 
   /**

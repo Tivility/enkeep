@@ -23,6 +23,7 @@ import {
   ForbiddenError,
   UnauthorizedError,
   ConflictError,
+  resolvePlatformDshHome,
   type User,
   type PlatformStorage,
   type AuthService,
@@ -549,7 +550,8 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
   const auditExportService = customAuditExportService ?? (db ? new AuditExportService(db) : undefined)!;
   const usageExportService = customUsageExportService ?? (db ? new UsageExportService(db) : undefined)!;
   const taskNotificationService = customTaskNotificationService ?? (db ? new TaskNotificationService({ db }) : undefined)!;
-  const modelSelectionService = customModelSelectionService ?? customCds?.modelSelectionService ?? (db ? new ModelSelectionService({ db, operations }) : undefined)!;
+  const effectiveDshHome = resolvePlatformDshHome(options.dshHome);
+  const modelSelectionService = customModelSelectionService ?? customCds?.modelSelectionService ?? (db ? new ModelSelectionService({ db, operations, customDshHome: effectiveDshHome ?? undefined }) : undefined)!;
 
   const fileService = options.fileService ?? (options.fileProvider ? new RuntimeFileApiService({ fileProvider: options.fileProvider, platformApi, operations }) : undefined);
 

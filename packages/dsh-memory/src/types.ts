@@ -14,6 +14,11 @@ export type MemoryScope = 'global' | 'space';
 export type MemorySearchScope = 'all' | 'global' | 'space';
 export type MemoryWriteMode = 'overwrite' | 'append';
 
+export interface MemoryPluginConfig {
+  readonly defaultMaxGlobalBytes?: number;
+  readonly injectGlobalMemory?: MemoryInjectionMode;
+}
+
 /**
  * Single matching snippet from memory search.
  */
@@ -105,12 +110,13 @@ export interface AssembleMemoryOptions {
  */
 export interface MountAgentMemoryOptions {
   readonly dshHome: string;
-  readonly spacePath: string;
+  readonly spacePath?: string;
   readonly spaceId?: string;
   readonly userId?: string;
   readonly memoryPlan?: MemoryPlan | null;
   readonly maxGlobalBytes?: number;
   readonly defaultApproval?: 'ask' | 'never';
+  readonly injectGlobalMemory?: MemoryInjectionMode;
 }
 
 /**

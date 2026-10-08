@@ -11,6 +11,7 @@ import { resetDemo } from './reset/index.js';
 import { launchDemoSystem } from './up/index.js';
 import { downDemo } from './down/index.js';
 import { runDemoTestSuite } from './test/index.js';
+import { runPreflight } from './preflight/index.js';
 import { listSignedProcesses, listSignedContainers } from './utils/crypto-meta.js';
 import { validateSafePort } from './utils/probes.js';
 import {
@@ -46,11 +47,14 @@ COMMANDS:
   down       Safely terminate demo processes and containers verified by signed metadata
   test       Run full automated verification suite and teardown with port 3000/3080 probes
   status     Show current status of demo services, processes, and containers
+  preflight  Verify platform and all host/container runtimes quiescence before deploy or stop
   bind-lark  Explicitly bind a Lark chatId to the dedicated test space
   help       Display this help message
 
 OPTIONS:
   --port <number>             Fixed loopback Platform port for up (default dynamic)
+  --data-dir <path>           Explicit platform data root (or env ENKEEP_DATA_DIR)
+  --due-within-minutes <N>    Lookahead window in minutes for due scheduled tasks (default: 10)
   --network-mode <mode>       Container network mode: "none" (default) or "bridge"
   --resource-suffix <suffix>  Resource suffix for Docker containers and volumes (or env ENKEEP_RESOURCE_SUFFIX)
   --dsh-home <dir>            Explicit DSH home directory (or env ENKEEP_DSH_HOME, DSH_HOME)
@@ -251,6 +255,86 @@ export function parseResourceSuffix(
 
   validateResourceSuffix(trimmed);
   return trimmed;
+}
+
+/**
+ * Parses explicit data directory from CLI arguments or environment variables.
+ * Priority: CLI `--data-dir <path>` > env `ENKEEP_DATA_DIR` > undefined.
+ */
+export function parseDataDir(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  let rawDir: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--data-dir') {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        throw new Error('Safety Violation: --data-dir requires a valid directory path.');
+      }
+      rawDir = next;
+      break;
+    } else if (arg.startsWith('--data-dir=')) {
+      const val = arg.slice('--data-dir='.length);
+      if (!val) {
+        throw new Error('Safety Violation: --data-dir requires a valid directory path.');
+      }
+      rawDir = val;
+      break;
+    }
+  }
+
+  if (rawDir === undefined && env.ENKEEP_DATA_DIR !== undefined && env.ENKEEP_DATA_DIR !== '') {
+    rawDir = env.ENKEEP_DATA_DIR;
+  }
+
+  return rawDir;
+}
+
+/**
+ * Parses due-within-minutes lookahead window from CLI arguments or environment variables.
+ * Priority: CLI `--due-within-minutes <number>` > env `ENKEEP_PREFLIGHT_DUE_MINUTES` > default 10.
+ */
+export function parseDueWithinMinutes(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env
+): number {
+  let rawVal: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--due-within-minutes' || arg === '--due-within') {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        throw new Error(`Safety Violation: ${arg} requires a valid number of minutes.`);
+      }
+      rawVal = next;
+      break;
+    } else if (arg.startsWith('--due-within-minutes=')) {
+      rawVal = arg.slice('--due-within-minutes='.length);
+      break;
+    } else if (arg.startsWith('--due-within=')) {
+      rawVal = arg.slice('--due-within='.length);
+      break;
+    }
+  }
+
+  if (rawVal === undefined && env.ENKEEP_PREFLIGHT_DUE_MINUTES !== undefined && env.ENKEEP_PREFLIGHT_DUE_MINUTES !== '') {
+    rawVal = env.ENKEEP_PREFLIGHT_DUE_MINUTES;
+  }
+
+  if (rawVal === undefined) {
+    return 10;
+  }
+
+  const trimmed = rawVal.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Safety Violation: Invalid minutes value "${rawVal}". Must be an integer.`);
+  }
+
+  return Number.parseInt(trimmed, 10);
 }
 
 export async function getStatus(options?: DemoStatusOptions | string): Promise<DemoStatusResult> {
@@ -473,6 +557,29 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
           console.log(`  Processes:  ${result.processes.length} active`);
           console.log(`  Containers: ${result.containers.length} active`);
           console.log(`  Ports:      ${result.activePortBindings.join(', ') || 'none'}\n`);
+        }
+        break;
+      }
+
+      case 'preflight': {
+        const platformPort = parsePlatformPort(args);
+        const dataDir = parseDataDir(args, process.env);
+        const dueWithinMinutes = parseDueWithinMinutes(args, process.env);
+        const result = await runPreflight({
+          dataDir,
+          repoRoot,
+          port: platformPort,
+          dueWithinMinutes,
+        });
+
+        if (isJson) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(result.summary);
+        }
+
+        if (!result.isIdle) {
+          process.exit(1);
         }
         break;
       }

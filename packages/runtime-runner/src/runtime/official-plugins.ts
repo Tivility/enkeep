@@ -91,6 +91,7 @@ import SubagentRuntime from '@deepseek-ai/dsh-subagent';
 import * as SubagentSpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process';
 import * as SubagentForkPlugin from '@deepseek-ai/dsh-subagent-fork-in-process';
 import * as ToolSubagentPlugin from '@deepseek-ai/dsh-tool-subagent';
+import * as ToolSubagentMemoryPlugin from '@enkeep/dsh-tool-subagent-memory';
 import SubagentModelSelectionConfig from '@deepseek-ai/dsh-tool-subagent/model-selection-settings';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite';
@@ -102,8 +103,7 @@ import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy';
 import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local';
 import { SandboxUnavailableError, type SandboxPolicy, type ConfinedArgv } from '@deepseek-ai/dsh-sandbox';
 import { NodePtcRuntime } from '@deepseek-ai/dsh-ptc-runtime-node';
-import PtcWorkflowEngine from '@deepseek-ai/dsh-workflow-ptc';
-import * as ToolWorkflowPlugin from '@deepseek-ai/dsh-tool-workflow';
+import { PtcWorkflowEngine, ToolWorkflowPlugin } from '@enkeep/dsh-tool-workflow-memory';
 import { scopeOf } from '@deepseek-ai/dsh-scope';
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets';
 import { WebRuntime } from '@deepseek-ai/dsh-web';
@@ -1369,7 +1369,7 @@ export async function mountWorkspaceTools(
       backfillSubagentModelSelection(agentCtx, session);
     }
 
-    const toolSubagentFiber = await agentCtx.plugin(ToolSubagentPlugin, {
+    const toolSubagentFiber = await agentCtx.plugin(ToolSubagentMemoryPlugin, {
       provider: 'spawn',
       toolName: 'subagent',
       maxDepth: maxSubagentDepth,

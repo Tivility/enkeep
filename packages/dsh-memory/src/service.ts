@@ -19,6 +19,7 @@ import type {
   MemoryMountHandle,
   MemorySnapshot,
   MemoryPlatformClientService,
+  MemoryPluginConfig,
 } from './types.js';
 import {
   MEMORY_SECTION_NAME,
@@ -31,8 +32,11 @@ import { createMemoryReadTool } from './tools/memory-read.js';
 import { createMemoryWriteTool } from './tools/memory-write.js';
 
 export class MemoryService extends Service {
-  constructor(ctx: Context) {
+  public readonly config: MemoryPluginConfig;
+
+  constructor(ctx: Context, config: MemoryPluginConfig = {}) {
     super(ctx, 'memory');
+    this.config = config;
   }
 
   /**
@@ -69,7 +73,7 @@ export class MemoryService extends Service {
    * @returns MemoryMountHandle with snapshot and composite disposer
    */
   mountAgentMemory(agentCtx: Context, options: MountAgentMemoryOptions): MemoryMountHandle {
-    const { dshHome, spacePath, spaceId, userId, memoryPlan, maxGlobalBytes } = options;
+    const { dshHome, spacePath, spaceId, userId, memoryPlan, maxGlobalBytes, injectGlobalMemory } = options;
 
     // 1. Ensure skeleton on disk
     ensureGlobalMemorySkeleton(dshHome);
@@ -80,7 +84,8 @@ export class MemoryService extends Service {
       spacePath,
       spaceId,
       userId,
-      maxGlobalBytes,
+      maxGlobalBytes: maxGlobalBytes ?? this.config.defaultMaxGlobalBytes,
+      injectGlobalMemory: injectGlobalMemory ?? this.config.injectGlobalMemory,
       memoryPlan,
     });
 

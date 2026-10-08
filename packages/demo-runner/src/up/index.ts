@@ -1206,6 +1206,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     db,
     operations: operationsService,
     customDshHome: dshDeploymentConfig?.dshHome ?? options.dshHome,
+    isProduction,
   });
 
   // 6c. Tenant Runtime File Provider wired to real Docker User Containers & Host Runtimes

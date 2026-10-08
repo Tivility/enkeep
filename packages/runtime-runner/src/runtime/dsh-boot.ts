@@ -229,6 +229,67 @@ export function isValidTurnId(turnId: unknown): turnId is string {
   return typeof turnId === 'string' && CANONICAL_TURN_ID_PATTERN.test(turnId);
 }
 
+/**
+ * Detects whether an agent / session represents a child session
+ * (subagent, subagent_fork, workflow child agent; i.e. session with a parent / origin subagent).
+ */
+export function isChildSession(agent: any, runtimeCtx?: Context): boolean {
+  if (!agent) return false;
+  const session = (agent as any)?.session ?? (agent?.get ? agent.get('session') : undefined);
+  const header = (session as any)?.header;
+  const meta = (session as any)?.meta;
+
+  const parentSession =
+    header?.parentSession ??
+    meta?.parentSession ??
+    header?.parentSessionId ??
+    meta?.parentSessionId;
+  if (parentSession != null && String(parentSession).trim().length > 0) {
+    return true;
+  }
+
+  const origin = header?.origin ?? meta?.origin;
+  if (origin === 'subagent') {
+    return true;
+  }
+
+  const agentId = agent.id ?? session?.id;
+  if (agentId && runtimeCtx) {
+    const agentsRegistry = runtimeCtx.agents ?? (runtimeCtx.get ? runtimeCtx.get('agents') : undefined);
+    const storeEntry = (agentsRegistry as any)?.store?.get?.(agentId);
+    if (storeEntry?.owner != null) {
+      return true;
+    }
+    const registeredAgent = agentsRegistry?.get?.(typeof agentId === 'string' ? SessionId(agentId) : agentId);
+    if (registeredAgent && registeredAgent !== agent) {
+      const regHeader = (registeredAgent.session as any)?.header;
+      const regMeta = (registeredAgent.session as any)?.meta;
+      const regParentSession =
+        regHeader?.parentSession ??
+        regMeta?.parentSession ??
+        regHeader?.parentSessionId ??
+        regMeta?.parentSessionId;
+      if (regParentSession != null && String(regParentSession).trim().length > 0) {
+        return true;
+      }
+      if (regHeader?.origin === 'subagent' || regMeta?.origin === 'subagent') {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Resolves the deployment global memory injection setting for child/subagent sessions.
+ * Note: ENKEEP_SUBAGENT_GLOBAL_MEMORY env mechanism has been removed in favor of
+ * per-call global_memory (subagent tool) / globalMemory (workflow agent opts) flags.
+ */
+export function resolveSubagentGlobalMemoryMode(): 'never' | 'always' {
+  return 'never';
+}
+
 export class PersistedSessionResumeError extends Error {
   readonly sessionId: string;
   readonly sessionsDir: string;
@@ -995,16 +1056,39 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     spacesDir,
   });
 
+  const mountedMemoryAgents = new WeakSet<any>();
+
+  function resolveInjectGlobalMemoryForAgent(agentCandidate: any, runtimeCtx?: Context): 'never' | 'always' | undefined {
+    if (isChildSession(agentCandidate, runtimeCtx)) {
+      const opts = agentCandidate?.options ?? (agentCandidate?.ctx?.get ? agentCandidate.ctx.get('agent')?.options : undefined);
+      const shouldInject = Boolean(
+        opts?.globalMemory ??
+        opts?.global_memory ??
+        agentCandidate?.globalMemory ??
+        agentCandidate?.global_memory
+      );
+      return shouldInject ? 'always' : 'never';
+    }
+    return undefined;
+  }
+
   function mountAgentMemoryFailClosed(
     memoryService: MemoryService,
     agentCtx: Context,
-    options: { dshHome: string; spacePath?: string; spaceId?: string; userId: string },
+    options: { dshHome: string; spacePath?: string; spaceId?: string; userId: string; injectGlobalMemory?: 'never' | 'always' },
     agentObj?: any
   ) {
-    const memHandle = memoryService.mountAgentMemory(agentCtx, options as any);
+    const targetAgent = agentObj ?? (agentCtx.get ? agentCtx.get('agent') : undefined) ?? agentCtx;
+    if (targetAgent && typeof targetAgent === 'object') {
+      mountedMemoryAgents.add(targetAgent);
+    }
+    const injectGlobalMemory = options.injectGlobalMemory ?? resolveInjectGlobalMemoryForAgent(targetAgent, ctx);
+    const memHandle = memoryService.mountAgentMemory(agentCtx, {
+      ...options,
+      ...(injectGlobalMemory !== undefined ? { injectGlobalMemory } : {}),
+    } as any);
     if (!options.spacePath) {
       const tools = agentCtx.tools ?? (agentCtx.get ? agentCtx.get('tools') : undefined);
-      const targetAgent = agentObj ?? (agentCtx.get ? agentCtx.get('agent') : undefined) ?? agentCtx;
       const view = (tools as any)?.view?.(targetAgent);
       for (const name of ['memory_write', 'memory_read', 'memory_search']) {
         const tool = view?.visible?.get(name);
@@ -1026,8 +1110,8 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   ctx.on('agent/created', ({ agent }): undefined => {
     const toolsService = agent.ctx.tools ?? (agent.ctx.get ? agent.ctx.get('tools') : undefined);
     if (!toolsService) return undefined;
-    const view = (toolsService as any).view?.(agent);
-    if (view?.visible?.has('memory_write')) return undefined;
+    if (mountedMemoryAgents.has(agent)) return undefined;
+    mountedMemoryAgents.add(agent);
 
     let sessionCwd = ((agent.session as any)?.header)?.cwd || ((agent.session as any)?.meta)?.cwd;
     const isValidSpace = (p: unknown): p is string =>
@@ -1059,11 +1143,13 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
       throw err;
     }
 
+    const injectGlobalMemory = resolveInjectGlobalMemoryForAgent(agent, ctx);
     const memHandle = mountAgentMemoryFailClosed(memoryService, agent.ctx, {
       dshHome,
       spacePath,
       spaceId: spaceId && spaceId.length > 0 ? spaceId : undefined,
       userId,
+      injectGlobalMemory,
     }, agent);
     agent.ctx.effect(() => {
       return () => {
@@ -1983,11 +2069,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           const isExplicitSpace = typeof spacePath === 'string' && spacePath !== spacesDir && isPathInside(spacePath, spacesDir);
           const resolvedSpacePath = isExplicitSpace ? spacePath : undefined;
           const resolvedSpaceId = isExplicitSpace ? (sessionWorkspaces.get(sessionIdStr) ?? path.relative(spacesDir, spacePath)) : undefined;
+          const targetAgent = _agent ?? (agentCtx.get ? agentCtx.get('agent') : undefined) ?? (ctx.agents?.get?.(SessionId(sessionIdStr)) as Agent | undefined) ?? agentCtx;
+          const injectGlobalMemory = resolveInjectGlobalMemoryForAgent(targetAgent, ctx);
           const memHandle = mountAgentMemoryFailClosed(memoryService, agentCtx, {
             dshHome,
             spacePath: resolvedSpacePath,
             spaceId: resolvedSpaceId,
             userId,
+            injectGlobalMemory,
           }, _agent);
           agentCtx.effect(() => {
             return () => {
@@ -3229,11 +3318,14 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
             const isExplicitSpace = typeof spacePath === 'string' && spacePath !== spacesDir && isPathInside(spacePath, spacesDir);
             const resolvedSpacePath = isExplicitSpace ? spacePath : undefined;
             const resolvedSpaceId = isExplicitSpace ? (workspaceFolder ?? sessionWorkspaces.get(sessionIdStr) ?? path.relative(spacesDir, spacePath)) : undefined;
+            const targetAgent = _agent ?? (agentCtx.get ? agentCtx.get('agent') : undefined) ?? (ctx.agents?.get?.(SessionId(sessionIdStr)) as Agent | undefined) ?? agentCtx;
+            const injectGlobalMemory = resolveInjectGlobalMemoryForAgent(targetAgent, ctx);
             const memHandle = mountAgentMemoryFailClosed(memoryService, agentCtx, {
               dshHome,
               spacePath: resolvedSpacePath,
               spaceId: resolvedSpaceId,
               userId,
+              injectGlobalMemory,
             }, _agent);
             agentCtx.effect(() => {
               return () => {
