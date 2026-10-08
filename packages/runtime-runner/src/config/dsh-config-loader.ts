@@ -16,7 +16,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import YAML from 'yaml';
 import type { RuntimeNetworkMode } from '../spec/types.js';
 
@@ -119,14 +118,15 @@ export function parseEnvContent(envText: string): Record<string, string> {
  * @param patchYmlContent - Content of cordis.patch.yml
  * @param settingsYamlContent - Optional content of settings.yaml
  * @param envContent - Optional content of .env file
- * @param dshHome - Path to DSH home directory
+ * @param dshHome - Optional path to DSH home directory
  */
 export function parseDshConfigFiles(
   patchYmlContent?: string,
   settingsYamlContent?: string,
   envContent?: string,
-  dshHome = path.join(os.homedir(), '.dsh')
+  dshHome?: string
 ): DshDeploymentConfig {
+  const effectiveDshHome = dshHome || resolvePlatformDshHome() || '';
   const providers: Record<string, DshParsedProvider> = {};
   const allowedHostsSet = new Set<string>();
   let patchParsed: unknown = undefined;
@@ -398,7 +398,7 @@ export function parseDshConfigFiles(
   }
 
   return {
-    dshHome,
+    dshHome: effectiveDshHome,
     providers,
     defaultModel,
     tokens,
@@ -409,14 +409,64 @@ export function parseDshConfigFiles(
   };
 }
 
+export interface DshConfigLoaderOptions {
+  isProduction?: boolean;
+}
+
 /**
- * Loads DSH deployment configuration from filesystem ($DSH_HOME).
- * Read-only; returns null if files are missing or unparseable.
+ * Resolves the platform-side DSH home directory.
+ * Priority:
+ * 1. customDshHome (explicit argument)
+ * 2. ENKEEP_DSH_HOME (preferred environment variable)
+ * 3. DSH_HOME (fallback environment variable)
  *
- * @param customDshHome - Optional explicit DSH Home directory (default: process.env.DSH_HOME || '~/.dsh')
+ * Never falls back to os.homedir()/.dsh.
  */
-export function loadDshDeploymentConfig(customDshHome?: string): DshDeploymentConfig | null {
-  const dshHome = customDshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+export function resolvePlatformDshHome(customDshHome?: string): string | null {
+  const candidate = customDshHome || process.env.ENKEEP_DSH_HOME || process.env.DSH_HOME;
+  if (!candidate || typeof candidate !== 'string' || candidate.trim().length === 0) {
+    return null;
+  }
+  return path.resolve(candidate.trim());
+}
+
+/**
+ * Loads DSH deployment configuration from filesystem ($ENKEEP_DSH_HOME or $DSH_HOME).
+ * Read-only; in production mode fails closed loudly if the directory is missing, invalid, or lacks required files.
+ * In non-production modes, returns null if files are missing or unparseable.
+ *
+ * @param customDshHome - Optional explicit DSH Home directory (preferred over env vars)
+ * @param options - Optional loader options or boolean flag for production mode
+ */
+export function loadDshDeploymentConfig(
+  customDshHome?: string,
+  options?: DshConfigLoaderOptions | boolean
+): DshDeploymentConfig | null {
+  const isProd = typeof options === 'boolean'
+    ? options
+    : (typeof options?.isProduction === 'boolean'
+        ? options.isProduction
+        : (process.env.NODE_ENV === 'production' || process.env.ENKEEP_MODE === 'production'));
+
+  const dshHome = resolvePlatformDshHome(customDshHome);
+
+  if (!dshHome) {
+    if (isProd) {
+      throw new Error(
+        'FAIL-CLOSED: ENKEEP_DSH_HOME or DSH_HOME environment variable is mandatory in production mode. Silent fallback to ~/.dsh is disabled.'
+      );
+    }
+    return null;
+  }
+
+  if (!fs.existsSync(dshHome)) {
+    if (isProd) {
+      throw new Error(
+        `FAIL-CLOSED: Configured DSH home directory does not exist: "${dshHome}".`
+      );
+    }
+    return null;
+  }
 
   // Candidate patch file locations: $DSH_HOME/profiles/web/cordis.patch.yml or $DSH_HOME/cordis.patch.yml
   const candidatePatchPaths = [
@@ -438,6 +488,12 @@ export function loadDshDeploymentConfig(customDshHome?: string): DshDeploymentCo
     const envPath = path.join(dshHome, '.env');
     const envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : undefined;
 
+    if (isProd) {
+      throw new Error(
+        `FAIL-CLOSED: DSH home directory "${dshHome}" lacks required configuration files: cordis.patch.yml (or profiles/web/cordis.patch.yml) is missing.`
+      );
+    }
+
     if (!settingsContent && !envContent) {
       return null;
     }
@@ -458,7 +514,12 @@ export function loadDshDeploymentConfig(customDshHome?: string): DshDeploymentCo
     const envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : undefined;
 
     return parseDshConfigFiles(patchContent, settingsContent, envContent, dshHome);
-  } catch (_err) {
+  } catch (err) {
+    if (isProd) {
+      throw new Error(
+        `FAIL-CLOSED: Failed to load DSH deployment configuration from "${dshHome}": ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
     return null;
   }
 }

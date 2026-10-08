@@ -1929,6 +1929,17 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
           }
           return res;
         }, { prepend: true });
+        // Suppress false model-switch notices injected into child/subagent turns by parent's installModelSelection
+        agentCtx.on('agent/pre-step', async (payload: any, next: any) => {
+          const decision = await next();
+          if (payload?.agent && payload.agent.id !== sessionIdStr && decision?.messages?.length) {
+            return {
+              ...decision,
+              messages: decision.messages.filter((m: any) => m?.source?.kind !== 'model-selection'),
+            };
+          }
+          return decision;
+        }, { prepend: true });
         if (validatedProfile) {
           installAgentProfile(agentCtx, validatedProfile);
         }
@@ -3164,6 +3175,17 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
               }
             }
             return res;
+          }, { prepend: true });
+          // Suppress false model-switch notices injected into child/subagent turns by parent's installModelSelection
+          agentCtx.on('agent/pre-step', async (payload: any, next: any) => {
+            const decision = await next();
+            if (payload?.agent && payload.agent.id !== sessionIdStr && decision?.messages?.length) {
+              return {
+                ...decision,
+                messages: decision.messages.filter((m: any) => m?.source?.kind !== 'model-selection'),
+              };
+            }
+            return decision;
           }, { prepend: true });
           if (validatedProfile) {
             installAgentProfile(agentCtx, validatedProfile);
