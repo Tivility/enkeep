@@ -118,6 +118,7 @@ export class LarkChannelGateway {
   private readonly inFlightTurns = new Set<string>();
   private readonly turnSenders = new Map<string, string>();
   private readonly stoppedTurns = new Set<string>();
+  private readonly finalizedStopTurns = new Set<string>();
   readonly cotManager: LarkCotManager;
   private readonly configuredWithThinkingPanel?: boolean;
   private readonly isOperatorAllowedCallback?: (params: {
@@ -1190,10 +1191,38 @@ export class LarkChannelGateway {
     };
 
     let turnId: string = platformIdempotencyKey;
+    const isStopCommand = /^\/stop(?:\s|$)/i.test(envelope.content.trim());
+    let activeTrackerForStop: StreamingReplyTracker | undefined;
+    if (isStopCommand) {
+      activeTrackerForStop = this.findActiveTracker({ sessionId: route.id });
+    }
+
     try {
       const dispatchResult = await this.runtimeGateway.dispatchInbound(envelope);
       turnId = dispatchResult.turnId || platformIdempotencyKey;
       inboxItem = await this.channelRepo.updateInboxStatus(inboxItem.id, 'delivered');
+
+      if (isStopCommand && activeTrackerForStop) {
+        if (!activeTrackerForStop.isSettled()) {
+          const currentText = activeTrackerForStop.getAccumulatedText();
+          const stoppedText =
+            currentText && currentText.trim().length > 0
+              ? `${currentText}\n\n*(已停止回复)*`
+              : '(已停止回复)';
+          const toolStatus = activeTrackerForStop.getToolStatusEntries();
+          await activeTrackerForStop.finalize(
+            stoppedText,
+            'stopped',
+            undefined,
+            toolStatus.length > 0 ? toolStatus : undefined
+          );
+          activeTrackerForStop.stop();
+        }
+        this.finalizedStopTurns.add(turnId);
+        if (dispatchResult.turnId) {
+          this.finalizedStopTurns.add(dispatchResult.turnId);
+        }
+      }
 
       if (parsed.senderId) {
         this.recordTurnSender(turnId, parsed.senderId);
@@ -1338,7 +1367,7 @@ export class LarkChannelGateway {
     for (const tracker of this.activeTrackers.values()) {
       if (turnId && tracker.getTurnId() === turnId) return tracker;
       if (messageId && tracker.getMessageId() === messageId) return tracker;
-      if (sessionId && tracker.getRouteId() === sessionId && tracker.isActive()) return tracker;
+      if (sessionId && tracker.getRouteId() === sessionId && !tracker.isSettled()) return tracker;
     }
 
     // Search continuationWatchers
@@ -1347,7 +1376,7 @@ export class LarkChannelGateway {
       if (tracker) {
         if (turnId && tracker.getTurnId() === turnId) return tracker;
         if (messageId && tracker.getMessageId() === messageId) return tracker;
-        if (sessionId && tracker.getRouteId() === sessionId && tracker.isActive()) return tracker;
+        if (sessionId && tracker.getRouteId() === sessionId && !tracker.isSettled()) return tracker;
       }
     }
 
@@ -1541,7 +1570,7 @@ export class LarkChannelGateway {
     }
 
     // 7. Update card to stopped state
-    if (tracker && tracker.isActive()) {
+    if (tracker && !tracker.isSettled()) {
       const currentText = tracker.getAccumulatedText();
       const stoppedText =
         currentText && currentText.trim().length > 0
@@ -1671,6 +1700,21 @@ export class LarkChannelGateway {
 
     // Require valid structured chatId (no split guessing)
     if (!chatId || typeof chatId !== 'string' || chatId.trim().length === 0) {
+      return null;
+    }
+
+    const isStopTurn =
+      this.finalizedStopTurns.has(params.turnId) ||
+      (params.idempotencyKey && this.finalizedStopTurns.has(params.idempotencyKey)) ||
+      (params.executionMode === 'command' && params.replyText === 'cancelled');
+
+    if (isStopTurn) {
+      this.finalizedStopTurns.delete(params.turnId);
+      if (params.idempotencyKey) this.finalizedStopTurns.delete(params.idempotencyKey);
+      return null;
+    }
+
+    if (!params.replyText || params.replyText.trim().length === 0) {
       return null;
     }
 

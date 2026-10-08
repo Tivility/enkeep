@@ -444,14 +444,14 @@ describe('Chat Commands /new, /newws, /list & /ls (Synthetic Data)', () => {
   });
 
   describe('7. Unknown commands and existing commands unaffected', () => {
-    it('returns Unrecognized command for unknown slash command', async () => {
+    it('returns synthetic hint for unknown slash command', async () => {
       const result = await chatCommandService.execute({
         userId,
         sessionId: webSessionId,
         spaceId: space1Id,
         content: '/unknown_synth_cmd',
       });
-      expect(result.replyText).toBe('Unrecognized command.');
+      expect(result.replyText).toBe('未知指令 /unknown_synth_cmd。发送 /help 查看全部指令。');
     });
 
     it('HELP_USAGE includes /newws and /list', async () => {

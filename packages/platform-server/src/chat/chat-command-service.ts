@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { ValidationError, PlatformError } from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 
-export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention';
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention' | 'unknown';
 
 export interface ParsedChatCommand {
   command: ChatCommandType;
@@ -17,6 +17,8 @@ export interface ParsedChatCommand {
   isConfirm?: boolean;
   all?: boolean;
   legacy?: 'where' | 'list' | 'bind' | 'unbind' | 'newws' | 'new' | 'clear' | 'reset';
+  word?: string;
+  closest?: string;
 }
 
 const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -164,11 +166,109 @@ const EFFORT_USAGE = `Usage:
   /effort <name> - Set reasoning effort for current session
   /effort reset - Reset reasoning effort override`;
 
+export const KNOWN_CHAT_COMMANDS = [
+  'model',
+  'effort',
+  'help',
+  'status',
+  'new',
+  'reset',
+  'clear',
+  'stop',
+  'compact',
+  'sw',
+  'spawn',
+  'where',
+  'bind',
+  'unbind',
+  'newws',
+  'new-workspace',
+  'list',
+  'ls',
+  'ws',
+  'session',
+  'ses',
+  'mention',
+  'require_mention',
+] as const;
+
+export function levenshteinDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      } else {
+        dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+      }
+    }
+  }
+  return dp[m][n];
+}
+
+export function findClosestCommand(
+  word: string,
+  knownCommands: readonly string[] = KNOWN_CHAT_COMMANDS
+): string | null {
+  const lower = word.toLowerCase();
+  let minDistance = Infinity;
+  let closest: string | null = null;
+  for (const cmd of knownCommands) {
+    const dist = levenshteinDistance(lower, cmd);
+    if (dist < minDistance) {
+      minDistance = dist;
+      closest = cmd;
+    }
+  }
+  return minDistance <= 2 ? closest : null;
+}
+
+export function parseUnknownChatCommand(content: unknown): {
+  word: string;
+  closest: string | null;
+  raw: string;
+} | null {
+  if (typeof content !== 'string') {
+    return null;
+  }
+  const trimmed = content.trim();
+  const match = trimmed.match(/^\/([A-Za-z][A-Za-z0-9_-]*)(\s|$)/);
+  if (!match) {
+    return null;
+  }
+  const word = match[1];
+  const lower = word.toLowerCase();
+  const isKnown = KNOWN_CHAT_COMMANDS.some((cmd) => cmd === lower);
+  if (isKnown) {
+    return null;
+  }
+  const closest = findClosestCommand(lower, KNOWN_CHAT_COMMANDS);
+  return {
+    word,
+    closest,
+    raw: trimmed,
+  };
+}
+
+export function formatUnknownCommandReply(word: string, closest: string | null): string {
+  if (closest) {
+    return `未知指令 /${word}。你是不是想用 /${closest}？发送 /help 查看全部指令。`;
+  }
+  return `未知指令 /${word}。发送 /help 查看全部指令。`;
+}
+
 /**
  * Parses in-chat slash commands (/model, /effort, /help, /status, /new, /reset, /clear, /stop) at a word boundary.
  * Returns null if the content does not match.
  */
-export function parseChatCommand(content: unknown): ParsedChatCommand | null {
+export function parseChatCommand(
+  content: unknown,
+  options?: { allowUnknown?: boolean }
+): ParsedChatCommand | null {
   if (typeof content !== 'string') {
     return null;
   }
@@ -176,6 +276,20 @@ export function parseChatCommand(content: unknown): ParsedChatCommand | null {
   const trimmed = content.trim();
   const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
+    if (options?.allowUnknown) {
+      const unknown = parseUnknownChatCommand(trimmed);
+      if (unknown) {
+        return {
+          command: 'unknown',
+          type: 'unknown',
+          subcommand: '',
+          action: '',
+          raw: trimmed,
+          word: unknown.word,
+          closest: unknown.closest ?? undefined,
+        };
+      }
+    }
     return null;
   }
 
@@ -937,9 +1051,15 @@ export class ChatCommandService {
     channelContext?: ChatCommandChannelContext;
   }): Promise<{ replyText: string }> {
     try {
-      const parsed = parseChatCommand(params.content);
+      const parsed = parseChatCommand(params.content, { allowUnknown: true });
       if (!parsed) {
         return { replyText: 'Unrecognized command.' };
+      }
+
+      if (parsed.command === 'unknown') {
+        return {
+          replyText: formatUnknownCommandReply(parsed.word!, parsed.closest ?? null),
+        };
       }
 
       // Group chat permission gating for mutating commands

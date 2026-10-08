@@ -520,8 +520,8 @@ export class StreamingReplyTracker {
       detail?: string;
       isSubagent?: boolean;
     }>
-  ): { terminalStatus?: 'completed' | 'failed' } {
-    let terminalStatus: 'completed' | 'failed' | undefined;
+  ): { terminalStatus?: 'completed' | 'failed' | 'stopped' } {
+    let terminalStatus: 'completed' | 'failed' | 'stopped' | undefined;
 
     for (const evt of events) {
       if (evt.type === 'turn_status' && evt.status === 'running') {
@@ -664,9 +664,15 @@ export class StreamingReplyTracker {
           evt.status === 'completed' ||
           evt.status === 'failed' ||
           evt.status === 'interrupted' ||
-          evt.status === 'stopped'
+          evt.status === 'stopped' ||
+          evt.status === 'cancelled'
         ) {
-          terminalStatus = evt.status === 'completed' ? 'completed' : 'failed';
+          terminalStatus =
+            evt.status === 'completed'
+              ? 'completed'
+              : evt.status === 'interrupted' || evt.status === 'stopped' || evt.status === 'cancelled'
+                ? 'stopped'
+                : 'failed';
           const now = Date.now();
           for (let i = 0; i < this.toolStatusEntries.length; i++) {
             if (
@@ -675,7 +681,7 @@ export class StreamingReplyTracker {
             ) {
               this.toolStatusEntries[i] = {
                 ...this.toolStatusEntries[i],
-                status: evt.status === 'completed' ? 'completed' : 'failed',
+                status: terminalStatus === 'completed' ? 'completed' : 'failed',
                 endTime: now,
               };
             }
@@ -854,9 +860,14 @@ export class StreamingReplyTracker {
           }
         }
 
-        // In detached mode, terminal turn_status triggers finalization
-        if (this.detached && terminalStatus && !this.isStopped) {
-          const finalText = this.accumulatedText || (terminalStatus === 'failed' ? 'Execution failed' : '');
+        // In detached mode, or when stopped, terminal turn_status triggers finalization
+        if ((this.detached || terminalStatus === 'stopped') && terminalStatus && !this.isStopped) {
+          const finalText =
+            terminalStatus === 'stopped'
+              ? (this.accumulatedText && this.accumulatedText.trim().length > 0
+                  ? `${this.accumulatedText}\n\n*(已停止回复)*`
+                  : '(已停止回复)')
+              : (this.accumulatedText || (terminalStatus === 'failed' ? 'Execution failed' : ''));
           await this.doFinalize(finalText, terminalStatus);
         }
       } catch (err) {
@@ -1028,8 +1039,9 @@ export class StreamingReplyTracker {
 
     let textToFinalize =
       finalText ||
-      this.accumulatedText ||
-      (status === 'failed' ? 'Execution failed' : status === 'stopped' ? '(已停止回复)' : '');
+      (this.accumulatedText && this.accumulatedText.trim().length > 0
+        ? (status === 'stopped' ? `${this.accumulatedText}\n\n*(已停止回复)*` : this.accumulatedText)
+        : (status === 'failed' ? 'Execution failed' : status === 'stopped' ? '(已停止回复)' : ''));
     const finalMetadata = await this.resolveMetadata(metadata);
 
     let finalThinking: string | undefined;

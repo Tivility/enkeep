@@ -1336,6 +1336,15 @@ export class FakeLarkTransport implements LarkTransport {
           }
         }
 
+        if (status === 'stopped') {
+          bodyElements.push({
+            tag: 'markdown',
+            element_id: 'streaming_status_bar',
+            text_size: 'notation',
+            content: "<font color='grey'>⏹ 已停止</font>",
+          });
+        }
+
         const footer = formatCardUsageFooter(metadata);
         if (footer) {
           bodyElements.push({
@@ -2977,6 +2986,15 @@ export class CredentialedLarkTransport implements LarkTransport {
             for (const el of contentElements) {
               bodyElements.push(el);
             }
+          }
+
+          if (status === 'stopped') {
+            bodyElements.push({
+              tag: 'markdown',
+              element_id: 'streaming_status_bar',
+              text_size: 'notation',
+              content: "<font color='grey'>⏹ 已停止</font>",
+            });
           }
 
           const footer = formatCardUsageFooter(metadata);
