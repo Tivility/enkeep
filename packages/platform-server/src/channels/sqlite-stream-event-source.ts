@@ -122,7 +122,92 @@ export class SqliteStreamEventSource implements StreamEventSource {
     turnId: string,
     sessionRouteId?: string
   ): Promise<ChannelTurnOrigin | null> {
-    return this.resolveTurnOriginRecursive(turnId, sessionRouteId, new Set<string>(), 0);
+    const result = this.resolveTurnOriginRecursive(turnId, sessionRouteId, new Set<string>(), 0);
+    if (result.status === 'resolved') {
+      return result.origin;
+    }
+    if (result.status === 'aborted') {
+      return null;
+    }
+    return this.resolveTurnOriginFallback(turnId, sessionRouteId);
+  }
+
+  private resolveTurnOriginFallback(
+    turnId: string,
+    sessionRouteId: string | undefined
+  ): ChannelTurnOrigin | null {
+    let effectiveSessionId = sessionRouteId;
+    if (!effectiveSessionId && turnId) {
+      const trimmed = turnId.trim();
+      const row = this.db
+        .prepare(
+          `SELECT session_id FROM web_events
+           WHERE json_valid(payload) = 1
+             AND (
+               json_extract(payload, '$.turnId') = ?
+               OR json_extract(payload, '$.turn_id') = ?
+             )
+             AND session_id IS NOT NULL AND session_id != ''
+           ORDER BY rowid DESC
+           LIMIT 1`
+        )
+        .get(trimmed, trimmed) as { session_id?: string } | undefined;
+      if (row?.session_id) {
+        effectiveSessionId = row.session_id;
+      }
+    }
+
+    if (!effectiveSessionId) {
+      return null;
+    }
+
+    const cutoffIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM channel_turn_origins
+         WHERE session_id = ?
+           AND (
+             datetime(created_at) >= datetime('now', '-24 hours')
+             OR created_at >= ?
+           )
+         ORDER BY created_at DESC, rowid DESC`
+      )
+      .all(effectiveSessionId, cutoffIso) as any[];
+
+    if (!rows || rows.length === 0) {
+      return null;
+    }
+
+    const first = rows[0];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      const sameContext =
+        r.channel === first.channel &&
+        r.account_id === first.account_id &&
+        r.chat_id === first.chat_id &&
+        (r.thread_id ?? null) === (first.thread_id ?? null) &&
+        (r.root_id ?? null) === (first.root_id ?? null) &&
+        (r.native_context_id ?? null) === (first.native_context_id ?? null);
+      if (!sameContext) {
+        return null;
+      }
+    }
+
+    return {
+      turnId: first.turn_id,
+      userId: first.user_id,
+      sessionId: first.session_id,
+      accountId: first.account_id,
+      channel: first.channel,
+      chatId: first.chat_id,
+      nativeContextId: first.native_context_id,
+      nativeEventId: first.native_event_id ?? null,
+      replyToMessageId: first.reply_to_message_id ?? null,
+      rootId: first.root_id ?? null,
+      threadId: first.thread_id ?? null,
+      originTurnId: first.origin_turn_id ?? null,
+      createdAt: first.created_at,
+    };
   }
 
   private resolveTurnOriginRecursive(
@@ -130,13 +215,13 @@ export class SqliteStreamEventSource implements StreamEventSource {
     sessionRouteId: string | undefined,
     visited: Set<string>,
     depth: number
-  ): ChannelTurnOrigin | null {
-    if (!turnId || typeof turnId !== 'string') return null;
+  ): { status: 'resolved'; origin: ChannelTurnOrigin } | { status: 'aborted' } | { status: 'not_found' } {
+    if (!turnId || typeof turnId !== 'string') return { status: 'not_found' };
     const trimmedTurnId = turnId.trim();
-    if (!trimmedTurnId) return null;
+    if (!trimmedTurnId) return { status: 'not_found' };
 
-    if (depth >= 8) return null;
-    if (visited.has(trimmedTurnId)) return null;
+    if (depth >= 8) return { status: 'aborted' };
+    if (visited.has(trimmedTurnId)) return { status: 'aborted' };
     visited.add(trimmedTurnId);
 
     const row = this.db
@@ -144,22 +229,25 @@ export class SqliteStreamEventSource implements StreamEventSource {
       .get(trimmedTurnId) as any;
     if (row) {
       if (sessionRouteId && row.session_id !== sessionRouteId) {
-        return null;
+        return { status: 'not_found' };
       }
       return {
-        turnId: row.turn_id,
-        userId: row.user_id,
-        sessionId: row.session_id,
-        accountId: row.account_id,
-        channel: row.channel,
-        chatId: row.chat_id,
-        nativeContextId: row.native_context_id,
-        nativeEventId: row.native_event_id ?? null,
-        replyToMessageId: row.reply_to_message_id ?? null,
-        rootId: row.root_id ?? null,
-        threadId: row.thread_id ?? null,
-        originTurnId: row.origin_turn_id ?? null,
-        createdAt: row.created_at,
+        status: 'resolved',
+        origin: {
+          turnId: row.turn_id,
+          userId: row.user_id,
+          sessionId: row.session_id,
+          accountId: row.account_id,
+          channel: row.channel,
+          chatId: row.chat_id,
+          nativeContextId: row.native_context_id,
+          nativeEventId: row.native_event_id ?? null,
+          replyToMessageId: row.reply_to_message_id ?? null,
+          rootId: row.root_id ?? null,
+          threadId: row.thread_id ?? null,
+          originTurnId: row.origin_turn_id ?? null,
+          createdAt: row.created_at,
+        },
       };
     }
 
@@ -211,11 +299,11 @@ export class SqliteStreamEventSource implements StreamEventSource {
     ) as { session_id?: string; origin_turn_id?: string } | undefined;
 
     if (!eventRow || typeof eventRow.origin_turn_id !== 'string') {
-      return null;
+      return { status: 'not_found' };
     }
 
     const nextOriginTurnId = eventRow.origin_turn_id.trim();
-    if (!nextOriginTurnId) return null;
+    if (!nextOriginTurnId) return { status: 'not_found' };
 
     const effectiveSessionId = sessionRouteId ?? eventRow.session_id;
     return this.resolveTurnOriginRecursive(nextOriginTurnId, effectiveSessionId, visited, depth + 1);

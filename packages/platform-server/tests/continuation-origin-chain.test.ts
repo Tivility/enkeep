@@ -248,4 +248,112 @@ describe('Turn Origin Resolution Chain & Guards', () => {
     const origin10 = await streamEventSource.resolveTurnOrigin('turn_synth_deep_10');
     expect(origin10).toBeNull();
   });
+
+  describe('Safe Fallback Attribution Rule', () => {
+    it('positive case: falls back to most recent platform turn when all origins in last 24h point to same chat context', async () => {
+      const platTurn1 = 'turn_synth_plat_recent_1';
+      const platTurn2 = 'turn_synth_plat_recent_2';
+      const orphanAutoTurn = 'turn_synth_auto_orphan_pos';
+
+      // Insert two platform turns in the last 24h pointing to the same chat context
+      db.prepare(`
+        INSERT INTO channel_turn_origins (
+          turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id, created_at
+        ) VALUES (?, ?, ?, ?, 'lark', ?, ?, datetime('now', '-2 hours'))
+      `).run(platTurn1, userId, sessionRouteId, accountId, chatId, `lark:${chatId}`);
+
+      db.prepare(`
+        INSERT INTO channel_turn_origins (
+          turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id, created_at
+        ) VALUES (?, ?, ?, ?, 'lark', ?, ?, datetime('now', '-30 minutes'))
+      `).run(platTurn2, userId, sessionRouteId, accountId, chatId, `lark:${chatId}`);
+
+      // Orphan auto turn with unknown root
+      db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload)
+        VALUES ('evt_synth_orphan_pos', ?, ?, 'turn_status', ?)
+      `).run(
+        sessionRouteId,
+        userId,
+        JSON.stringify({
+          status: 'completed',
+          turnId: orphanAutoTurn,
+          originTurnId: 'turn_synth_completely_unknown',
+        })
+      );
+
+      // Safe fallback should resolve to the most recent platform turn (platTurn2)
+      const origin = await streamEventSource.resolveTurnOrigin(orphanAutoTurn, sessionRouteId);
+      expect(origin).toBeDefined();
+      expect(origin?.turnId).toBe(platTurn2);
+      expect(origin?.chatId).toBe(chatId);
+      expect(origin?.channel).toBe('lark');
+    });
+
+    it('negative case: aborts when session has multiple conflicting chat contexts in last 24h', async () => {
+      const platTurn1 = 'turn_synth_plat_conflict_1';
+      const platTurn2 = 'turn_synth_plat_conflict_2';
+      const orphanAutoTurn = 'turn_synth_auto_orphan_neg_conflict';
+
+      // Turn 1 in chat 1
+      db.prepare(`
+        INSERT INTO channel_turn_origins (
+          turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id, created_at
+        ) VALUES (?, ?, ?, ?, 'lark', 'oc_synth_chat_001', 'lark:oc_synth_chat_001', datetime('now', '-1 hour'))
+      `).run(platTurn1, userId, sessionRouteId, accountId);
+
+      // Turn 2 in chat 2 (different chat context)
+      db.prepare(`
+        INSERT INTO channel_turn_origins (
+          turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id, created_at
+        ) VALUES (?, ?, ?, ?, 'lark', 'oc_synth_chat_002', 'lark:oc_synth_chat_002', datetime('now', '-10 minutes'))
+      `).run(platTurn2, userId, sessionRouteId, accountId);
+
+      db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload)
+        VALUES ('evt_synth_orphan_conflict', ?, ?, 'turn_status', ?)
+      `).run(
+        sessionRouteId,
+        userId,
+        JSON.stringify({
+          status: 'completed',
+          turnId: orphanAutoTurn,
+          originTurnId: 'turn_synth_completely_unknown',
+        })
+      );
+
+      // Must abort (return null) to prevent wrong target delivery
+      const origin = await streamEventSource.resolveTurnOrigin(orphanAutoTurn, sessionRouteId);
+      expect(origin).toBeNull();
+    });
+
+    it('negative case: aborts when channel origins in session are older than 24h', async () => {
+      const platTurnOld = 'turn_synth_plat_old_48h';
+      const orphanAutoTurn = 'turn_synth_auto_orphan_neg_old';
+
+      // Platform turn created 48h ago
+      db.prepare(`
+        INSERT INTO channel_turn_origins (
+          turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id, created_at
+        ) VALUES (?, ?, ?, ?, 'lark', ?, ?, datetime('now', '-48 hours'))
+      `).run(platTurnOld, userId, sessionRouteId, accountId, chatId, `lark:${chatId}`);
+
+      db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload)
+        VALUES ('evt_synth_orphan_old', ?, ?, 'turn_status', ?)
+      `).run(
+        sessionRouteId,
+        userId,
+        JSON.stringify({
+          status: 'completed',
+          turnId: orphanAutoTurn,
+          originTurnId: 'turn_synth_completely_unknown',
+        })
+      );
+
+      // Must abort (return null) because origin is older than 24h
+      const origin = await streamEventSource.resolveTurnOrigin(orphanAutoTurn, sessionRouteId);
+      expect(origin).toBeNull();
+    });
+  });
 });

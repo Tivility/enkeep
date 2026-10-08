@@ -266,7 +266,7 @@ export class ContinuationWatcher {
 
         if (runningEvt.originTurnId) {
           if (typeof this.streamEventSource.resolveTurnOrigin === 'function') {
-            const origin = await this.streamEventSource.resolveTurnOrigin(runningEvt.originTurnId);
+            const origin = await this.streamEventSource.resolveTurnOrigin(runningEvt.originTurnId, this.sessionRouteId);
             if (!origin) {
               console.warn('[lark-cont] unknown causal origin for autonomous turn, aborting delivery to prevent wrong target send', {
                 originTurnId: runningEvt.originTurnId,
@@ -285,15 +285,28 @@ export class ContinuationWatcher {
             };
           }
         } else if (runningEvt.turnId) {
-          // Autonomous turn detected without causal origin metadata: fail explicitly, do not send to wrong target
-          console.warn('[lark-cont] autonomous turn missing originTurnId causal metadata, aborting delivery to prevent wrong target send', {
-            turnId: runningEvt.turnId,
-            routeId: this.sessionRouteId,
-          });
-          if (runningEvt.rowId > this.cursor) {
-            this.cursor = runningEvt.rowId;
+          let origin: any = null;
+          if (typeof this.streamEventSource.resolveTurnOrigin === 'function') {
+            origin = await this.streamEventSource.resolveTurnOrigin(runningEvt.turnId, this.sessionRouteId);
           }
-          return;
+          if (origin) {
+            targetCardParams = {
+              chatId: origin.chatId,
+              replyToMessageId: origin.replyToMessageId || undefined,
+              rootId: origin.rootId || undefined,
+              threadId: origin.threadId || undefined,
+            };
+          } else {
+            // Autonomous turn detected without causal origin metadata: fail explicitly, do not send to wrong target
+            console.warn('[lark-cont] autonomous turn missing originTurnId causal metadata, aborting delivery to prevent wrong target send', {
+              turnId: runningEvt.turnId,
+              routeId: this.sessionRouteId,
+            });
+            if (runningEvt.rowId > this.cursor) {
+              this.cursor = runningEvt.rowId;
+            }
+            return;
+          }
         }
 
         const causeChildId = (runningEvt as any).causeChildId;

@@ -216,7 +216,7 @@ export interface StreamEventSource {
     turnId: string
   ): Promise<'queued' | 'running' | 'completed' | 'failed' | 'unknown'>;
   hasPendingPlatformTurn?(sessionRouteId: string): Promise<boolean>;
-  resolveTurnOrigin?(turnId: string): Promise<ChannelTurnOrigin | null>;
+  resolveTurnOrigin?(turnId: string, sessionRouteId?: string): Promise<ChannelTurnOrigin | null>;
   getTurnMetrics?(
     sessionRouteId: string,
     turnId: string

@@ -319,6 +319,94 @@ export class UpstreamModelError extends Error {
   }
 }
 
+/**
+ * Default backoff schedule for LLM request retries: 2s, 5s, 15s.
+ */
+export const DEFAULT_LLM_RETRY_BACKOFF_SCHEDULE_MS = [2000, 5000, 15000] as const;
+
+/**
+ * Resolves the backoff schedule in milliseconds.
+ * Respects ENKEEP_LLM_RETRY_BACKOFF_MS if specified as comma-separated integers.
+ */
+export function resolveLlmRetryBackoffSchedule(): readonly number[] {
+  const envVal = process.env.ENKEEP_LLM_RETRY_BACKOFF_MS;
+  if (envVal !== undefined && envVal.trim().length > 0) {
+    const parsed = envVal.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0);
+    if (parsed.length > 0) return parsed;
+  }
+  if (process.env.VITEST && !process.env.ENKEEP_LLM_RETRY_BACKOFF_MS) {
+    return [20, 50, 150];
+  }
+  return DEFAULT_LLM_RETRY_BACKOFF_SCHEDULE_MS;
+}
+
+/**
+ * Abortable sleep utility for backoff delays.
+ */
+export function abortableSleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  if (ms <= 0) return Promise.resolve(true);
+
+  return new Promise<boolean>((resolve) => {
+    let timer: NodeJS.Timeout | null = null;
+
+    const onAbort = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      signal?.removeEventListener('abort', onAbort);
+      resolve(false);
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    timer = setTimeout(() => {
+      timer = null;
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+  });
+}
+
+/**
+ * Extracts Retry-After delay in milliseconds from failure object if present.
+ */
+export function parseRetryAfterMs(failure: unknown): number | undefined {
+  if (!failure || typeof failure !== 'object') return undefined;
+  const f = failure as Record<string, unknown>;
+  if (typeof f.providerRetryAfterMs === 'number' && Number.isFinite(f.providerRetryAfterMs) && f.providerRetryAfterMs > 0) {
+    return f.providerRetryAfterMs;
+  }
+  if (typeof f.retryAfterMs === 'number' && Number.isFinite(f.retryAfterMs) && f.retryAfterMs > 0) {
+    return f.retryAfterMs;
+  }
+  const headers = f.headers as Record<string, unknown> | undefined;
+  const rawHeader = f.retryAfter ??
+    headers?.['retry-after'] ??
+    (typeof (headers as any)?.get === 'function' ? (headers as any).get('retry-after') : undefined);
+  if (rawHeader !== undefined && rawHeader !== null) {
+    if (typeof rawHeader === 'number' && Number.isFinite(rawHeader) && rawHeader > 0) {
+      return rawHeader * 1000;
+    }
+    if (typeof rawHeader === 'string') {
+      const trimmed = rawHeader.trim();
+      if (/^\d+$/.test(trimmed)) {
+        const sec = Number(trimmed);
+        if (Number.isFinite(sec) && sec > 0) return sec * 1000;
+      }
+      const parsedDate = Date.parse(trimmed);
+      if (!Number.isNaN(parsedDate)) {
+        const delta = parsedDate - Date.now();
+        if (delta > 0) return delta;
+      }
+    }
+  }
+  return undefined;
+}
+
 export interface DshRuntimeBootConfig {
   /** User identifier (mandatory, e.g. 'alice', 'bob') */
   readonly userId: string;
@@ -1447,6 +1535,22 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   const activeFallbackContexts = new Map<string, AgentFallbackContext>();
   const circuitBreakers = new ModelCircuitBreakerRegistry();
 
+function logInfo(agentCtx: Context, message: string): void {
+  if (agentCtx.logger?.info) {
+    agentCtx.logger.info(message);
+  } else {
+    console.info(message);
+  }
+}
+
+function logWarn(agentCtx: Context, message: string): void {
+  if (agentCtx.logger?.warn) {
+    agentCtx.logger.warn(message);
+  } else {
+    console.warn(message);
+  }
+}
+
   /**
    * Installs agent-scoped fallback router and telemetry recorder onto agentCtx.
    */
@@ -1514,42 +1618,152 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
         return next();
       }
 
-      // 4. Permanent / Auth error check (401, 403, 400, 422, AUTH, INVALID_REQUEST) -> Fail fast!
-      if (classification.isAuthOrPermanent) {
+      // 4. Permanent / 4xx Validation error check (400, 401, 403, 404, 422, AUTH, INVALID_REQUEST) -> Fail fast, NEVER retry!
+      const rawStatus = (payload.failure as any)?.status ??
+        (payload.failure as any)?.statusCode ??
+        classification.statusCode;
+      const failureMsg = String((payload.failure as any)?.message ?? payload.failure ?? '');
+      const failureCode = String((payload.failure as any)?.code ?? '');
+      const statusFromMsg = failureMsg.match(/\b(?:status|HTTP|code)?\s*(\d{3})\b/i);
+      const effectiveStatusCode = typeof rawStatus === 'number' && Number.isFinite(rawStatus)
+        ? rawStatus
+        : (statusFromMsg ? parseInt(statusFromMsg[1], 10) : undefined);
+
+      const msgLower = failureMsg.toLowerCase();
+      const codeUpper = failureCode.toUpperCase();
+
+      const is4xxValidationError =
+        (effectiveStatusCode !== undefined && effectiveStatusCode >= 400 && effectiveStatusCode < 500 && effectiveStatusCode !== 429) ||
+        classification.isAuthOrPermanent ||
+        ['INVALID_REQUEST', 'AUTH', 'AUTH_FAILURE', 'VALIDATION_ERROR', 'BAD_REQUEST', 'NOT_FOUND', 'UNPROCESSABLE_ENTITY'].includes(codeUpper) ||
+        msgLower.includes('validation') ||
+        msgLower.includes('invalid_request') ||
+        msgLower.includes('bad request') ||
+        msgLower.includes('unauthorized') ||
+        msgLower.includes('forbidden') ||
+        msgLower.includes('invalid api key');
+
+      if (is4xxValidationError) {
+        logWarn(
+          agentCtx,
+          `[dsh-boot] LLM request failed with non-retryable 4xx validation/client error (status: ${effectiveStatusCode ?? 'unknown'}, code: ${failureCode || 'none'}): ${failureMsg}. Skipping retry.`
+        );
         return next();
       }
 
-      // 5. Transient error: check bounded retry (1 retry per candidate) or fallback chain
-      if (classification.isTransient) {
-        // 5a. 1 retry on same candidate if not already retried
-        if (fbCtx.candidateRetries < 1) {
-          fbCtx.candidateRetries++;
-          fbCtx.currentAttemptStart = Date.now();
-          return { kind: 'retry' };
+      // 5. Check transient error class: 429, 500, 502, 503, 504, network errors, upstream_transient_error
+      const isNetworkError =
+        msgLower.includes('econnreset') ||
+        msgLower.includes('etimedout') ||
+        msgLower.includes('econnrefused') ||
+        msgLower.includes('enotfound') ||
+        msgLower.includes('eai_again') ||
+        msgLower.includes('und_err_connect_timeout') ||
+        msgLower.includes('und_err_socket') ||
+        msgLower.includes('socket hang up') ||
+        msgLower.includes('fetch failed') ||
+        msgLower.includes('network error') ||
+        msgLower.includes('network timeout') ||
+        msgLower.includes('connection error') ||
+        msgLower.includes('connection refused') ||
+        msgLower.includes('connection reset');
+
+      const isTransientClass =
+        (effectiveStatusCode !== undefined && (effectiveStatusCode === 429 || (effectiveStatusCode >= 500 && effectiveStatusCode <= 504) || (effectiveStatusCode >= 500 && effectiveStatusCode < 600))) ||
+        msgLower.includes('upstream_transient_error') ||
+        codeUpper.includes('UPSTREAM_TRANSIENT_ERROR') ||
+        isNetworkError ||
+        ['RATE_LIMIT', 'SERVER_ERROR', 'TRANSIENT', 'TRANSIENT_NETWORK', 'TIMEOUT'].includes(codeUpper) ||
+        classification.isTransient;
+
+      if (!isTransientClass) {
+        logWarn(
+          agentCtx,
+          `[dsh-boot] LLM request failed with non-transient error (status: ${effectiveStatusCode ?? 'unknown'}, code: ${failureCode || 'none'}): ${failureMsg}. Skipping retry.`
+        );
+        return next();
+      }
+
+      // 6. Transient error: bounded retry with backoff 2s/5s/15s (respect Retry-After)
+      // If a healthy fallback candidate exists, retry 1 time before advancing to fallback chain.
+      // If no healthy fallback candidate exists (e.g. host runtimes or final candidate), retry up to 3 times.
+      let hasHealthyFallback = false;
+      for (let i = fbCtx.candidateIndex + 1; i < fbCtx.candidates.length; i++) {
+        const cand = fbCtx.candidates[i];
+        if (circuitBreakers.canExecute(cand.provider, cand.model).allowed) {
+          hasHealthyFallback = true;
+          break;
+        }
+      }
+      const maxRetries = hasHealthyFallback ? 1 : 3;
+
+      if (fbCtx.candidateRetries < maxRetries) {
+        let delayMs: number;
+        let isRetryAfter = false;
+
+        const retryAfterMs = parseRetryAfterMs(payload.failure);
+        if (retryAfterMs !== undefined && retryAfterMs > 0) {
+          delayMs = retryAfterMs;
+          isRetryAfter = true;
+        } else {
+          const schedule = resolveLlmRetryBackoffSchedule();
+          delayMs = schedule[Math.min(fbCtx.candidateRetries, schedule.length - 1)] ?? 2000;
         }
 
-        // 5b. Advance to next healthy candidate in fallback chain
-        let nextIdx = fbCtx.candidateIndex + 1;
-        while (nextIdx < fbCtx.candidates.length) {
-          const nextCand = fbCtx.candidates[nextIdx];
-          const check = circuitBreakers.canExecute(nextCand.provider, nextCand.model);
-          if (check.allowed) {
-            fbCtx.candidateIndex = nextIdx;
-            fbCtx.candidateRetries = 0;
-            fbCtx.currentAttemptStart = Date.now();
-            selectionRef.current = {
-              provider: nextCand.provider,
-              model: nextCand.model,
-              reasoningEffort: nextCand.reasoningEffort || undefined,
-            };
-            (selectionRef as any).assembled = selectionRef.current;
-            return { kind: 'retry' };
-          }
-          nextIdx++;
+        const retryAttempt = fbCtx.candidateRetries + 1;
+        logInfo(
+          agentCtx,
+          `[dsh-boot] LLM transient error retry attempt ${retryAttempt}/${maxRetries} for ${currentCand.provider}/${currentCand.model} after ${delayMs}ms backoff (${isRetryAfter ? 'Retry-After' : 'backoff schedule'}) (status: ${effectiveStatusCode ?? 'unknown'}, code: ${failureCode || 'none'}): ${failureMsg}`
+        );
+
+        const ok = await abortableSleep(delayMs, payload.signal);
+        if (!ok || payload.signal?.aborted) {
+          logWarn(
+            agentCtx,
+            `[dsh-boot] LLM retry cancelled by abort signal during ${delayMs}ms backoff delay.`
+          );
+          return;
         }
+
+        fbCtx.candidateRetries++;
+        fbCtx.currentAttemptStart = Date.now();
+        return { kind: 'retry' };
+      }
+
+      logWarn(
+        agentCtx,
+        `[dsh-boot] LLM transient error retries exhausted (${maxRetries}/${maxRetries}) for candidate ${currentCand.provider}/${currentCand.model}. Checking fallback chain.`
+      );
+
+      // Advance to next healthy candidate in fallback chain
+      let nextIdx = fbCtx.candidateIndex + 1;
+      while (nextIdx < fbCtx.candidates.length) {
+        const nextCand = fbCtx.candidates[nextIdx];
+        const check = circuitBreakers.canExecute(nextCand.provider, nextCand.model);
+        if (check.allowed) {
+          fbCtx.candidateIndex = nextIdx;
+          fbCtx.candidateRetries = 0;
+          fbCtx.currentAttemptStart = Date.now();
+          selectionRef.current = {
+            provider: nextCand.provider,
+            model: nextCand.model,
+            reasoningEffort: nextCand.reasoningEffort || undefined,
+          };
+          (selectionRef as any).assembled = selectionRef.current;
+          logInfo(
+            agentCtx,
+            `[dsh-boot] LLM fallback advancing to candidate ${nextIdx} (${nextCand.provider}/${nextCand.model}).`
+          );
+          return { kind: 'retry' };
+        }
+        nextIdx++;
       }
 
       // All candidates exhausted or non-retryable error
+      logWarn(
+        agentCtx,
+        `[dsh-boot] All LLM candidates exhausted or circuit-broken for session ${sid}. Failing turn.`
+      );
       return next();
     });
 
@@ -3514,14 +3728,43 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     const eventRelay = ctx.eventRelay ?? (ctx.get ? ctx.get('eventRelay') : undefined);
     let unbindTurnCtx: (() => void) | undefined;
     if (eventRelay && typeof eventRelay.bindTurnContext === 'function') {
-      const currentIntTurn = typeof (currentAgent.session as any)?.turnCount === 'number'
-        ? (currentAgent.session as any).turnCount + 1
-        : undefined;
+      const agentPhase = (currentAgent as any)?.phase;
+      let currentIntTurn = typeof agentPhase?.turn === 'number'
+        ? agentPhase.turn
+        : typeof agentPhase?.lastTurn === 'number'
+          ? agentPhase.lastTurn + 1
+          : undefined;
       unbindTurnCtx = eventRelay.bindTurnContext(effSessionId, {
         turnId: assignedTurnId,
         originTurnId: (requestOrPrompt as any)?.originTurnId,
         dshIntTurn: currentIntTurn,
       });
+
+      if (typeof ctx?.on === 'function') {
+        const unsubTurnStart = ctx.on('session/event', (s: any, ev: any) => {
+          if (
+            (s?.id === effSessionId || s?.header?.id === effSessionId) &&
+            ev?.type === 'turn/start' &&
+            typeof ev.data?.turn === 'number'
+          ) {
+            if (ev.data.turn !== currentIntTurn) {
+              currentIntTurn = ev.data.turn;
+              eventRelay.bindTurnContext(effSessionId, {
+                turnId: assignedTurnId,
+                originTurnId: (requestOrPrompt as any)?.originTurnId,
+                dshIntTurn: currentIntTurn,
+              });
+            }
+          }
+        });
+        if (typeof unsubTurnStart === 'function') {
+          const originalUnbind = unbindTurnCtx;
+          unbindTurnCtx = () => {
+            unsubTurnStart();
+            originalUnbind?.();
+          };
+        }
+      }
     }
 
     try {
