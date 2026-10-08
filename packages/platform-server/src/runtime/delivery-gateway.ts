@@ -111,9 +111,32 @@ export interface DeliveryTurnExecutor {
     turnId: string;
     dshSessionId: string;
   }): Promise<InspectedTurnResult>;
+  listBackgroundTasks?(userId: string, sessionId: string): Promise<BackgroundTask[]>;
+  stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
 }
 
 export type RuntimeTurnExecutor = DeliveryTurnExecutor;
+
+export interface BackgroundTaskProgress {
+  agentsDone?: number;
+  agentsTotal?: number;
+  step?: number;
+}
+
+export interface BackgroundTask {
+  id: string;                // DSH child session id / job id
+  shortId: string;           // 4+ chars, unique within session
+  kind: 'subagent' | 'workflow' | 'job';
+  name: string;              // workflow name / subagent label / job title (truncated 60)
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  startedAt: string;         // ISO
+  finishedAt?: string;       // ISO
+  lastActivityAt: string;    // ISO
+  stalled: boolean;          // running && now - lastActivityAt > 10 min
+  progress?: BackgroundTaskProgress;
+  originTurnId?: string;     // platform turn that launched it (from durable child-origin mapping)
+  originChatContextId?: string; // chat-level native context of the origin turn (from channel_turn_origins)
+}
 
 export interface DrainableRuntimeGateway extends RuntimeGateway {
   drain(timeoutMs?: number): Promise<boolean>;
@@ -121,6 +144,8 @@ export interface DrainableRuntimeGateway extends RuntimeGateway {
   recoverQueuedTurns?(): Promise<number>;
   getCurrentTurnStatus(userId: string, sessionId: string): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number } | null>;
   cancelCurrentTurn(userId: string, sessionId: string): Promise<boolean>;
+  getBackgroundTasks?(userId: string, sessionId: string, options?: { chatContextId?: string }): Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+  stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
 }
 
 export function isDrainableRuntimeGateway(gateway: unknown): gateway is DrainableRuntimeGateway {
@@ -3542,6 +3567,77 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     }
 
     return false;
+  }
+
+  async getBackgroundTasks(
+    userId: string,
+    sessionId: string,
+    options?: { chatContextId?: string }
+  ): Promise<{ items: BackgroundTask[]; updatedAt: string }> {
+    let items: BackgroundTask[] = [];
+    let updatedAt = new Date().toISOString();
+
+    if (this.executor && typeof (this.executor as any).listBackgroundTasks === 'function') {
+      try {
+        const res = await (this.executor as any).listBackgroundTasks(userId, sessionId);
+        if (Array.isArray(res)) {
+          items = res;
+        } else if (res && Array.isArray(res.items)) {
+          items = res.items;
+          if (res.updatedAt) updatedAt = res.updatedAt;
+        }
+      } catch (err) {
+        console.warn('[delivery-gateway] failed to list background tasks from executor', { userId, sessionId, error: err });
+      }
+    }
+
+    // Enrich with originTurnId and originChatContextId from DB
+    if (this.db) {
+      for (const item of items) {
+        if (!item.originTurnId) {
+          try {
+            const originRow = this.db.prepare(
+              'SELECT origin_turn_id FROM session_child_origins WHERE session_id = ? AND child_id = ? LIMIT 1'
+            ).get(sessionId, item.id) as { origin_turn_id?: string } | undefined;
+            if (originRow?.origin_turn_id) {
+              item.originTurnId = originRow.origin_turn_id;
+            }
+          } catch {}
+        }
+        if (item.originTurnId && !item.originChatContextId) {
+          try {
+            const chanRow = this.db.prepare(
+              'SELECT native_context_id FROM channel_turn_origins WHERE turn_id = ? LIMIT 1'
+            ).get(item.originTurnId) as { native_context_id?: string } | undefined;
+            if (chanRow?.native_context_id) {
+              item.originChatContextId = chanRow.native_context_id;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    if (options?.chatContextId) {
+      items = items.filter((t) => t.originChatContextId === options.chatContextId);
+    }
+
+    return { items, updatedAt };
+  }
+
+  async stopBackgroundTask(
+    userId: string,
+    sessionId: string,
+    taskId: string
+  ): Promise<{ stopped: boolean }> {
+    if (this.executor && typeof (this.executor as any).stopBackgroundTask === 'function') {
+      try {
+        const res = await (this.executor as any).stopBackgroundTask(userId, sessionId, taskId);
+        return { stopped: Boolean(res?.stopped) };
+      } catch (err) {
+        console.warn('[delivery-gateway] failed to stop background task from executor', { userId, sessionId, taskId, error: err });
+      }
+    }
+    return { stopped: false };
   }
 
   /**

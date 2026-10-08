@@ -152,6 +152,8 @@ export interface ActiveRuntimeHandle {
     expectedEtag?: string | null;
     requireAbsent?: boolean;
   }): Promise<ExecCliEnvelope>;
+  listBackgroundTasks?(sessionId: string): Promise<any>;
+  stopBackgroundTask?(sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
   fileWriteStream?(
     options: {
       space: string;

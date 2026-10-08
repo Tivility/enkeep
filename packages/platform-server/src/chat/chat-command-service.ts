@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { ValidationError, PlatformError } from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
+import type { BackgroundTask } from '../runtime/delivery-gateway.js';
 
-export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention' | 'unknown';
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention' | 'bg' | 'background' | 'unknown';
 
 export interface ParsedChatCommand {
   command: ChatCommandType;
@@ -41,6 +42,7 @@ export const HELP_USAGE = `Available commands:
 
 运行与控制指令:
   /status - 查看当前工作区、会话、模型与排队状态
+  /bg - 查看当前会话后台任务 (别名: /bg stop <短ID> 停止任务)
   /stop - 取消正在运行或排队的轮次
   /compact - Force session compaction regardless of threshold
   /model - Show, list, set, or reset session model override
@@ -274,7 +276,7 @@ export function parseChatCommand(
   }
 
   const trimmed = content.trim();
-  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention)(?:[\s\t\r\n]+([\s\S]*))?$/i);
+  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention|bg|background)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
     if (options?.allowUnknown) {
       const unknown = parseUnknownChatCommand(trimmed);
@@ -295,6 +297,50 @@ export function parseChatCommand(
 
   const cmd = match[1].toLowerCase() as ChatCommandType | 'new-workspace' | 'ls' | 'reset' | 'clear' | 'spawn';
   const rest = match[2] !== undefined ? match[2].trim() : '';
+
+  if (cmd === 'bg' || cmd === 'background') {
+    if (!rest) {
+      return {
+        command: 'bg',
+        type: 'bg' as any,
+        subcommand: 'list',
+        action: 'list',
+        raw: trimmed,
+      };
+    }
+    const [first, ...restTokens] = rest.split(/\s+/);
+    const sub = first.toLowerCase();
+    const subRest = restTokens.join(' ').trim();
+
+    if (sub === 'stop') {
+      return {
+        command: 'bg',
+        type: 'bg' as any,
+        subcommand: 'stop',
+        action: 'stop',
+        target: subRest || undefined,
+        arg: subRest || undefined,
+        raw: trimmed,
+      };
+    }
+    if (sub === 'list' || sub === 'ls') {
+      return {
+        command: 'bg',
+        type: 'bg' as any,
+        subcommand: 'list',
+        action: 'list',
+        raw: trimmed,
+      };
+    }
+    return {
+      command: 'bg',
+      type: 'bg' as any,
+      subcommand: 'unknown',
+      action: 'unknown',
+      arg: rest,
+      raw: trimmed,
+    };
+  }
 
   if (cmd === 'ws') {
     if (!rest) {
@@ -1134,6 +1180,14 @@ export class ChatCommandService {
         case 'require_mention':
           result = await this.executeMentionCommand(params, parsed);
           break;
+        case 'bg':
+        case 'background' as any:
+          if (parsed.subcommand === 'stop') {
+            result = await this.executeBgStopCommand(params, parsed);
+          } else {
+            result = await this.executeBgListCommand(params, parsed);
+          }
+          break;
         default:
           result = { replyText: 'Unrecognized command.' };
           break;
@@ -1164,6 +1218,9 @@ export class ChatCommandService {
     }
     if (parsed.command === 'session' || parsed.command === 'ses') {
       return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'clear';
+    }
+    if (parsed.command === 'bg') {
+      return parsed.subcommand === 'stop';
     }
     if (parsed.command === 'sw' || parsed.command === 'spawn') {
       return true;
@@ -1343,6 +1400,15 @@ export class ChatCommandService {
       } catch {}
     }
 
+    let bgRunningCount = 0;
+    if (this.gateway && typeof (this.gateway as any).getBackgroundTasks === 'function') {
+      try {
+        const bgRes = await (this.gateway as any).getBackgroundTasks(userId, sessionId);
+        const bgItems = bgRes?.items ?? [];
+        bgRunningCount = bgItems.filter((t: any) => t.status === 'running').length;
+      } catch {}
+    }
+
     const queuePosText = queuePosition !== null && turnStatus === 'queued' ? ` (#${queuePosition})` : '';
     const lines = [
       `space: ${spaceName} (${spaceMode})`,
@@ -1351,10 +1417,86 @@ export class ChatCommandService {
       `model: ${modelStr}`,
       `turn: ${turnStatus}${queuePosText}`,
       `queue: ${turnStatus}${queuePosText} (user queue: ${activeCount} running, ${queuedCount} queued)`,
+      `background: ${bgRunningCount} running`,
       `resources: ${resourcesStr}`,
       `last activity: ${lastActivity}`,
     ];
     return { replyText: lines.join('\n') };
+  }
+
+  private async executeBgListCommand(
+    params: {
+      userId: string;
+      sessionId: string;
+      spaceId: string;
+      channelContext?: ChatCommandChannelContext;
+    },
+    _parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId } = params;
+    const { channel, nativeContextId, chatId } = this.resolveChannelContext(params);
+    const filterContext = (channel && channel !== 'web') ? (nativeContextId || chatId || undefined) : undefined;
+
+    let items: BackgroundTask[] = [];
+    if (this.gateway && typeof (this.gateway as any).getBackgroundTasks === 'function') {
+      try {
+        const bgRes = await (this.gateway as any).getBackgroundTasks(userId, sessionId, {
+          chatContextId: filterContext ?? undefined,
+        });
+        items = bgRes?.items ?? [];
+      } catch {}
+    }
+
+    if (items.length === 0) {
+      return {
+        replyText: filterContext
+          ? '当前聊天暂无后台任务。'
+          : '当前会话暂无后台任务。',
+      };
+    }
+
+    const lines = items.map((task) => {
+      let statusStr: string = task.status;
+      if (task.status === 'running') {
+        if (task.stalled) {
+          statusStr = 'running ⚠️ 可能卡住';
+        } else if (task.progress && (task.progress.agentsTotal || 0) > 0) {
+          statusStr = `running (${task.progress.agentsDone || 0}/${task.progress.agentsTotal} agents)`;
+        }
+      }
+      return `[${task.shortId}] ${task.name} · ${statusStr}`;
+    });
+
+    return { replyText: lines.join('\n') };
+  }
+
+  private async executeBgStopCommand(
+    params: {
+      userId: string;
+      sessionId: string;
+      spaceId: string;
+      channelContext?: ChatCommandChannelContext;
+    },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId } = params;
+    const targetId = parsed.target || parsed.arg;
+    if (!targetId) {
+      return { replyText: '用法: /bg stop <短ID>' };
+    }
+
+    let stopped = false;
+    if (this.gateway && typeof (this.gateway as any).stopBackgroundTask === 'function') {
+      try {
+        const res = await (this.gateway as any).stopBackgroundTask(userId, sessionId, targetId);
+        stopped = Boolean(res?.stopped);
+      } catch {}
+    }
+
+    if (stopped) {
+      return { replyText: `后台任务 ${targetId} 已停止。` };
+    }
+    return { replyText: `未找到后台任务 "${targetId}"。` };
   }
 
   private async executeWhereCommand(

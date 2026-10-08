@@ -13,6 +13,7 @@ import {
   type DeliveryTurnExecutor,
   type QuotaMode,
   type TenantQuotaProvider,
+  type BackgroundTask,
 } from '../src/runtime/delivery-gateway.js';
 
 export interface TestOnlyRuntimeGatewayOptions {
@@ -117,6 +118,22 @@ export class TestOnlyRuntimeGateway implements DrainableRuntimeGateway {
 
   async redriveHeld(): Promise<number> {
     return this.gateway.redriveHeld();
+  }
+
+  async getBackgroundTasks(
+    userId: string,
+    sessionId: string,
+    options?: { chatContextId?: string }
+  ): Promise<{ items: BackgroundTask[]; updatedAt: string }> {
+    return this.gateway.getBackgroundTasks(userId, sessionId, options);
+  }
+
+  async stopBackgroundTask(
+    userId: string,
+    sessionId: string,
+    taskId: string
+  ): Promise<{ stopped: boolean }> {
+    return this.gateway.stopBackgroundTask(userId, sessionId, taskId);
   }
 
   clearPending(): void {

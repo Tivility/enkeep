@@ -770,6 +770,22 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
           };
         }
       },
+      listBackgroundTasks: async (sessionId: string) => {
+        try {
+          const res = await transport.listBackgroundTasks(sessionId);
+          return res.items ?? [];
+        } catch {
+          return [];
+        }
+      },
+      stopBackgroundTask: async (sessionId: string, taskId: string) => {
+        try {
+          const res = await transport.stopBackgroundTask(sessionId, taskId);
+          return { stopped: Boolean(res?.stopped) };
+        } catch {
+          return { stopped: false };
+        }
+      },
       fileOperation: async (request: FileOperationRequest) => {
         try {
           const res = await transport.fileOperation(request);

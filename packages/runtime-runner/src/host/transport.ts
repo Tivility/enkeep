@@ -51,6 +51,10 @@ import {
   type InstructionsWriteResponse,
   type CompactSessionRequest,
   type CompactSessionResponse,
+  type ListBackgroundTasksRequest,
+  type ListBackgroundTasksResponse,
+  type StopBackgroundTaskRequest,
+  type StopBackgroundTaskResponse,
   DEFAULT_DAEMON_SOCKET_PATH,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
@@ -692,6 +696,23 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       id: `compact_${sessionId}_${crypto.randomBytes(4).toString('hex')}`,
       op: DAEMON_OPS.COMPACT_SESSION,
       sessionId,
+    });
+  }
+
+  public async listBackgroundTasks(sessionId: string): Promise<ListBackgroundTasksResponse> {
+    return this.request<ListBackgroundTasksRequest, ListBackgroundTasksResponse>({
+      id: `bg_list_${crypto.randomBytes(4).toString('hex')}`,
+      op: DAEMON_OPS.LIST_BACKGROUND_TASKS,
+      sessionId,
+    });
+  }
+
+  public async stopBackgroundTask(sessionId: string, taskId: string): Promise<StopBackgroundTaskResponse> {
+    return this.request<StopBackgroundTaskRequest, StopBackgroundTaskResponse>({
+      id: `bg_stop_${crypto.randomBytes(4).toString('hex')}`,
+      op: DAEMON_OPS.STOP_BACKGROUND_TASK,
+      sessionId,
+      taskId,
     });
   }
 }

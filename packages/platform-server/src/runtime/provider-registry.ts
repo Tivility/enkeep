@@ -39,6 +39,7 @@ import type {
   DeliveryExecutionRequest,
   TurnExecutionResult,
   InspectedTurnResult,
+  BackgroundTask,
 } from './delivery-gateway.js';
 import type {
   TenantRuntimeFileProvider,
@@ -198,6 +199,38 @@ export class CompositeDeliveryTurnExecutor implements DeliveryTurnExecutor {
       }
     }
     return { status: 'absent' };
+  }
+
+  async listBackgroundTasks(userId: string, sessionId: string): Promise<BackgroundTask[]> {
+    for (const provider of this.registry.listProviders()) {
+      if (typeof (provider.turnExecutor as any).listBackgroundTasks === 'function') {
+        try {
+          const res = await (provider.turnExecutor as any).listBackgroundTasks(userId, sessionId);
+          if (Array.isArray(res) && res.length > 0) {
+            return res;
+          }
+        } catch {
+          // continue checking
+        }
+      }
+    }
+    return [];
+  }
+
+  async stopBackgroundTask(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }> {
+    for (const provider of this.registry.listProviders()) {
+      if (typeof (provider.turnExecutor as any).stopBackgroundTask === 'function') {
+        try {
+          const res = await (provider.turnExecutor as any).stopBackgroundTask(userId, sessionId, taskId);
+          if (res?.stopped) {
+            return { stopped: true };
+          }
+        } catch {
+          // continue checking
+        }
+      }
+    }
+    return { stopped: false };
   }
 }
 

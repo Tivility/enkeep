@@ -73,6 +73,10 @@ import {
   type ListApprovalsResponse,
   type CompactSessionRequest,
   type CompactSessionResponse,
+  type ListBackgroundTasksRequest,
+  type ListBackgroundTasksResponse,
+  type StopBackgroundTaskRequest,
+  type StopBackgroundTaskResponse,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
@@ -902,6 +906,23 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       id: `req_${crypto.randomUUID()}`,
       op: DAEMON_OPS.COMPACT_SESSION,
       sessionId,
+    });
+  }
+
+  public async listBackgroundTasks(sessionId: string): Promise<ListBackgroundTasksResponse> {
+    return this.request<ListBackgroundTasksRequest, ListBackgroundTasksResponse>({
+      id: `req_${crypto.randomUUID()}`,
+      op: DAEMON_OPS.LIST_BACKGROUND_TASKS,
+      sessionId,
+    });
+  }
+
+  public async stopBackgroundTask(sessionId: string, taskId: string): Promise<StopBackgroundTaskResponse> {
+    return this.request<StopBackgroundTaskRequest, StopBackgroundTaskResponse>({
+      id: `req_${crypto.randomUUID()}`,
+      op: DAEMON_OPS.STOP_BACKGROUND_TASK,
+      sessionId,
+      taskId,
     });
   }
 

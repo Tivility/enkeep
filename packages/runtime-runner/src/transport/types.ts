@@ -26,6 +26,8 @@ import type {
   AnswerApprovalResponse,
   ListApprovalsResponse,
   CompactSessionResponse,
+  ListBackgroundTasksResponse,
+  StopBackgroundTaskResponse,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
 
@@ -326,6 +328,8 @@ export interface RuntimeDaemonTransportPort {
   answerApproval?(sessionId: string, approvalId: string, decision: 'allowed-once' | 'rejected' | 'allowed-always'): Promise<AnswerApprovalResponse>;
   listApprovals?(sessionId: string): Promise<ListApprovalsResponse>;
   compactSession?(sessionId: string): Promise<CompactSessionResponse>;
+  listBackgroundTasks?(sessionId: string): Promise<ListBackgroundTasksResponse>;
+  stopBackgroundTask?(sessionId: string, taskId: string): Promise<StopBackgroundTaskResponse>;
   request?<TReq extends DaemonRequest, TRes extends DaemonResponse>(
     req: TReq,
     timeoutMs?: number
