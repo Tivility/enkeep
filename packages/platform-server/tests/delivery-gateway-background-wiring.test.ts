@@ -51,9 +51,9 @@ describe('Cross-Layer DeliveryGateway & ProviderRegistry Background Tasks Wiring
   const fakeContainerTurnExecutor: DeliveryTurnExecutor = {
     execute: async () => ({ replyText: 'Container turn executed' }),
     cancel: async () => true,
-    listBackgroundTasks: async (sessionId: string): Promise<BackgroundTask[]> => {
-      containerCalls.list.push(sessionId);
-      if (sessionId === containerDshSessionId) {
+    listBackgroundTasks: async (req: { userId: string; platformSpaceId: string; dshSessionId: string }): Promise<BackgroundTask[]> => {
+      containerCalls.list.push(req.dshSessionId);
+      if (req.dshSessionId === containerDshSessionId) {
         return [
           {
             id: 'job_synth_cont_001',
@@ -70,8 +70,8 @@ describe('Cross-Layer DeliveryGateway & ProviderRegistry Background Tasks Wiring
       }
       return [];
     },
-    stopBackgroundTask: async (sessionId: string, taskId: string) => {
-      containerCalls.stop.push({ sessionId, taskId });
+    stopBackgroundTask: async (req: { userId: string; platformSpaceId: string; dshSessionId: string; taskId: string }) => {
+      containerCalls.stop.push({ sessionId: req.dshSessionId, taskId: req.taskId });
       return { stopped: true };
     },
   };
@@ -79,9 +79,9 @@ describe('Cross-Layer DeliveryGateway & ProviderRegistry Background Tasks Wiring
   const fakeHostTurnExecutor: DeliveryTurnExecutor = {
     execute: async () => ({ replyText: 'Host turn executed' }),
     cancel: async () => true,
-    listBackgroundTasks: async (sessionId: string): Promise<BackgroundTask[]> => {
-      hostCalls.list.push(sessionId);
-      if (sessionId === hostDshSessionId) {
+    listBackgroundTasks: async (req: { userId: string; platformSpaceId: string; dshSessionId: string }): Promise<BackgroundTask[]> => {
+      hostCalls.list.push(req.dshSessionId);
+      if (req.dshSessionId === hostDshSessionId) {
         return [
           {
             id: syntheticChildId,
@@ -108,8 +108,8 @@ describe('Cross-Layer DeliveryGateway & ProviderRegistry Background Tasks Wiring
       }
       return [];
     },
-    stopBackgroundTask: async (sessionId: string, taskId: string) => {
-      hostCalls.stop.push({ sessionId, taskId });
+    stopBackgroundTask: async (req: { userId: string; platformSpaceId: string; dshSessionId: string; taskId: string }) => {
+      hostCalls.stop.push({ sessionId: req.dshSessionId, taskId: req.taskId });
       return { stopped: true };
     },
   };

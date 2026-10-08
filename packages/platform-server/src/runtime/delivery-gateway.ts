@@ -111,8 +111,17 @@ export interface DeliveryTurnExecutor {
     turnId: string;
     dshSessionId: string;
   }): Promise<InspectedTurnResult>;
-  listBackgroundTasks?(sessionId: string): Promise<BackgroundTask[]>;
-  stopBackgroundTask?(sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
+  listBackgroundTasks?(req: {
+    userId: string;
+    platformSpaceId: string;
+    dshSessionId: string;
+  }): Promise<BackgroundTask[]>;
+  stopBackgroundTask?(req: {
+    userId: string;
+    platformSpaceId: string;
+    dshSessionId: string;
+    taskId: string;
+  }): Promise<{ stopped: boolean }>;
 }
 
 export type RuntimeTurnExecutor = DeliveryTurnExecutor;
@@ -3578,20 +3587,36 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     let updatedAt = new Date().toISOString();
 
     let dshSessionId = sessionId;
+    let platformSpaceId = '';
     if (this.db) {
       try {
         const routeRow = this.db.prepare(
-          'SELECT dsh_session_id FROM session_routes WHERE (id = ? OR dsh_session_id = ?) AND user_id = ? LIMIT 1'
-        ).get(sessionId, sessionId, userId) as { dsh_session_id?: string } | undefined;
+          'SELECT dsh_session_id, space_id FROM session_routes WHERE (id = ? OR dsh_session_id = ?) AND user_id = ? LIMIT 1'
+        ).get(sessionId, sessionId, userId) as { dsh_session_id?: string; space_id?: string } | undefined;
         if (routeRow?.dsh_session_id) {
           dshSessionId = routeRow.dsh_session_id;
+        }
+        if (routeRow?.space_id) {
+          platformSpaceId = routeRow.space_id;
+        }
+        if (!platformSpaceId) {
+          const spaceRow = this.db.prepare(
+            'SELECT id FROM spaces WHERE user_id = ? LIMIT 1'
+          ).get(userId) as { id?: string } | undefined;
+          if (spaceRow?.id) {
+            platformSpaceId = spaceRow.id;
+          }
         }
       } catch {}
     }
 
     if (this.executor && typeof this.executor.listBackgroundTasks === 'function') {
       try {
-        const res = await this.executor.listBackgroundTasks(dshSessionId);
+        const res = await this.executor.listBackgroundTasks({
+          userId,
+          platformSpaceId,
+          dshSessionId,
+        });
         if (Array.isArray(res)) {
           items = res;
         } else if (res && Array.isArray((res as any).items)) {
@@ -3643,18 +3668,35 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   ): Promise<{ stopped: boolean }> {
     if (this.executor && typeof this.executor.stopBackgroundTask === 'function') {
       let dshSessionId = sessionId;
+      let platformSpaceId = '';
       try {
         if (this.db) {
           try {
             const routeRow = this.db.prepare(
-              'SELECT dsh_session_id FROM session_routes WHERE (id = ? OR dsh_session_id = ?) AND user_id = ? LIMIT 1'
-            ).get(sessionId, sessionId, userId) as { dsh_session_id?: string } | undefined;
+              'SELECT dsh_session_id, space_id FROM session_routes WHERE (id = ? OR dsh_session_id = ?) AND user_id = ? LIMIT 1'
+            ).get(sessionId, sessionId, userId) as { dsh_session_id?: string; space_id?: string } | undefined;
             if (routeRow?.dsh_session_id) {
               dshSessionId = routeRow.dsh_session_id;
             }
+            if (routeRow?.space_id) {
+              platformSpaceId = routeRow.space_id;
+            }
+            if (!platformSpaceId) {
+              const spaceRow = this.db.prepare(
+                'SELECT id FROM spaces WHERE user_id = ? LIMIT 1'
+              ).get(userId) as { id?: string } | undefined;
+              if (spaceRow?.id) {
+                platformSpaceId = spaceRow.id;
+              }
+            }
           } catch {}
         }
-        const res = await this.executor.stopBackgroundTask(dshSessionId, taskId);
+        const res = await this.executor.stopBackgroundTask({
+          userId,
+          platformSpaceId,
+          dshSessionId,
+          taskId,
+        });
         return { stopped: Boolean(res?.stopped) };
       } catch (err) {
         console.warn('[delivery-gateway] failed to stop background task from executor', { userId, sessionId, dshSessionId, taskId, error: err });

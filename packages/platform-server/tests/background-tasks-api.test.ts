@@ -42,7 +42,7 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
     (runtimeGateway as any).gateway.executor = {
       execute: async () => ({ replyText: 'Executed' }),
       cancel: async () => true,
-      listBackgroundTasks: async () => [
+      listBackgroundTasks: async (_req: { userId: string; platformSpaceId: string; dshSessionId: string }) => [
         {
           id: syntheticChildId,
           shortId: '0099',
@@ -65,7 +65,7 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
           progress: { agentsDone: 2, agentsTotal: 5 },
         },
       ],
-      stopBackgroundTask: async (_sessionId: string, _taskId: string) => ({
+      stopBackgroundTask: async (_req: { userId: string; platformSpaceId: string; dshSessionId: string; taskId: string }) => ({
         stopped: true,
       }),
     };

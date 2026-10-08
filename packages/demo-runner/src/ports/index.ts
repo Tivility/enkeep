@@ -172,6 +172,8 @@ export interface UserRuntimeHandle {
   fileOperation(request: import('@enkeep/runtime-runner').FileOperationRequest): Promise<import('@enkeep/runtime-runner').ExecCliEnvelope>;
   instructionsRead?(request: { target: 'global' | 'space'; spaceFolder?: string; filename?: string }): Promise<import('@enkeep/runtime-runner').ExecCliEnvelope>;
   instructionsWrite?(request: { target: 'global' | 'space'; content: string; spaceFolder?: string; filename?: string; expectedEtag?: string | null; requireAbsent?: boolean }): Promise<import('@enkeep/runtime-runner').ExecCliEnvelope>;
+  listBackgroundTasks?(sessionId: string): Promise<import('@enkeep/platform-server').BackgroundTask[]>;
+  stopBackgroundTask?(sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
   stop(): Promise<void>;
   teardown(removeVolume?: boolean): Promise<void>;
 }
@@ -626,6 +628,12 @@ function createUserRuntimeHandle(
       : undefined,
     instructionsWrite: activeHandle.instructionsWrite
       ? activeHandle.instructionsWrite.bind(activeHandle)
+      : undefined,
+    listBackgroundTasks: activeHandle.listBackgroundTasks
+      ? activeHandle.listBackgroundTasks.bind(activeHandle)
+      : undefined,
+    stopBackgroundTask: activeHandle.stopBackgroundTask
+      ? activeHandle.stopBackgroundTask.bind(activeHandle)
       : undefined,
     stop: async () => {
       await activeHandle.stop();
