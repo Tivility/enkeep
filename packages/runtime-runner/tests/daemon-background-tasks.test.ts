@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -418,16 +418,47 @@ describe('RuntimeDaemon Background Tasks RPC & Tracking', () => {
     expect(tasks[0].progress?.agentsTotal).toBe(0);
     expect(tasks[0].progress?.agentsDone).toBe(0);
 
-    // Simulate agent starts
-    ctx.emit('workflow/agent-start', { runId: workflowRunId }, { seq: 1 });
-    ctx.emit('workflow/agent-start', { runId: workflowRunId }, { seq: 2 });
+    const sessionStub = {
+      id: parentSessionId,
+      header: { id: parentSessionId },
+      events: [] as any[],
+      snapshotEvents() {
+        return this.events;
+      },
+      eventAt(seq: number) {
+        return this.events.find((e: any) => e.seq === seq);
+      },
+    };
+
+    // Simulate agent starts via session event tool-workflow/agent-start
+    const evStart1 = {
+      seq: 0,
+      type: 'tool-workflow/agent-start',
+      data: { runId: workflowRunId },
+    };
+    sessionStub.events.push(evStart1);
+    ctx.emit('session/event', sessionStub, evStart1);
+
+    const evStart2 = {
+      seq: 1,
+      type: 'tool-workflow/agent-start',
+      data: { runId: workflowRunId },
+    };
+    sessionStub.events.push(evStart2);
+    ctx.emit('session/event', sessionStub, evStart2);
 
     tasks = await daemon.listBackgroundTasks(parentSessionId);
     expect(tasks[0].progress?.agentsTotal).toBe(2);
     expect(tasks[0].progress?.agentsDone).toBe(0);
 
-    // Simulate one agent ending
-    ctx.emit('workflow/agent-end', { runId: workflowRunId }, { seq: 1, outcome: 'completed' });
+    // Simulate one agent ending via session event tool-workflow/agent-end
+    const evEnd1 = {
+      seq: 2,
+      type: 'tool-workflow/agent-end',
+      data: { runId: workflowRunId, outcome: 'completed' },
+    };
+    sessionStub.events.push(evEnd1);
+    ctx.emit('session/event', sessionStub, evEnd1);
 
     tasks = await daemon.listBackgroundTasks(parentSessionId);
     expect(tasks[0].progress?.agentsTotal).toBe(2);
@@ -700,6 +731,153 @@ describe('RuntimeDaemon Background Tasks RPC & Tracking', () => {
 
     expect(killedTask?.status).toBe('cancelled');
     expect(failedTask?.status).toBe('failed');
+
+    await daemon.shutdown();
+  });
+
+  it('A-03: single subagent start and end event results in exactly 1 agentsTotal and 1 agentsDone', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000095';
+    const workflowRunId = 'wf_00000000000000000000000000000096';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    ctx.emit('workflow/start', {
+      runId: workflowRunId,
+      parentSession: parentSessionId,
+      meta: { name: 'single-agent-counting' },
+    });
+
+    const sessionStub = {
+      id: parentSessionId,
+      header: { id: parentSessionId },
+      events: [] as any[],
+      snapshotEvents() { return this.events; },
+      eventAt(seq: number) { return this.events.find((e: any) => e.seq === seq); },
+    };
+
+    const evStart = {
+      seq: 0,
+      type: 'tool-workflow/agent-start',
+      data: { runId: workflowRunId },
+    };
+    sessionStub.events.push(evStart);
+    ctx.emit('session/event', sessionStub, evStart);
+
+    // Also emit legacy global workflow/agent-start to verify daemon does not double count
+    ctx.emit('workflow/agent-start', { runId: workflowRunId });
+
+    let tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasks[0].progress?.agentsTotal).toBe(1);
+    expect(tasks[0].progress?.agentsDone).toBe(0);
+
+    const evEnd = {
+      seq: 1,
+      type: 'tool-workflow/agent-end',
+      data: { runId: workflowRunId, outcome: 'completed' },
+    };
+    sessionStub.events.push(evEnd);
+    ctx.emit('session/event', sessionStub, evEnd);
+
+    // Also emit legacy global workflow/agent-end to verify daemon does not double count
+    ctx.emit('workflow/agent-end', { runId: workflowRunId });
+
+    tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasks[0].progress?.agentsTotal).toBe(1);
+    expect(tasks[0].progress?.agentsDone).toBe(1);
+
+    await daemon.shutdown();
+  });
+
+  it('A-04: listBackgroundTasks lists session jobs when caller === sessionId is required', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000097';
+    const jobId = 'job_00000000000000000000000000000098';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // Mock jobs registry with owner filtering matching DSH jobs-local contract
+    const mockJobsService = {
+      list: vi.fn((caller?: any) => {
+        if (caller === parentSessionId) {
+          return [
+            {
+              id: jobId,
+              kind: 'job',
+              label: 'session-owned-backup-job',
+              status: 'running',
+              owner: parentSessionId,
+              startedAt: Date.now() - 5000,
+            },
+          ];
+        }
+        return [];
+      }),
+    };
+    ctx.get = (name: string) => {
+      if (name === 'jobs') return mockJobsService;
+      return undefined;
+    };
+
+    const tasks = await daemon.listBackgroundTasks(parentSessionId);
+    expect(mockJobsService.list).toHaveBeenCalledWith(parentSessionId);
+    expect(tasks.some((t) => t.id === jobId)).toBe(true);
+
+    await daemon.shutdown();
+  });
+
+  it('A-05: stopBackgroundTask returns stopped: false when underlying interrupt throws or fails', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000099';
+    const childSessionId = 'ses_00000000000000000000000000000100';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // Track a running task in tracker
+    const parentAgentStub = { id: parentSessionId, session: { id: parentSessionId } };
+    const carrier = scopeTarget(ctx.subagents || {}, parentAgentStub as any);
+    ctx.emit(carrier, 'subagent/start', {
+      runId: 'run-stop-fail-001',
+      provider: 'spawn',
+      id: childSessionId,
+      local: true,
+      label: 'Worker failing to stop',
+    });
+
+    // Mock subagents service to throw on interrupt
+    const subagentsService = ctx.get('subagents');
+    if (subagentsService) {
+      subagentsService.interrupt = () => {
+        throw new Error('Process lock error');
+      };
+    }
+
+    const tasksBefore = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasksBefore[0].status).toBe('running');
+
+    const stopRes = await daemon.stopBackgroundTask(parentSessionId, tasksBefore[0].shortId);
+    expect(stopRes.stopped).toBe(false);
+
+    const tasksAfter = await daemon.listBackgroundTasks(parentSessionId);
+    expect(tasksAfter[0].status).toBe('running');
 
     await daemon.shutdown();
   });
