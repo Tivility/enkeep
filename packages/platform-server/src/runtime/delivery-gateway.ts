@@ -158,7 +158,7 @@ export interface DrainableRuntimeGateway extends RuntimeGateway {
   recoverQueuedTurns?(): Promise<number>;
   getCurrentTurnStatus(userId: string, sessionId: string): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number } | null>;
   cancelCurrentTurn(userId: string, sessionId: string): Promise<boolean>;
-  getBackgroundTasks?(userId: string, sessionId: string, options?: { chatContextId?: string }): Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+  getBackgroundTasks?(userId: string, sessionId: string, options?: { chatContextId?: string }): Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
   stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
 }
 
@@ -3614,9 +3614,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     userId: string,
     sessionId: string,
     options?: { chatContextId?: string }
-  ): Promise<{ items: BackgroundTask[]; updatedAt: string }> {
+  ): Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }> {
     let items: BackgroundTask[] = [];
     let updatedAt = new Date().toISOString();
+    let available = true;
 
     let dshSessionId = sessionId;
     let platformSpaceId = '';
@@ -3657,6 +3658,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         }
       } catch (err) {
         console.warn('[delivery-gateway] failed to list background tasks from executor', { userId, sessionId, dshSessionId, error: err });
+        available = false;
+        return { items: [], updatedAt, available: false };
       }
     }
 
@@ -3819,7 +3822,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       });
     }
 
-    return { items, updatedAt };
+    return { items, updatedAt, available: true };
   }
 
   async stopBackgroundTask(

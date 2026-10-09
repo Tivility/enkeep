@@ -19,6 +19,7 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
   let sessionId: string;
   let db: DatabaseSync;
   let chatCommandService: ChatCommandService;
+  let runtimeGateway: TestOnlyRuntimeGateway;
   const testCsrfToken = 'bg-tasks-csrf-token-32-chars-long-sec!';
 
   const syntheticChildId = 'ses_00000000000000000000000000000099';
@@ -30,7 +31,7 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
     const storage = new SqlitePlatformStorage(db);
     const messageStore = new SqliteWebMessageStore(db);
 
-    const runtimeGateway = new TestOnlyRuntimeGateway({
+    runtimeGateway = new TestOnlyRuntimeGateway({
       storage,
       messageStore,
       database: db,
@@ -309,9 +310,60 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
       sessionId,
       spaceId: aliceSpaceId,
       content: '/bg stop 0099',
-      channelContext: { channel: 'lark', chatType: 'group' } as any,
+      channelContext: {
+        channel: 'lark',
+        chatType: 'group',
+        nativeContextId: syntheticNativeContextId,
+      } as any,
     });
     expect(groupAllowedRes.replyText).toContain('后台任务 0099 已停止。');
+  });
+
+  it('A-08: /bg stop rejects stopping a task belonging to a different chat context', async () => {
+    // Attempt to stop task 0099 (which belongs to syntheticNativeContextId) from a different chat
+    const crossChatRes = await chatCommandService.execute({
+      userId: 'user_alice',
+      sessionId,
+      spaceId: aliceSpaceId,
+      content: '/bg stop 0099',
+      channelContext: {
+        channel: 'lark',
+        chatType: 'p2p',
+        nativeContextId: 'oc_other_chat_context',
+      } as any,
+    });
+    expect(crossChatRes.replyText).toContain('未找到后台任务');
+  });
+
+  it('A-01: /bg command and /bg stop report "后台任务状态暂不可用。" when gateway reports available: false', async () => {
+    const origGetBg = (runtimeGateway as any).getBackgroundTasks;
+    (runtimeGateway as any).getBackgroundTasks = async () => ({
+      items: [],
+      updatedAt: new Date().toISOString(),
+      available: false,
+    });
+
+    try {
+      const listRes = await chatCommandService.execute({
+        userId: 'user_alice',
+        sessionId,
+        spaceId: aliceSpaceId,
+        content: '/bg',
+        channelContext: { channel: 'web', chatType: 'p2p' } as any,
+      });
+      expect(listRes.replyText).toBe('后台任务状态暂不可用。');
+
+      const stopRes = await chatCommandService.execute({
+        userId: 'user_alice',
+        sessionId,
+        spaceId: aliceSpaceId,
+        content: '/bg stop 0099',
+        channelContext: { channel: 'web', chatType: 'p2p' } as any,
+      });
+      expect(stopRes.replyText).toBe('后台任务状态暂不可用。');
+    } finally {
+      (runtimeGateway as any).getBackgroundTasks = origGetBg;
+    }
   });
 
   it('/status command includes background count line', async () => {
