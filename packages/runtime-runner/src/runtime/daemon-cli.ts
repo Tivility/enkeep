@@ -32,10 +32,8 @@ import {
 } from './daemon-protocol.js';
 import { isValidUserId, isNormalizedAbsolutePath } from './dsh-boot.js';
 import type { ResolvedRuntimeMount } from '../spec/types.js';
-import { deriveCompactionThresholdRatio, type CompactionMountConfig } from './official-plugins.js';
+import type { CompactionMountConfig } from './official-plugins.js';
 import { runSessionPremigrateCli } from './session-premigrate.js';
-
-export { deriveCompactionThresholdRatio };
 
 /**
  * Redirects standard console methods to stderr so that library logging
@@ -119,15 +117,6 @@ export function resolveDaemonBootConfig(): {
     } catch {}
   }
 
-  const rawCompactionThresholdTokens = process.env.DSH_COMPACTION_THRESHOLD_TOKENS;
-  const compactionThresholdTokens =
-    rawCompactionThresholdTokens !== undefined && !Number.isNaN(parseInt(rawCompactionThresholdTokens, 10))
-      ? parseInt(rawCompactionThresholdTokens, 10)
-      : 200000;
-  const compaction: CompactionMountConfig = {
-    thresholdTokens: compactionThresholdTokens,
-  };
-
   return {
     userId,
     dshHome,
@@ -137,7 +126,6 @@ export function resolveDaemonBootConfig(): {
     maxConcurrentSessions,
     llmEnabled,
     mounts,
-    compaction,
   };
 }
 

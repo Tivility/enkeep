@@ -50,7 +50,7 @@ describe('Server Restart & SQLite Persistence Lifecycle', () => {
 
     // Verify migration version was recorded via versioned migration table
     version1 = await server1.migrationRunner.getCurrentVersion();
-    expect(version1).toBe(31);
+    expect(version1).toBe(ALL_PLATFORM_MIGRATIONS.length);
 
     // Provision fixtures
     const fixtures = await provisionFixtures(server1.storage, server1.authService, {

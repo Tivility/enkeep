@@ -164,6 +164,31 @@ describe('I4 & I5: Subagent Progress and Elapsed/Last-Activity Indicator (Parity
       });
       expect(line2).toContain('⏳ 已用 2m 30s');
       expect(line2).toContain('· 2m 10s 无新事件，仍在运行');
+
+      // Running tool status line tests
+      const lineJob = buildStreamingStatusLine({
+        elapsedMs: 600_000,
+        nowMs: now,
+        lastActivityAt: now - 451_000,
+        runningTool: 'job_output',
+      });
+      expect(lineJob).toContain('⏳ 已用 10m');
+      expect(lineJob).toContain('· 等待后台任务结果（job_output）');
+      expect(lineJob).toContain('· 7m 31s 无新事件，仍在运行');
+
+      const lineWorkflow = buildStreamingStatusLine({
+        elapsedMs: 30_000,
+        nowMs: now,
+        runningTool: 'workflow',
+      });
+      expect(lineWorkflow).toContain('· 运行 workflow …');
+
+      const lineOther = buildStreamingStatusLine({
+        elapsedMs: 30_000,
+        nowMs: now,
+        runningTool: 'web_search',
+      });
+      expect(lineOther).toContain('· web_search 执行中');
     });
 
     it('createStreamingCard includes streaming_status_bar element when withStatusBar is enabled', async () => {

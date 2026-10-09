@@ -716,6 +716,7 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       attachments: request.attachments,
       modelSelection: request.modelSelection,
       cacheRetention: request.cacheRetention,
+      contextWindow: request.contextWindow,
       replyReference: request.replyReference ?? null,
       timeoutMs: request.timeoutMs,
       idleTimeoutMs: request.idleTimeoutMs,

@@ -90,33 +90,46 @@ export class SqliteTenantScopedSpaceRepository implements TenantScopedSpaceRepos
       }
     }
 
-    const hasCacheCol = (() => {
+    const cols = (() => {
       try {
-        const cols = this.db.prepare('PRAGMA table_info(spaces)').all() as Array<{ name: string }>;
-        return cols.some((c) => c.name === 'cache_retention');
+        return this.db.prepare('PRAGMA table_info(spaces)').all() as Array<{ name: string }>;
       } catch {
-        return false;
+        return [];
       }
     })();
+    const hasCacheCol = cols.some((c) => c.name === 'cache_retention');
+    const hasWindowCol = cols.some((c) => c.name === 'context_window');
 
-    if (input.canonicalSessionId) {
-      if (hasCacheCol) {
+    if (hasCacheCol && hasWindowCol) {
+      if (input.canonicalSessionId) {
+        this.db.prepare(`
+          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, cache_retention, context_window, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId, input.cacheRetention ?? null, input.contextWindow ?? null);
+      } else {
+        this.db.prepare(`
+          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, cache_retention, context_window, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(id, this.userId, name, folder, executionMode, status, agentProfileId, agentProfileSnapshotId, input.cacheRetention ?? null, input.contextWindow ?? null);
+      }
+    } else if (hasCacheCol) {
+      if (input.canonicalSessionId) {
         this.db.prepare(`
           INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, cache_retention, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId, input.cacheRetention ?? null);
       } else {
         this.db.prepare(`
-          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId);
-      }
-    } else {
-      if (hasCacheCol) {
-        this.db.prepare(`
           INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, cache_retention, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         `).run(id, this.userId, name, folder, executionMode, status, agentProfileId, agentProfileSnapshotId, input.cacheRetention ?? null);
+      }
+    } else {
+      if (input.canonicalSessionId) {
+        this.db.prepare(`
+          INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, canonical_session_id, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(id, this.userId, name, folder, executionMode, status, input.canonicalSessionId, agentProfileId, agentProfileSnapshotId);
       } else {
         this.db.prepare(`
           INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, agent_profile_id, agent_profile_snapshot_id, created_at, updated_at)
@@ -197,18 +210,23 @@ export class SqliteTenantScopedSpaceRepository implements TenantScopedSpaceRepos
         params.push(null);
       }
     }
-    const hasCacheCol = (() => {
+    const cols = (() => {
       try {
-        const cols = this.db.prepare('PRAGMA table_info(spaces)').all() as Array<{ name: string }>;
-        return cols.some((c) => c.name === 'cache_retention');
+        return this.db.prepare('PRAGMA table_info(spaces)').all() as Array<{ name: string }>;
       } catch {
-        return false;
+        return [];
       }
     })();
+    const hasCacheCol = cols.some((c) => c.name === 'cache_retention');
+    const hasWindowCol = cols.some((c) => c.name === 'context_window');
 
     if (input.cacheRetention !== undefined && hasCacheCol) {
       updates.push('cache_retention = ?');
       params.push(input.cacheRetention);
+    }
+    if (input.contextWindow !== undefined && hasWindowCol) {
+      updates.push('context_window = ?');
+      params.push(input.contextWindow);
     }
 
     params.push(id, this.userId);

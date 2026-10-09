@@ -274,7 +274,7 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
       channelContext: {
         channel: 'lark',
         chatType: 'p2p',
-        nativeContextId: 'chat_other_context',
+        nativeContextId: 'oc_different_chat',
       } as any,
     });
     expect(unmatchRes.replyText).toContain('当前聊天暂无后台任务。');

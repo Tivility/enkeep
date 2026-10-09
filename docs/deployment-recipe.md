@@ -139,7 +139,7 @@ Enkeep 生产运行由 `~/Library/LaunchAgents/com.owner-user.enkeep.plist` 定�
   - `ENKEEP_PIPELINE_MANIFEST`: `<enkeep-config-dir>/pipeline-task-capabilities.json`
   - `ENKEEP_DSH_HOME`: `<enkeep-config-dir>/dsh-home`
   - `DSH_WEB_URL`: `http://127.0.0.1:3080`
-  - `DSH_COMPACTION_THRESHOLD_TOKENS`: `200000`
+  - `ENKEEP_CONTEXT_WINDOW_DEFAULT`: `272000`
 - `StandardOutPath`: `~/Library/Logs/enkeep.log`
 - `StandardErrorPath`: `~/Library/Logs/enkeep.err`
 - `KeepAlive`: `<true/>`

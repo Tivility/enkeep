@@ -1118,7 +1118,7 @@ describe('Server Configuration, Credentials & Migration Manifest Enforcement', (
 
   it('guarantees published migration checksums for versions 1 to 30 remain strictly immutable', async () => {
     // Expected checksums for published migrations v1 - v31
-    const expectedVersions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
+    const expectedVersions = Array.from({ length: ALL_PLATFORM_MIGRATIONS.length }, (_, i) => i + 1);
     const versions = ALL_PLATFORM_MIGRATIONS.map((m) => m.version);
     expect(versions).toEqual(expectedVersions);
 
@@ -1156,7 +1156,7 @@ describe('Server Configuration, Credentials & Migration Manifest Enforcement', (
       31: { name: '031_generic_channel_tables', checksum: '3ae9433678068bab97db4c7e6a5dd7a0e984fb5391b7ea06be97438fb91e09cf' },
     };
 
-    for (const m of ALL_PLATFORM_MIGRATIONS) {
+    for (const m of ALL_PLATFORM_MIGRATIONS.filter((m) => m.version <= 31)) {
       const exp = EXPECTED_IMMUTABLE_CHECKSUMS[m.version];
       expect(exp).toBeDefined();
       expect(m.name).toBe(exp.name);
@@ -1164,12 +1164,12 @@ describe('Server Configuration, Credentials & Migration Manifest Enforcement', (
       expect(computeChecksum(m.upSql)).toBe(exp.checksum);
     }
 
-    // Run migrations v1 to v31 on a fresh database and verify validateAppliedMigrations
+    // Run migrations v1 to v40 on a fresh database and verify validateAppliedMigrations
     const db = new DatabaseSync(':memory:');
     const runner = new PlatformServerMigrationRunner(db);
     await runner.migrate(ALL_PLATFORM_MIGRATIONS);
 
-    expect(await runner.getCurrentVersion()).toBe(31);
+    expect(await runner.getCurrentVersion()).toBe(ALL_PLATFORM_MIGRATIONS.length);
     await expect(runner.validateAppliedMigrations(ALL_PLATFORM_MIGRATIONS)).resolves.not.toThrow();
 
     db.close();
@@ -1183,10 +1183,11 @@ describe('Server Configuration, Credentials & Migration Manifest Enforcement', (
 
       const demoDb = new DatabaseSync(demoDbPath);
       const demoRunner = new PlatformServerMigrationRunner(demoDb);
-      expect(await demoRunner.getCurrentVersion()).toBe(31);
-      // Validates that existing 31 migrations match without mismatch
+      const currentVer = await demoRunner.getCurrentVersion();
+      expect(currentVer).toBeGreaterThanOrEqual(31);
+      // Validates that existing migrations match without mismatch
       const applied = await demoRunner.getAppliedMigrations();
-      expect(applied.length).toBe(31);
+      expect(applied.length).toBe(currentVer);
       expect(applied[0].version).toBe(1);
       expect(applied[0].checksum).toBe(ALL_PLATFORM_MIGRATIONS[0].checksum);
       expect(applied[0].checksum).toBe('dad9c52bb64d8435f055bd7305c55689061ea2a0d564123c7d39d12f390804d2');

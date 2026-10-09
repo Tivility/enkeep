@@ -143,17 +143,43 @@ export class SqliteTenantScopedSessionRouteRepository implements TenantScopedSes
       }
     }
 
-    const hasCacheCol = (() => {
+    const cols = (() => {
       try {
-        const cols = this.db.prepare('PRAGMA table_info(session_routes)').all() as Array<{ name: string }>;
-        return cols.some((c) => c.name === 'cache_retention');
+        return this.db.prepare('PRAGMA table_info(session_routes)').all() as Array<{ name: string }>;
       } catch {
-        return false;
+        return [];
       }
     })();
+    const hasCacheCol = cols.some((c) => c.name === 'cache_retention');
+    const hasWindowCol = cols.some((c) => c.name === 'context_window');
 
     return withImmediateTransactionSync(this.db, () => {
-      if (hasCacheCol) {
+      if (hasCacheCol && hasWindowCol) {
+        this.db.prepare(`
+          INSERT INTO session_routes (
+            id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode,
+            status, title, last_reset_at, reset_count, current_generation, agent_profile_id, agent_profile_snapshot_id,
+            cache_retention, context_window, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(
+          id,
+          input.spaceId,
+          this.userId,
+          input.channel,
+          accountId,
+          nativeContextId,
+          peerId,
+          dshSessionId,
+          executionMode,
+          status,
+          title,
+          agentProfileId,
+          agentProfileSnapshotId,
+          input.cacheRetention ?? null,
+          input.contextWindow ?? null
+        );
+      } else if (hasCacheCol) {
         this.db.prepare(`
           INSERT INTO session_routes (
             id, space_id, user_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode,
@@ -302,18 +328,23 @@ export class SqliteTenantScopedSessionRouteRepository implements TenantScopedSes
         params.push(null);
       }
     }
-    const hasCacheCol = (() => {
+    const cols = (() => {
       try {
-        const cols = this.db.prepare('PRAGMA table_info(session_routes)').all() as Array<{ name: string }>;
-        return cols.some((c) => c.name === 'cache_retention');
+        return this.db.prepare('PRAGMA table_info(session_routes)').all() as Array<{ name: string }>;
       } catch {
-        return false;
+        return [];
       }
     })();
+    const hasCacheCol = cols.some((c) => c.name === 'cache_retention');
+    const hasWindowCol = cols.some((c) => c.name === 'context_window');
 
     if (input.cacheRetention !== undefined && hasCacheCol) {
       updates.push('cache_retention = ?');
       params.push(input.cacheRetention);
+    }
+    if (input.contextWindow !== undefined && hasWindowCol) {
+      updates.push('context_window = ?');
+      params.push(input.contextWindow);
     }
 
     params.push(id, this.userId);

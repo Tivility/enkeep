@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  deriveCompactionThresholdRatio,
-  resolveDaemonBootConfig,
-} from '../src/runtime/daemon-cli.js';
+  getPlatformDefaultContextWindow,
+  resolveTopLevelContextWindow,
+  resolveChildContextWindow,
+  DEFAULT_ENKEEP_CONTEXT_WINDOW,
+} from '@enkeep/platform-core';
 
-describe('Piece 1: Compaction Threshold Derivation and Environment Variable', () => {
+describe('Piece 1: Context Window Resolution and Environment Variable', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
@@ -15,46 +17,63 @@ describe('Piece 1: Compaction Threshold Derivation and Environment Variable', ()
     process.env = originalEnv;
   });
 
-  describe('deriveCompactionThresholdRatio', () => {
-    it('yields 0.2 for 1,000,000 contextWindow and 200,000 threshold', () => {
-      const ratio = deriveCompactionThresholdRatio(200000, 1000000);
-      expect(ratio).toBeCloseTo(0.2);
+  describe('getPlatformDefaultContextWindow', () => {
+    it('defaults to 272000 when ENKEEP_CONTEXT_WINDOW_DEFAULT is unset', () => {
+      delete process.env.ENKEEP_CONTEXT_WINDOW_DEFAULT;
+      expect(getPlatformDefaultContextWindow()).toBe(DEFAULT_ENKEEP_CONTEXT_WINDOW);
+      expect(getPlatformDefaultContextWindow()).toBe(272000);
     });
 
-    it('yields 0.5 for 400,000 contextWindow and 200,000 threshold', () => {
-      const ratio = deriveCompactionThresholdRatio(200000, 400000);
-      expect(ratio).toBeCloseTo(0.5);
+    it('reads custom ENKEEP_CONTEXT_WINDOW_DEFAULT integer from environment', () => {
+      process.env.ENKEEP_CONTEXT_WINDOW_DEFAULT = '350000';
+      expect(getPlatformDefaultContextWindow()).toBe(350000);
     });
 
-    it('clamps ratio to minimum 0.2 when threshold / contextWindow < 0.2', () => {
-      const ratio = deriveCompactionThresholdRatio(50000, 1000000);
-      expect(ratio).toBe(0.2);
-    });
-
-    it('clamps ratio to maximum 0.8 when threshold / contextWindow > 0.8', () => {
-      const ratio = deriveCompactionThresholdRatio(900000, 1000000);
-      expect(ratio).toBe(0.8);
-    });
-
-    it('handles zero or negative contextWindow by returning 0.2', () => {
-      expect(deriveCompactionThresholdRatio(200000, 0)).toBe(0.2);
-      expect(deriveCompactionThresholdRatio(200000, -100)).toBe(0.2);
+    it('falls back to default when ENKEEP_CONTEXT_WINDOW_DEFAULT is invalid', () => {
+      process.env.ENKEEP_CONTEXT_WINDOW_DEFAULT = 'not_a_number';
+      expect(getPlatformDefaultContextWindow()).toBe(272000);
     });
   });
 
-  describe('resolveDaemonBootConfig', () => {
-    it('defaults thresholdTokens to 200000 when DSH_COMPACTION_THRESHOLD_TOKENS is unset', () => {
-      delete process.env.DSH_COMPACTION_THRESHOLD_TOKENS;
-      const config = resolveDaemonBootConfig();
-      expect(config.compaction).toBeDefined();
-      expect(config.compaction?.thresholdTokens).toBe(200000);
+  describe('resolveTopLevelContextWindow', () => {
+    it('resolves session override when present', () => {
+      const res = resolveTopLevelContextWindow({
+        sessionContextWindow: 128000,
+        spaceContextWindow: 200000,
+      });
+      expect(res.contextWindow).toBe(128000);
+      expect(res.source).toBe('session');
+      expect(res.override).toBe(128000);
     });
 
-    it('reads custom DSH_COMPACTION_THRESHOLD_TOKENS integer from environment', () => {
-      process.env.DSH_COMPACTION_THRESHOLD_TOKENS = '350000';
-      const config = resolveDaemonBootConfig();
-      expect(config.compaction).toBeDefined();
-      expect(config.compaction?.thresholdTokens).toBe(350000);
+    it('resolves space override when session is unset', () => {
+      const res = resolveTopLevelContextWindow({
+        sessionContextWindow: null,
+        spaceContextWindow: 200000,
+      });
+      expect(res.contextWindow).toBe(200000);
+      expect(res.source).toBe('space');
+      expect(res.override).toBeNull();
+    });
+
+    it('resolves platform default when both session and space are unset', () => {
+      delete process.env.ENKEEP_CONTEXT_WINDOW_DEFAULT;
+      const res = resolveTopLevelContextWindow({
+        sessionContextWindow: null,
+        spaceContextWindow: null,
+      });
+      expect(res.contextWindow).toBe(272000);
+      expect(res.source).toBe('platform');
+      expect(res.override).toBeNull();
+    });
+  });
+
+  describe('resolveChildContextWindow', () => {
+    it('always returns platform child default unaffected by parent overrides', () => {
+      delete process.env.ENKEEP_CONTEXT_WINDOW_DEFAULT;
+      const res = resolveChildContextWindow();
+      expect(res.contextWindow).toBe(272000);
+      expect(res.source).toBe('child_default');
     });
   });
 });

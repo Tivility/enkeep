@@ -450,17 +450,10 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
     const llmProvider = options.llmProvider || process.env.ENKEEP_LLM_PROVIDER || 'cpa-claude';
     const llmModel = options.llmModel || process.env.ENKEEP_LLM_MODEL || 'claude-fable-5';
 
-    const compactionThresholdTokens =
-      (options as any).compactionThresholdTokens ||
-      (options as any).extraEnv?.DSH_COMPACTION_THRESHOLD_TOKENS ||
-      process.env.DSH_COMPACTION_THRESHOLD_TOKENS ||
-      '200000';
-
     const env: Record<string, string> = {
       DSH_USER: userId,
       DSH_HOME: '/home/dsh/.dsh',
       DSH_SPACES: '/home/dsh/spaces',
-      DSH_COMPACTION_THRESHOLD_TOKENS: String(compactionThresholdTokens),
     };
 
     if (isLlmEnabled) {
@@ -900,7 +893,8 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           attachments,
           modelSelection,
           cacheRetention,
-        } = request;
+          contextWindow,
+        } = request as any;
         const replyReference = (request as {
           replyReference?: {
             readonly replyToMessageId: string;
@@ -942,6 +936,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
             attachments,
             modelSelection: modelSelection ?? undefined,
             cacheRetention: cacheRetention ?? undefined,
+            contextWindow: contextWindow ?? undefined,
             replyReference: replyReference ?? null,
             timeoutMs: effTimeout,
             mounts: inContainerMounts,

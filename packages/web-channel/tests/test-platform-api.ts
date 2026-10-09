@@ -195,7 +195,6 @@ export class InMemoryPlatformWebApi implements PlatformWebApi {
     return {
       id: space.id,
       name: space.name,
-      executionMode: space.executionMode,
       status: space.status as PublicSpace['status'],
       canonicalSessionId: space.canonicalSessionId ?? null,
       createdAt: space.createdAt,

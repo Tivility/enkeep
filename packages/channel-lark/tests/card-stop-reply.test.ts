@@ -84,16 +84,18 @@ describe('C3: Feishu Streaming Card Stop-Reply Button & Authorization (card-stop
 
       expect(createdCardPayload).toBeDefined();
       const elements = createdCardPayload.body.elements;
-      expect(elements.length).toBe(2);
+      expect(elements.length).toBe(3);
       expect(elements[0].tag).toBe('markdown');
       expect(elements[0].element_id).toBe('main_content');
+      expect(elements[1].tag).toBe('markdown');
+      expect(elements[1].element_id).toBe('bg_panel');
       // Stop button element
-      expect(elements[1].tag).toBe('button');
-      expect(elements[1].type).toBe('danger');
-      expect(elements[1].text.content).toBe('⏹ 停止回复');
-      expect(elements[1].value.action).toBe('stop_reply');
-      expect(elements[1].value.turnId).toBe('turn_stop_cred_1');
-      expect(elements[1].value.sessionId).toBe('ses_stop_cred_1');
+      expect(elements[2].tag).toBe('button');
+      expect(elements[2].type).toBe('danger');
+      expect(elements[2].text.content).toBe('⏹ 停止回复');
+      expect(elements[2].value.action).toBe('stop_reply');
+      expect(elements[2].value.turnId).toBe('turn_stop_cred_1');
+      expect(elements[2].value.sessionId).toBe('ses_stop_cred_1');
     });
 
     it('FakeLarkTransport finalizes card with status "stopped" using grey header and "已中止" title', async () => {

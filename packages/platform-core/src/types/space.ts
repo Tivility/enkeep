@@ -14,6 +14,7 @@ export interface Space {
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
   cacheRetention?: CacheRetention | null;
+  contextWindow?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -29,6 +30,7 @@ export interface CreateSpaceInput {
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
   cacheRetention?: CacheRetention | null;
+  contextWindow?: number | null;
 }
 
 export interface UpdateSpaceInput {
@@ -40,4 +42,5 @@ export interface UpdateSpaceInput {
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
   cacheRetention?: CacheRetention | null;
+  contextWindow?: number | null;
 }

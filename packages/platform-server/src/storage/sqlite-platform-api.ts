@@ -226,6 +226,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       status: space.status,
       canonicalSessionId: space.canonicalSessionId ?? null,
       cacheRetention: space.cacheRetention ?? null,
+      contextWindow: space.contextWindow ?? null,
       createdAt: space.createdAt,
       updatedAt: space.updatedAt,
       ...(profileBinding !== undefined ? { profileBinding } : {}),
@@ -395,6 +396,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
     const updated = await tenant.spaces.update(spaceId, {
       name: input.name,
       ...(input.cacheRetention !== undefined ? { cacheRetention: input.cacheRetention } : {}),
+      ...(input.contextWindow !== undefined ? { contextWindow: input.contextWindow } : {}),
     });
 
     return this.toPublicSpace(userId, updated);
@@ -561,6 +563,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       status: route.status,
       currentGeneration: route.currentGeneration,
       cacheRetention: route.cacheRetention ?? null,
+      contextWindow: route.contextWindow ?? null,
       createdAt: route.createdAt,
       updatedAt: route.updatedAt,
     };
@@ -1050,6 +1053,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
     const updated = await tenant.sessionRoutes.update(sessionId, {
       title,
       ...(input.cacheRetention !== undefined ? { cacheRetention: input.cacheRetention } : {}),
+      ...(input.contextWindow !== undefined ? { contextWindow: input.contextWindow } : {}),
     });
 
     return this.toPublicSession(updated);

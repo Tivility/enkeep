@@ -517,7 +517,8 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
           attachments,
           modelSelection,
           cacheRetention,
-        } = request;
+          contextWindow,
+        } = request as any;
         const replyReference = (request as any).replyReference;
 
         if (!prompt || typeof prompt !== 'string') {
@@ -541,6 +542,7 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
             attachments,
             modelSelection: modelSelection ?? undefined,
             cacheRetention: cacheRetention ?? undefined,
+            contextWindow: contextWindow ?? undefined,
             replyReference: replyReference ?? null,
             timeoutMs,
             mounts: request.mounts,

@@ -522,6 +522,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       attachments: request.attachments as any,
       modelSelection: request.modelSelection ?? undefined,
       cacheRetention: request.cacheRetention ?? undefined,
+      contextWindow: request.contextWindow ?? undefined,
       replyReference: request.replyReference ?? null,
       timeoutMs: rawBudgetMs,
       idleTimeoutMs,

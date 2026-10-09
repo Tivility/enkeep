@@ -27,6 +27,9 @@ import {
   resolveTopLevelCacheRetention,
   isValidCacheRetention,
   isValidCacheRetentionInput,
+  resolveTopLevelContextWindow,
+  isValidContextWindow,
+  isValidContextWindowInput,
   type User,
   type PlatformStorage,
   type AuthService,
@@ -154,6 +157,10 @@ const ALLOWED_MODEL_OVERRIDE_KEYS = new Set([
 const ALLOWED_CACHE_OVERRIDE_KEYS = new Set([
   "cacheRetention",
   "retention",
+]);
+const ALLOWED_CONTEXT_WINDOW_OVERRIDE_KEYS = new Set([
+  "contextWindow",
+  "window",
 ]);
 const ALLOWED_MODEL_PROBE_KEYS = new Set([
   "provider",
@@ -1408,6 +1415,71 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           if (method === "DELETE") {
             validateCsrf(req, { csrfToken });
             await platformApi.updateSpace(user.id, spaceId, { cacheRetention: null });
+            sendJsonResponse(res, 200, createSuccessEnvelope({ deleted: true }));
+            return;
+          }
+
+          throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+        }
+
+        // 5.1.4d /api/spaces/:spaceId/context-window
+        if (subPath === "/context-window") {
+          const space = await platformApi.getSpace(user.id, spaceId);
+          if (!space) {
+            throw new NotFoundError(`Space "${spaceId}" not found`);
+          }
+
+          if (method === "GET") {
+            const override = space.contextWindow ?? null;
+            const resolution = resolveTopLevelContextWindow({ spaceContextWindow: override });
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override,
+              effective: resolution.contextWindow,
+              source: override ? "space" : "platform",
+            }));
+            return;
+          }
+
+          if (method === "PUT" || method === "PATCH") {
+            validateCsrf(req, { csrfToken });
+            const rawBody = await parseJsonBody(req, maxBodyBytes);
+            if (!isRecord(rawBody) || Object.keys(rawBody).length === 0) {
+              throw new ValidationError("Request body cannot be empty");
+            }
+            const unknownKeys = getUnknownKeys(rawBody, ALLOWED_CONTEXT_WINDOW_OVERRIDE_KEYS);
+            if (unknownKeys.length > 0) {
+              throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+            }
+
+            const rawVal = rawBody.contextWindow !== undefined ? rawBody.contextWindow : rawBody.window;
+            if (rawVal === undefined || rawVal === null || rawVal === "default") {
+              const updated = await platformApi.updateSpace(user.id, spaceId, { contextWindow: null });
+              const resolution = resolveTopLevelContextWindow({ spaceContextWindow: null });
+              sendJsonResponse(res, 200, createSuccessEnvelope({
+                override: null,
+                effective: resolution.contextWindow,
+                source: "platform",
+              }));
+              return;
+            }
+
+            if (!isValidContextWindow(rawVal)) {
+              throw new ValidationError('Field "contextWindow" must be a positive integer or "default"');
+            }
+
+            const updated = await platformApi.updateSpace(user.id, spaceId, { contextWindow: rawVal });
+            const resolution = resolveTopLevelContextWindow({ spaceContextWindow: rawVal });
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override: rawVal,
+              effective: resolution.contextWindow,
+              source: "space",
+            }));
+            return;
+          }
+
+          if (method === "DELETE") {
+            validateCsrf(req, { csrfToken });
+            await platformApi.updateSpace(user.id, spaceId, { contextWindow: null });
             sendJsonResponse(res, 200, createSuccessEnvelope({ deleted: true }));
             return;
           }
@@ -3347,6 +3419,134 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           if (method === "DELETE") {
             validateCsrf(req, { csrfToken });
             await platformApi.updateSession(user.id, sessionId, { cacheRetention: null });
+            sendJsonResponse(res, 200, createSuccessEnvelope({ deleted: true }));
+            return;
+          }
+
+          throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+        }
+
+        // 6.1.9d /api/sessions/:sessionId/context-window
+        if (subPath === "/context-window") {
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          const space = await platformApi.getSpace(user.id, session.spaceId);
+
+          const effectiveModel = await modelSelectionService.resolveEffectiveModel({
+            sessionId,
+            spaceId: session.spaceId,
+            userId: user.id,
+          });
+          const modelCatalog = modelSelectionService.getDshCatalog();
+          const targetModel = effectiveModel.provider && effectiveModel.model
+            ? modelCatalog.providers?.[effectiveModel.provider]?.models?.find(m => m.id === effectiveModel.model)
+            : undefined;
+          const realContextWindow = targetModel?.contextWindow ?? 0;
+
+          if (method === "GET") {
+            const override = session.contextWindow ?? null;
+            const spaceContextWindow = space?.contextWindow ?? null;
+            const resolution = resolveTopLevelContextWindow({
+              sessionContextWindow: override,
+              spaceContextWindow,
+            });
+            const workingWindow = resolution.contextWindow;
+            const clamped = realContextWindow > 0 ? Math.min(workingWindow, realContextWindow) : workingWindow;
+            const isClamped = realContextWindow > 0 && workingWindow > realContextWindow;
+
+            let problem: string | undefined;
+            if (clamped > 0 && clamped < 65536) {
+              problem = `BasicCompactionConfig: contextWindow (${clamped}) cannot work with default headroomTokens (65536)`;
+            }
+
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override,
+              effective: resolution.contextWindow,
+              source: resolution.source,
+              realContextWindow,
+              clamped,
+              isClamped,
+              ...(problem ? { problem } : {}),
+            }));
+            return;
+          }
+
+          if (method === "PUT" || method === "PATCH") {
+            validateCsrf(req, { csrfToken });
+            const rawBody = await parseJsonBody(req, maxBodyBytes);
+            if (!isRecord(rawBody) || Object.keys(rawBody).length === 0) {
+              throw new ValidationError("Request body cannot be empty");
+            }
+            const unknownKeys = getUnknownKeys(rawBody, ALLOWED_CONTEXT_WINDOW_OVERRIDE_KEYS);
+            if (unknownKeys.length > 0) {
+              throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+            }
+
+            const rawVal = rawBody.contextWindow !== undefined ? rawBody.contextWindow : rawBody.window;
+            const spaceContextWindow = space?.contextWindow ?? null;
+
+            if (rawVal === undefined || rawVal === null || rawVal === "default") {
+              const updated = await platformApi.updateSession(user.id, sessionId, { contextWindow: null });
+              const resolution = resolveTopLevelContextWindow({
+                sessionContextWindow: null,
+                spaceContextWindow,
+              });
+              const workingWindow = resolution.contextWindow;
+              const clamped = realContextWindow > 0 ? Math.min(workingWindow, realContextWindow) : workingWindow;
+              const isClamped = realContextWindow > 0 && workingWindow > realContextWindow;
+
+              let problem: string | undefined;
+              if (clamped > 0 && clamped < 65536) {
+                problem = `BasicCompactionConfig: contextWindow (${clamped}) cannot work with default headroomTokens (65536)`;
+              }
+
+              sendJsonResponse(res, 200, createSuccessEnvelope({
+                override: null,
+                effective: resolution.contextWindow,
+                source: resolution.source,
+                realContextWindow,
+                clamped,
+                isClamped,
+                ...(problem ? { problem } : {}),
+              }));
+              return;
+            }
+
+            if (!isValidContextWindow(rawVal)) {
+              throw new ValidationError('Field "contextWindow" must be a positive integer or "default"');
+            }
+
+            const updated = await platformApi.updateSession(user.id, sessionId, { contextWindow: rawVal });
+            const resolution = resolveTopLevelContextWindow({
+              sessionContextWindow: rawVal,
+              spaceContextWindow,
+            });
+            const workingWindow = resolution.contextWindow;
+            const clamped = realContextWindow > 0 ? Math.min(workingWindow, realContextWindow) : workingWindow;
+            const isClamped = realContextWindow > 0 && workingWindow > realContextWindow;
+
+            let problem: string | undefined;
+            if (clamped > 0 && clamped < 65536) {
+              problem = `BasicCompactionConfig: contextWindow (${clamped}) cannot work with default headroomTokens (65536)`;
+            }
+
+            sendJsonResponse(res, 200, createSuccessEnvelope({
+              override: rawVal,
+              effective: resolution.contextWindow,
+              source: "session",
+              realContextWindow,
+              clamped,
+              isClamped,
+              ...(problem ? { problem } : {}),
+            }));
+            return;
+          }
+
+          if (method === "DELETE") {
+            validateCsrf(req, { csrfToken });
+            await platformApi.updateSession(user.id, sessionId, { contextWindow: null });
             sendJsonResponse(res, 200, createSuccessEnvelope({ deleted: true }));
             return;
           }
