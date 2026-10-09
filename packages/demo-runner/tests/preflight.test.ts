@@ -5,7 +5,13 @@ import path from 'node:path';
 import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { runPreflight, inspectPlatformDb, queryDaemonActivityOverSocket } from '../src/preflight/index.js';
-import { runDemoRunnerCli, parseDataDir, parseDueWithinMinutes } from '../src/demo-runner.js';
+import {
+  runDemoRunnerCli,
+  parseDataDir,
+  parseDueWithinMinutes,
+  parseTimeoutSeconds,
+  parseIntervalSeconds,
+} from '../src/demo-runner.js';
 import type { DaemonActivityStatus } from '@enkeep/runtime-runner';
 
 describe('Deploy Preflight Quiescence Aggregator (`demo-runner preflight`)', () => {
@@ -231,5 +237,55 @@ describe('Deploy Preflight Quiescence Aggregator (`demo-runner preflight`)', () 
     expect(parseDueWithinMinutes(['--due-within=25'])).toBe(25);
     expect(parseDueWithinMinutes([], { ENKEEP_PREFLIGHT_DUE_MINUTES: '30' })).toBe(30);
     expect(parseDueWithinMinutes([])).toBe(10);
+
+    expect(parseTimeoutSeconds(['--timeout-seconds', '120'])).toBe(120);
+    expect(parseTimeoutSeconds(['--timeout=45'])).toBe(45);
+    expect(parseTimeoutSeconds([], { ENKEEP_PREFLIGHT_TIMEOUT_SECONDS: '300' })).toBe(300);
+    expect(parseTimeoutSeconds([])).toBe(0);
+
+    expect(parseIntervalSeconds(['--interval-seconds', '15'])).toBe(15);
+    expect(parseIntervalSeconds(['--interval=20'])).toBe(20);
+    expect(parseIntervalSeconds([], { ENKEEP_PREFLIGHT_INTERVAL_SECONDS: '10' })).toBe(10);
+    expect(parseIntervalSeconds([])).toBe(60);
+  });
+
+  it('P-02: demo-runner preflight --wait --timeout-seconds times out and exits non-zero while summarizing in-flight tasks', async () => {
+    // Construct busy platform database with in-flight turn
+    const dbPath = path.join(dataDir, 'platform.db');
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE turn_runs (id TEXT PRIMARY KEY, status TEXT);
+      INSERT INTO turn_runs (id, status) VALUES ('turn_active_busy_001', 'running');
+    `);
+    db.close();
+
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((code?: string | number | null | undefined) => {
+      throw new Error(`Process.exit called with code ${code}`);
+    });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    try {
+      await expect(
+        runDemoRunnerCli([
+          'preflight',
+          '--data-dir',
+          dataDir,
+          '--wait',
+          '--timeout-seconds',
+          '1',
+          '--interval-seconds',
+          '1',
+        ])
+      ).rejects.toThrow('Process.exit called with code 1');
+
+      // Verify that log output contained timeout message and active turn summary without message contents
+      const allLogs = logSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(allLogs).toContain('Preflight wait timeout exceeded');
+      expect(allLogs).toContain('Platform Active / Queued Turns: 1');
+      expect(allLogs).toContain('BUSY / TIMED OUT ✖');
+    } finally {
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+    }
   });
 });
