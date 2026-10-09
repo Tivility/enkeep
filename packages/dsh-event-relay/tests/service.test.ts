@@ -104,4 +104,106 @@ describe('EventRelayService Unit Tests', () => {
     // Buffer was NOT trimmed due to persistence failure
     expect(relay.getBufferSize('sess-err')).toBe(2);
   });
+
+  describe('resolvePlatformTurnForSession', () => {
+    it('resolves direct platform turn context by sessionId:intTurn and active turn', () => {
+      const sessionId = 'sess-direct-001';
+      relay.bindTurnContext(sessionId, { turnId: 'turn_direct_1', dshIntTurn: 1 });
+
+      // 1. With exact turn number
+      const res1 = relay.resolvePlatformTurnForSession(sessionId, 1);
+      expect(res1).toEqual({ turnId: 'turn_direct_1', kind: 'direct' });
+
+      // 2. Fallback to active turn context when intTurn omitted or unmatched
+      const resActive = relay.resolvePlatformTurnForSession(sessionId);
+      expect(resActive).toEqual({ turnId: 'turn_direct_1', kind: 'direct' });
+    });
+
+    it('resolves autonomous turn originTurnId', () => {
+      const sessionId = 'sess-auto-001';
+      const mockSession = { id: SessionId(sessionId) } as any;
+
+      // 1. First platform turn creates a child subagent
+      relay.bindTurnContext(sessionId, { turnId: 'turn_plat_origin', dshIntTurn: 1 });
+      relay.ingest(mockSession, { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } });
+      relay.ingest(mockSession, { type: 'subagent/catalog', seq: 2, time: 101, data: { childId: 'child-1' } });
+      relay.ingest(mockSession, { type: 'turn/end', seq: 3, time: 102, data: { turn: 1, reason: { kind: 'completed' } } });
+
+      // 2. Child completes -> autonomous continuation turn starts
+      relay.ingest(mockSession, {
+        type: 'agent/inbox/spliced',
+        seq: 4,
+        time: 103,
+        data: {
+          inserted: [
+            {
+              source: {
+                kind: 'agent-message',
+                form: 'relay',
+                senderSessionId: 'child-1',
+              },
+              message: { content: 'Synthetic subagent completed task.' },
+            },
+          ],
+        },
+      });
+      relay.ingest(mockSession, { type: 'turn/start', seq: 5, time: 104, data: { turn: 2 } });
+
+      const res = relay.resolvePlatformTurnForSession(sessionId, 2);
+      expect(res).toEqual({ turnId: 'turn_plat_origin', kind: 'autonomous-origin' });
+    });
+
+    it('resolves child session provenance recursively via parentSession', () => {
+      const rootSessionId = 'sess-root-100';
+      const childSessionId = 'sess-child-101';
+      const grandChildSessionId = 'sess-grandchild-102';
+
+      // Set up mock agents service in Cordis context
+      const agentsMap = new Map<string, any>();
+      agentsMap.set(rootSessionId, {
+        id: rootSessionId,
+        session: { header: { id: rootSessionId } },
+      });
+      agentsMap.set(childSessionId, {
+        id: childSessionId,
+        session: {
+          header: {
+            id: childSessionId,
+            origin: 'subagent',
+            parentSession: rootSessionId,
+          },
+        },
+      });
+      agentsMap.set(grandChildSessionId, {
+        id: grandChildSessionId,
+        session: {
+          header: {
+            id: grandChildSessionId,
+            origin: 'subagent',
+            parentSession: childSessionId,
+          },
+        },
+      });
+
+      ctx.provide('agents', {
+        get: (id: string) => agentsMap.get(id),
+      } as any);
+
+      // Root session has an active turn
+      relay.bindTurnContext(rootSessionId, { turnId: 'turn_root_active' });
+
+      // Grandchild session should resolve to root turn with kind 'child-origin'
+      const resGrandChild = relay.resolvePlatformTurnForSession(grandChildSessionId);
+      expect(resGrandChild).toEqual({ turnId: 'turn_root_active', kind: 'child-origin' });
+
+      // Child session should also resolve to root turn
+      const resChild = relay.resolvePlatformTurnForSession(childSessionId);
+      expect(resChild).toEqual({ turnId: 'turn_root_active', kind: 'child-origin' });
+    });
+
+    it('returns undefined for unknown session', () => {
+      const res = relay.resolvePlatformTurnForSession('sess-unknown-999');
+      expect(res).toBeUndefined();
+    });
+  });
 });

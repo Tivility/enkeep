@@ -207,4 +207,63 @@ describe('B-01 & B-02: Platform Proxy send_file turn resolution and forwarding',
       })
     );
   });
+
+  it('session without turnId and not in session_child_origins passes undefined turnId resulting in no target resolution', async () => {
+    const directSessionId = 'ses_main_standalone_001';
+
+    db.exec(`
+      INSERT INTO session_routes (id, user_id, space_id, channel, dsh_session_id)
+      VALUES ('${directSessionId}', '${userId}', 'spc_001', 'web', 'dsh_main_001');
+    `);
+
+    const mockSendFile = vi.fn().mockResolvedValue({
+      success: true,
+      fileId: 'file_standalone_001',
+      recipient: directSessionId,
+      deliveryStatus: 'recorded',
+    });
+
+    const mockOperations = {
+      forTenant: vi.fn(() => ({
+        files: {
+          sendFile: mockSendFile,
+        },
+      })),
+    };
+
+    const handler = createPlatformProxyHandler({
+      platformUserId: userId,
+      db,
+      operations: mockOperations as any,
+    });
+
+    const requestBody = JSON.stringify({
+      recipient: directSessionId,
+      path: 'standalone.txt',
+      filename: 'standalone.txt',
+      size: 10,
+      content: Buffer.from('data').toString('base64'),
+      sessionId: directSessionId,
+    });
+
+    const stream = new PassThrough();
+    await (handler as any).handleSendFile({
+      method: 'POST',
+      url: '/api/files',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(requestBody)),
+      },
+      body: Buffer.from(requestBody),
+    }, stream);
+
+    expect(mockSendFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipient: directSessionId,
+        path: 'standalone.txt',
+        sessionId: directSessionId,
+        turnId: undefined,
+      })
+    );
+  });
 });

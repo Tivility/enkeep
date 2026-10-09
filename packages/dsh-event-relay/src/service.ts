@@ -246,7 +246,104 @@ export class EventRelayService implements IEventRelayService {
         this.childOriginMap.set(childId, fromStore);
         return fromStore;
       }
+    } else {
+      const fromStore = this.lookupOriginFromReceiptStore(childId, childId);
+      if (fromStore) {
+        this.childOriginMap.set(childId, fromStore);
+        return fromStore;
+      }
     }
+    return undefined;
+  }
+
+  resolvePlatformTurnForSession(
+    sessionId: string,
+    intTurn?: number
+  ): { turnId: string; kind: 'direct' | 'autonomous-origin' | 'child-origin' } | undefined {
+    if (!sessionId) return undefined;
+
+    // 1. Direct match on current sessionId:intTurn or active turn context
+    if (intTurn !== undefined) {
+      const directInt = this.dshIntTurnMap.get(`${sessionId}:${intTurn}`);
+      if (directInt?.platformTurnId) {
+        if (directInt.originTurnId) {
+          return { turnId: directInt.originTurnId, kind: 'autonomous-origin' };
+        }
+        return { turnId: directInt.platformTurnId, kind: 'direct' };
+      }
+    }
+
+    const activeDirect = this.activeTurnContexts.get(sessionId);
+    if (activeDirect?.platformTurnId) {
+      if (activeDirect.originTurnId) {
+        return { turnId: activeDirect.originTurnId, kind: 'autonomous-origin' };
+      }
+      return { turnId: activeDirect.platformTurnId, kind: 'direct' };
+    }
+
+    // 2. Autonomous context: returns originTurnId if available
+    const activeAuto = this.activeAutonomousContexts.get(sessionId);
+    if (activeAuto) {
+      if (activeAuto.originTurnId) {
+        return { turnId: activeAuto.originTurnId, kind: 'autonomous-origin' };
+      }
+      if (activeAuto.platformTurnId) {
+        return { turnId: activeAuto.platformTurnId, kind: 'direct' };
+      }
+    }
+
+    // 3. Child session provenance resolution (e.g. subagent)
+    // Check direct childOriginMap / receiptStore
+    const childOrigin = this.resolveOriginTurnId(sessionId);
+    if (childOrigin) {
+      return { turnId: childOrigin, kind: 'child-origin' };
+    }
+
+    // Look up parent session via agents service if available on Cordis context
+    const agentsService = this.ctx.get?.('agents') as any;
+    let currentSessionId = sessionId;
+    const visited = new Set<string>([sessionId]);
+
+    while (agentsService && typeof agentsService.get === 'function') {
+      const agent = agentsService.get(currentSessionId);
+      const sessionHeader = agent?.session?.header;
+      const parentSessionId = sessionHeader?.parentSession ? String(sessionHeader.parentSession) : undefined;
+      const isSubagent = sessionHeader?.origin === 'subagent' || parentSessionId !== undefined;
+
+      if (!isSubagent || !parentSessionId || visited.has(parentSessionId)) {
+        break;
+      }
+
+      visited.add(parentSessionId);
+
+      // Check if child was recorded under parentSession:childId
+      const mappedUnderParent = this.resolveOriginTurnId(`${parentSessionId}:${currentSessionId}`);
+      if (mappedUnderParent) {
+        return { turnId: mappedUnderParent, kind: 'child-origin' };
+      }
+
+      // Check parent's active or autonomous turn
+      const parentActive = this.activeTurnContexts.get(parentSessionId);
+      if (parentActive?.platformTurnId) {
+        return { turnId: parentActive.platformTurnId, kind: 'child-origin' };
+      }
+
+      const parentAuto = this.activeAutonomousContexts.get(parentSessionId);
+      if (parentAuto?.originTurnId) {
+        return { turnId: parentAuto.originTurnId, kind: 'child-origin' };
+      }
+      if (parentAuto?.platformTurnId) {
+        return { turnId: parentAuto.platformTurnId, kind: 'child-origin' };
+      }
+
+      const parentChildOrigin = this.resolveOriginTurnId(parentSessionId);
+      if (parentChildOrigin) {
+        return { turnId: parentChildOrigin, kind: 'child-origin' };
+      }
+
+      currentSessionId = parentSessionId;
+    }
+
     return undefined;
   }
 

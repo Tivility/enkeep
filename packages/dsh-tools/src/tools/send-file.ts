@@ -354,17 +354,30 @@ export function createSendFileTool(
       const sha256Hex = crypto.createHash('sha256').update(validated.content).digest('hex');
       const base64Content = validated.content.toString('base64');
 
-      // Extract calling sessionId and turnId if known
+      // Extract calling sessionId and turn number if known
       const callerSessionId: string | undefined =
         activeAgent?.session?.header?.id ??
         (context as any)?.sessionId ??
         (context as any)?.session?.header?.id;
 
-      const callerTurnId: string | undefined =
-        (context as any)?.turnId ??
-        (context as any)?.turn?.id ??
-        activeAgent?.session?.header?.turnId ??
-        (context as any)?.session?.header?.turnId;
+      const intTurn: number | undefined =
+        typeof (context as any)?.turn === 'number'
+          ? (context as any).turn
+          : typeof (context as any)?.dshIntTurn === 'number'
+            ? (context as any).dshIntTurn
+            : typeof (context as any)?.turnNumber === 'number'
+              ? (context as any).turnNumber
+              : undefined;
+
+      // Resolve authoritative platform turn via eventRelay service if available
+      let callerTurnId: string | undefined;
+      const relayService = effectiveCtx?.get ? (effectiveCtx.get('eventRelay') as any) : (effectiveCtx as any)?.eventRelay;
+      if (relayService && typeof relayService.resolvePlatformTurnForSession === 'function' && callerSessionId) {
+        const resolved = relayService.resolvePlatformTurnForSession(callerSessionId, intTurn);
+        if (resolved?.turnId) {
+          callerTurnId = resolved.turnId;
+        }
+      }
 
       // 7. Execute platform request
       // Platform proxy will resolve route & spaceId from recipient or sessionId mapping in SQLite

@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { Context } from '@deepseek-ai/cordis';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -355,6 +356,54 @@ describe('dsh-tools: tool implementations with Operational Truth', () => {
       expect(requestBody.encoding).toBe('base64');
       expect(requestBody.content).toBe(expectedBase64);
       expect(requestBody.description).toBe('CSV metrics');
+      expect(requestBody.sessionId).toBe(validSessionId);
+      expect(requestBody.turnId).toBeUndefined(); // without eventRelay, no turnId in request
+    });
+
+    it('resolves turnId via eventRelay service on cordis context and passes to /api/files', async () => {
+      const testFile = path.join(spaceADir, 'report.pdf');
+      fs.writeFileSync(testFile, 'PDF-CONTENT');
+
+      let requestBody: any = null;
+      const mockClient: PlatformClientService = {
+        async request(_p, opts: any) {
+          requestBody = opts?.body;
+          return {
+            status: 200,
+            data: {
+              success: true,
+              fileId: 'file-pdf-123',
+              path: 'report.pdf',
+              size: 11,
+              recipient: 'user-charlie',
+            },
+          };
+        },
+      };
+
+      const mockRelay = {
+        resolvePlatformTurnForSession: vi.fn().mockReturnValue({
+          turnId: 'turn_plat_relay_resolved_001',
+          kind: 'direct',
+        }),
+      };
+
+      const cordisCtx = new Context();
+      cordisCtx.provide('eventRelay', mockRelay as any);
+
+      const tool = createSendFileTool(() => mockClient, {
+        workspaceBoundaryRoot: spacesDir,
+        context: cordisCtx,
+      });
+
+      const res = await tool.execute(
+        { recipient: 'user-charlie', path: 'report.pdf' },
+        { ...agentAContext, turn: 2 } as any
+      );
+
+      expect(res.success).toBe(true);
+      expect(mockRelay.resolvePlatformTurnForSession).toHaveBeenCalledWith(validSessionId, 2);
+      expect(requestBody.turnId).toBe('turn_plat_relay_resolved_001');
       expect(requestBody.sessionId).toBe(validSessionId);
     });
 

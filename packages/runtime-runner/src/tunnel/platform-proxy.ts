@@ -1164,15 +1164,15 @@ export class PlatformProxyHandler implements StreamHandler {
       }
     }
 
-    // Resolve turnId if missing: check session_child_origins
+    // Resolve turnId if missing: check session_child_origins strictly by child_id
     let effectiveTurnId: string | undefined = typeof turnId === 'string' && turnId.trim() ? turnId.trim() : undefined;
     const effectiveSessionId: string | undefined = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : (matchedSessionId ?? undefined);
 
     if (!effectiveTurnId && effectiveSessionId && this.db) {
       try {
         const childOrigin = this.db.prepare(
-          'SELECT origin_turn_id FROM session_child_origins WHERE session_id = ? OR child_id = ? ORDER BY created_at DESC LIMIT 1'
-        ).get(effectiveSessionId, effectiveSessionId) as { origin_turn_id?: string } | undefined;
+          'SELECT origin_turn_id FROM session_child_origins WHERE child_id = ? LIMIT 1'
+        ).get(effectiveSessionId) as { origin_turn_id?: string } | undefined;
         if (childOrigin?.origin_turn_id) {
           effectiveTurnId = childOrigin.origin_turn_id;
         }

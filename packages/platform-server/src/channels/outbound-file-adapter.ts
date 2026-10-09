@@ -49,12 +49,12 @@ export class DefaultOutboundFileChannelAdapter implements OutboundFileChannelAda
 
     let targetTurnId = turnId;
 
-    // 1. If turnId not directly supplied, try to look up via session_child_origins using sessionId
+    // 1. If turnId not directly supplied, try to look up via session_child_origins using sessionId as child_id
     if (!targetTurnId && sessionId) {
       try {
         const childRow = this.db.prepare(
-          'SELECT origin_turn_id FROM session_child_origins WHERE session_id = ? OR child_id = ? ORDER BY created_at DESC LIMIT 1'
-        ).get(sessionId, sessionId) as { origin_turn_id?: string } | undefined;
+          'SELECT origin_turn_id FROM session_child_origins WHERE child_id = ? LIMIT 1'
+        ).get(sessionId) as { origin_turn_id?: string } | undefined;
         if (childRow?.origin_turn_id) {
           targetTurnId = childRow.origin_turn_id;
         }
