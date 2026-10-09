@@ -131,7 +131,6 @@ export function verifyReleaseManifest(options = {}) {
       `ENKEEP_RUNTIME_IMAGE=${imageTag}`,
       `ENKEEP_PIPELINE_MANIFEST=${configDir}/pipeline-task-capabilities.json`,
       `DSH_WEB_URL=http://127.0.0.1:3080`,
-      `DSH_COMPACTION_THRESHOLD_TOKENS=200000`,
       `node ${join(worktreePath, 'packages/demo-runner/dist/demo-runner.js')} up --port ${port} --network-mode none --allow-host --repo-root ${repoRoot}`,
     ].join(' \\\n  '),
     quiescenceCheckQueries: [

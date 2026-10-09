@@ -847,8 +847,6 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       ? createInContainerProvidersSpec(dshConfig.providers)
       : undefined;
 
-    const compactionThreshold = process.env.DSH_COMPACTION_THRESHOLD_TOKENS || '200000';
-
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
       image: options.image ?? 'enkeep-demo-runtime:latest',
@@ -861,9 +859,6 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       llmModel,
       llmProviders: inContainerProviders,
     });
-    if (spec.environment) {
-      spec.environment.DSH_COMPACTION_THRESHOLD_TOKENS = compactionThreshold;
-    }
     if (options.mounts && options.mounts.length > 0) {
       spec.mounts = [...options.mounts];
     }
@@ -1267,8 +1262,6 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
 
     const runId = generateRunId();
     const storageId = `vol_host_${randomBytes(16).toString('hex').toLowerCase()}`;
-    const compactionThreshold = process.env.DSH_COMPACTION_THRESHOLD_TOKENS || '200000';
-
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
       dataRoot: paths.dataRoot,
@@ -1282,9 +1275,6 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
       platformProxyOptions: options.platformProxyOptions,
       platformProxyHandler: options.platformProxyHandler,
       mounts: options.mounts ? [...options.mounts] : undefined,
-      extraEnv: {
-        DSH_COMPACTION_THRESHOLD_TOKENS: compactionThreshold,
-      },
     });
 
     let activeHandle: ActiveRuntimeHandle;

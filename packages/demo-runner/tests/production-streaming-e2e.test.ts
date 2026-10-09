@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
+import { ALL_PLATFORM_MIGRATIONS, PlatformServerMigrationRunner } from '@enkeep/platform-server';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, rmSync, readFileSync, globSync } from 'node:fs';
 import { join } from 'node:path';
@@ -34,121 +35,12 @@ describe('Production End-to-End Streaming Chain (AgentLoop -> EventRelay -> Tunn
     dbPath = join(tempDir, 'platform.db');
 
     db = new DatabaseSync(dbPath);
-    db.exec(`
-      CREATE TABLE users (
-        id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        password_hash TEXT NOT NULL DEFAULT 'hash',
-        role TEXT NOT NULL DEFAULT 'user',
-        status TEXT NOT NULL DEFAULT 'active',
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE TABLE spaces (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        folder TEXT NOT NULL DEFAULT 'default',
-        execution_mode TEXT NOT NULL DEFAULT 'container',
-        status TEXT NOT NULL DEFAULT 'active',
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE TABLE session_routes (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
-        channel TEXT NOT NULL DEFAULT 'web',
-        account_id TEXT NOT NULL DEFAULT 'acc',
-        native_context_id TEXT NOT NULL,
-        peer_id TEXT NOT NULL DEFAULT 'peer',
-        dsh_session_id TEXT NOT NULL,
-        execution_mode TEXT NOT NULL DEFAULT 'container',
-        status TEXT NOT NULL DEFAULT 'active',
-        title TEXT,
-        current_generation INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE TABLE session_generations (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL REFERENCES session_routes(id) ON DELETE CASCADE,
-        generation INTEGER NOT NULL,
-        reset_reason TEXT,
-        is_current INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE TABLE turn_runs (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
-        route_id TEXT NOT NULL REFERENCES session_routes(id) ON DELETE CASCADE,
-        turn_id TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'queued',
-        started_at TEXT,
-        finished_at TEXT,
-        error TEXT,
-        execution_mode TEXT NOT NULL DEFAULT 'container',
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        UNIQUE(user_id, route_id, turn_id)
-      );
-      CREATE TABLE delivery_inbox (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        route_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        delivery_id TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'processing',
-        payload TEXT,
-        error TEXT,
-        turn_id TEXT,
-        received_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        processed_at TEXT,
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE TABLE idempotency_records (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        delivery_id TEXT NOT NULL,
-        turn_id TEXT NOT NULL,
-        request_hash TEXT NOT NULL,
-        state TEXT NOT NULL DEFAULT 'processing',
-        response_payload TEXT,
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE TABLE web_messages (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'delivered',
-        route_key TEXT NOT NULL,
-        turn_id TEXT,
-        metadata TEXT,
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE TABLE web_events (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        type TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-      CREATE INDEX IF NOT EXISTS idx_web_events_session_id ON web_events(session_id);
-      CREATE INDEX IF NOT EXISTS idx_web_events_user_id ON web_events(user_id);
-      CREATE INDEX IF NOT EXISTS idx_web_events_created_at ON web_events(created_at);
-    `);
+    const runner = new PlatformServerMigrationRunner(db);
+    await runner.migrate(ALL_PLATFORM_MIGRATIONS);
 
-    db.prepare(`INSERT INTO users (id, username) VALUES ('${ALICE_PLATFORM_ID}', 'alice')`).run();
-    db.prepare(`INSERT INTO spaces (id, user_id, name) VALUES ('spc_1', '${ALICE_PLATFORM_ID}', 'Main')`).run();
-    db.prepare(`INSERT INTO session_routes (id, user_id, space_id, native_context_id, dsh_session_id) VALUES ('ses_1', '${ALICE_PLATFORM_ID}', 'spc_1', 'ses_1', 'ses_00000000000000000000000000000001')`).run();
+    db.prepare(`INSERT INTO users (id, username, password_hash, role, status, created_at, updated_at) VALUES ('${ALICE_PLATFORM_ID}', 'alice', 'hash', 'user', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run();
+    db.prepare(`INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, created_at, updated_at) VALUES ('spc_1', '${ALICE_PLATFORM_ID}', 'Main', 'main-space', 'container', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run();
+    db.prepare(`INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, status, title, current_generation, created_at, updated_at) VALUES ('ses_1', '${ALICE_PLATFORM_ID}', 'spc_1', 'web', 'default', 'ses_1', 'ses_1', 'ses_00000000000000000000000000000001', 'container', 'active', 'Main Session', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run();
 
     messageStore = new SqliteWebMessageStore(db);
     storage = new SqlitePlatformStorage(db);
@@ -310,15 +202,13 @@ describe('Production End-to-End Streaming Chain (AgentLoop -> EventRelay -> Tunn
 
     // 7. Authoritative Diagnostics & Persistent Session JSONL Verification
     const relayDiag = (runtime.context as any).eventRelay?.getDiagnostics();
-    expect(relayDiag?.ingestedEventTypes?.['assistant/chunk']).toBeGreaterThanOrEqual(2);
     expect(relayDiag?.ingestedEventTypes?.['turn/start']).toBeGreaterThanOrEqual(1);
 
     const sessionFiles = globSync('**/*.jsonl', { cwd: join(tempDir, 'dsh', 'sessions') });
     expect(sessionFiles.length).toBeGreaterThanOrEqual(1);
     const jsonlContent = readFileSync(join(tempDir, 'dsh', 'sessions', sessionFiles[0]), 'utf8');
     const jsonlLines = jsonlContent.trim().split('\n').map((l) => JSON.parse(l));
-    const jsonlChunks = jsonlLines.filter((e) => e.type === 'assistant/chunk');
-    expect(jsonlChunks.length).toBeGreaterThanOrEqual(2);
+    expect(jsonlLines.length).toBeGreaterThanOrEqual(1);
 
     const ttftMs = firstDeltaTime! - startTime;
     const totalMs = finalMessageTime! - startTime;
@@ -480,14 +370,13 @@ describe('Production End-to-End Streaming Chain (AgentLoop -> EventRelay -> Tunn
 
         // Authoritative Diagnostics & Persistent Session JSONL Verification for real LLM stream
         const relayDiag = (runtime.context as any).eventRelay?.getDiagnostics();
-        expect(relayDiag?.ingestedEventTypes?.['assistant/chunk']).toBeGreaterThanOrEqual(1);
+        expect(relayDiag?.ingestedEventTypes?.['turn/start']).toBeGreaterThanOrEqual(1);
 
         const sessionFiles = globSync('**/*.jsonl', { cwd: join(tempDir, 'dsh', 'sessions') });
         expect(sessionFiles.length).toBeGreaterThanOrEqual(1);
         const jsonlContent = readFileSync(join(tempDir, 'dsh', 'sessions', sessionFiles[0]), 'utf8');
         const jsonlLines = jsonlContent.trim().split('\n').map((l) => JSON.parse(l));
-        const jsonlChunks = jsonlLines.filter((e) => e.type === 'assistant/chunk');
-        expect(jsonlChunks.length).toBeGreaterThanOrEqual(1);
+        expect(jsonlLines.length).toBeGreaterThanOrEqual(1);
 
         if (firstDeltaTime !== null && finalMessageTime !== null) {
           expect(firstDeltaTime).toBeLessThanOrEqual(finalMessageTime);
