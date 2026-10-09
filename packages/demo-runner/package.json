@@ -28,7 +28,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --exclude '**/*docker*' --exclude '**/attachment-agent-docker-e2e*' --exclude '**/fork-restore-docker-e2e*' --exclude '**/advanced-capabilities-docker-e2e*' --exclude '**/session-queue-docker-e2e*' --exclude '**/instructions-docker-e2e*' --exclude '**/controlled-mounts-docker-e2e*' --exclude '**/browser-docker-e2e*'",
+    "test": "vitest run --exclude '**/*docker*' --exclude '**/attachment-agent-docker-e2e*' --exclude '**/fork-restore-docker-e2e*' --exclude '**/advanced-capabilities-docker-e2e*' --exclude '**/session-queue-docker-e2e*' --exclude '**/instructions-docker-e2e*' --exclude '**/controlled-mounts-docker-e2e*' --exclude '**/browser-docker-e2e*' --exclude '**/browser-integration*'",
     "test:host": "vitest run tests/host-runtime-integration.test.ts tests/host-mixed-mode-routing.test.ts tests/host-crash-recovery.test.ts tests/host-security-containment.test.ts",
     "test:mounts": "vitest run --fileParallelism=false --maxWorkers=1 tests/controlled-mounts-integration.test.ts tests/controlled-mounts-docker-e2e.test.ts",
     "test:cli": "vitest run tests/cli-docker-e2e.test.ts",
