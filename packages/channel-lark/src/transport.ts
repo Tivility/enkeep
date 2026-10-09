@@ -1229,6 +1229,7 @@ export class FakeLarkTransport implements LarkTransport {
     let lastToolStatus: string | readonly CardToolStatusEntry[] | undefined;
     let lastThinkingText: string | undefined;
     let currentBackgroundPanel: string | null = null;
+    let isFinalized = false;
 
     const buildFinalCardJson = () => {
       let cleanFinalText = lastFinalText;
@@ -1292,12 +1293,21 @@ export class FakeLarkTransport implements LarkTransport {
         }
       }
 
+      if (lastStatus === 'stopped') {
+        bodyElements.push({
+          tag: 'markdown',
+          element_id: 'streaming_status_bar',
+          text_size: 'notation',
+          content: "<font color='grey'>⏹ 已停止</font>",
+        });
+      }
+
       // 3. Background tasks panel
       if (currentBackgroundPanel) {
         bodyElements.push({
           tag: 'markdown',
           content: currentBackgroundPanel,
-          element_id: 'background_tasks_panel',
+          element_id: 'bg_panel',
         });
       }
 
@@ -1402,6 +1412,7 @@ export class FakeLarkTransport implements LarkTransport {
         if (backgroundPanel !== undefined) {
           currentBackgroundPanel = backgroundPanel;
         }
+        isFinalized = true;
 
         const card = buildFinalCardJson();
 
@@ -1420,6 +1431,18 @@ export class FakeLarkTransport implements LarkTransport {
       },
       updateBackgroundPanel: async (panelText: string | null): Promise<void> => {
         currentBackgroundPanel = panelText;
+        if (!isFinalized) {
+          // Before finalize, do NOT build or push a final card, leaving the live streaming card untouched.
+          this._streamingCalls.push({
+            type: 'update_background_panel',
+            cardId,
+            messageId,
+            panelText,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
         const card = buildFinalCardJson();
 
         this._streamingCalls.push({
@@ -2726,6 +2749,7 @@ export class CredentialedLarkTransport implements LarkTransport {
       let lastToolStatus: string | readonly CardToolStatusEntry[] | undefined;
       let lastThinkingText: string | undefined;
       let currentBackgroundPanel: string | null = null;
+      let isFinalized = false;
 
       const buildFinalCard = () => {
         let cleanFinalText = lastFinalText;
@@ -2790,12 +2814,21 @@ export class CredentialedLarkTransport implements LarkTransport {
           }
         }
 
+        if (lastStatus === 'stopped') {
+          bodyElements.push({
+            tag: 'markdown',
+            element_id: 'streaming_status_bar',
+            text_size: 'notation',
+            content: "<font color='grey'>⏹ 已停止</font>",
+          });
+        }
+
         // 3. Background tasks panel
         if (currentBackgroundPanel) {
           bodyElements.push({
             tag: 'markdown',
             content: currentBackgroundPanel,
-            element_id: 'background_tasks_panel',
+            element_id: 'bg_panel',
           });
         }
 
@@ -2838,7 +2871,7 @@ export class CredentialedLarkTransport implements LarkTransport {
         };
       };
 
-      const pushFullCardUpdate = async (finalCard: any): Promise<void> => {
+      const pushFullCardUpdate = async (finalCard: any, isPanelOnly = false): Promise<void> => {
         const finalCardJson = JSON.stringify(finalCard);
         let updateSuccess = false;
         let updateError: any;
@@ -2873,6 +2906,14 @@ export class CredentialedLarkTransport implements LarkTransport {
         }
 
         if (updateSuccess) {
+          return;
+        }
+
+        if (isPanelOnly) {
+          logger.warn('[lark-stream] session card.update failed for panel-only change, skipping fallback to preserve card content', {
+            code: updateError?.code ?? (updateError as any)?.status,
+            message: updateError instanceof Error ? updateError.message : String(updateError),
+          });
           return;
         }
 
@@ -3168,14 +3209,19 @@ export class CredentialedLarkTransport implements LarkTransport {
           if (backgroundPanel !== undefined) {
             currentBackgroundPanel = backgroundPanel;
           }
+          isFinalized = true;
 
           const finalCard = buildFinalCard();
-          await pushFullCardUpdate(finalCard);
+          await pushFullCardUpdate(finalCard, false);
         },
         updateBackgroundPanel: async (panelText: string | null): Promise<void> => {
           currentBackgroundPanel = panelText;
+          if (!isFinalized) {
+            // Before finalize, do NOT build or push a final card, leaving the live streaming card untouched.
+            return;
+          }
           const finalCard = buildFinalCard();
-          await pushFullCardUpdate(finalCard);
+          await pushFullCardUpdate(finalCard, true);
         },
       };
 

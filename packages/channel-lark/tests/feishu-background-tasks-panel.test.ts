@@ -285,7 +285,7 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       const bgCall = transport.streamingCalls.find((c) => c.type === 'update_background_panel');
       expect(bgCall).toBeDefined();
       expect(bgCall?.panelText).toBe('**🔄 后台任务**\n• [subagent] worker-1 · running · 10s');
-      expect(JSON.stringify(bgCall?.card)).toContain('background_tasks_panel');
+      expect(JSON.stringify(bgCall?.card)).toContain('bg_panel');
 
       await transport.stop();
     });
