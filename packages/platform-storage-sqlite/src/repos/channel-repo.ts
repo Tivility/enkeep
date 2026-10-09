@@ -449,12 +449,12 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
   async listPendingOutbox(limit = 50, accountId?: string): Promise<ChannelOutboxItem[]> {
     if (accountId) {
       const stmt = this.db.prepare(
-        "SELECT * FROM channel_outbox WHERE user_id = ? AND account_id = ? AND status IN ('pending', 'sending') ORDER BY created_at ASC LIMIT ?"
+        "SELECT * FROM channel_outbox WHERE user_id = ? AND account_id = ? AND status IN ('pending', 'sending') AND (json_extract(payload_json, '$.deliveryStatus') IS NULL OR json_extract(payload_json, '$.deliveryStatus') != 'unknown') ORDER BY created_at ASC LIMIT ?"
       );
       return queryAll(stmt, parseChannelOutboxRow, this.userId, accountId, limit);
     }
     const stmt = this.db.prepare(
-      "SELECT * FROM channel_outbox WHERE user_id = ? AND status IN ('pending', 'sending') ORDER BY created_at ASC LIMIT ?"
+      "SELECT * FROM channel_outbox WHERE user_id = ? AND status IN ('pending', 'sending') AND (json_extract(payload_json, '$.deliveryStatus') IS NULL OR json_extract(payload_json, '$.deliveryStatus') != 'unknown') ORDER BY created_at ASC LIMIT ?"
     );
     return queryAll(stmt, parseChannelOutboxRow, this.userId, limit);
   }

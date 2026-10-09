@@ -57,6 +57,7 @@ export interface SendFileResult {
   path: string;
   size: number;
   recipient: string;
+  deliveryStatus?: 'recorded' | 'sent' | 'failed' | 'unknown';
 }
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';

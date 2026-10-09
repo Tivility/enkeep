@@ -1014,7 +1014,9 @@ export class WeChatRuntimeManager {
           SELECT co.id, co.user_id, co.account_id, co.session_id, co.payload_json, co.attempts
           FROM channel_outbox co
           JOIN channel_accounts ca ON ca.id = co.account_id AND ca.status = 'active' AND ca.type = 'wechat'
-          WHERE co.status IN ('pending', 'failed') AND co.attempts < 3
+          WHERE co.status IN ('pending', 'failed')
+            AND co.attempts < 3
+            AND (json_extract(co.payload_json, '$.deliveryStatus') IS NULL OR json_extract(co.payload_json, '$.deliveryStatus') != 'unknown')
           ORDER BY co.created_at ASC LIMIT 10
         `)
         .all() as Array<{

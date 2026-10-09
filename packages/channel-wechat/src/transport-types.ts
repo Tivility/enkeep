@@ -51,6 +51,18 @@ export interface CredentialedWeChatTransport extends WeChatTransport {
   onMessage(handler: (msg: WeChatParsedMessage) => Promise<void>): void;
   removeMessageHandler(handler: (msg: WeChatParsedMessage) => Promise<void>): void;
   sendTyping(toUserId: string, contextToken: string, isTyping: boolean): Promise<void>;
+  sendImage(
+    toUserId: string,
+    contextToken: string,
+    imageBuffer: Buffer,
+    fileName?: string
+  ): Promise<{ success: boolean; error?: string; messageId?: string }>;
+  sendFile(
+    toUserId: string,
+    contextToken: string,
+    fileBuffer: Buffer,
+    fileName?: string
+  ): Promise<{ success: boolean; error?: string; messageId?: string }>;
 }
 
 export interface WeChatTransportDeps {

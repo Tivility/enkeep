@@ -257,6 +257,14 @@ export interface IEventRelayService {
   resolveOriginTurnId(childId: string): string | undefined;
 
   /**
+   * Resolves the platform turn ID and attribution kind for a given session and optional turn number.
+   */
+  resolvePlatformTurnForSession(
+    sessionId: string,
+    intTurn?: number
+  ): { turnId: string; kind: 'direct' | 'autonomous-origin' | 'child-origin' } | undefined;
+
+  /**
    * Flush all buffered streaming event frames to platform immediately.
    */
   flush(): Promise<void>;

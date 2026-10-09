@@ -616,6 +616,11 @@ export {
   type CreateOnboardingJobOptions,
 } from './channels/lark-onboarding-service.js';
 
+export {
+  DefaultOutboundFileChannelAdapter,
+  type DefaultOutboundFileChannelAdapterOptions,
+} from './channels/outbound-file-adapter.js';
+
 // DSH Model Config
 export {
   loadDshSafeModelConfig,

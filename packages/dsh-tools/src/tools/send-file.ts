@@ -233,16 +233,21 @@ export function createSendFileTool(
           path: { type: 'string' },
           size: { type: 'integer' },
           recipient: { type: 'string' },
+          deliveryStatus: {
+            type: 'string',
+            enum: ['recorded', 'sent', 'failed', 'unknown'],
+          },
         },
         required: ['success', 'fileId', 'path', 'size', 'recipient'],
         additionalProperties: false,
       },
       render: (_args: unknown, value: JsonValue): ContentBlock[] => {
         if (isSendFileResult(value)) {
+          const statusText = value.deliveryStatus ? ` (Status: ${value.deliveryStatus})` : '';
           return [
             {
               type: 'text',
-              text: `File "${value.path}" (${value.size} bytes) sent to ${value.recipient} (File ID: ${value.fileId})`,
+              text: `File "${value.path}" (${value.size} bytes) sent to ${value.recipient} (File ID: ${value.fileId})${statusText}`,
             },
           ];
         }
@@ -349,11 +354,30 @@ export function createSendFileTool(
       const sha256Hex = crypto.createHash('sha256').update(validated.content).digest('hex');
       const base64Content = validated.content.toString('base64');
 
-      // Extract calling sessionId if known
+      // Extract calling sessionId and turn number if known
       const callerSessionId: string | undefined =
         activeAgent?.session?.header?.id ??
         (context as any)?.sessionId ??
         (context as any)?.session?.header?.id;
+
+      const intTurn: number | undefined =
+        typeof (context as any)?.turn === 'number'
+          ? (context as any).turn
+          : typeof (context as any)?.dshIntTurn === 'number'
+            ? (context as any).dshIntTurn
+            : typeof (context as any)?.turnNumber === 'number'
+              ? (context as any).turnNumber
+              : undefined;
+
+      // Resolve authoritative platform turn via eventRelay service if available
+      let callerTurnId: string | undefined;
+      const relayService = effectiveCtx?.get ? (effectiveCtx.get('eventRelay') as any) : (effectiveCtx as any)?.eventRelay;
+      if (relayService && typeof relayService.resolvePlatformTurnForSession === 'function' && callerSessionId) {
+        const resolved = relayService.resolvePlatformTurnForSession(callerSessionId, intTurn);
+        if (resolved?.turnId) {
+          callerTurnId = resolved.turnId;
+        }
+      }
 
       // 7. Execute platform request
       // Platform proxy will resolve route & spaceId from recipient or sessionId mapping in SQLite
@@ -364,6 +388,7 @@ export function createSendFileTool(
         path?: string;
         size?: number;
         recipient?: string;
+        deliveryStatus?: 'recorded' | 'sent' | 'failed' | 'unknown';
       }>('/api/files', {
         method: 'POST',
         body: {
@@ -376,6 +401,7 @@ export function createSendFileTool(
           checksum: `sha256:${sha256Hex}`,
           sha256: sha256Hex,
           ...(callerSessionId ? { sessionId: callerSessionId } : {}),
+          ...(callerTurnId ? { turnId: callerTurnId } : {}),
           ...(args.description !== undefined ? { description: args.description } : {}),
         },
       });
@@ -418,6 +444,7 @@ export function createSendFileTool(
         path: data.path || validated.relativePath,
         size: typeof data.size === 'number' ? data.size : validated.size,
         recipient: data.recipient || args.recipient,
+        ...(data.deliveryStatus ? { deliveryStatus: data.deliveryStatus } : {}),
       };
     },
     presentCall: (rawArgs: unknown) => ({

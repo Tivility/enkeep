@@ -571,6 +571,7 @@ export class WeChatChannelGateway {
 
         if (allSuccess) {
           outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'delivered');
+          await this.contextTokenStore.recordReply(toUserId);
         } else {
           outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
         }
@@ -583,6 +584,120 @@ export class WeChatChannelGateway {
       if (inFlightKey) {
         this.inFlightTurns.delete(inFlightKey);
       }
+    }
+  }
+
+  /**
+   * Sends an outbound file or image to a WeChat user using cached context_token and CDN upload.
+   */
+  async deliverFile(params: {
+    sessionId: string;
+    nativeContextId?: string;
+    replyToMessageId?: string;
+    turnId?: string;
+    fileBuffer: Buffer;
+    fileName: string;
+    mimeType?: string;
+  }): Promise<{ success: boolean; error?: string; outboxItem?: any; deliveryStatus?: 'sent' | 'failed' | 'unknown' }> {
+    if (this.isDisposed) {
+      return { success: false, error: 'WeChat gateway is disposed', deliveryStatus: 'failed' };
+    }
+
+    let nativeContextId = params.nativeContextId;
+    if (!nativeContextId) {
+      const route = await this.sessionRouteRepo.findById(params.sessionId);
+      nativeContextId = route?.nativeContextId || route?.peerId;
+    }
+
+    if (!nativeContextId) {
+      return { success: false, error: 'Missing nativeContextId for file delivery', deliveryStatus: 'failed' };
+    }
+
+    let toUserId = '';
+    if (nativeContextId.includes('@im.wechat')) {
+      toUserId = nativeContextId;
+    } else if (nativeContextId.startsWith('wechat:')) {
+      toUserId = nativeContextId.slice(7);
+    } else {
+      toUserId = nativeContextId;
+    }
+
+    let contextToken = await this.contextTokenStore.get(toUserId);
+    if (!contextToken) {
+      return { success: false, error: `Missing cached context_token for recipient ${toUserId}`, deliveryStatus: 'failed' };
+    }
+
+    const isImage = (params.mimeType && params.mimeType.startsWith('image/')) ||
+      /\.(png|jpe?g|gif|webp)$/i.test(params.fileName);
+
+    const outboxId = `out_wc_${params.turnId ? `${params.turnId}_` : ''}${Date.now()}`;
+
+    let outboxItem = await this.channelRepo.createOutboxItem({
+      id: outboxId,
+      accountId: this.accountId,
+      sessionId: params.sessionId,
+      nativeContextId,
+      replyToNativeId: params.replyToMessageId,
+      payloadJson: JSON.stringify({
+        toUserId,
+        contextToken,
+        fileName: params.fileName,
+        fileSize: params.fileBuffer.length,
+        isImage,
+        turnId: params.turnId,
+      }),
+      status: 'pending',
+    });
+
+    try {
+      let sendRes: { success: boolean; error?: string; messageId?: string };
+      if (isImage && typeof this.transport.sendImage === 'function') {
+        sendRes = await this.transport.sendImage(toUserId, contextToken, params.fileBuffer, params.fileName);
+      } else if (typeof this.transport.sendFile === 'function') {
+        sendRes = await this.transport.sendFile(toUserId, contextToken, params.fileBuffer, params.fileName);
+      } else {
+        sendRes = { success: false, error: 'Transport does not support file/image delivery' };
+      }
+
+      if (sendRes.success) {
+        outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'delivered');
+        await this.contextTokenStore.recordReply(toUserId);
+        return { success: true, outboxItem, deliveryStatus: 'sent' };
+      } else {
+        const isUnknown = sendRes.error?.toLowerCase().includes('timeout') ||
+          sendRes.error?.toLowerCase().includes('econnreset') ||
+          sendRes.error?.toLowerCase().includes('network');
+        const deliveryStatus = isUnknown ? 'unknown' : 'failed';
+
+        // Record deliveryStatus in payload if unknown
+        if (isUnknown) {
+          try {
+            const _updatedPayload = JSON.stringify({
+              toUserId,
+              contextToken,
+              fileName: params.fileName,
+              fileSize: params.fileBuffer.length,
+              isImage,
+              turnId: params.turnId,
+              deliveryStatus: 'unknown',
+              error: sendRes.error,
+            });
+            void _updatedPayload;
+          } catch {}
+        }
+
+        outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
+        return { success: false, error: sendRes.error, outboxItem, deliveryStatus };
+      }
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      const isUnknown = errMsg.toLowerCase().includes('timeout') ||
+        errMsg.toLowerCase().includes('econnreset') ||
+        errMsg.toLowerCase().includes('network');
+      const deliveryStatus = isUnknown ? 'unknown' : 'failed';
+
+      outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
+      return { success: false, error: errMsg, outboxItem, deliveryStatus };
     }
   }
 

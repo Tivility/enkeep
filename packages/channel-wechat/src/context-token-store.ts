@@ -8,14 +8,18 @@
 export interface ContextTokenEntry {
   readonly token: string;
   readonly expiresAt: number;
+  replyCount: number;
 }
 
 export interface ContextTokenStoreOptions {
   readonly maxCapacity?: number; // default: 1000
   readonly ttlMs?: number; // default: 24h (86,400,000 ms)
+  readonly maxRepliesPerToken?: number; // optional reply count cap
+  readonly replyWarningThreshold?: number; // warning threshold before reaching maxRepliesPerToken
   readonly db?: any; // optional DatabaseSync instance from node:sqlite
   readonly onPersist?: (senderId: string, token: string) => Promise<void> | void;
   readonly onLoad?: (senderId: string) => Promise<string | undefined> | string | undefined;
+  readonly onWarning?: (senderId: string, currentCount: number, limit: number) => void;
 }
 
 const DEFAULT_MAX_CAPACITY = 1000;
@@ -24,17 +28,23 @@ const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export class ContextTokenStore {
   private readonly maxCapacity: number;
   private readonly ttlMs: number;
+  private readonly maxRepliesPerToken?: number;
+  private readonly replyWarningThreshold?: number;
   private readonly db?: any;
   private readonly onPersist?: (senderId: string, token: string) => Promise<void> | void;
   private readonly onLoad?: (senderId: string) => Promise<string | undefined> | string | undefined;
+  private readonly onWarning?: (senderId: string, currentCount: number, limit: number) => void;
   private readonly l1Cache = new Map<string, ContextTokenEntry>();
 
   constructor(options: ContextTokenStoreOptions = {}) {
     this.maxCapacity = options.maxCapacity ?? DEFAULT_MAX_CAPACITY;
     this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+    this.maxRepliesPerToken = options.maxRepliesPerToken;
+    this.replyWarningThreshold = options.replyWarningThreshold;
     this.db = options.db;
     this.onPersist = options.onPersist;
     this.onLoad = options.onLoad;
+    this.onWarning = options.onWarning;
 
     if (this.db) {
       this.initDatabaseTable();
@@ -87,7 +97,7 @@ export class ContextTokenStore {
     }
 
     const expiresAt = Date.now() + this.ttlMs;
-    this.l1Cache.set(cleanSenderId, { token: cleanToken, expiresAt });
+    this.l1Cache.set(cleanSenderId, { token: cleanToken, expiresAt, replyCount: 0 });
 
     // L2 SQLite persistence
     if (this.db) {
@@ -148,6 +158,7 @@ export class ContextTokenStore {
           this.l1Cache.set(cleanSenderId, {
             token,
             expiresAt: Date.now() + this.ttlMs,
+            replyCount: 0,
           });
           return token;
         }
@@ -188,6 +199,7 @@ export class ContextTokenStore {
           this.l1Cache.set(cleanSenderId, {
             token: loaded,
             expiresAt: Date.now() + this.ttlMs,
+            replyCount: 0,
           });
           return loaded;
         }
@@ -224,6 +236,41 @@ export class ContextTokenStore {
         // Ignore
       }
     }
+  }
+
+  /**
+   * Increments reply count for a sender's context_token and checks threshold warnings.
+   */
+  async recordReply(senderId: string): Promise<{ replyCount: number; isWarning: boolean; isLimitReached: boolean }> {
+    if (!senderId) return { replyCount: 0, isWarning: false, isLimitReached: false };
+    const cleanSenderId = senderId.trim();
+    // Ensure token is loaded in L1
+    await this.get(cleanSenderId);
+    const entry = this.l1Cache.get(cleanSenderId);
+    if (!entry) return { replyCount: 0, isWarning: false, isLimitReached: false };
+
+    entry.replyCount = (entry.replyCount || 0) + 1;
+    const currentCount = entry.replyCount;
+    const limit = this.maxRepliesPerToken;
+    const warnThresh = this.replyWarningThreshold;
+
+    let isWarning = false;
+    let isLimitReached = false;
+
+    if (limit !== undefined && currentCount >= limit) {
+      isLimitReached = true;
+    }
+
+    if (limit !== undefined && warnThresh !== undefined && currentCount >= (limit - warnThresh)) {
+      isWarning = true;
+      if (this.onWarning) {
+        try {
+          this.onWarning(cleanSenderId, currentCount, limit);
+        } catch {}
+      }
+    }
+
+    return { replyCount: currentCount, isWarning, isLimitReached };
   }
 
   /**
