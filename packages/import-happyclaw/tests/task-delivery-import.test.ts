@@ -101,7 +101,7 @@ describe('HappyClaw Task Import Target Chat & Delivery Mapping (DEF-01)', () => 
         'source_only',
         'auto',
         'owner_only',
-        'ou_6749227878d159775090098ff3e65af5',
+        'ou_00000000000000000000000000000101',
         '2026-08-30T09:46:05.329Z',
         '2026-09-06T09:46:09.440Z',
         'de942f0b-e437-41a6-a0d6-067bd01f82ba'

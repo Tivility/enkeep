@@ -239,7 +239,7 @@ describe('dsh-tools: task management tools (cancel_task, list_tasks, get_task, c
       // Exact F-41 scenario: platform returns tasks with null dueDate / nextRunAt / lastRun
       const f41PlatformTasks = [
         {
-          id: 'task_86124d169cea44e0862ee5e671775aae',
+          id: 'task_00000000000000000000000000000101',
           title: 'Daily 23:00 Notification Reminder',
           status: 'cancelled',
           priority: null,
@@ -249,7 +249,7 @@ describe('dsh-tools: task management tools (cancel_task, list_tasks, get_task, c
           createdAt: '2026-09-24T15:00:00.000Z',
         },
         {
-          id: 'task_e8392104928104820194820194820194',
+          id: 'task_00000000000000000000000000000102',
           title: 'One-off Analysis Task',
           status: 'completed',
           priority: 'medium',
@@ -288,7 +288,7 @@ describe('dsh-tools: task management tools (cancel_task, list_tasks, get_task, c
       expect(patchedViolations).toEqual([]);
 
       // Verify task fields preserved accurately
-      expect(res.tasks[0].taskId).toBe('task_86124d169cea44e0862ee5e671775aae');
+      expect(res.tasks[0].taskId).toBe('task_00000000000000000000000000000101');
       expect(res.tasks[0].nextRunAt).toBeNull();
       expect(res.tasks[0].dueDate).toBeNull();
       expect(res.tasks[0].lastRun).toBeNull();
@@ -300,7 +300,7 @@ describe('dsh-tools: task management tools (cancel_task, list_tasks, get_task, c
       const blocks = renderFn!({}, res as any);
       expect(blocks).toHaveLength(1);
       const text = (blocks[0] as any).text;
-      expect(text).toContain('[task_86124d169cea44e0862ee5e671775aae] "Daily 23:00 Notification Reminder" (cancelled)');
+      expect(text).toContain('[task_00000000000000000000000000000101] "Daily 23:00 Notification Reminder" (cancelled)');
       expect(text).not.toContain('next: null');
     });
   });
