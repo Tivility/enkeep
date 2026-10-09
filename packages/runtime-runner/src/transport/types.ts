@@ -235,6 +235,8 @@ export interface AgentFollowupRequest {
   extraReadableRoots?: readonly string[];
   /** Optional effective prompt cache retention override ('short' | 'long' | 'none') */
   cacheRetention?: 'short' | 'long' | 'none' | null;
+  /** Optional effective working context window override */
+  contextWindow?: number | null;
 }
 
 export interface AgentFollowupCompletedResponse {
@@ -247,6 +249,7 @@ export interface AgentFollowupCompletedResponse {
   usage?: {
     totalTokens: number;
   };
+  compactionInfo?: any;
   modelInfo?: {
     provider: string;
     model: string;

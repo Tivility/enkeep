@@ -725,10 +725,10 @@ describe('MCP Extension Catalog & Canonical Manifest Integration', () => {
       expect(contribTableSql.sql).toContain("'mcp'");
       expect(contribTableSql.sql).toContain("'skill'");
 
-      // Verify migration count is at current latest 31
+      // Verify migration count is at current latest
       const applied = db.prepare('SELECT version FROM _schema_migrations ORDER BY version ASC').all() as any[];
-      expect(applied.length).toBe(31);
-      expect(applied[applied.length - 1].version).toBe(31);
+      expect(applied.length).toBe(ALL_PLATFORM_MIGRATIONS.length);
+      expect(applied[applied.length - 1].version).toBe(ALL_PLATFORM_MIGRATIONS.length);
     });
   });
 });

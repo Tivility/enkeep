@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { ValidationError, PlatformError, resolveTopLevelCacheRetention, isValidCacheRetention } from '@enkeep/platform-core';
+import {
+  ValidationError,
+  PlatformError,
+  resolveTopLevelCacheRetention,
+  isValidCacheRetention,
+  resolveTopLevelContextWindow,
+  isValidContextWindow,
+} from '@enkeep/platform-core';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 import type { BackgroundTask } from '../runtime/delivery-gateway.js';
 
@@ -33,6 +40,7 @@ export const HELP_USAGE = `Available commands:
   /ws new <名称> - 新建工作区并切换
   /ws home - 回到账号默认工作区
   /ws cache [long|short|none|default] - 查看或设置工作区 Prompt 缓存保留策略
+  /ws window [<tokens>|default] - 查看或设置工作区上下文窗口上限
 
 会话指令 (/session, 别名 /ses):
   /session - 查看当前会话 (短ID、标题、主会话、代际、最后活跃)
@@ -41,6 +49,7 @@ export const HELP_USAGE = `Available commands:
   /session new [标题] - 新建会话并固定
   /session clear - 清空当前会话 (主会话被共享时需 /session clear confirm)
   /session cache [long|short|none|default] - 查看或设置当前会话 Prompt 缓存保留策略
+  /session window [<tokens>|default] - 查看或设置当前会话上下文窗口上限
 
 运行与控制指令:
   /status - 查看当前工作区、会话、模型与排队状态
@@ -68,7 +77,8 @@ export const WS_USAGE = `用法:
   /ws use <名称/目录/ID/main> - 切换到工作区主会话并清除固定会话
   /ws new <名称> - 新建工作区并切换
   /ws home - 回到账号默认工作区
-  /ws cache [long|short|none|default] - 查看或设置工作区 Prompt 缓存保留策略`;
+  /ws cache [long|short|none|default] - 查看或设置工作区 Prompt 缓存保留策略
+  /ws window [<tokens>|default] - 查看或设置工作区上下文窗口上限`;
 
 export const SESSION_USAGE = `用法:
   /session - 查看当前会话 (别名: /ses)
@@ -77,7 +87,8 @@ export const SESSION_USAGE = `用法:
   /session new [标题] - 新建会话并固定
   /session clear - 清空当前会话
   /session clear confirm - 确认清空共享主会话
-  /session cache [long|short|none|default] - 查看或设置当前会话 Prompt 缓存保留策略`;
+  /session cache [long|short|none|default] - 查看或设置当前会话 Prompt 缓存保留策略
+  /session window [<tokens>|default] - 查看或设置当前会话上下文窗口上限`;
 
 /**
  * Computes deterministic short session ID:
@@ -411,6 +422,17 @@ export function parseChatCommand(
         raw: trimmed,
       };
     }
+    if (sub === 'window') {
+      return {
+        command: 'ws',
+        type: 'ws',
+        subcommand: 'window',
+        action: 'window',
+        target: subRest || undefined,
+        arg: subRest || undefined,
+        raw: trimmed,
+      };
+    }
     return {
       command: 'ws',
       type: 'ws',
@@ -487,6 +509,17 @@ export function parseChatCommand(
         type: 'session',
         subcommand: 'cache',
         action: 'cache',
+        target: subRest || undefined,
+        arg: subRest || undefined,
+        raw: trimmed,
+      };
+    }
+    if (sub === 'window') {
+      return {
+        command: 'session',
+        type: 'session',
+        subcommand: 'window',
+        action: 'window',
         target: subRest || undefined,
         arg: subRest || undefined,
         raw: trimmed,
@@ -1250,10 +1283,10 @@ export class ChatCommandService {
 
   private isMutatingCommand(parsed: ParsedChatCommand): boolean {
     if (parsed.command === 'ws') {
-      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'home' || (parsed.subcommand === 'cache' && Boolean(parsed.target || parsed.arg));
+      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'home' || ((parsed.subcommand === 'cache' || parsed.subcommand === 'window') && Boolean(parsed.target || parsed.arg));
     }
     if (parsed.command === 'session' || parsed.command === 'ses') {
-      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'clear' || (parsed.subcommand === 'cache' && Boolean(parsed.target || parsed.arg));
+      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'clear' || ((parsed.subcommand === 'cache' || parsed.subcommand === 'window') && Boolean(parsed.target || parsed.arg));
     }
     if (parsed.command === 'bg') {
       return parsed.subcommand === 'stop';
@@ -1587,6 +1620,8 @@ export class ChatCommandService {
         return await this.executeWsHomeCommand(params, parsed);
       case 'cache':
         return await this.executeWsCacheCommand(params, parsed);
+      case 'window':
+        return await this.executeWsWindowCommand(params, parsed);
       default:
         return { replyText: WS_USAGE };
     }
@@ -1643,6 +1678,60 @@ export class ChatCommandService {
     }
 
     return { replyText: '用法: /ws cache [long|short|none|default]' };
+  }
+
+  private async executeWsWindowCommand(
+    params: { userId: string; sessionId: string; spaceId: string; channelContext?: ChatCommandChannelContext },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, spaceId } = params;
+    const targetArg = (parsed.target || parsed.arg || '').trim().toLowerCase();
+
+    let targetSpaceId = spaceId;
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT space_id FROM session_routes WHERE id = ?')
+          .get(params.sessionId) as { space_id?: string } | undefined;
+        if (routeRow?.space_id) targetSpaceId = routeRow.space_id;
+      } catch {}
+    }
+
+    let currentOverride: number | null = null;
+    if (this.db) {
+      try {
+        const spaceRow = this.db
+          .prepare('SELECT context_window FROM spaces WHERE id = ?')
+          .get(targetSpaceId) as { context_window?: number | null } | undefined;
+        if (spaceRow?.context_window) {
+          currentOverride = spaceRow.context_window;
+        }
+      } catch {}
+    }
+
+    if (!targetArg) {
+      const resolution = resolveTopLevelContextWindow({ spaceContextWindow: currentOverride });
+      const source = currentOverride ? 'space' : 'platform';
+      return { replyText: `当前工作区 Working Context Window: ${resolution.contextWindow} (来源: ${source})` };
+    }
+
+    if (targetArg === 'default') {
+      if (this.db) {
+        this.db.prepare('UPDATE spaces SET context_window = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(targetSpaceId);
+      }
+      const resolution = resolveTopLevelContextWindow({ spaceContextWindow: null });
+      return { replyText: `已清除当前工作区 Context Window 覆盖，恢复平台默认值 (${resolution.contextWindow}).` };
+    }
+
+    const parsedTokens = Number(targetArg);
+    if (isValidContextWindow(parsedTokens)) {
+      if (this.db) {
+        this.db.prepare('UPDATE spaces SET context_window = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(parsedTokens, targetSpaceId);
+      }
+      return { replyText: `已设置当前工作区 Context Window 为 ${parsedTokens}.` };
+    }
+
+    return { replyText: '用法: /ws window [<tokens>|default]' };
   }
 
   private async executeWsShowCommand(
@@ -2085,6 +2174,8 @@ export class ChatCommandService {
         return await this.executeSessionClearCommand(params, parsed);
       case 'cache':
         return await this.executeSessionCacheCommand(params, parsed);
+      case 'window':
+        return await this.executeSessionWindowCommand(params, parsed);
       default:
         return { replyText: SESSION_USAGE };
     }
@@ -2147,6 +2238,66 @@ export class ChatCommandService {
     }
 
     return { replyText: '用法: /session cache [long|short|none|default]' };
+  }
+
+  private async executeSessionWindowCommand(
+    params: { userId: string; sessionId: string; spaceId: string; channelContext?: ChatCommandChannelContext },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId, spaceId } = params;
+    const targetArg = (parsed.target || parsed.arg || '').trim().toLowerCase();
+
+    let targetSpaceId = spaceId;
+    let sessionOverride: number | null = null;
+    let spaceOverride: number | null = null;
+
+    if (this.db) {
+      try {
+        const routeRow = this.db
+          .prepare('SELECT space_id, context_window FROM session_routes WHERE id = ? AND user_id = ?')
+          .get(sessionId, userId) as { space_id?: string; context_window?: number | null } | undefined;
+        if (routeRow) {
+          if (routeRow.space_id) targetSpaceId = routeRow.space_id;
+          if (routeRow.context_window) sessionOverride = routeRow.context_window;
+        }
+
+        const spaceRow = this.db
+          .prepare('SELECT context_window FROM spaces WHERE id = ?')
+          .get(targetSpaceId) as { context_window?: number | null } | undefined;
+        if (spaceRow?.context_window) {
+          spaceOverride = spaceRow.context_window;
+        }
+      } catch {}
+    }
+
+    if (!targetArg) {
+      const resolution = resolveTopLevelContextWindow({
+        sessionContextWindow: sessionOverride,
+        spaceContextWindow: spaceOverride,
+      });
+      return { replyText: `当前会话 Working Context Window: ${resolution.contextWindow} (来源: ${resolution.source})` };
+    }
+
+    if (targetArg === 'default') {
+      if (this.db) {
+        this.db.prepare('UPDATE session_routes SET context_window = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?').run(sessionId, userId);
+      }
+      const resolution = resolveTopLevelContextWindow({
+        sessionContextWindow: null,
+        spaceContextWindow: spaceOverride,
+      });
+      return { replyText: `已清除当前会话 Context Window 覆盖，生效值: ${resolution.contextWindow} (来源: ${resolution.source}).` };
+    }
+
+    const parsedTokens = Number(targetArg);
+    if (isValidContextWindow(parsedTokens)) {
+      if (this.db) {
+        this.db.prepare('UPDATE session_routes SET context_window = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?').run(parsedTokens, sessionId, userId);
+      }
+      return { replyText: `已设置当前会话 Context Window 为 ${parsedTokens}.` };
+    }
+
+    return { replyText: '用法: /session window [<tokens>|default]' };
   }
 
   private async executeSessionShowCommand(

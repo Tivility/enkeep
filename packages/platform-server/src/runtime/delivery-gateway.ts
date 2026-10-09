@@ -5,6 +5,7 @@ import {
   NotFoundError,
   ValidationError,
   resolveTopLevelCacheRetention,
+  resolveTopLevelContextWindow,
   type PlatformStorage,
   type EffectiveModelSelection,
   type ExecutionMode,
@@ -78,6 +79,7 @@ export interface DeliveryExecutionRequest {
   readonly extensionPlan?: ExtensionActivationPlan | null;
   readonly timeoutMs?: number;
   readonly cacheRetention?: 'short' | 'long' | 'none' | null;
+  readonly contextWindow?: number | null;
 }
 
 const envGrace = process.env.ENKEEP_QUOTA_RESERVATION_GRACE_SECONDS;
@@ -2216,8 +2218,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         };
 
         const spaceRow = this.db
-          .prepare('SELECT folder, status, execution_mode, cache_retention FROM spaces WHERE id = ? AND user_id = ?')
-          .get(spaceId, userId) as { folder: string; status: string; execution_mode?: string; cache_retention?: string | null } | undefined;
+          .prepare('SELECT folder, status, execution_mode, cache_retention, context_window FROM spaces WHERE id = ? AND user_id = ?')
+          .get(spaceId, userId) as { folder: string; status: string; execution_mode?: string; cache_retention?: string | null; context_window?: number | null } | undefined;
         if (!spaceRow) {
           throw new PlatformError(`Space "${spaceId}" not found for user "${userId}"`, 'SPACE_NOT_FOUND', 404);
         }
@@ -2233,18 +2235,27 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
         // Resolve top-level session cache retention precedence: session override -> space override -> platform top default
         let sessionCacheRetention: string | null = null;
+        let sessionContextWindow: number | null = null;
         try {
           const routeRow = this.db
-            .prepare('SELECT cache_retention FROM session_routes WHERE id = ? AND user_id = ?')
-            .get(sessionId, userId) as { cache_retention?: string | null } | undefined;
+            .prepare('SELECT cache_retention, context_window FROM session_routes WHERE id = ? AND user_id = ?')
+            .get(sessionId, userId) as { cache_retention?: string | null; context_window?: number | null } | undefined;
           if (routeRow?.cache_retention) {
             sessionCacheRetention = routeRow.cache_retention;
+          }
+          if (routeRow?.context_window) {
+            sessionContextWindow = routeRow.context_window;
           }
         } catch {}
 
         const effectiveCacheRetention = resolveTopLevelCacheRetention({
           sessionRetention: sessionCacheRetention,
           spaceRetention: spaceRow.cache_retention ?? null,
+        });
+
+        const effectiveContextWindow = resolveTopLevelContextWindow({
+          sessionContextWindow,
+          spaceContextWindow: spaceRow.context_window ?? null,
         });
 
         // 6. Execute turn via executor (exactly once)
@@ -2300,6 +2311,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             extensionPlan: spaceExtensionPlan,
             timeoutMs,
             cacheRetention: effectiveCacheRetention.retention,
+            contextWindow: effectiveContextWindow.contextWindow,
           };
 
           executionResult = await this.executor.execute(executionRequest);

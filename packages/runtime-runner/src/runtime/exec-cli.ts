@@ -1790,6 +1790,7 @@ export async function runExecCli(argv: string[] = process.argv.slice(2)): Promis
           attachments: (req as any).attachments,
           modelSelection: (req as any).modelSelection,
           cacheRetention: (req as any).cacheRetention,
+          contextWindow: (req as any).contextWindow,
         });
       } catch (err: unknown) {
         if (err instanceof PersistedSessionResumeError) {

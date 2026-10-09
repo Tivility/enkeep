@@ -428,7 +428,7 @@ describe('Management Console Backend Contract & Security Tests', () => {
       expect(json.data.kpis.processingTasks).toBe(0); // all tasks pending, completed, or failed
       expect(json.data.kpis.runningTasks).toBe(0);
       expect(json.data.kpis.recentLoginFailures24h).toBeGreaterThanOrEqual(1);
-      expect(json.data.kpis.currentSchemaVersion).toBe(31);
+      expect(json.data.kpis.currentSchemaVersion).toBe(40);
 
       // Runtime without provider: explicit unavailable contract (never synthetic 0)
       expect(json.data.kpis.containers.available).toBe(false);
@@ -444,7 +444,7 @@ describe('Management Console Backend Contract & Security Tests', () => {
       expect(json.data.runtime.healthyContainers).toBeNull();
       expect(json.data.runtime.totalContainers).toBeNull();
 
-      expect(json.data.schema.currentVersion).toBe(31);
+      expect(json.data.schema.currentVersion).toBe(40);
 
       assertNoSensitiveFields(json);
 
@@ -569,11 +569,11 @@ describe('Management Console Backend Contract & Security Tests', () => {
       expect(res.status).toBe(200);
       const json = await res.json();
       expect(json.success).toBe(true);
-      expect(json.data.migrations.currentVersion).toBe(31);
-      expect(json.data.migrations.expectedVersion).toBe(31);
+      expect(json.data.migrations.currentVersion).toBe(40);
+      expect(json.data.migrations.expectedVersion).toBe(40);
       expect(json.data.migrations.checksumsMatch).toBe(true);
       expect(Array.isArray(json.data.migrations.applied)).toBe(true);
-      expect(json.data.migrations.applied.length).toBe(31);
+      expect(json.data.migrations.applied.length).toBe(40);
 
       // Verify applied items contain version, name, appliedAt and NEVER expose checksum hashes
       for (const item of json.data.migrations.applied) {
@@ -824,8 +824,8 @@ describe('Management Console Backend Contract & Security Tests', () => {
         expect(json.data.kpis.runningTasks).toBeGreaterThanOrEqual(1);
         expect(json.data.kpis.processingTasks).toBeGreaterThanOrEqual(2); // running + claimed
         expect(json.data.counts.tasks.processing).toBeGreaterThanOrEqual(2);
-        expect(json.data.kpis.currentSchemaVersion).toBe(31);
-        expect(json.data.schema.currentVersion).toBe(31);
+        expect(json.data.kpis.currentSchemaVersion).toBe(40);
+        expect(json.data.schema.currentVersion).toBe(40);
       } finally {
         db.prepare(`DELETE FROM delivery_inbox WHERE status = 'held' OR id = 'deliv-held-test-1'`).run();
         db.prepare(`DELETE FROM web_messages WHERE id = 'msg-held-1'`).run();

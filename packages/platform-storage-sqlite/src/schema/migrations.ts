@@ -1592,6 +1592,14 @@ ALTER TABLE session_routes ADD COLUMN cache_retention TEXT;
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_040_CONTEXT_WINDOW_OVERRIDES_SQL = `
+-- Migration 40: Layered working context window override on spaces and session_routes
+ALTER TABLE spaces ADD COLUMN context_window INTEGER;
+ALTER TABLE session_routes ADD COLUMN context_window INTEGER;
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

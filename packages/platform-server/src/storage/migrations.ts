@@ -52,6 +52,7 @@ import {
   MIGRATION_037_CHANNEL_TURN_ORIGINS_SQL,
   MIGRATION_038_CHANNEL_BINDING_SESSION_ROUTE_SQL,
   MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL,
+  MIGRATION_040_CONTEXT_WINDOW_OVERRIDES_SQL,
 } from '@enkeep/platform-storage-sqlite';
 
 export {
@@ -326,6 +327,12 @@ export const ALL_PLATFORM_MIGRATIONS: MigrationDefinition[] = [
     name: '039_cache_retention_overrides',
     upSql: MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL,
     checksum: computeChecksum(MIGRATION_039_CACHE_RETENTION_OVERRIDES_SQL),
+  },
+  {
+    version: 40,
+    name: '040_context_window_overrides',
+    upSql: MIGRATION_040_CONTEXT_WINDOW_OVERRIDES_SQL,
+    checksum: computeChecksum(MIGRATION_040_CONTEXT_WINDOW_OVERRIDES_SQL),
   },
 ];
 

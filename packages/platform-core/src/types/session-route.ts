@@ -20,6 +20,7 @@ export interface SessionRoute {
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
   cacheRetention?: CacheRetention | null;
+  contextWindow?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -39,6 +40,7 @@ export interface CreateSessionRouteInput {
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
   cacheRetention?: CacheRetention | null;
+  contextWindow?: number | null;
 }
 
 export interface UpdateSessionRouteInput {
@@ -49,6 +51,7 @@ export interface UpdateSessionRouteInput {
   agentProfileId?: string | null;
   agentProfileSnapshotId?: string | null;
   cacheRetention?: CacheRetention | null;
+  contextWindow?: number | null;
 }
 
 export interface ResetSessionRouteInput {

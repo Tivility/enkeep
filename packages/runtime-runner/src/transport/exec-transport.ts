@@ -198,7 +198,7 @@ export class DockerExecTransport implements RuntimeTransport {
 
     // Validate exact allowed keys on request: no unknown keys allowed
     const requestKeys = Object.keys(request);
-    const allowedKeys = new Set(['prompt', 'sessionId', 'turnId', 'profile', 'timeoutMs', 'workspaceFolder', 'spaceId', 'attachments', 'modelSelection', 'cacheRetention']);
+    const allowedKeys = new Set(['prompt', 'sessionId', 'turnId', 'profile', 'timeoutMs', 'workspaceFolder', 'spaceId', 'attachments', 'modelSelection', 'cacheRetention', 'contextWindow']);
     for (const key of requestKeys) {
       if (!allowedKeys.has(key)) {
         throw new RuntimeProtocolError(RUNTIME_ERROR_CODES.PROTOCOL_VIOLATION);
@@ -279,6 +279,15 @@ export class DockerExecTransport implements RuntimeTransport {
       throw new RuntimeProtocolError(RUNTIME_ERROR_CODES.PROTOCOL_VIOLATION);
     }
 
+    if (
+      'contextWindow' in request &&
+      request.contextWindow !== undefined &&
+      request.contextWindow !== null &&
+      (typeof request.contextWindow !== 'number' || !Number.isSafeInteger(request.contextWindow) || request.contextWindow <= 0)
+    ) {
+      throw new RuntimeProtocolError(RUNTIME_ERROR_CODES.PROTOCOL_VIOLATION);
+    }
+
     // Validate prompt: non-empty string, exact preserved representation, max 64KiB (65,536 UTF-8 bytes)
     if (
       typeof request.prompt !== 'string' ||
@@ -332,6 +341,7 @@ export class DockerExecTransport implements RuntimeTransport {
         ...(request.attachments ? { attachments: request.attachments } : {}),
         ...(request.modelSelection ? { modelSelection: request.modelSelection } : {}),
         ...(request.cacheRetention ? { cacheRetention: request.cacheRetention } : {}),
+        ...(request.contextWindow ? { contextWindow: request.contextWindow } : {}),
       },
       {
         cliPath: this.cliScriptPath,

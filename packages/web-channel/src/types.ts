@@ -53,6 +53,7 @@ export interface PublicSpace {
   readonly status: PublicLifecycleStatus;
   readonly canonicalSessionId?: string | null;
   readonly cacheRetention?: 'short' | 'long' | 'none' | null;
+  readonly contextWindow?: number | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lastActivityAt?: string;
@@ -73,6 +74,7 @@ export interface PublicSession {
   readonly status: PublicLifecycleStatus;
   readonly currentGeneration: number;
   readonly cacheRetention?: 'short' | 'long' | 'none' | null;
+  readonly contextWindow?: number | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lastActivityAt?: string;
@@ -232,6 +234,7 @@ export interface UpdateSpaceInput {
   readonly name?: string;
   readonly executionMode?: 'container' | 'host';
   readonly cacheRetention?: 'short' | 'long' | 'none' | null;
+  readonly contextWindow?: number | null;
 }
 
 /**
@@ -250,6 +253,7 @@ export interface CreateSessionInput {
 export interface UpdateSessionInput {
   readonly title?: string | null;
   readonly cacheRetention?: 'short' | 'long' | 'none' | null;
+  readonly contextWindow?: number | null;
 }
 
 /**

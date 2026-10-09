@@ -63,7 +63,7 @@ describe('Official DSH 0.1.1-rc.2 Capability Plugins Integration', () => {
     } catch {}
   });
 
-  describe('P0: Compaction (compaction-basic + tool-result-pruner + token-meter)', () => {
+  describe('P0: Compaction (compaction-window + tool-result-pruner + token-meter)', () => {
     it('reads model contextWindow/maxTokens and exposes operational compaction engine', async () => {
       const runtime = await bootDshRuntime({
         userId: 'alice',

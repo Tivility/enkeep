@@ -183,6 +183,7 @@ export interface SubmitTurnRequest extends DaemonRequestBase {
   readonly extensionPlan?: ExtensionActivationPlan | null;
   readonly extraReadableRoots?: readonly string[];
   readonly cacheRetention?: 'short' | 'long' | 'none' | null;
+  readonly contextWindow?: number | null;
 }
 
 export interface CancelRequest extends DaemonRequestBase {

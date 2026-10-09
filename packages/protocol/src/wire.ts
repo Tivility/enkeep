@@ -673,6 +673,8 @@ export interface RuntimeTurnRequest {
   readonly extraReadableRoots?: readonly string[];
   /** Optional effective prompt cache retention for the top-level turn ('short' | 'long' | 'none') */
   readonly cacheRetention?: 'short' | 'long' | 'none' | null;
+  /** Optional effective working context window for the top-level turn */
+  readonly contextWindow?: number | null;
 }
 
 

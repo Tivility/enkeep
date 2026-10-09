@@ -15371,6 +15371,7 @@ function selectSpace(spaceId) {
 function updateSpaceLifecycleControls() {
   const renameBtn = document.getElementById("btn-rename-space");
   const cacheBtn = document.getElementById("btn-space-cache");
+  const windowBtn = document.getElementById("btn-space-window");
   const mountsBtn = document.getElementById("btn-manage-mounts");
   const archiveBtn = document.getElementById("btn-archive-space");
   const restoreBtn = document.getElementById("btn-restore-space");
@@ -15388,6 +15389,11 @@ function updateSpaceLifecycleControls() {
     cacheBtn.disabled = !hasSpace || isArchived;
     if (isArchived) cacheBtn.classList.add("hidden");
     else cacheBtn.classList.remove("hidden");
+  }
+  if (windowBtn) {
+    windowBtn.disabled = !hasSpace || isArchived;
+    if (isArchived) windowBtn.classList.add("hidden");
+    else windowBtn.classList.remove("hidden");
   }
   if (mountsBtn) {
     if (isAdmin && hasSpace && !isArchived) {
@@ -15596,6 +15602,108 @@ async function handleSaveSessionCache(e) {
     closeModal("modal-session-cache");
   } catch (err) {
     showToast(getSafeErrorMessage(err, "Failed to update cache override"), "error");
+  }
+}
+
+let activeWindowSpaceId = null;
+
+async function openSpaceWindowModal(spaceId = state.currentSpaceId) {
+  if (!spaceId) return;
+  activeWindowSpaceId = spaceId;
+  const effEl = document.getElementById("space-window-effective");
+  const inputEl = document.getElementById("space-window-input");
+
+  if (effEl) effEl.textContent = t("common.loading", null, "Loading...");
+
+  try {
+    const res = await apiRequest(`/api/spaces/${encodeURIComponent(spaceId)}/context-window`);
+    if (res && res.data) {
+      if (effEl) {
+        effEl.textContent = `${res.data.effective} tokens (Source: ${res.data.source})`;
+      }
+      if (inputEl) {
+        inputEl.value = res.data.override !== null && res.data.override !== undefined ? res.data.override : "";
+      }
+    }
+  } catch (err) {
+    if (effEl) effEl.textContent = getSafeErrorMessage(err, "Failed to load context window");
+  }
+
+  openModal("modal-space-window");
+}
+
+async function handleSaveSpaceWindow(e) {
+  e.preventDefault();
+  if (!activeWindowSpaceId) return;
+  const inputEl = document.getElementById("space-window-input");
+  const rawVal = inputEl ? inputEl.value.trim() : "";
+  const val = rawVal ? Number(rawVal) : "default";
+
+  try {
+    await apiRequest(`/api/spaces/${encodeURIComponent(activeWindowSpaceId)}/context-window`, {
+      method: "PUT",
+      body: { contextWindow: val },
+    });
+    showToast(t("toast.windowSavedSuccess", null, "Context window updated"), "success");
+    closeModal("modal-space-window");
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, "Failed to update context window"), "error");
+  }
+}
+
+let activeWindowSessionId = null;
+
+async function openSessionWindowModal(sessionId = state.currentSessionId) {
+  if (!sessionId) return;
+  activeWindowSessionId = sessionId;
+  const effEl = document.getElementById("session-window-effective");
+  const probEl = document.getElementById("session-window-problem");
+  const inputEl = document.getElementById("session-window-input");
+
+  if (effEl) effEl.textContent = t("common.loading", null, "Loading...");
+  if (probEl) {
+    probEl.textContent = "";
+    probEl.classList.add("hidden");
+  }
+
+  try {
+    const res = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/context-window`);
+    if (res && res.data) {
+      if (effEl) {
+        const clampNotice = res.data.isClamped ? ` [clamped to model max: ${res.data.clamped}]` : "";
+        effEl.textContent = `${res.data.effective} tokens (Source: ${res.data.source})${clampNotice}`;
+      }
+      if (probEl && res.data.problem) {
+        probEl.textContent = `⚠️ ${res.data.problem}`;
+        probEl.classList.remove("hidden");
+      }
+      if (inputEl) {
+        inputEl.value = res.data.override !== null && res.data.override !== undefined ? res.data.override : "";
+      }
+    }
+  } catch (err) {
+    if (effEl) effEl.textContent = getSafeErrorMessage(err, "Failed to load context window");
+  }
+
+  openModal("modal-session-window");
+}
+
+async function handleSaveSessionWindow(e) {
+  e.preventDefault();
+  if (!activeWindowSessionId) return;
+  const inputEl = document.getElementById("session-window-input");
+  const rawVal = inputEl ? inputEl.value.trim() : "";
+  const val = rawVal ? Number(rawVal) : "default";
+
+  try {
+    await apiRequest(`/api/sessions/${encodeURIComponent(activeWindowSessionId)}/context-window`, {
+      method: "PUT",
+      body: { contextWindow: val },
+    });
+    showToast(t("toast.windowSavedSuccess", null, "Context window updated"), "success");
+    closeModal("modal-session-window");
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, "Failed to update context window"), "error");
   }
 }
 
@@ -16276,6 +16384,11 @@ async function selectSession(sessionId) {
   const sessionCacheBtn = document.getElementById("btn-session-cache");
   if (sessionCacheBtn) {
     sessionCacheBtn.classList.remove("hidden");
+  }
+
+  const sessionWindowBtn = document.getElementById("btn-session-window");
+  if (sessionWindowBtn) {
+    sessionWindowBtn.classList.remove("hidden");
   }
 
   const renameBtn = document.getElementById("btn-rename-session");
@@ -20546,6 +20659,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const spaceCacheForm = document.getElementById('form-space-cache');
   if (spaceCacheForm) spaceCacheForm.addEventListener('submit', handleSaveSpaceCache);
 
+  const spaceWindowBtn = document.getElementById('btn-space-window');
+  if (spaceWindowBtn) spaceWindowBtn.addEventListener('click', () => openSpaceWindowModal(state.currentSpaceId));
+
+  const spaceWindowForm = document.getElementById('form-space-window');
+  if (spaceWindowForm) spaceWindowForm.addEventListener('submit', handleSaveSpaceWindow);
+
   const manageMountsBtn = document.getElementById('btn-manage-mounts');
   if (manageMountsBtn) manageMountsBtn.addEventListener('click', openSpaceMountsModal);
 
@@ -20636,6 +20755,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const sessionCacheForm = document.getElementById('form-session-cache');
   if (sessionCacheForm) sessionCacheForm.addEventListener('submit', handleSaveSessionCache);
+
+  const sessionWindowBtn = document.getElementById('btn-session-window');
+  if (sessionWindowBtn) sessionWindowBtn.addEventListener('click', () => openSessionWindowModal(state.currentSessionId));
+
+  const sessionWindowForm = document.getElementById('form-session-window');
+  if (sessionWindowForm) sessionWindowForm.addEventListener('submit', handleSaveSessionWindow);
 
   const renameSessionForm = document.getElementById('rename-session-form');
   if (renameSessionForm) renameSessionForm.addEventListener('submit', handleRenameSession);

@@ -60,6 +60,8 @@ import {
   getPlatformTopLevelCacheRetention,
   getPlatformChildCacheRetention,
   isValidCacheRetention,
+  getPlatformDefaultContextWindow,
+  isValidContextWindow,
   type CircuitBreakerState,
 } from '@enkeep/platform-core';
 import {
@@ -888,7 +890,6 @@ const ALLOWED_BOOT_CONFIG_KEYS = new Set([
   'llmBaseUrl',
   'providers',
   'compaction',
-  'thresholdTokens',
   'instructions',
   'skills',
   'subagents',
@@ -998,12 +999,6 @@ export function validateDshRuntimeBootConfig(rawConfig: unknown): ValidatedDshRu
       throw new TypeError('Invalid "compaction": must be an object');
     }
     compaction = { ...(rawConfig.compaction as CompactionMountConfig) };
-  }
-  if ('thresholdTokens' in rawConfig && rawConfig.thresholdTokens !== undefined) {
-    if (typeof rawConfig.thresholdTokens !== 'number' || !Number.isSafeInteger(rawConfig.thresholdTokens) || rawConfig.thresholdTokens <= 0) {
-      throw new TypeError('Invalid "thresholdTokens": must be a positive safe integer');
-    }
-    compaction = { ...compaction, thresholdTokens: rawConfig.thresholdTokens };
   }
 
   let instructions: InstructionsMountConfig | undefined;
@@ -1209,12 +1204,7 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
   function resolveInjectGlobalMemoryForAgent(agentCandidate: any, runtimeCtx?: Context): 'never' | 'always' | undefined {
     if (isChildSession(agentCandidate, runtimeCtx)) {
       const opts = agentCandidate?.options ?? (agentCandidate?.ctx?.get ? agentCandidate.ctx.get('agent')?.options : undefined);
-      const shouldInject = Boolean(
-        opts?.globalMemory ??
-        opts?.global_memory ??
-        agentCandidate?.globalMemory ??
-        agentCandidate?.global_memory
-      );
+      const shouldInject = opts?.globalMemory === true;
       return shouldInject ? 'always' : 'never';
     }
     return undefined;
@@ -1302,6 +1292,15 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
 
     if (agent?.id && isChildSession(agent, ctx)) {
       agentRetentionRefs.set(agent.id, { current: getPlatformChildCacheRetention() });
+      if (agent.session) {
+        const compactionService = (ctx as any).compaction ?? (ctx.get ? ctx.get('compaction') : undefined);
+        if (compactionService && typeof compactionService.setSessionSettings === 'function') {
+          const defaultWindow = getPlatformDefaultContextWindow();
+          compactionService.setSessionSettings(agent.session, { contextWindow: defaultWindow }).catch((err: unknown) => {
+            ctx.logger?.warn?.(`Failed to set default contextWindow for child agent ${agent.id}:`, err);
+          });
+        }
+      }
     }
 
     agent.ctx.effect(() => {
@@ -3798,6 +3797,7 @@ function logWarn(agentCtx: Context, message: string): void {
       fallbackChain?: readonly any[];
     } | null | undefined;
     let effCacheRetention: 'short' | 'long' | 'none';
+    let effContextWindow: number | undefined;
 
     let effReplyReference: {
       replyToMessageId: string;
@@ -3821,6 +3821,9 @@ function logWarn(agentCtx: Context, message: string): void {
       effCacheRetention = (req.cacheRetention && isValidCacheRetention(req.cacheRetention))
         ? req.cacheRetention
         : getPlatformTopLevelCacheRetention();
+      effContextWindow = (req.contextWindow && isValidContextWindow(req.contextWindow))
+        ? req.contextWindow
+        : (req.contextWindow === null ? undefined : (isValidContextWindow(req.contextWindow) ? req.contextWindow : undefined));
       effReplyReference = req.replyReference;
       effMounts = req.mounts ?? undefined;
       effExtensionPlan = req.extensionPlan !== undefined ? req.extensionPlan : undefined;
@@ -3834,6 +3837,7 @@ function logWarn(agentCtx: Context, message: string): void {
       effAttachments = attachments;
       effModelSelection = undefined;
       effCacheRetention = getPlatformTopLevelCacheRetention();
+      effContextWindow = undefined;
       effReplyReference = undefined;
       effMounts = undefined;
       effExtensionPlan = undefined;
@@ -3942,6 +3946,31 @@ function logWarn(agentCtx: Context, message: string): void {
         agentRetentionRefs.set(effSessionId, retentionRef);
       } else {
         retentionRef.current = effCacheRetention;
+      }
+
+      // Update per-turn dynamic working context window on compaction service
+      const compactionService = (ctx as any).compaction ?? (ctx.get ? ctx.get('compaction') : undefined);
+      if (compactionService && typeof compactionService.setSessionSettings === 'function' && currentAgent?.session) {
+        const projections = (ctx as any).sessionProjections ?? (ctx.get ? ctx.get('sessionProjections') : undefined);
+        const currentSettings = projections?.stateOf ? projections.stateOf(currentAgent.session, 'compaction-window') : undefined;
+        const currentWindow = currentSettings?.contextWindow;
+
+        if (effContextWindow !== undefined) {
+          if (currentWindow !== effContextWindow) {
+            await compactionService.setSessionSettings(currentAgent.session, {
+              ...currentSettings,
+              contextWindow: effContextWindow,
+            });
+          }
+        } else if (currentWindow !== undefined) {
+          // If caller cleared/defaulted contextWindow, clear or restore
+          if (currentSettings && Object.keys(currentSettings).length > 1) {
+            const { contextWindow: _discard, ...remaining } = currentSettings;
+            await compactionService.setSessionSettings(currentAgent.session, remaining);
+          } else {
+            await compactionService.clearSessionSettings(currentAgent.session);
+          }
+        }
       }
 
       // 0. Update dynamic per-turn model selection on live agent if specified
@@ -4203,6 +4232,13 @@ function logWarn(agentCtx: Context, message: string): void {
           source: effModelSelection?.source ?? (effModelSelection ? 'override' : 'dsh_default'),
         };
 
+        let compactionEffective: any = undefined;
+        if (compactionService && typeof compactionService.effectiveSettings === 'function' && currentAgent?.session) {
+          try {
+            compactionEffective = await compactionService.effectiveSettings(currentAgent.session);
+          } catch {}
+        }
+
         return {
           sessionId: effSessionId,
           turnId: assignedTurnId,
@@ -4212,6 +4248,7 @@ function logWarn(agentCtx: Context, message: string): void {
           persisted: true,
           usage: finalUsage,
           modelInfo: finalModelInfo,
+          compactionInfo: compactionEffective,
           routeAttempts,
         };
       }

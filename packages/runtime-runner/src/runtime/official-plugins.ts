@@ -82,7 +82,7 @@ import LocalSpillStore from '@deepseek-ai/dsh-spill-local';
 import * as SpillPolicyPlugin from '@deepseek-ai/dsh-spill-policy';
 import TokenMeter from '@deepseek-ai/dsh-token-meter';
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner';
-import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic';
+import CompactionWindowService, { type CompactionWindowConfig, type CompactionWindowEngine } from '@tivility/dsh-compaction-window';
 import * as AgentInstructionsPlugin from '@deepseek-ai/dsh-agent-instructions';
 import SkillRegistry from '@deepseek-ai/dsh-skill';
 import * as SkillFilesystemPlugin from '@deepseek-ai/dsh-skill-filesystem';
@@ -91,7 +91,7 @@ import SubagentRuntime from '@deepseek-ai/dsh-subagent';
 import * as SubagentSpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process';
 import * as SubagentForkPlugin from '@deepseek-ai/dsh-subagent-fork-in-process';
 import * as ToolSubagentPlugin from '@deepseek-ai/dsh-tool-subagent';
-import * as ToolSubagentMemoryPlugin from '@enkeep/dsh-tool-subagent-memory';
+import * as ToolSubagentMemoryPlugin from '@tivility/dsh-tool-subagent-memory';
 import SubagentModelSelectionConfig from '@deepseek-ai/dsh-tool-subagent/model-selection-settings';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite';
@@ -103,7 +103,8 @@ import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy';
 import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local';
 import { SandboxUnavailableError, type SandboxPolicy, type ConfinedArgv } from '@deepseek-ai/dsh-sandbox';
 import { NodePtcRuntime } from '@deepseek-ai/dsh-ptc-runtime-node';
-import { PtcWorkflowEngine, ToolWorkflowPlugin } from '@enkeep/dsh-tool-workflow-memory';
+import PtcWorkflowEngine from '@tivility/dsh-tool-workflow-memory/engine';
+import * as ToolWorkflowPlugin from '@tivility/dsh-tool-workflow-memory';
 import { scopeOf } from '@deepseek-ai/dsh-scope';
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets';
 import { WebRuntime } from '@deepseek-ai/dsh-web';
@@ -270,17 +271,12 @@ export function backfillSubagentModelSelection(ctx: Context, session?: Session):
   recordSubagentModelSelection(ctx.get('sessionProjections'), session, current.allowedModels);
 }
 
-export function deriveCompactionThresholdRatio(thresholdTokens: number, contextWindow: number): number {
-  if (contextWindow <= 0) return 0.2;
-  const ratio = thresholdTokens / contextWindow;
-  return Math.min(0.8, Math.max(0.2, ratio));
-}
-
 export interface CompactionMountConfig {
-  readonly thresholdTokens?: number;
+  readonly contextWindow?: number;
   readonly thresholdRatio?: number;
   readonly retainRatio?: number;
   readonly retainTokens?: number;
+  readonly headroomTokens?: number;
   readonly auto?: boolean;
   readonly thresholdChars?: number;
   readonly headChars?: number;
@@ -1777,20 +1773,16 @@ export async function mountOfficialPlugins(
     fibers.push(prunerFiber);
     mountedPlugins.set('tool-result-pruner', prunerFiber);
 
-    // 1.3 BasicCompactionEngine (provides ctx.compaction)
-    let thresholdRatio = config.compaction?.thresholdRatio;
-    if (thresholdRatio === undefined && config.compaction?.thresholdTokens !== undefined) {
-      const effectiveContextWindow = config.contextWindow ?? 1000000;
-      thresholdRatio = deriveCompactionThresholdRatio(config.compaction.thresholdTokens, effectiveContextWindow);
-    }
-    const compactionFiber = await ctx.plugin(BasicCompactionEngine, {
+    // 1.3 CompactionWindowService (provides ctx.compaction)
+    const compactionFiber = await ctx.plugin(CompactionWindowService, {
       auto: config.compaction?.auto ?? true,
-      thresholdRatio,
+      thresholdRatio: config.compaction?.thresholdRatio,
       retainRatio: config.compaction?.retainRatio,
       retainTokens: config.compaction?.retainTokens,
+      headroomTokens: config.compaction?.headroomTokens,
     });
     fibers.push(compactionFiber);
-    mountedPlugins.set('compaction-basic', compactionFiber);
+    mountedPlugins.set('compaction-window', compactionFiber);
 
     // 2. Approval Subsystem (Process-global service definition)
     const approvalFiber = await ctx.plugin(ApprovalService, {
@@ -2055,7 +2047,7 @@ export async function mountOfficialPlugins(
     const compactionService = ctx.get('compaction');
     const tokenMeterService = ctx.get('tokenMeter');
     const prunerService = ctx.get('toolResultPruner');
-    const compactionFiber = mountedPlugins.get('compaction-basic');
+    const compactionFiber = mountedPlugins.get('compaction-window') ?? mountedPlugins.get('compaction-basic');
     const compactionReady = Boolean(
       compactionService &&
         tokenMeterService &&
