@@ -103,10 +103,16 @@ importers:
       '@enkeep/platform-core':
         specifier: workspace:*
         version: link:../platform-core
+      qrcode:
+        specifier: ^1.5.4
+        version: 1.5.4
     devDependencies:
       '@types/node':
         specifier: ^26.2.0
         version: 26.2.0
+      '@types/qrcode':
+        specifier: ^1.5.6
+        version: 1.5.6
       typescript:
         specifier: ^5.9.0
         version: 5.9.3
@@ -717,6 +723,9 @@ importers:
       '@enkeep/channel-lark':
         specifier: workspace:*
         version: link:../channel-lark
+      '@enkeep/channel-wechat':
+        specifier: workspace:*
+        version: link:../channel-wechat
       '@enkeep/dsh-enkeep-bundle':
         specifier: workspace:*
         version: link:../dsh-enkeep-bundle

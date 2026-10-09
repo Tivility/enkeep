@@ -33,7 +33,7 @@ import {
   type WeChatTransport,
   type WeChatTransportConfig,
   type WeChatMediaAttachmentIngestor,
-} from '../../../channel-wechat/dist/index.js';
+} from '@enkeep/channel-wechat';
 
 export interface WeChatResolvedCredentials {
   readonly botToken: string;

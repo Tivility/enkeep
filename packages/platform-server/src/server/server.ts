@@ -136,6 +136,7 @@ import {
 import { SqliteStreamEventSource } from '../channels/sqlite-stream-event-source.js';
 import { LarkEncryptedCredentialStore } from '../channels/lark-encrypted-credentials.js';
 import { LarkOnboardingService } from '../channels/lark-onboarding-service.js';
+import { WeChatOnboardingService } from '../channels/wechat-onboarding-service.js';
 import type { LarkCredentialResolver, StreamEventSource } from '@enkeep/channel-lark';
 import {
   createPlatformLarkScopedConfigProvider,
@@ -266,6 +267,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'larkEncryptedCredentialStore',
   'larkCredentialKeyFilePath',
   'larkScopedConfigProvider',
+  'wechatOnboardingService',
   'streamEventSource',
   'dataRoot',
   'pipelineManifestPath',
@@ -448,6 +450,8 @@ export interface PlatformServerOptions {
   larkCredentialKeyFilePath?: string;
   /** Optional platform-level Lark scoped configuration provider for Feishu CLI tool execution */
   larkScopedConfigProvider?: LarkScopedConfigProvider;
+  /** Optional WeChat onboarding service */
+  wechatOnboardingService?: WeChatOnboardingService;
   /** Optional stream event source for Lark interactive reply cards */
   streamEventSource?: StreamEventSource;
 }
@@ -507,6 +511,7 @@ export class PlatformServer {
   public readonly wechatRuntimeManager?: WeChatRuntimeManager;
   public readonly larkEncryptedCredentialStore?: LarkEncryptedCredentialStore;
   public readonly larkOnboardingService?: LarkOnboardingService;
+  public readonly wechatOnboardingService?: WeChatOnboardingService;
   public readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
   public readonly externalInteractionService?: IExternalInteractionService;
   public readonly mountReconciler?: RuntimeMountReconciler;
@@ -1005,6 +1010,15 @@ export class PlatformServer {
           })
         : undefined);
 
+    this.wechatOnboardingService =
+      options.wechatOnboardingService ??
+      new WeChatOnboardingService({
+        storage: this.storage,
+        db,
+        runtimeManager: this.wechatRuntimeManager,
+        masterKey: effectiveWeChatMasterKey,
+      });
+
     // 7. Initialize Task Worker if requested or injected (placed after providers, dshHome, dataRoot, and channelRuntimeManager)
     if (options.taskWorker) {
       this.taskWorker = options.taskWorker;
@@ -1067,7 +1081,7 @@ export class PlatformServer {
 
     this.channelRoutes =
       options.channelRoutes ??
-      new ChannelRoutes(this.channelService, this.csrfToken, this.larkOnboardingService);
+      new ChannelRoutes(this.channelService, this.csrfToken, this.larkOnboardingService, this.wechatOnboardingService);
 
     // 8. Construct HTTP Request Handler with all injected and adapted operational services
     this.handler = createPlatformServerHandler({

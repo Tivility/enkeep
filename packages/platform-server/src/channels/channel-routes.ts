@@ -32,6 +32,7 @@ import { assertStrictBodyShape, validateExactString } from '../extensions/extens
 
 import type { ChannelRuntimeManager } from './channel-runtime-manager.js';
 import type { LarkOnboardingService } from './lark-onboarding-service.js';
+import type { WeChatOnboardingService } from './wechat-onboarding-service.js';
 import type { WeChatRuntimeManager } from './wechat-runtime.js';
 
 export const ALLOWED_CHANNEL_ACCOUNT_CREATE_KEYS = Object.freeze([
@@ -62,6 +63,7 @@ export const ALLOWED_CHANNEL_BINDING_UPDATE_KEYS = Object.freeze([
 ]);
 
 export const ALLOWED_ONBOARDING_JOB_CREATE_KEYS = Object.freeze([
+  'channel',
   'action',
   'spaceId',
   'accountId',
@@ -69,6 +71,10 @@ export const ALLOWED_ONBOARDING_JOB_CREATE_KEYS = Object.freeze([
   'appName',
   'initialChatId',
   'brand',
+]);
+
+export const ALLOWED_ONBOARDING_JOB_VERIFY_KEYS = Object.freeze([
+  'verifyCode',
 ]);
 
 export class ChannelManagementService {
@@ -261,16 +267,19 @@ export class ChannelManagementService {
 export class ChannelRoutes {
   private readonly service: ChannelManagementService;
   private readonly onboardingService?: LarkOnboardingService;
+  private readonly wechatOnboardingService?: WeChatOnboardingService;
   private readonly expectedCsrfToken?: string;
 
   constructor(
     service: ChannelManagementService,
     expectedCsrfToken?: string,
-    onboardingService?: LarkOnboardingService
+    onboardingService?: LarkOnboardingService,
+    wechatOnboardingService?: WeChatOnboardingService
   ) {
     this.service = service;
     this.expectedCsrfToken = expectedCsrfToken;
     this.onboardingService = onboardingService;
+    this.wechatOnboardingService = wechatOnboardingService;
   }
 
   async handle(
@@ -287,15 +296,17 @@ export class ChannelRoutes {
         if (this.expectedCsrfToken) {
           validateCsrf(req, { csrfToken: this.expectedCsrfToken });
         }
-        if (!this.onboardingService) {
-          throw new PlatformError('Onboarding service is not configured on this server');
-        }
 
         const body = await readJsonBody(req);
         if (!isRecord(body)) {
           throw new ValidationError('Request body must be a JSON object');
         }
         assertStrictBodyShape(body, ALLOWED_ONBOARDING_JOB_CREATE_KEYS, 'Onboarding Job Creation payload');
+
+        const channel = body.channel !== undefined ? validateExactString(body.channel, 'channel') : 'lark';
+        if (channel !== 'lark' && channel !== 'wechat') {
+          throw new ValidationError(`Invalid channel "${channel}". Allowed: lark, wechat.`);
+        }
 
         const action = validateExactString(body.action, 'action', true)!;
         if (action !== 'create_new' && action !== 'configure_existing') {
@@ -304,8 +315,31 @@ export class ChannelRoutes {
 
         const spaceId = validateExactString(body.spaceId, 'spaceId', true)!;
         const accountId = body.accountId !== undefined ? validateExactString(body.accountId, 'accountId') : undefined;
-        const appId = body.appId !== undefined ? validateExactString(body.appId, 'appId') : undefined;
         const appName = body.appName !== undefined ? validateExactString(body.appName, 'appName') : undefined;
+
+        if (channel === 'wechat') {
+          if (!this.wechatOnboardingService) {
+            throw new PlatformError('WeChat onboarding service is not configured on this server');
+          }
+
+          const job = await this.wechatOnboardingService.createJob({
+            userId: user.id,
+            spaceId,
+            action: action as any,
+            accountId,
+            appName,
+          });
+
+          sendJsonResponse(res, 201, createSuccessEnvelope(job));
+          return true;
+        }
+
+        // Default Lark channel flow
+        if (!this.onboardingService) {
+          throw new PlatformError('Onboarding service is not configured on this server');
+        }
+
+        const appId = body.appId !== undefined ? validateExactString(body.appId, 'appId') : undefined;
         const initialChatId = body.initialChatId !== undefined ? validateExactString(body.initialChatId, 'initialChatId') : undefined;
         const brand = body.brand !== undefined ? validateExactString(body.brand, 'brand') : undefined;
 
@@ -329,6 +363,31 @@ export class ChannelRoutes {
       }
     }
 
+    // ──────────────── /api/manage/channels/onboarding/jobs/:id/verify ────────────────
+    const jobVerifyMatch = pathname.match(/^\/api\/manage\/channels\/onboarding\/jobs\/([^/]+)\/verify$/);
+    if (jobVerifyMatch) {
+      const jobId = decodeURIComponent(jobVerifyMatch[1]);
+      if (method === 'POST') {
+        if (this.expectedCsrfToken) {
+          validateCsrf(req, { csrfToken: this.expectedCsrfToken });
+        }
+        if (!this.wechatOnboardingService) {
+          throw new PlatformError('WeChat onboarding service is not configured on this server');
+        }
+
+        const body = await readJsonBody(req);
+        if (!isRecord(body)) {
+          throw new ValidationError('Request body must be a JSON object');
+        }
+        assertStrictBodyShape(body, ALLOWED_ONBOARDING_JOB_VERIFY_KEYS, 'Onboarding Job Verify payload');
+
+        const verifyCode = validateExactString(body.verifyCode, 'verifyCode', true)!;
+        const job = await this.wechatOnboardingService.submitVerifyCode(user.id, jobId, verifyCode);
+        sendJsonResponse(res, 200, createSuccessEnvelope(job));
+        return true;
+      }
+    }
+
     // ──────────────── /api/manage/channels/onboarding/jobs/:id/cancel ────────────────
     const jobCancelMatch = pathname.match(/^\/api\/manage\/channels\/onboarding\/jobs\/([^/]+)\/cancel$/);
     if (jobCancelMatch) {
@@ -337,6 +396,20 @@ export class ChannelRoutes {
         if (this.expectedCsrfToken) {
           validateCsrf(req, { csrfToken: this.expectedCsrfToken });
         }
+
+        // Try wechat first if jobId has wx or wechat service exists
+        if (this.wechatOnboardingService) {
+          try {
+            const job = await this.wechatOnboardingService.cancelJob(user.id, jobId);
+            sendJsonResponse(res, 200, createSuccessEnvelope(job));
+            return true;
+          } catch (err) {
+            if (!(err instanceof NotFoundError) || !this.onboardingService) {
+              throw err;
+            }
+          }
+        }
+
         if (!this.onboardingService) {
           throw new PlatformError('Onboarding service is not configured on this server');
         }
@@ -352,6 +425,18 @@ export class ChannelRoutes {
     if (jobMatch) {
       const jobId = decodeURIComponent(jobMatch[1]);
       if (method === 'GET') {
+        if (this.wechatOnboardingService) {
+          try {
+            const job = await this.wechatOnboardingService.getJobStatus(user.id, jobId);
+            sendJsonResponse(res, 200, createSuccessEnvelope(job));
+            return true;
+          } catch (err) {
+            if (!(err instanceof NotFoundError) || !this.onboardingService) {
+              throw err;
+            }
+          }
+        }
+
         if (!this.onboardingService) {
           throw new PlatformError('Onboarding service is not configured on this server');
         }

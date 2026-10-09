@@ -19,10 +19,12 @@
     "test:wechat": "vitest run tests/wechat-parser-and-fake-transport.test.ts"
   },
   "dependencies": {
-    "@enkeep/platform-core": "workspace:*"
+    "@enkeep/platform-core": "workspace:*",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "@types/qrcode": "^1.5.6",
     "typescript": "^5.9.0",
     "vitest": "^4.1.8"
   }

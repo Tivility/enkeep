@@ -66,6 +66,14 @@ const MANAGEMENT_LOCALES = {
     'channels.groupTriggerModeAlways': 'Reply to all group messages',
     'channels.groupTriggerSaved': 'Group trigger saved',
     'channels.groupTriggerSaveFailed': 'Failed to update group trigger',
+    'channels.btnWeChatScan': 'WeChat QR Onboarding',
+    'channels.btnSubmitVerifyCode': 'Submit Code',
+    'channels.onboardingModalTitleWeChat': 'WeChat QR Integration',
+    'channels.wechatVerifyCodeTitle': 'Enter WeChat Verification Code',
+    'channels.wechatVerifyCodeDesc': 'WeChat requires secondary confirmation. Please enter the numeric verification code displayed in WeChat on your phone; this is not an SMS code and will not be stored permanently.',
+    'channels.wechatVerifyCodePlaceholder': 'Enter numeric code',
+    'channels.wechatScanPrompt': 'Please scan with WeChat App and confirm on mobile',
+    'channels.wechatReadyAlert': 'WeChat Bot onboarding successful! Channel connected and ready.',
     'section.workspaces.deliveries.label': 'Delivery Pipeline',
     'section.workspaces.deliveries.desc': 'Inbound delivery receipts and dispatch status',
     'section.storage.files.label': 'Files Workbench',
@@ -600,6 +608,14 @@ const MANAGEMENT_LOCALES = {
     'channels.groupTriggerModeAlways': '监听群内所有消息',
     'channels.groupTriggerSaved': '群聊触发方式已保存',
     'channels.groupTriggerSaveFailed': '保存群聊触发方式失败',
+    'channels.btnWeChatScan': '微信扫码接入',
+    'channels.btnSubmitVerifyCode': '提交验证码',
+    'channels.onboardingModalTitleWeChat': '微信扫码接入',
+    'channels.wechatVerifyCodeTitle': '输入微信验证码',
+    'channels.wechatVerifyCodeDesc': '微信可能要求二次确认。请输入手机微信中显示的数字验证码；这不是短信验证码，也不会被长期保存。',
+    'channels.wechatVerifyCodePlaceholder': '输入数字验证码',
+    'channels.wechatScanPrompt': '请使用微信扫描二维码，并在手机端确认登录',
+    'channels.wechatReadyAlert': '微信机器人接入完成！渠道已连接并正常运行。',
     'section.workspaces.deliveries.label': '投递流水线',
     'section.workspaces.deliveries.desc': '入站投递回执与分发状态',
     'section.storage.files.label': '文件工作台',
@@ -9279,8 +9295,8 @@ window.channelOnboardingController = {
     this.currentJobId = null;
     this.currentStatus = null;
 
-    // cleanup仅waiting/configuring/verifying状态cancel；ready/awaiting_approval关闭不发cancel已提交任务（只本地stop）
-    const cancellableStatuses = ['waiting_for_scan', 'configuring', 'verifying', 'waiting', 'pending'];
+    // cleanup仅waiting/configuring/verifying/need_verifycode状态cancel；ready/awaiting_approval关闭不发cancel已提交任务（只本地stop）
+    const cancellableStatuses = ['waiting_for_scan', 'need_verifycode', 'configuring', 'verifying', 'waiting', 'pending'];
     if (jobId && status && cancellableStatuses.includes(status)) {
       try {
         await apiRequest(`/api/manage/channels/onboarding/jobs/${encodeURIComponent(jobId)}/cancel`, {
@@ -9291,7 +9307,7 @@ window.channelOnboardingController = {
   },
 };
 
-function openChannelOnboardingModal(action, accounts = [], spaces = [], initialAccountId = null) {
+function openChannelOnboardingModal(action, accounts = [], spaces = [], initialAccountId = null, channel = 'lark') {
   if (window.channelOnboardingController) {
     window.channelOnboardingController.cleanup();
     window.channelOnboardingController.epoch = (window.channelOnboardingController.epoch || 0) + 1;
@@ -9304,11 +9320,18 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
   if (!modalBody) return;
   modalBody.replaceChildren();
 
+  const isWeChat = channel === 'wechat';
   const titleEl = document.getElementById('channel-onboarding-modal-title');
   if (titleEl) {
-    titleEl.textContent = action === 'create_new'
-      ? (getLocale() === 'zh-CN' ? '新建机器人' : 'Create New Bot')
-      : (getLocale() === 'zh-CN' ? '配置已有机器人' : 'Configure Existing Bot');
+    if (isWeChat) {
+      titleEl.textContent = action === 'create_new'
+        ? (getLocale() === 'zh-CN' ? '微信扫码接入' : 'WeChat QR Integration')
+        : (getLocale() === 'zh-CN' ? '重新绑定微信' : 'Rebind WeChat Account');
+    } else {
+      titleEl.textContent = action === 'create_new'
+        ? (getLocale() === 'zh-CN' ? '新建机器人' : 'Create New Bot')
+        : (getLocale() === 'zh-CN' ? '配置已有机器人' : 'Configure Existing Bot');
+    }
   }
 
   const renderStep1 = () => {
@@ -9316,7 +9339,9 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
 
     const stepHeader = document.createElement('h4');
     stepHeader.className = 'channel-step-subtitle';
-    stepHeader.textContent = getLocale() === 'zh-CN' ? '1. 选择机器人与默认工作区' : '1. Select Bot & Default Workspace';
+    stepHeader.textContent = isWeChat
+      ? (getLocale() === 'zh-CN' ? '1. 选择默认工作区' : '1. Select Default Workspace')
+      : (getLocale() === 'zh-CN' ? '1. 选择机器人与默认工作区' : '1. Select Bot & Default Workspace');
     modalBody.appendChild(stepHeader);
 
     const form = document.createElement('form');
@@ -9326,65 +9351,92 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
     let appNameInput = null;
     let accSelect = null;
 
-    if (action === 'configure_existing') {
-      const larkAccounts = accounts.filter((a) => a.type === 'lark');
-      if (larkAccounts.length > 0) {
-        const accGroup = document.createElement('div');
-        accGroup.className = 'form-group';
-        const accLabel = document.createElement('label');
-        accLabel.textContent = getLocale() === 'zh-CN' ? '选择机器人' : 'Choose bot';
-        accLabel.htmlFor = 'channel-modal-bot-select';
-        accSelect = document.createElement('select');
-        accSelect.id = 'channel-modal-bot-select';
-        accSelect.className = 'form-select channel-modal-bot-select';
+    if (!isWeChat) {
+      if (action === 'configure_existing') {
+        const larkAccounts = accounts.filter((a) => a.type === 'lark');
+        if (larkAccounts.length > 0) {
+          const accGroup = document.createElement('div');
+          accGroup.className = 'form-group';
+          const accLabel = document.createElement('label');
+          accLabel.textContent = getLocale() === 'zh-CN' ? '选择机器人' : 'Choose bot';
+          accLabel.htmlFor = 'channel-modal-bot-select';
+          accSelect = document.createElement('select');
+          accSelect.id = 'channel-modal-bot-select';
+          accSelect.className = 'form-select channel-modal-bot-select';
 
-        const manualOpt = document.createElement('option');
-        manualOpt.value = '';
-        manualOpt.textContent = getLocale() === 'zh-CN' ? '-- 输入其他已有应用 App ID --' : '-- Enter other App ID --';
-        accSelect.appendChild(manualOpt);
+          const manualOpt = document.createElement('option');
+          manualOpt.value = '';
+          manualOpt.textContent = getLocale() === 'zh-CN' ? '-- 输入其他已有应用 App ID --' : '-- Enter other App ID --';
+          accSelect.appendChild(manualOpt);
 
-        larkAccounts.forEach((a) => {
-          const opt = document.createElement('option');
-          opt.value = a.id;
-          const match = a.credentialRef ? a.credentialRef.match(/cli_[a-zA-Z0-9]+/) : null;
-          const appSuffix = match ? ` (...${match[0].slice(-6)})` : ` (${a.id.slice(-6)})`;
-          opt.textContent = `${a.name || (getLocale() === 'zh-CN' ? '飞书账号' : 'Feishu Account')}${appSuffix}`;
-          accSelect.appendChild(opt);
-        });
+          larkAccounts.forEach((a) => {
+            const opt = document.createElement('option');
+            opt.value = a.id;
+            const match = a.credentialRef ? a.credentialRef.match(/cli_[a-zA-Z0-9]+/) : null;
+            const appSuffix = match ? ` (...${match[0].slice(-6)})` : ` (${a.id.slice(-6)})`;
+            opt.textContent = `${a.name || (getLocale() === 'zh-CN' ? '飞书账号' : 'Feishu Account')}${appSuffix}`;
+            accSelect.appendChild(opt);
+          });
 
-        accGroup.appendChild(accLabel);
-        accGroup.appendChild(accSelect);
-        form.appendChild(accGroup);
+          accGroup.appendChild(accLabel);
+          accGroup.appendChild(accSelect);
+          form.appendChild(accGroup);
+        }
+
+        const appGroup = document.createElement('div');
+        appGroup.className = 'form-group';
+        const appLabel = document.createElement('label');
+        appLabel.textContent = getLocale() === 'zh-CN' ? '已有应用 App ID (cli_*) *' : 'Existing App ID (cli_*) *';
+        appLabel.htmlFor = 'channel-modal-appid-input';
+        appIdInput = document.createElement('input');
+        appIdInput.id = 'channel-modal-appid-input';
+        appIdInput.type = 'text';
+        appIdInput.className = 'form-input';
+        appIdInput.placeholder = 'cli_xxxxxxxxxxxxxxxx';
+        appIdInput.required = true;
+        appGroup.appendChild(appLabel);
+        appGroup.appendChild(appIdInput);
+        form.appendChild(appGroup);
+      } else {
+        const nameGroup = document.createElement('div');
+        nameGroup.className = 'form-group';
+        const nameLabel = document.createElement('label');
+        nameLabel.textContent = getLocale() === 'zh-CN' ? '机器人名称 (可选)' : 'Bot Name (optional)';
+        nameLabel.htmlFor = 'channel-modal-appname-input';
+        appNameInput = document.createElement('input');
+        appNameInput.id = 'channel-modal-appname-input';
+        appNameInput.type = 'text';
+        appNameInput.className = 'form-input';
+        appNameInput.placeholder = getLocale() === 'zh-CN' ? '飞书机器人' : 'Enkeep Bot';
+        nameGroup.appendChild(nameLabel);
+        nameGroup.appendChild(appNameInput);
+        form.appendChild(nameGroup);
       }
-
-      const appGroup = document.createElement('div');
-      appGroup.className = 'form-group';
-      const appLabel = document.createElement('label');
-      appLabel.textContent = getLocale() === 'zh-CN' ? '已有应用 App ID (cli_*) *' : 'Existing App ID (cli_*) *';
-      appLabel.htmlFor = 'channel-modal-appid-input';
-      appIdInput = document.createElement('input');
-      appIdInput.id = 'channel-modal-appid-input';
-      appIdInput.type = 'text';
-      appIdInput.className = 'form-input';
-      appIdInput.placeholder = 'cli_xxxxxxxxxxxxxxxx';
-      appIdInput.required = true;
-      appGroup.appendChild(appLabel);
-      appGroup.appendChild(appIdInput);
-      form.appendChild(appGroup);
     } else {
-      const nameGroup = document.createElement('div');
-      nameGroup.className = 'form-group';
-      const nameLabel = document.createElement('label');
-      nameLabel.textContent = getLocale() === 'zh-CN' ? '机器人名称 (可选)' : 'Bot Name (optional)';
-      nameLabel.htmlFor = 'channel-modal-appname-input';
-      appNameInput = document.createElement('input');
-      appNameInput.id = 'channel-modal-appname-input';
-      appNameInput.type = 'text';
-      appNameInput.className = 'form-input';
-      appNameInput.placeholder = getLocale() === 'zh-CN' ? '飞书机器人' : 'Enkeep Bot';
-      nameGroup.appendChild(nameLabel);
-      nameGroup.appendChild(appNameInput);
-      form.appendChild(nameGroup);
+      if (action === 'configure_existing') {
+        const wechatAccounts = accounts.filter((a) => a.type === 'wechat');
+        if (wechatAccounts.length > 0) {
+          const accGroup = document.createElement('div');
+          accGroup.className = 'form-group';
+          const accLabel = document.createElement('label');
+          accLabel.textContent = getLocale() === 'zh-CN' ? '选择微信账号' : 'Choose WeChat account';
+          accLabel.htmlFor = 'channel-modal-bot-select';
+          accSelect = document.createElement('select');
+          accSelect.id = 'channel-modal-bot-select';
+          accSelect.className = 'form-select channel-modal-bot-select';
+
+          wechatAccounts.forEach((a) => {
+            const opt = document.createElement('option');
+            opt.value = a.id;
+            opt.textContent = `${a.name || (getLocale() === 'zh-CN' ? '微信账号' : 'WeChat Account')} (${a.id.slice(-6)})`;
+            accSelect.appendChild(opt);
+          });
+
+          accGroup.appendChild(accLabel);
+          accGroup.appendChild(accSelect);
+          form.appendChild(accGroup);
+        }
+      }
     }
 
     // Default workspace selector (pure workspace name, NO UUIDs in text!)
@@ -9422,11 +9474,13 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
 
     // Existing bot pre-selection logic
     if (action === 'configure_existing') {
-      const larkAccounts = accounts.filter((a) => a.type === 'lark');
+      const matchedAccounts = accounts.filter((a) => a.type === channel);
       const updateSelectedBot = (acc) => {
         if (acc) {
-          const match = acc.credentialRef ? acc.credentialRef.match(/cli_[a-zA-Z0-9]+/) : null;
-          if (appIdInput) appIdInput.value = match ? match[0] : '';
+          if (appIdInput) {
+            const match = acc.credentialRef ? acc.credentialRef.match(/cli_[a-zA-Z0-9]+/) : null;
+            appIdInput.value = match ? match[0] : '';
+          }
           if (spaceSelect) {
             if (acc.defaultSpaceId && spaces.some((s) => s.id === acc.defaultSpaceId)) {
               spaceSelect.value = acc.defaultSpaceId;
@@ -9443,13 +9497,13 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
       if (accSelect) {
         let defaultAcc = null;
         if (initialAccountId) {
-          defaultAcc = larkAccounts.find((a) => a.id === initialAccountId);
+          defaultAcc = matchedAccounts.find((a) => a.id === initialAccountId);
         }
-        if (!defaultAcc) {
-          defaultAcc = larkAccounts.find((a) => a.credentialRef && /cli_[a-zA-Z0-9]+/.test(a.credentialRef));
+        if (!defaultAcc && !isWeChat) {
+          defaultAcc = matchedAccounts.find((a) => a.credentialRef && /cli_[a-zA-Z0-9]+/.test(a.credentialRef));
         }
-        if (!defaultAcc && larkAccounts.length > 0) {
-          defaultAcc = larkAccounts[0];
+        if (!defaultAcc && matchedAccounts.length > 0) {
+          defaultAcc = matchedAccounts[0];
         }
 
         if (defaultAcc) {
@@ -9462,13 +9516,13 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
 
         accSelect.addEventListener('change', () => {
           if (accSelect.value) {
-            const acc = larkAccounts.find((a) => a.id === accSelect.value);
+            const acc = matchedAccounts.find((a) => a.id === accSelect.value);
             updateSelectedBot(acc || null);
           } else {
             updateSelectedBot(null);
           }
         });
-      } else if (larkAccounts.length === 0 && spaces.length > 0) {
+      } else if (matchedAccounts.length === 0 && spaces.length > 0) {
         spaceSelect.value = spaces[0].id;
       }
     }
@@ -9488,7 +9542,9 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
     const submitBtn = document.createElement('button');
     submitBtn.type = 'submit';
     submitBtn.className = 'btn btn-primary';
-    submitBtn.textContent = getLocale() === 'zh-CN' ? '下一步：扫码授权' : 'Next: Scan QR';
+    submitBtn.textContent = isWeChat
+      ? (getLocale() === 'zh-CN' ? '下一步：微信扫码' : 'Next: Scan WeChat QR')
+      : (getLocale() === 'zh-CN' ? '下一步：扫码授权' : 'Next: Scan QR');
 
     actionsRow.appendChild(cancelBtn);
     actionsRow.appendChild(submitBtn);
@@ -9503,9 +9559,10 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
 
       try {
         const payload = {
+          channel,
           action,
           spaceId: spaceSelect.value ? spaceSelect.value : undefined,
-          accountId: accSelect && accSelect.value ? accSelect.value : undefined,
+          accountId: accSelect && accSelect.value ? accSelect.value : (initialAccountId || undefined),
           appId: appIdInput ? appIdInput.value.trim() : undefined,
           appName: appNameInput ? appNameInput.value.trim() : undefined,
         };
@@ -9528,7 +9585,7 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
           const job = res && res.data;
           if (job && job.id) {
             const jobStatus = job.status || 'waiting_for_scan';
-            const cancellableStatuses = ['waiting_for_scan', 'configuring', 'verifying', 'waiting', 'pending'];
+            const cancellableStatuses = ['waiting_for_scan', 'need_verifycode', 'configuring', 'verifying', 'waiting', 'pending'];
             if (cancellableStatuses.includes(jobStatus)) {
               try {
                 await apiRequest(`/api/manage/channels/onboarding/jobs/${encodeURIComponent(job.id)}/cancel`, {
@@ -9550,7 +9607,9 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
         }
         showToast(err.message || 'Failed to start onboarding', 'error');
         submitBtn.disabled = false;
-        submitBtn.textContent = getLocale() === 'zh-CN' ? '下一步：扫码授权' : 'Next: Scan QR';
+        submitBtn.textContent = isWeChat
+          ? (getLocale() === 'zh-CN' ? '下一步：微信扫码' : 'Next: Scan WeChat QR')
+          : (getLocale() === 'zh-CN' ? '下一步：扫码授权' : 'Next: Scan QR');
       }
     });
 
@@ -9567,9 +9626,13 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
     window.channelOnboardingController.currentStatus = currentJob.status;
     modalBody.replaceChildren();
 
+    const isWeChatJob = currentJob.channel === 'wechat' || isWeChat;
+
     const stepHeader = document.createElement('h4');
     stepHeader.className = 'channel-step-subtitle';
-    stepHeader.textContent = getLocale() === 'zh-CN' ? '2. 请用飞书App扫一扫，并在手机确认' : '2. Please scan with Feishu App and confirm on mobile';
+    stepHeader.textContent = isWeChatJob
+      ? (getLocale() === 'zh-CN' ? '2. 请使用微信扫描二维码' : '2. Please scan with WeChat App and confirm')
+      : (getLocale() === 'zh-CN' ? '2. 请用飞书App扫一扫，并在手机确认' : '2. Please scan with Feishu App and confirm on mobile');
     modalBody.appendChild(stepHeader);
 
     const qrBox = document.createElement('div');
@@ -9584,7 +9647,7 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
 
     const updateQrDisplay = () => {
       qrMediaWrap.replaceChildren();
-      if (currentJob.status !== 'waiting_for_scan') {
+      if (currentJob.status !== 'waiting_for_scan' && currentJob.status !== 'need_verifycode') {
         return;
       }
       if (currentJob.qrSvg) {
@@ -9602,7 +9665,7 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
       } else if (currentJob.qrDataUrl) {
         const qrImg = document.createElement('img');
         qrImg.src = currentJob.qrDataUrl;
-        qrImg.alt = 'Feishu QR Code';
+        qrImg.alt = isWeChatJob ? 'WeChat QR Code' : 'Feishu QR Code';
         qrImg.setAttribute('width', '240');
         qrImg.setAttribute('height', '240');
         qrMediaWrap.appendChild(qrImg);
@@ -9612,7 +9675,9 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
 
     const qrPrompt = document.createElement('div');
     qrPrompt.className = 'channel-qr-prompt';
-    qrPrompt.textContent = getLocale() === 'zh-CN' ? '请用飞书App扫一扫，并在手机确认' : 'Please scan with Feishu App and confirm on mobile';
+    qrPrompt.textContent = isWeChatJob
+      ? (t('channels.wechatScanPrompt') || (getLocale() === 'zh-CN' ? '请使用微信扫描二维码，并在手机端确认登录' : 'Please scan with WeChat App and confirm on mobile'))
+      : (getLocale() === 'zh-CN' ? '请用飞书App扫一扫，并在手机确认' : 'Please scan with Feishu App and confirm on mobile');
     qrCanvas.appendChild(qrPrompt);
 
     const countdownSpan = document.createElement('div');
@@ -9633,6 +9698,75 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
       qrCanvas.appendChild(link);
     }
     qrBox.appendChild(qrCanvas);
+
+    // WeChat Secondary Verify Code Form Section
+    const verifySection = document.createElement('div');
+    verifySection.className = 'channel-verify-section hidden';
+
+    const verifyForm = document.createElement('form');
+    verifyForm.className = 'channel-verify-form';
+
+    const verifyTitle = document.createElement('div');
+    verifyTitle.className = 'form-label channel-verify-title';
+    verifyTitle.textContent = t('channels.wechatVerifyCodeTitle') || (getLocale() === 'zh-CN' ? '输入微信验证码' : 'Enter WeChat Verification Code');
+    verifyForm.appendChild(verifyTitle);
+
+    const verifyDesc = document.createElement('p');
+    verifyDesc.className = 'form-hint form-text-muted channel-verify-desc';
+    verifyDesc.textContent = t('channels.wechatVerifyCodeDesc') || (getLocale() === 'zh-CN'
+      ? '微信可能要求二次确认。请输入手机微信中显示的数字验证码；这不是短信验证码，也不会被长期保存。'
+      : 'WeChat requires secondary confirmation. Please enter the numeric verification code displayed in WeChat on your phone; this is not an SMS code and will not be stored permanently.');
+    verifyForm.appendChild(verifyDesc);
+
+    const verifyInputRow = document.createElement('div');
+    verifyInputRow.className = 'channel-verify-input-row';
+
+    const verifyInput = document.createElement('input');
+    verifyInput.type = 'text';
+    verifyInput.id = 'channel-wechat-verify-input';
+    verifyInput.className = 'form-input';
+    verifyInput.inputMode = 'numeric';
+    verifyInput.pattern = '[0-9]*';
+    verifyInput.maxLength = 12;
+    verifyInput.placeholder = t('channels.wechatVerifyCodePlaceholder') || (getLocale() === 'zh-CN' ? '输入数字验证码' : 'Enter numeric code');
+    verifyInput.required = true;
+    verifyInput.addEventListener('input', () => {
+      verifyInput.value = verifyInput.value.replace(/\D/g, '').slice(0, 12);
+    });
+
+    const verifySubmitBtn = document.createElement('button');
+    verifySubmitBtn.type = 'submit';
+    verifySubmitBtn.className = 'btn btn-primary btn-sm';
+    verifySubmitBtn.textContent = t('channels.btnSubmitVerifyCode') || (getLocale() === 'zh-CN' ? '提交验证码' : 'Submit Code');
+
+    verifyInputRow.appendChild(verifyInput);
+    verifyInputRow.appendChild(verifySubmitBtn);
+    verifyForm.appendChild(verifyInputRow);
+
+    verifyForm.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const code = verifyInput.value.trim();
+      if (!code || !/^\d{1,12}$/.test(code)) {
+        showToast(getLocale() === 'zh-CN' ? '请输入1-12位纯数字验证码' : 'Please enter 1-12 digits verification code', 'error');
+        return;
+      }
+      verifySubmitBtn.disabled = true;
+      try {
+        await apiRequest(`/api/manage/channels/onboarding/jobs/${encodeURIComponent(currentJob.id)}/verify`, {
+          method: 'POST',
+          body: JSON.stringify({ verifyCode: code }),
+        });
+        showToast(getLocale() === 'zh-CN' ? '验证码已提交，正在等待微信确认...' : 'Verification code submitted, waiting for WeChat...', 'success');
+        verifyInput.value = '';
+      } catch (err) {
+        showToast(err.message || 'Failed to submit verification code', 'error');
+      } finally {
+        verifySubmitBtn.disabled = false;
+      }
+    });
+
+    verifySection.appendChild(verifyForm);
+    qrBox.appendChild(verifySection);
 
     const clearQrDisplay = () => {
       qrMediaWrap.replaceChildren();
@@ -9661,7 +9795,7 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
         }
         const waitingJobId = currentJob.id;
         const waitingStatus = currentJob.status || window.channelOnboardingController.currentStatus;
-        if (waitingStatus === 'waiting_for_scan' || waitingStatus === 'waiting') {
+        if (waitingStatus === 'waiting_for_scan' || waitingStatus === 'waiting' || waitingStatus === 'need_verifycode') {
           try {
             apiRequest(`/api/manage/channels/onboarding/jobs/${encodeURIComponent(waitingJobId)}/cancel`, {
               method: 'POST',
@@ -9671,6 +9805,7 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
         currentJob.status = 'expired';
         window.channelOnboardingController.currentStatus = 'expired';
         renderStatus('expired', getLocale() === 'zh-CN' ? '二维码已失效，请重新生成' : 'QR code expired, please retry');
+        verifySection.classList.add('hidden');
         retryBtn.classList.remove('hidden');
         cancelBtn.textContent = getLocale() === 'zh-CN' ? '关闭' : 'Close';
         return;
@@ -9811,12 +9946,20 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
         }
 
         if (res && res.data) {
+          const prevStatus = currentJob.status;
           currentJob = res.data;
           window.channelOnboardingController.currentStatus = currentJob.status;
           msgSpan.textContent = currentJob.statusMessage || currentJob.status;
 
           if (currentJob.lastPollAt) {
             diagSpan.textContent = `[${getLocale() === 'zh-CN' ? '最后核验' : 'Last poll'}: ${new Date(currentJob.lastPollAt).toLocaleTimeString()}]`;
+          }
+
+          if (currentJob.status === 'need_verifycode') {
+            renderStatus('need_verifycode', currentJob.statusMessage || (getLocale() === 'zh-CN' ? '需输入微信验证码' : 'Verification code required'));
+            verifySection.classList.remove('hidden');
+          } else {
+            verifySection.classList.add('hidden');
           }
 
           if (currentJob.status === 'awaiting_approval') {
@@ -9833,9 +9976,9 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
             clearQrDisplay();
             renderStatus('ready', currentJob.statusMessage);
             alertBox.className = 'alert alert-success';
-            alertBox.textContent = getLocale() === 'zh-CN'
-              ? '飞书机器人配置完成！渠道已连接并正常运行。'
-              : 'Feishu Bot onboarding successful! Channel connected and ready.';
+            alertBox.textContent = isWeChatJob
+              ? (t('channels.wechatReadyAlert') || (getLocale() === 'zh-CN' ? '微信机器人接入完成！渠道已连接并正常运行。' : 'WeChat Bot onboarding successful! Channel connected and ready.'))
+              : (t('channels.readyAlert') || (getLocale() === 'zh-CN' ? '飞书机器人配置完成！渠道已连接并正常运行。' : 'Feishu Bot onboarding successful! Channel connected and ready.'));
             cancelBtn.classList.add('hidden');
             retryBtn.classList.add('hidden');
             checkApprovalBtn.classList.add('hidden');
@@ -9860,6 +10003,11 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
           } else if (currentJob.status === 'configuring' || currentJob.status === 'verifying') {
             clearQrDisplay();
             renderStatus(currentJob.status, currentJob.statusMessage);
+          } else if (currentJob.status === 'waiting_for_scan') {
+            renderStatus(currentJob.status, currentJob.statusMessage);
+            if (prevStatus !== 'waiting_for_scan') {
+              updateQrDisplay();
+            }
           }
         }
       } catch (err) {
@@ -9921,18 +10069,25 @@ async function renderChannelsView(container) {
   const toolbarSection = document.createElement('div');
   toolbarSection.className = 'channel-toolbar-row mb-3';
 
+  const btnWeChatScan = document.createElement('button');
+  btnWeChatScan.type = 'button';
+  btnWeChatScan.className = 'btn btn-primary';
+  btnWeChatScan.textContent = t('channels.btnWeChatScan') || (getLocale() === 'zh-CN' ? '微信扫码接入' : 'WeChat QR Onboarding');
+  btnWeChatScan.addEventListener('click', () => openChannelOnboardingModal('create_new', accounts, spaces, null, 'wechat'));
+
   const btnConfigExisting = document.createElement('button');
   btnConfigExisting.type = 'button';
-  btnConfigExisting.className = 'btn btn-primary';
+  btnConfigExisting.className = 'btn btn-secondary';
   btnConfigExisting.textContent = getLocale() === 'zh-CN' ? '配置已有机器人' : 'Configure Existing Bot';
-  btnConfigExisting.addEventListener('click', () => openChannelOnboardingModal('configure_existing', accounts, spaces));
+  btnConfigExisting.addEventListener('click', () => openChannelOnboardingModal('configure_existing', accounts, spaces, null, 'lark'));
 
   const btnCreateNew = document.createElement('button');
   btnCreateNew.type = 'button';
   btnCreateNew.className = 'btn btn-secondary';
   btnCreateNew.textContent = getLocale() === 'zh-CN' ? '新建机器人' : 'Create New Bot';
-  btnCreateNew.addEventListener('click', () => openChannelOnboardingModal('create_new', accounts, spaces));
+  btnCreateNew.addEventListener('click', () => openChannelOnboardingModal('create_new', accounts, spaces, null, 'lark'));
 
+  toolbarSection.appendChild(btnWeChatScan);
   toolbarSection.appendChild(btnConfigExisting);
   toolbarSection.appendChild(btnCreateNew);
   container.appendChild(toolbarSection);
@@ -10158,9 +10313,18 @@ async function renderChannelsView(container) {
         configBtn.className = "btn btn-secondary btn-sm channel-config-acc-btn";
         configBtn.textContent = getLocale() === "zh-CN" ? "配置" : "Configure";
         configBtn.addEventListener("click", () => {
-          openChannelOnboardingModal('configure_existing', accounts, spaces, acc.id);
+          openChannelOnboardingModal('configure_existing', accounts, spaces, acc.id, 'lark');
         });
         actionsWrap.appendChild(configBtn);
+      } else if (acc.type === "wechat") {
+        const rebindBtn = document.createElement("button");
+        rebindBtn.type = "button";
+        rebindBtn.className = "btn btn-secondary btn-sm channel-rebind-acc-btn";
+        rebindBtn.textContent = getLocale() === "zh-CN" ? "重新绑定" : "Rebind";
+        rebindBtn.addEventListener("click", () => {
+          openChannelOnboardingModal('configure_existing', accounts, spaces, acc.id, 'wechat');
+        });
+        actionsWrap.appendChild(rebindBtn);
       }
 
       const delBtn = document.createElement("button");
