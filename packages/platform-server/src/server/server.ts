@@ -41,6 +41,9 @@ import {
   type HttpRequestHandler,
 } from './handler.js';
 import {
+  DefaultOutboundFileChannelAdapter,
+} from '../channels/outbound-file-adapter.js';
+import {
   DeliveryRuntimeGateway,
   type DrainableRuntimeGateway,
   type TenantQuotaProvider,
@@ -1049,6 +1052,17 @@ export class PlatformServer {
     if (this.taskWorker) {
       this.taskWorker.channelRuntimeManager = this.channelRuntimeManager;
       this.taskWorker.wechatRuntimeManager = this.wechatRuntimeManager;
+    }
+
+    // Inject outbound file channel adapter into operations service
+    if (this.operationsService && (this.channelRuntimeManager || this.wechatRuntimeManager)) {
+      const fileChannelAdapter = new DefaultOutboundFileChannelAdapter({
+        db,
+        spacesDir: options.spacesDir ?? (process.env.ENKEEP_SPACES_DIR || path.join(os.homedir(), '.enkeep', 'spaces')),
+        channelRuntimeManager: this.channelRuntimeManager,
+        wechatRuntimeManager: this.wechatRuntimeManager,
+      });
+      (this.operationsService as any).fileChannelAdapter = fileChannelAdapter;
     }
 
     this.channelRoutes =

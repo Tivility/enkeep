@@ -132,13 +132,25 @@ export class FileOperationService {
     }
 
     // Deliver via channel adapter if provided
+    let deliveryStatus: 'recorded' | 'sent' | 'failed' | 'unknown' | undefined;
+    let deliveryError: string | undefined;
+
     if (this.channelAdapter) {
-      await this.channelAdapter.deliverFile({
-        userId: this.userId,
-        recipient: input.recipient,
-        fileMetadata,
-        customPayload: input.metadata,
-      });
+      try {
+        const deliverRes = await this.channelAdapter.deliverFile({
+          userId: this.userId,
+          recipient: input.recipient,
+          fileMetadata,
+          customPayload: input.metadata,
+          turnId: input.turnId,
+          sessionId: input.sessionId,
+        });
+        deliveryStatus = deliverRes?.deliveryStatus ?? 'sent';
+        deliveryError = deliverRes?.deliveryError;
+      } catch (err: any) {
+        deliveryStatus = 'failed';
+        deliveryError = err?.message || String(err);
+      }
     }
 
     return {
@@ -147,6 +159,8 @@ export class FileOperationService {
       recipient: input.recipient,
       metadata: fileMetadata,
       timestamp: fileMetadata.createdAt,
+      ...(deliveryStatus !== undefined ? { deliveryStatus } : {}),
+      ...(deliveryError !== undefined ? { deliveryError } : {}),
     };
   }
 

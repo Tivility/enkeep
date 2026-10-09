@@ -1079,7 +1079,7 @@ export class PlatformProxyHandler implements StreamHandler {
       return;
     }
 
-    const { recipient, path: filePath, filename, size, content, checksum, sha256, description } = parsedBody;
+    const { recipient, path: filePath, filename, size, content, checksum, sha256, description, sessionId, turnId } = parsedBody;
     if (typeof recipient !== 'string' || recipient.trim().length === 0) {
       this.writeJsonResponse(stream, 400, {
         error: { code: 'VALIDATION_ERROR', message: 'Recipient must be a non-empty string' },
@@ -1164,15 +1164,36 @@ export class PlatformProxyHandler implements StreamHandler {
       }
     }
 
+    // Resolve turnId if missing: check session_child_origins
+    let effectiveTurnId: string | undefined = typeof turnId === 'string' && turnId.trim() ? turnId.trim() : undefined;
+    const effectiveSessionId: string | undefined = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : (matchedSessionId ?? undefined);
+
+    if (!effectiveTurnId && effectiveSessionId && this.db) {
+      try {
+        const childOrigin = this.db.prepare(
+          'SELECT origin_turn_id FROM session_child_origins WHERE session_id = ? OR child_id = ? ORDER BY created_at DESC LIMIT 1'
+        ).get(effectiveSessionId, effectiveSessionId) as { origin_turn_id?: string } | undefined;
+        if (childOrigin?.origin_turn_id) {
+          effectiveTurnId = childOrigin.origin_turn_id;
+        }
+      } catch (_originErr: unknown) {
+        // session_child_origins table might not exist in some standalone test setups
+      }
+    }
+
+    let sendFileResult: any = undefined;
+
     // 2. Delegate to operations if available
     if (this.operations) {
       try {
-        await this.operations.forTenant(this.platformUserId).files.sendFile({
+        sendFileResult = await this.operations.forTenant(this.platformUserId).files.sendFile({
           recipient,
           path: filePath,
           filename: effectiveFilename,
           size: effectiveSize,
           checksum: effectiveSha256,
+          sessionId: effectiveSessionId,
+          turnId: effectiveTurnId,
         });
       } catch (_opErr: unknown) {
         // Operations recording error contained
@@ -1186,6 +1207,8 @@ export class PlatformProxyHandler implements StreamHandler {
       path: filePath,
       size: effectiveSize,
       recipient,
+      ...(sendFileResult?.deliveryStatus ? { deliveryStatus: sendFileResult.deliveryStatus } : {}),
+      ...(sendFileResult?.deliveryError ? { deliveryError: sendFileResult.deliveryError } : {}),
       ...(matchedSpaceId ? { fileReference: `/api/spaces/${encodeURIComponent(matchedSpaceId)}/files/download?path=${encodeURIComponent(filePath)}` } : {}),
     });
   }

@@ -97,4 +97,16 @@ export interface WeChatTransport {
   start(): Promise<void>;
   stop(): Promise<void>;
   sendReply(toUserId: string, contextToken: string, text: string): Promise<{ success: boolean; error?: string; messageId?: string }>;
+  sendImage?(
+    toUserId: string,
+    contextToken: string,
+    imageBuffer: Buffer,
+    fileName?: string
+  ): Promise<{ success: boolean; error?: string; messageId?: string }>;
+  sendFile?(
+    toUserId: string,
+    contextToken: string,
+    fileBuffer: Buffer,
+    fileName?: string
+  ): Promise<{ success: boolean; error?: string; messageId?: string }>;
 }

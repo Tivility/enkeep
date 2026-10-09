@@ -36,6 +36,8 @@ import type {
   WeChatTransportDeps,
 } from './transport-types.js';
 import {
+  WECHAT_ITEM_TYPE_FILE,
+  WECHAT_ITEM_TYPE_IMAGE,
   WECHAT_ITEM_TYPE_TEXT,
   WECHAT_MESSAGE_TYPE_BOT,
   type WeChatGetUpdatesResponse,
@@ -43,6 +45,8 @@ import {
   type WeChatParsedMessage,
   type WeChatTransport,
 } from './types.js';
+import { uploadMediaBuffer } from './crypto.js';
+import { WECHAT_MEDIA_TYPE_FILE, WECHAT_MEDIA_TYPE_IMAGE } from './crypto-types.js';
 
 export * from './transport-types.js';
 export * from './http.js';
@@ -154,6 +158,60 @@ export class FakeWeChatTransport implements WeChatTransport {
       success: true,
       messageId,
     };
+  }
+
+  async sendImage(
+    toUserId: string,
+    contextToken: string,
+    imageBuffer: Buffer,
+    fileName?: string
+  ): Promise<{ success: boolean; error?: string; messageId?: string }> {
+    if (!this._connected) {
+      return { success: false, error: 'FakeWeChatTransport is not connected' };
+    }
+    if (!contextToken) {
+      return { success: false, error: 'Missing required context_token for WeChat reply' };
+    }
+    if (this.failNextSend) {
+      this.failNextSend = false;
+      return { success: false, error: this.failNextSendReason };
+    }
+    const messageId = `msg_wc_img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this._sentReplies.push({
+      toUserId,
+      contextToken,
+      text: `[Image: ${fileName || 'image.png'}] (${imageBuffer.length} bytes)`,
+      messageId,
+      timestamp: new Date().toISOString(),
+    });
+    return { success: true, messageId };
+  }
+
+  async sendFile(
+    toUserId: string,
+    contextToken: string,
+    fileBuffer: Buffer,
+    fileName?: string
+  ): Promise<{ success: boolean; error?: string; messageId?: string }> {
+    if (!this._connected) {
+      return { success: false, error: 'FakeWeChatTransport is not connected' };
+    }
+    if (!contextToken) {
+      return { success: false, error: 'Missing required context_token for WeChat reply' };
+    }
+    if (this.failNextSend) {
+      this.failNextSend = false;
+      return { success: false, error: this.failNextSendReason };
+    }
+    const messageId = `msg_wc_file_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this._sentReplies.push({
+      toUserId,
+      contextToken,
+      text: `[File: ${fileName || 'file.bin'}] (${fileBuffer.length} bytes)`,
+      messageId,
+      timestamp: new Date().toISOString(),
+    });
+    return { success: true, messageId };
   }
 }
 
@@ -608,6 +666,152 @@ export class CredentialedWeChatTransport implements ICredentialedWeChatTransport
       });
     } catch (err) {
       this.deps.logger?.debug?.(err, 'WeChat sendTyping failed');
+    }
+  }
+
+  async sendImage(
+    toUserId: string,
+    contextToken: string,
+    imageBuffer: Buffer,
+    fileName = 'image.png'
+  ): Promise<{ success: boolean; error?: string; messageId?: string }> {
+    if (!this._running) {
+      return {
+        success: false,
+        error: 'CredentialedWeChatTransport is not running',
+      };
+    }
+
+    if (!contextToken) {
+      return {
+        success: false,
+        error: 'Missing required context_token for WeChat reply',
+      };
+    }
+
+    try {
+      const uploadRes = await uploadMediaBuffer({
+        buf: imageBuffer,
+        fileName,
+        toUserId,
+        baseUrl: this.baseUrl,
+        token: this.config.botToken,
+        cdnBaseUrl: this.cdnBaseUrl,
+        mediaType: WECHAT_MEDIA_TYPE_IMAGE,
+        fetchFn: this.fetchImpl,
+      });
+
+      const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
+      const resp = await this.apiPost<WeChatGetUpdatesResponse>(
+        'ilink/bot/sendmessage',
+        {
+          msg: {
+            to_user_id: toUserId,
+            context_token: contextToken,
+            item_list: [
+              {
+                type: WECHAT_ITEM_TYPE_IMAGE,
+                image_item: {
+                  media: {
+                    encrypt_query_param: uploadRes.downloadEncryptedQueryParam,
+                    aes_key: uploadRes.aeskey,
+                    encrypt_type: 1,
+                  },
+                },
+              },
+            ],
+            message_type: WECHAT_MESSAGE_TYPE_BOT,
+            message_state: 2, // MESSAGE_STATE_FINISH
+            client_id: clientId,
+          },
+          base_info: buildBaseInfo(),
+        }
+      );
+
+      assertWeChatApiSuccess(resp, 'sendImage');
+      return {
+        success: true,
+        messageId: `msg_wc_img_${clientId}`,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  async sendFile(
+    toUserId: string,
+    contextToken: string,
+    fileBuffer: Buffer,
+    fileName = 'file.bin'
+  ): Promise<{ success: boolean; error?: string; messageId?: string }> {
+    if (!this._running) {
+      return {
+        success: false,
+        error: 'CredentialedWeChatTransport is not running',
+      };
+    }
+
+    if (!contextToken) {
+      return {
+        success: false,
+        error: 'Missing required context_token for WeChat reply',
+      };
+    }
+
+    try {
+      const uploadRes = await uploadMediaBuffer({
+        buf: fileBuffer,
+        fileName,
+        toUserId,
+        baseUrl: this.baseUrl,
+        token: this.config.botToken,
+        cdnBaseUrl: this.cdnBaseUrl,
+        mediaType: WECHAT_MEDIA_TYPE_FILE,
+        fetchFn: this.fetchImpl,
+      });
+
+      const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
+      const resp = await this.apiPost<WeChatGetUpdatesResponse>(
+        'ilink/bot/sendmessage',
+        {
+          msg: {
+            to_user_id: toUserId,
+            context_token: contextToken,
+            item_list: [
+              {
+                type: WECHAT_ITEM_TYPE_FILE,
+                file_item: {
+                  media: {
+                    encrypt_query_param: uploadRes.downloadEncryptedQueryParam,
+                    aes_key: uploadRes.aeskey,
+                    encrypt_type: 1,
+                  },
+                  file_name: fileName,
+                  len: String(fileBuffer.length),
+                },
+              },
+            ],
+            message_type: WECHAT_MESSAGE_TYPE_BOT,
+            message_state: 2, // MESSAGE_STATE_FINISH
+            client_id: clientId,
+          },
+          base_info: buildBaseInfo(),
+        }
+      );
+
+      assertWeChatApiSuccess(resp, 'sendFile');
+      return {
+        success: true,
+        messageId: `msg_wc_file_${clientId}`,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
   }
 }

@@ -48,6 +48,8 @@ export interface SendFileInput {
   description?: string;
   metadata?: Record<string, unknown>;
   idempotencyKey?: string;
+  turnId?: string;
+  sessionId?: string;
 }
 
 export interface SendFileResult {
@@ -57,6 +59,8 @@ export interface SendFileResult {
   metadata: FileMetadata;
   timestamp: string;
   isIdempotentHit?: boolean;
+  deliveryStatus?: 'recorded' | 'sent' | 'failed' | 'unknown';
+  deliveryError?: string;
 }
 
 export interface OutboundFileChannelAdapter {
@@ -65,5 +69,12 @@ export interface OutboundFileChannelAdapter {
     recipient: string;
     fileMetadata: FileMetadata;
     customPayload?: Record<string, unknown>;
-  }): Promise<{ channelFileId?: string; metadata?: Record<string, unknown> }>;
+    turnId?: string;
+    sessionId?: string;
+  }): Promise<{
+    channelFileId?: string;
+    metadata?: Record<string, unknown>;
+    deliveryStatus?: 'recorded' | 'sent' | 'failed' | 'unknown';
+    deliveryError?: string;
+  }>;
 }
