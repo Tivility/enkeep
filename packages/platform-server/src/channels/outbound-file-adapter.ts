@@ -184,53 +184,42 @@ export class DefaultOutboundFileChannelAdapter implements OutboundFileChannelAda
     }
 
     if (channel === 'lark') {
-      // Check if lark gateway implements deliverFile (E-01)
-      const larkGateway = this.channelRuntimeManager?.getActiveGateway(userId, originRow.account_id);
-      if (larkGateway && typeof (larkGateway as any).deliverFile === 'function') {
-        const res = await (larkGateway as any).deliverFile({
-          sessionId: originRow.session_id,
-          chatId: originRow.chat_id,
-          replyToMessageId: originRow.reply_to_message_id,
-          threadId: originRow.thread_id,
-          turnId: targetTurnId,
-          fileBuffer: fileBuffer || Buffer.from(''),
-          fileName: fileMetadata.filename,
-          mimeType: fileMetadata.mimeType,
-        });
+      const channelRuntime = this.channelRuntimeManager;
+      if (!channelRuntime) {
         return {
-          deliveryStatus: res.deliveryStatus || (res.success ? 'sent' : 'failed'),
-          deliveryError: res.error,
+          deliveryStatus: 'failed',
+          deliveryError: 'Channel runtime manager is not available on platform server',
         };
       }
 
-      // Step B: Lark file sending not yet implemented in Step B (will be in Step E)
-      // Record outbox row as failed
-      try {
-        const outboxId = `out_lark_file_${targetTurnId || Date.now()}`;
-        this.db.prepare(`
-          INSERT OR IGNORE INTO channel_outbox (
-            id, user_id, account_id, session_id, native_context_id, reply_to_native_id, payload_json, status, attempts, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        `).run(
-          outboxId,
-          userId,
-          originRow.account_id,
-          originRow.session_id,
-          originRow.native_context_id,
-          originRow.reply_to_message_id || null,
-          JSON.stringify({
-            channel: 'lark',
-            fileName: fileMetadata.filename,
-            fileSize: fileMetadata.size,
-            turnId: targetTurnId,
-            error: '渠道暂不支持文件发送',
-          })
-        );
-      } catch {}
+      const larkGateway = channelRuntime.getActiveGateway(userId, originRow.account_id);
+      if (!larkGateway) {
+        return {
+          deliveryStatus: 'failed',
+          deliveryError: `No active Lark gateway for account ${originRow.account_id}`,
+        };
+      }
+
+      if (!fileBuffer) {
+        fileBuffer = Buffer.from('');
+      }
+
+      const res = await larkGateway.deliverFile({
+        sessionId: originRow.session_id,
+        chatId: originRow.chat_id,
+        replyToMessageId: originRow.reply_to_message_id,
+        rootId: originRow.root_id,
+        threadId: originRow.thread_id,
+        turnId: targetTurnId,
+        fileBuffer,
+        fileName: fileMetadata.filename,
+        mimeType: fileMetadata.mimeType,
+      });
 
       return {
-        deliveryStatus: 'failed',
-        deliveryError: '渠道暂不支持文件发送',
+        deliveryStatus: res.deliveryStatus,
+        deliveryError: res.error,
+        channelFileId: res.outboxItem?.id,
       };
     }
 

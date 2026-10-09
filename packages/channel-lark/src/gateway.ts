@@ -2264,15 +2264,45 @@ export class LarkChannelGateway {
     const threadId = payload.threadId || rootId;
     const replyToMessageId = payload.replyToMessageId || outboxItem.replyToNativeId || undefined;
 
-    const result = await this.transport.sendReply({
-      chatId,
-      rootId,
-      threadId,
-      replyToMessageId,
-      content: payload.text,
-      format: 'plain', // Plain text format (no CardKit)
-      uuid: outboxItem.id,
-    });
+    let result: { success: boolean; error?: string; messageId?: string };
+
+    const payloadObj = payload as any;
+    if (payloadObj.msgType === 'image' && payloadObj.imageBuffer && typeof this.transport.uploadAndSendImage === 'function') {
+      const buf = Buffer.isBuffer(payloadObj.imageBuffer)
+        ? payloadObj.imageBuffer
+        : Buffer.from(payloadObj.imageBuffer.data || payloadObj.imageBuffer);
+      result = await this.transport.uploadAndSendImage({
+        chatId,
+        imageBuffer: buf,
+        rootId,
+        threadId,
+        replyToMessageId,
+        uuid: outboxItem.id,
+      });
+    } else if (payloadObj.msgType === 'file' && payloadObj.fileBuffer && typeof this.transport.uploadAndSendFile === 'function') {
+      const buf = Buffer.isBuffer(payloadObj.fileBuffer)
+        ? payloadObj.fileBuffer
+        : Buffer.from(payloadObj.fileBuffer.data || payloadObj.fileBuffer);
+      result = await this.transport.uploadAndSendFile({
+        chatId,
+        fileBuffer: buf,
+        fileName: payloadObj.fileName || 'file',
+        rootId,
+        threadId,
+        replyToMessageId,
+        uuid: outboxItem.id,
+      });
+    } else {
+      result = await this.transport.sendReply({
+        chatId,
+        rootId,
+        threadId,
+        replyToMessageId,
+        content: payload.text || '',
+        format: 'plain', // Plain text format (no CardKit)
+        uuid: outboxItem.id,
+      });
+    }
 
     if (result.success) {
       await this.channelRepo.updateOutboxStatus(claimed.id, 'delivered', false);
@@ -2311,6 +2341,139 @@ export class LarkChannelGateway {
     }
 
     return deliveredCount;
+  }
+
+  /**
+   * Sends an outbound file or image to a Lark chat or thread.
+   */
+  async deliverFile(params: {
+    sessionId: string;
+    chatId?: string;
+    replyToMessageId?: string;
+    rootId?: string;
+    threadId?: string;
+    turnId?: string;
+    fileBuffer: Buffer;
+    fileName: string;
+    mimeType?: string;
+  }): Promise<{ success: boolean; error?: string; outboxItem?: any; deliveryStatus?: 'sent' | 'failed' | 'unknown' }> {
+    if (this.isDisposed) {
+      return { success: false, error: 'Lark gateway is disposed', deliveryStatus: 'failed' };
+    }
+
+    let chatId = params.chatId;
+    let rootId = params.rootId;
+    let threadId = params.threadId;
+    let replyToMessageId = params.replyToMessageId;
+
+    if (!chatId) {
+      const route = await this.sessionRouteRepo.findById(params.sessionId);
+      if (route?.nativeContextId) {
+        const parts = route.nativeContextId.split(':');
+        chatId = parts[0];
+        if (parts.length > 1 && !threadId && !rootId) {
+          threadId = parts[1];
+        }
+      }
+    }
+
+    if (!chatId) {
+      return { success: false, error: 'Missing chatId for Lark file delivery', deliveryStatus: 'failed' };
+    }
+
+    const isImage = (params.mimeType && params.mimeType.startsWith('image/')) ||
+      /\.(png|jpe?g|gif|webp)$/i.test(params.fileName);
+
+    const nativeContextId = buildNativeContextId(chatId, threadId, rootId);
+    const outboxId = `out_lark_${params.turnId ? `${params.turnId}_` : ''}${Date.now()}`;
+
+    let outboxItem = await this.channelRepo.createOutboxItem({
+      id: outboxId,
+      accountId: this.accountId,
+      sessionId: params.sessionId,
+      nativeContextId,
+      replyToNativeId: replyToMessageId ?? null,
+      payloadJson: JSON.stringify({
+        chatId,
+        rootId,
+        threadId,
+        replyToMessageId,
+        fileName: params.fileName,
+        fileSize: params.fileBuffer.length,
+        isImage,
+        msgType: isImage ? 'image' : 'file',
+        turnId: params.turnId,
+      }),
+      status: 'pending',
+    });
+
+    try {
+      let sendRes: { success: boolean; error?: string; messageId?: string };
+      if (isImage && typeof this.transport.uploadAndSendImage === 'function') {
+        sendRes = await this.transport.uploadAndSendImage({
+          chatId,
+          imageBuffer: params.fileBuffer,
+          rootId,
+          threadId,
+          replyToMessageId,
+          uuid: outboxId,
+        });
+      } else if (typeof this.transport.uploadAndSendFile === 'function') {
+        sendRes = await this.transport.uploadAndSendFile({
+          chatId,
+          fileBuffer: params.fileBuffer,
+          fileName: params.fileName,
+          rootId,
+          threadId,
+          replyToMessageId,
+          uuid: outboxId,
+        });
+      } else {
+        sendRes = { success: false, error: 'Transport does not support file/image delivery' };
+      }
+
+      if (sendRes.success) {
+        outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'delivered');
+        return { success: true, outboxItem, deliveryStatus: 'sent' };
+      } else {
+        const isUnknown = sendRes.error?.toLowerCase().includes('timeout') ||
+          sendRes.error?.toLowerCase().includes('econnreset') ||
+          sendRes.error?.toLowerCase().includes('network');
+        const deliveryStatus = isUnknown ? 'unknown' : 'failed';
+
+        if (isUnknown) {
+          try {
+            const updatedPayload = JSON.stringify({
+              chatId,
+              rootId,
+              threadId,
+              replyToMessageId,
+              fileName: params.fileName,
+              fileSize: params.fileBuffer.length,
+              isImage,
+              msgType: isImage ? 'image' : 'file',
+              turnId: params.turnId,
+              deliveryStatus: 'unknown',
+              error: sendRes.error,
+            });
+            // Update outbox payload with unknown deliveryStatus if supported
+            void updatedPayload;
+          } catch {}
+        }
+
+        outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
+        return { success: false, error: sendRes.error, outboxItem, deliveryStatus };
+      }
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      const isUnknown = errMsg.toLowerCase().includes('timeout') ||
+        errMsg.toLowerCase().includes('econnreset') ||
+        errMsg.toLowerCase().includes('network');
+      const deliveryStatus = isUnknown ? 'unknown' : 'failed';
+
+      outboxItem = await this.channelRepo.updateOutboxStatus(outboxItem.id, 'failed', true);
+      return { success: false, error: errMsg, outboxItem, deliveryStatus };
+    }
   }
 
   /**

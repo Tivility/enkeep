@@ -287,6 +287,25 @@ export interface LarkTransport {
     format?: 'plain' | 'markdown';
     uuid?: string;
   }): Promise<OutboundReplyResult>;
+  uploadAndSendImage?(params: {
+    chatId: string;
+    imageBuffer: Buffer;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    uuid?: string;
+  }): Promise<OutboundReplyResult>;
+  uploadAndSendFile?(params: {
+    chatId: string;
+    fileBuffer: Buffer;
+    fileName: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    fileType?: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
+    durationMs?: number;
+    uuid?: string;
+  }): Promise<OutboundReplyResult>;
   createStreamingCard?(params: {
     chatId: string;
     replyToMessageId?: string;
@@ -392,6 +411,14 @@ export interface ILarkApiClient {
     };
   };
   im: {
+    image?: {
+      create: (req: any, options?: any) => Promise<any>;
+      get?: (req: any, options?: any) => Promise<any>;
+    };
+    file?: {
+      create: (req: any, options?: any) => Promise<any>;
+      get?: (req: any, options?: any) => Promise<any>;
+    };
     message: {
       reply: (req: any, options?: any) => Promise<any>;
       create: (req: any, options?: any) => Promise<any>;
@@ -415,6 +442,14 @@ export interface ILarkApiClient {
       delete: (req: any, options?: any) => Promise<any>;
     };
     v1?: {
+      image?: {
+        create?: (req: any, options?: any) => Promise<any>;
+        get?: (req: any, options?: any) => Promise<any>;
+      };
+      file?: {
+        create?: (req: any, options?: any) => Promise<any>;
+        get?: (req: any, options?: any) => Promise<any>;
+      };
       message?: {
         reply?: (req: any, options?: any) => Promise<any>;
         create?: (req: any, options?: any) => Promise<any>;

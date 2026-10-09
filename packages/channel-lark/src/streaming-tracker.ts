@@ -27,6 +27,21 @@ export const STREAMING_MAX_CONTENT_LENGTH = 3800;
 export const STREAMING_MAX_LENGTH = STREAMING_MAX_CONTENT_LENGTH;
 export const STREAMING_TRUNCATION_NOTICE = '... (内容超长，流式阶段仅展示最新部分，完整内容将在生成完毕后呈现)\n\n';
 
+export const DEGRADED_PREVIEW_MAX_LENGTH = 1000;
+export const DEGRADED_PREVIEW_NOTICE = '\n\n... (卡片内容超限，仅展示部分预览，完整内容见附件)';
+
+export function applyDegradedPreview(
+  text: string,
+  maxLength: number = DEGRADED_PREVIEW_MAX_LENGTH,
+  notice: string = DEGRADED_PREVIEW_NOTICE
+): string {
+  if (text.length <= maxLength) {
+    return text + notice;
+  }
+  const allowed = Math.max(0, maxLength - notice.length);
+  return text.slice(0, allowed) + notice;
+}
+
 const envBudget =
   process.env.ENKEEP_EXECUTION_BUDGET_MS ||
   process.env.ENKEEP_INTERACTIVE_TURN_TIMEOUT_MS ||
@@ -1137,25 +1152,50 @@ export class StreamingReplyTracker {
       }
       return res;
     } catch (finalizeErr) {
-      console.warn('[lark-stream] session.finalize error, falling back to pushText', {
+      console.warn('[lark-stream] session.finalize error, falling back to pushText and outbound file', {
         code: (finalizeErr as any)?.code,
         message: finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr),
       });
       if (textToFinalize && textToFinalize.trim().length > 0) {
         try {
-          const guardedText = applyStreamingLengthGuard(textToFinalize, this.maxStreamingLength);
+          const previewText = applyDegradedPreview(textToFinalize, this.maxStreamingLength);
           const fallbackStatus = this.toolStatusEntries.length > 0
             ? formatToolStatusMarkdown(this.toolStatusEntries)
             : (this.withStatusPanel ? "<font color='grey'>无工具调用</font>" : undefined);
           const fallbackThinking = finalThinking
             ? formatThinkingContent(finalThinking)
             : (this.withThinkingPanel ? "<font color='grey'>无思考过程</font>" : undefined);
-          await session.pushText(guardedText, fallbackStatus ?? undefined, fallbackThinking ?? undefined);
+          await session.pushText(previewText, fallbackStatus ?? undefined, fallbackThinking ?? undefined);
         } catch (pushErr) {
           console.warn('[lark-stream] pushText fallback error', {
             code: (pushErr as any)?.code,
             message: pushErr instanceof Error ? pushErr.message : String(pushErr),
           });
+        }
+
+        // Send full response as reply-<turnId>.md attachment to the same topic/thread
+        if (typeof this.transport.uploadAndSendFile === 'function' && this.cardParams?.chatId) {
+          try {
+            const rawTurnId = this.turnId || this.cardParams.turnId || 'answer';
+            const shortTurnId = rawTurnId.length > 12 ? rawTurnId.slice(-8) : rawTurnId;
+            const fileName = `reply-${shortTurnId}.md`;
+            const fileBuffer = Buffer.from(textToFinalize, 'utf8');
+
+            await this.transport.uploadAndSendFile({
+              chatId: this.cardParams.chatId,
+              fileBuffer,
+              fileName,
+              rootId: this.cardParams.rootId,
+              threadId: this.cardParams.threadId,
+              replyToMessageId: this.cardParams.replyToMessageId,
+              fileType: 'stream',
+            });
+          } catch (fileErr) {
+            console.warn('[lark-stream] degraded file delivery error', {
+              code: (fileErr as any)?.code,
+              message: fileErr instanceof Error ? fileErr.message : String(fileErr),
+            });
+          }
         }
       }
       const res = { handled: true, messageId: session.messageId, degraded: true };

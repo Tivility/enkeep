@@ -275,7 +275,8 @@ describe('I3: Feishu Thinking & Process Panels Content Mapping & Placeholder Fix
       const pushCalls = transport.streamingCalls.filter((c) => c.type === 'push');
       const lastPush = pushCalls[pushCalls.length - 1];
       expect(lastPush).toBeDefined();
-      expect(lastPush.content).toBe('Final fallback answer');
+      expect(lastPush.content).toContain('Final fallback answer');
+      expect(lastPush.content).toContain('完整内容见附件');
       // Placeholders are cleared to non-frozen values!
       expect(lastPush.thinkingText).toBe("<font color='grey'>无思考过程</font>");
       expect(lastPush.toolStatus).toBe("<font color='grey'>无工具调用</font>");
