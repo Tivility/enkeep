@@ -55,6 +55,8 @@ import {
   type ListBackgroundTasksResponse,
   type StopBackgroundTaskRequest,
   type StopBackgroundTaskResponse,
+  type SteerRequest,
+  type SteerResponse,
   DEFAULT_DAEMON_SOCKET_PATH,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
@@ -560,6 +562,26 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       op: DAEMON_OPS.CANCEL,
       turnId,
       reason,
+    });
+  }
+
+  public async steerTurn(
+    sessionId: string,
+    expectedTurnId: string,
+    message: string,
+    attachments?: readonly any[],
+    clientRequestId?: string,
+    workspaceFolder?: string
+  ): Promise<SteerResponse> {
+    return this.request<SteerRequest, SteerResponse>({
+      id: `steer_${sessionId}_${crypto.randomBytes(4).toString('hex')}`,
+      op: DAEMON_OPS.STEER,
+      sessionId,
+      expectedTurnId,
+      message,
+      attachments,
+      clientRequestId,
+      workspaceFolder,
     });
   }
 

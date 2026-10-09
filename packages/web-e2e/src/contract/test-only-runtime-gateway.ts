@@ -321,6 +321,8 @@ export class TestOnlyContractRuntimeGateway implements RuntimeGateway {
   async getCurrentTurnStatus(userId: string, sessionId: string): Promise<{
     readonly status: TurnExecutionStatus;
     readonly code?: PublicEventCode;
+    readonly turnId?: string;
+    readonly queuePosition?: number;
   } | null> {
     let latestActive: TestOnlyTurnRecord | null = null;
     for (const turn of this.turns.values()) {
@@ -336,6 +338,7 @@ export class TestOnlyContractRuntimeGateway implements RuntimeGateway {
     }
 
     return {
+      turnId: latestActive.turnId,
       status: latestActive.status,
     };
   }

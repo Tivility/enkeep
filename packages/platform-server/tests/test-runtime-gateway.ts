@@ -104,8 +104,22 @@ export class TestOnlyRuntimeGateway implements DrainableRuntimeGateway {
   async getCurrentTurnStatus(userId: string, sessionId: string): Promise<{
     status: TurnExecutionStatus;
     code?: PublicEventCode;
+    turnId?: string;
+    queuePosition?: number;
   } | null> {
     return this.gateway.getCurrentTurnStatus(userId, sessionId);
+  }
+
+  async steerTurn(userId: string, sessionId: string, req: { clientRequestId: string; expectedTurnId: string; content: string }): Promise<{ messageId: string; ok: boolean }> {
+    return this.gateway.steerTurn(userId, sessionId, req);
+  }
+
+  async cancelQueuedTurn(userId: string, sessionId: string, turnId: string): Promise<boolean> {
+    return this.gateway.cancelQueuedTurn(userId, sessionId, turnId);
+  }
+
+  async listQueuedTurns(userId: string, sessionId: string): Promise<Array<{ turnId: string; createdAt: string; contentSnippet: string }>> {
+    return this.gateway.listQueuedTurns(userId, sessionId);
   }
 
   async drain(timeoutMs?: number): Promise<boolean> {

@@ -28,6 +28,7 @@ import type {
   CompactSessionResponse,
   ListBackgroundTasksResponse,
   StopBackgroundTaskResponse,
+  SteerResponse,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
 
@@ -326,6 +327,14 @@ export interface RuntimeDaemonTransportPort {
     spaceId?: string
   ): Promise<ImportSeedResponse>;
   cancelTurn?(turnId: string, reason?: string): Promise<CancelResponse>;
+  steerTurn?(
+    sessionId: string,
+    expectedTurnId: string,
+    message: string,
+    attachments?: readonly any[],
+    clientRequestId?: string,
+    workspaceFolder?: string
+  ): Promise<SteerResponse>;
   inspectTurn?(turnId: string): Promise<InspectTurnResponse>;
   fileOperation?(request: FileOperationRequest): Promise<FileOpDaemonResponse>;
   instructionsRead?(request: { target: 'global' | 'space'; spaceFolder?: string; filename?: string }): Promise<InstructionsReadResponse>;

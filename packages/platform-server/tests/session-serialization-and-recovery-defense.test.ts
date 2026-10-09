@@ -655,11 +655,11 @@ describe('Full Defense-in-Depth Session Serialization & Recovery (E1 - E8)', () 
 
     // 2. Queued turn -> returns queued with queuePosition
     db.prepare("INSERT INTO turn_runs (id, user_id, space_id, route_id, turn_id, status) VALUES ('r_q', 'u1', 'sp1', 'ses1', 't_q', 'queued')").run();
-    expect(await gateway.getCurrentTurnStatus('u1', 'ses1')).toEqual({ status: 'queued', queuePosition: 1 });
+    expect(await gateway.getCurrentTurnStatus('u1', 'ses1')).toEqual({ turnId: 't_q', status: 'queued', queuePosition: 1 });
 
     // 3. Running turn -> returns running
     db.prepare("UPDATE turn_runs SET status = 'running' WHERE id = 'r_q'").run();
-    expect(await gateway.getCurrentTurnStatus('u1', 'ses1')).toEqual({ status: 'running' });
+    expect(await gateway.getCurrentTurnStatus('u1', 'ses1')).toEqual({ turnId: 't_q', status: 'running' });
 
     // 4. Recovery required -> returns recovery_required
     db.prepare("INSERT INTO session_recovery_state (id, user_id, route_id, generation, status, failure_code) VALUES ('rec_1', 'u1', 'ses1', 1, 'recovery_required', 'CORRUPTED_SESSION_ARTIFACT')").run();

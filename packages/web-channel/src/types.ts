@@ -415,6 +415,8 @@ export interface RuntimeGateway {
   getCurrentTurnStatus(userId: string, sessionId: string): Promise<{
     readonly status: TurnExecutionStatus;
     readonly code?: PublicEventCode;
+    readonly turnId?: string;
+    readonly queuePosition?: number;
   } | null>;
   cancelCurrentTurn(userId: string, sessionId: string): Promise<boolean>;
   getTurnStatus?(userId: string, turnId: string): Promise<{
@@ -432,6 +434,20 @@ export interface RuntimeGateway {
     sessionId: string,
     taskId: string
   ): Promise<{ stopped: boolean }>;
+  steerTurn?(
+    userId: string,
+    sessionId: string,
+    req: { clientRequestId: string; expectedTurnId: string; content: string }
+  ): Promise<{ messageId: string; ok: boolean }>;
+  cancelQueuedTurn?(
+    userId: string,
+    sessionId: string,
+    turnId: string
+  ): Promise<boolean>;
+  listQueuedTurns?(
+    userId: string,
+    sessionId: string
+  ): Promise<Array<{ turnId: string; createdAt: string; contentSnippet: string }>>;
 }
 
 export type { LifecycleStatus, AuthContext, PublicMessageAttachment, CanonicalAttachment };

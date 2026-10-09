@@ -1207,6 +1207,9 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     async stopBackgroundTask(req) {
       return bgDelegates.stopBackgroundTask(req);
     },
+    async steerTurn(req) {
+      return bgDelegates.steerTurn(req);
+    },
   };
 
   // 6b. Platform Operations & Multi-Metric Quota Provider Setup

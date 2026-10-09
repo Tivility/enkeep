@@ -93,12 +93,13 @@ export class InMemoryRuntimeGateway implements RuntimeGateway {
   async getCurrentTurnStatus(
     userId: string,
     sessionId: string
-  ): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode } | null> {
+  ): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; turnId?: string; queuePosition?: number } | null> {
     const turnIds = this.sessionTurns.get(sessionId) || [];
     for (let i = turnIds.length - 1; i >= 0; i--) {
       const t = this.turns.get(turnIds[i]);
       if (t && t.envelope.userId === userId) {
         return {
+          turnId: t.turnId,
           status: t.status,
           ...(t.code ? { code: t.code } : {}),
         };

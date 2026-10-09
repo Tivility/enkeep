@@ -77,6 +77,8 @@ import {
   type ListBackgroundTasksResponse,
   type StopBackgroundTaskRequest,
   type StopBackgroundTaskResponse,
+  type SteerRequest,
+  type SteerResponse,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
@@ -742,6 +744,26 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       op: DAEMON_OPS.CANCEL,
       turnId,
       reason,
+    });
+  }
+
+  public async steerTurn(
+    sessionId: string,
+    expectedTurnId: string,
+    message: string,
+    attachments?: readonly any[],
+    clientRequestId?: string,
+    workspaceFolder?: string
+  ): Promise<SteerResponse> {
+    return this.request<SteerRequest, SteerResponse>({
+      id: `req_${crypto.randomUUID()}`,
+      op: DAEMON_OPS.STEER,
+      sessionId,
+      expectedTurnId,
+      message,
+      attachments,
+      clientRequestId,
+      workspaceFolder,
     });
   }
 
