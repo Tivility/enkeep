@@ -1,15 +1,47 @@
-import { describe, it, expect, vi } from 'vitest';
-import { parseEnvFile, resolveDeployConfig, validateConfig, checkTreeMatch, updatePlistContent } from '../scripts/deploy-release.mjs';
-import { planPruneWorktrees, executePrune, parseArgs } from '../scripts/prune-release-worktrees.mjs';
+import { describe, it, expect } from 'vitest';
+import {
+  parseEnvFile,
+  resolveDeployConfig,
+  validateConfig,
+  checkTreeMatch,
+  updatePlistContent,
+  computeNextReleaseId,
+  sanitizePlistForLog,
+  executeDeploy,
+  executeRollback,
+  executeVerify,
+} from '../scripts/deploy-release.mjs';
+import { planPruneWorktrees, executePrune } from '../scripts/prune-release-worktrees.mjs';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
-describe('Deploy & Prune Tooling (P-01, P-03, P-04)', () => {
-  describe('P-01: Parameterization & Validation', () => {
-    it('fails validation when required parameters are missing', () => {
+describe('Deploy Tooling Enhancements', () => {
+  describe('Parameterization & Validation', () => {
+    it('fails validation when required parameters (PORT, PROXY_PORT, RUNTIME_IMAGE_PREFIX, CONTAINER_NAME_PREFIX) are missing', () => {
       expect(() => validateConfig({})).toThrow(/Missing required configuration/);
-      expect(() => validateConfig({ releaseId: 'batch1' })).toThrow(/Missing required configuration/);
+      expect(() => validateConfig({
+        releaseId: 'batch1',
+        repoRoot: '/tmp/repo',
+        releaseRoot: '/tmp/releases',
+        dataDir: '/tmp/data',
+        configDir: '/tmp/config',
+        plistPath: '/tmp/agent.plist',
+        launchdLabel: 'com.example.app',
+      })).toThrow(/PORT/);
+
+      expect(() => validateConfig({
+        releaseId: 'batch1',
+        repoRoot: '/tmp/repo',
+        releaseRoot: '/tmp/releases',
+        dataDir: '/tmp/data',
+        configDir: '/tmp/config',
+        plistPath: '/tmp/agent.plist',
+        launchdLabel: 'com.example.app',
+        port: 3900,
+        proxyPort: 3901,
+        runtimeImagePrefix: 'enkeep-runtime:test-',
+      })).toThrow(/CONTAINER_NAME_PREFIX/);
     });
 
     it('rejects forbidden system roots', () => {
@@ -21,30 +53,71 @@ describe('Deploy & Prune Tooling (P-01, P-03, P-04)', () => {
         configDir: '/tmp/config',
         plistPath: '/tmp/agent.plist',
         launchdLabel: 'com.example.app',
+        port: 3900,
+        proxyPort: 3901,
+        runtimeImagePrefix: 'enkeep-runtime:test-',
+        containerNamePrefix: 'enkeep-test-',
       })).toThrow(/Safety violation/);
     });
 
-    it('parses env files correctly without hardcoded defaults', () => {
+    it('parses env files and splits TEST_CMDS', () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-env-'));
       const envPath = path.join(tmpDir, 'test.env');
-      fs.writeFileSync(envPath, 'RELEASE_ID=batch-synth\nPORT=3900\nREPO_ROOT="/tmp/test/repo"\n# Comment line\n');
+      fs.writeFileSync(envPath, [
+        'RELEASE_ID=batch55',
+        'PORT=3900',
+        'PROXY_PORT=3901',
+        'RUNTIME_IMAGE_PREFIX=enkeep-runtime:gap-',
+        'CONTAINER_NAME_PREFIX=enkeep-',
+        'REPO_ROOT="/tmp/test/repo"',
+        'TEST_CMDS="pnpm --filter @enkeep/pkg1 test tests/a.test.ts; pnpm --filter @enkeep/pkg2 test tests/b.test.ts"',
+      ].join('\n'));
 
       const parsed = parseEnvFile(envPath);
-      expect(parsed.RELEASE_ID).toBe('batch-synth');
+      expect(parsed.RELEASE_ID).toBe('batch55');
       expect(parsed.PORT).toBe('3900');
-      expect(parsed.REPO_ROOT).toBe('/tmp/test/repo');
+      expect(parsed.PROXY_PORT).toBe('3901');
+
+      const config = resolveDeployConfig(['--env-file', envPath]);
+      expect(config.testCmds).toEqual([
+        'pnpm --filter @enkeep/pkg1 test tests/a.test.ts',
+        'pnpm --filter @enkeep/pkg2 test tests/b.test.ts',
+      ]);
 
       fs.rmSync(tmpDir, { recursive: true, force: true });
     });
+  });
 
-    it('correctly updates plist demo-runner path and image tag', () => {
-      const samplePlist = `
-<plist>
+  describe('Batch ID Calculation', () => {
+    it('computes next release batch number from git branch output', () => {
+      const branchOutput = `
+  origin/release/batch01
+  origin/release/batch2
+  origin/release/batch48
+  origin/release/batch55
+  release/batch12
+`;
+      const nextId = computeNextReleaseId('/dummy/repo', branchOutput);
+      expect(nextId).toBe('batch56');
+    });
+
+    it('defaults to batch1 when no release/batch branches exist', () => {
+      const nextId = computeNextReleaseId('/dummy/repo', '');
+      expect(nextId).toBe('batch1');
+    });
+  });
+
+  describe('Plist updates and redaction', () => {
+    const samplePlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
   <key>EnvironmentVariables</key>
   <dict>
     <key>ENKEEP_RUNTIME_IMAGE</key>
     <string>enkeep-runtime:gap-batch54-oldsha</string>
+    <key>SECRET_KEY</key>
+    <string>super-secret-token</string>
   </dict>
   <key>ProgramArguments</key>
   <array>
@@ -55,10 +128,97 @@ describe('Deploy & Prune Tooling (P-01, P-03, P-04)', () => {
 </dict>
 </plist>`;
 
+    it('only changes worktree path and runtime image tag in plist', () => {
       const updated = updatePlistContent(samplePlist, '/tmp/worktrees/release-worktree-batch55', 'enkeep-runtime:gap-batch55-newsha');
       expect(updated).toContain('/tmp/worktrees/release-worktree-batch55/packages/demo-runner/dist/demo-runner.js');
       expect(updated).toContain('enkeep-runtime:gap-batch55-newsha');
+      expect(updated).toContain('<key>SECRET_KEY</key>');
+      expect(updated).toContain('<string>super-secret-token</string>');
       expect(updated).not.toContain('batch54');
+    });
+
+    it('sanitizes EnvironmentVariables when preparing logs', () => {
+      const sanitized = sanitizePlistForLog(samplePlist);
+      expect(sanitized).not.toContain('super-secret-token');
+      expect(sanitized).toContain('<!-- [REDACTED EnvironmentVariables] -->');
+    });
+  });
+
+  describe('Dry-run & Plan Executions', () => {
+    it('errors when no test-cmd given and skip-tests not set', async () => {
+      const config = {
+        releaseId: 'batch1',
+        targetRef: 'origin/main',
+        repoRoot: '/tmp/repo',
+        releaseRoot: '/tmp/releases',
+        dataDir: '/tmp/data',
+        configDir: '/tmp/config',
+        plistPath: '/tmp/agent.plist',
+        launchdLabel: 'com.example.app',
+        port: 3900,
+        proxyPort: 3901,
+        runtimeImagePrefix: 'enkeep-runtime:test-',
+        containerNamePrefix: 'enkeep-test-',
+        testCmds: [],
+        skipTests: false,
+        testedCommit: '',
+        dryRun: true,
+      };
+
+      await expect(executeDeploy(config)).rejects.toThrow(/No test commands specified/);
+    });
+
+    it('executes dry-run deploy successfully when testCmds are provided', async () => {
+      const config = {
+        releaseId: 'batch99',
+        targetRef: 'origin/main',
+        repoRoot: '/tmp/repo',
+        releaseRoot: '/tmp/releases',
+        dataDir: '/tmp/data',
+        configDir: '/tmp/config',
+        plistPath: '/tmp/agent.plist',
+        launchdLabel: 'com.example.app',
+        port: 3900,
+        proxyPort: 3901,
+        runtimeImagePrefix: 'enkeep-runtime:test-',
+        containerNamePrefix: 'enkeep-test-',
+        testCmds: ['pnpm --filter @enkeep/test-pkg test'],
+        skipTests: false,
+        testedCommit: '',
+        dryRun: true,
+      };
+
+      await expect(executeDeploy(config)).resolves.not.toThrow();
+    });
+
+    it('executes dry-run rollback and verify plans', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-rb-'));
+      const snapshotsDir = path.join(tmpDir, 'snapshots');
+      fs.mkdirSync(snapshotsDir);
+      const fakeBackup = path.join(snapshotsDir, 'com.example.app.plist.pre-batch98-backup');
+      fs.writeFileSync(fakeBackup, '<plist></plist>');
+
+      const rollbackConfig = {
+        configDir: tmpDir,
+        plistPath: path.join(tmpDir, 'com.example.app.plist'),
+        launchdLabel: 'com.example.app',
+        dryRun: true,
+      };
+
+      await expect(executeRollback(rollbackConfig)).resolves.not.toThrow();
+
+      const verifyConfig = {
+        port: 3900,
+        proxyPort: 3901,
+        containerNamePrefix: 'enkeep-test-',
+        plistPath: path.join(tmpDir, 'com.example.app.plist'),
+        dataDir: tmpDir,
+        dryRun: true,
+      };
+
+      await expect(executeVerify(verifyConfig)).resolves.not.toThrow();
+
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     });
   });
 
@@ -70,7 +230,6 @@ describe('Deploy & Prune Tooling (P-01, P-03, P-04)', () => {
       fs.mkdirSync(repoDir);
       fs.mkdirSync(releaseDir);
 
-      // Create synthetic release worktrees with synthetic mtimes
       const wt1 = path.join(releaseDir, 'release-worktree-batch1');
       const wt2 = path.join(releaseDir, 'release-worktree-batch2');
       const wt3 = path.join(releaseDir, 'release-worktree-batch3');
@@ -90,7 +249,6 @@ describe('Deploy & Prune Tooling (P-01, P-03, P-04)', () => {
       fs.utimesSync(wt4, now - 200, now - 200);
       fs.utimesSync(wt5, now - 100, now - 100);
 
-      // We ask to keep 2, and active is wt1 (oldest)
       const plan = planPruneWorktrees({
         releaseRoot: releaseDir,
         repoRoot: repoDir,
@@ -99,12 +257,9 @@ describe('Deploy & Prune Tooling (P-01, P-03, P-04)', () => {
       });
 
       expect(plan.totalFound).toBe(5);
-      // wt5, wt4 kept due to most recent 2. wt1 kept because it is active.
       expect(plan.kept.map(k => k.name).sort()).toEqual(['release-worktree-batch1', 'release-worktree-batch4', 'release-worktree-batch5']);
-      // wt2, wt3 should be pruned
       expect(plan.pruned.map(p => p.name).sort()).toEqual(['release-worktree-batch2', 'release-worktree-batch3']);
 
-      // Dry run execution
       const dryResult = executePrune(plan, true);
       expect(dryResult.prunedCount).toBe(2);
       expect(dryResult.actions.length).toBe(2);
