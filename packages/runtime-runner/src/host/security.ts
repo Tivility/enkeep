@@ -51,6 +51,7 @@ export const ALLOWED_HOST_ENV_KEYS = new Set([
   'TMPDIR',
   'TEMP',
   'TMP',
+  'PTHREAD_MUTEX_USE_ULOCK',
 ]);
 
 const SENSITIVE_KEY_PATTERNS = [
@@ -205,6 +206,14 @@ export function filterHostEnvironment(
   env.LANG = process.env.LANG || 'en_US.UTF-8';
   env.LC_ALL = process.env.LC_ALL || 'en_US.UTF-8';
   env.LC_CTYPE = process.env.LC_CTYPE || 'en_US.UTF-8';
+
+  // macOS: a psynch condition-variable defect can wedge the libuv threadpool in
+  // long-running processes (https://github.com/libuv/libuv/issues/5280). Routing
+  // pthread mutexes to the ulock path avoids it; it must be set at process launch.
+  // An operator can opt out by exporting PTHREAD_MUTEX_USE_ULOCK=0.
+  if (process.platform === 'darwin') {
+    env.PTHREAD_MUTEX_USE_ULOCK = process.env.PTHREAD_MUTEX_USE_ULOCK ?? '1';
+  }
 
   // Isolated user and home pointing to controlled runtime directories
   env.USER = spec.userId;

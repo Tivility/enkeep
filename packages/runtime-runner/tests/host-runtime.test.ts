@@ -20,6 +20,7 @@ import {
   HostCollisionError,
   HostNotFoundError,
   filterHostEnvironment,
+  ALLOWED_HOST_ENV_KEYS,
   validateHostRuntimePaths,
   writeProcessMeta,
   readProcessMeta,
@@ -134,6 +135,46 @@ describe('Host Runtime Adapter & Lifecycle Subsystem', () => {
         if (origClaude) process.env.ANTHROPIC_API_KEY = origClaude;
         else delete process.env.ANTHROPIC_API_KEY;
       }
+    });
+
+    describe('PTHREAD_MUTEX_USE_ULOCK (macOS libuv threadpool stall mitigation)', () => {
+      const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      const origUlock = process.env.PTHREAD_MUTEX_USE_ULOCK;
+
+      const stubPlatform = (platform: NodeJS.Platform) => {
+        Object.defineProperty(process, 'platform', { ...platformDescriptor, value: platform });
+      };
+
+      afterEach(() => {
+        Object.defineProperty(process, 'platform', platformDescriptor);
+        if (origUlock === undefined) delete process.env.PTHREAD_MUTEX_USE_ULOCK;
+        else process.env.PTHREAD_MUTEX_USE_ULOCK = origUlock;
+      });
+
+      it('is part of the host env allowlist', () => {
+        expect(ALLOWED_HOST_ENV_KEYS.has('PTHREAD_MUTEX_USE_ULOCK')).toBe(true);
+      });
+
+      it('defaults to "1" on darwin', () => {
+        stubPlatform('darwin');
+        delete process.env.PTHREAD_MUTEX_USE_ULOCK;
+        const spec = adapter.createDefaultUserSpec({ userId: 'alice', dataRoot: tmpDataRoot });
+        expect(filterHostEnvironment(spec).PTHREAD_MUTEX_USE_ULOCK).toBe('1');
+      });
+
+      it('preserves an explicit "0" opt-out on darwin', () => {
+        stubPlatform('darwin');
+        process.env.PTHREAD_MUTEX_USE_ULOCK = '0';
+        const spec = adapter.createDefaultUserSpec({ userId: 'alice', dataRoot: tmpDataRoot });
+        expect(filterHostEnvironment(spec).PTHREAD_MUTEX_USE_ULOCK).toBe('0');
+      });
+
+      it('is not set on non-darwin platforms', () => {
+        stubPlatform('linux');
+        process.env.PTHREAD_MUTEX_USE_ULOCK = '1';
+        const spec = adapter.createDefaultUserSpec({ userId: 'alice', dataRoot: tmpDataRoot });
+        expect(filterHostEnvironment(spec).PTHREAD_MUTEX_USE_ULOCK).toBeUndefined();
+      });
     });
   });
 

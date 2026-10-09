@@ -140,6 +140,7 @@ Enkeep 生产运行由 `~/Library/LaunchAgents/com.owner-user.enkeep.plist` 定�
   - `ENKEEP_DSH_HOME`: `<enkeep-config-dir>/dsh-home`
   - `DSH_WEB_URL`: `http://127.0.0.1:3080`
   - `ENKEEP_CONTEXT_WINDOW_DEFAULT`: `272000`
+  - `PTHREAD_MUTEX_USE_ULOCK`: `1`（仅 macOS；须在进程启动时即存在：macOS 内核 psynch 条件变量缺陷可能使长时间运行的 Node 进程 libuv 线程池全部卡死在 `__psynch_cvwait`，该变量让 pthread mutex 走 ulock 路径以规避，见 [libuv#5280](https://github.com/libuv/libuv/issues/5280)；宿主运行时子进程在 macOS 上默认设为 `1` 并沿用平台进程显式设置的值，设为 `0` 可关闭）
 - `StandardOutPath`: `~/Library/Logs/enkeep.log`
 - `StandardErrorPath`: `~/Library/Logs/enkeep.err`
 - `KeepAlive`: `<true/>`
