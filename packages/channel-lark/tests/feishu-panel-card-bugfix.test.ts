@@ -23,6 +23,7 @@ describe('Feishu/Lark Streaming Card Background Tasks Panel Fixes', () => {
     let finalizedCard: any;
     let patchCount = 0;
     let updateCount = 0;
+    const cardElementCalls: any[] = [];
 
     const client: any = {
       cardkit: {
@@ -45,7 +46,10 @@ describe('Feishu/Lark Streaming Card Background Tasks Panel Fixes', () => {
             },
           },
           cardElement: {
-            content: async () => ({ code: 0, data: {} }),
+            content: async (req: any) => {
+              cardElementCalls.push(req);
+              return { code: 0, data: {} };
+            },
           },
         },
       },
@@ -67,6 +71,7 @@ describe('Feishu/Lark Streaming Card Background Tasks Panel Fixes', () => {
       getFinalizedCard: () => finalizedCard,
       getPatchCount: () => patchCount,
       getUpdateCount: () => updateCount,
+      getCardElementCalls: () => cardElementCalls,
     };
   }
 
@@ -223,7 +228,7 @@ describe('Feishu/Lark Streaming Card Background Tasks Panel Fixes', () => {
       await transport.stop();
     });
 
-    it('CredentialedLarkTransport: panel update before finalize does NOT call card.update or message.patch; finalize renders panel', async () => {
+    it('CredentialedLarkTransport: panel update before finalize updates bg_panel via cardElement.content without calling card.update or message.patch; finalize renders panel', async () => {
       const mockApi = createMockApiClient();
 
       const transport = new CredentialedLarkTransport({
@@ -240,10 +245,20 @@ describe('Feishu/Lark Streaming Card Background Tasks Panel Fixes', () => {
         title: 'Live Task',
       });
 
+      // Initial card should contain empty bg_panel
+      const initialCard = mockApi.getCreatedInitialCard();
+      expect(initialCard.body.elements.find((e: any) => e.element_id === 'bg_panel')).toBeDefined();
+
       await session!.pushText('Live streaming tokens...');
 
       // Panel update during streaming
       await session!.updateBackgroundPanel?.('**🔄 后台任务**\n• [job] worker-1 · running · 10s');
+
+      // cardElement.content should have been called for bg_panel!
+      const elementCalls = mockApi.getCardElementCalls();
+      const bgPanelCall = elementCalls.find((c: any) => c.path?.element_id === 'bg_panel');
+      expect(bgPanelCall).toBeDefined();
+      expect(bgPanelCall.data?.content).toBe('**🔄 后台任务**\n• [job] worker-1 · running · 10s');
 
       // card.update and message.patch must NOT have been called yet!
       expect(mockApi.getUpdateCount()).toBe(0);

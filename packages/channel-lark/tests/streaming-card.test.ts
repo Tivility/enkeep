@@ -644,13 +644,15 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       expect(initialCard.schema).toBe('2.0');
       expect(initialCard.config.streaming_mode).toBe(true);
       const initialElements = initialCard.body.elements;
-      expect(initialElements.length).toBe(2);
+      expect(initialElements.length).toBe(3);
       expect(initialElements[0].tag).toBe('collapsible_panel');
       expect(initialElements[0].expanded).toBe(true);
       expect(initialElements[0].header.background_color).toBe('wathet-50');
       expect(initialElements[0].elements[0].element_id).toBe('tool_status_content');
       expect(initialElements[1].tag).toBe('markdown');
       expect(initialElements[1].element_id).toBe('main_content');
+      expect(initialElements[2].tag).toBe('markdown');
+      expect(initialElements[2].element_id).toBe('bg_panel');
 
       // 2. Push tool status update
       await session!.pushToolStatus?.('🔨 **web_search**: 正在检索相关资料…');

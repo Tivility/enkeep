@@ -330,11 +330,25 @@ export function buildStreamingStatusLine(params: {
   nowMs?: number;
   lastActivityAt?: number;
   staleThresholdMs?: number;
+  runningTool?: string;
 }): string {
   const elapsedBucket = Math.max(0, Math.floor(params.elapsedMs / 5000) * 5000);
   const now = params.nowMs ?? Date.now();
   const nowBucket = Math.floor(now / 5000) * 5000;
   const timeSec = `<local_datetime millisecond='${nowBucket}' format_type='time_sec'></local_datetime>`;
+
+  let toolNotice = '';
+  if (params.runningTool) {
+    const rawTool = params.runningTool.trim();
+    const lower = rawTool.toLowerCase();
+    if (lower === 'job_output') {
+      toolNotice = ' · 等待后台任务结果（job_output）';
+    } else if (lower === 'workflow') {
+      toolNotice = ' · 运行 workflow …';
+    } else {
+      toolNotice = ` · ${rawTool} 执行中`;
+    }
+  }
 
   let idleNotice = '';
   const staleThreshold = params.staleThresholdMs ?? 120_000;
@@ -343,7 +357,7 @@ export function buildStreamingStatusLine(params: {
     idleNotice = ` · ${formatDuration(silenceMs)} 无新事件，仍在运行`;
   }
 
-  return `<font color='grey'>⏳ 已用 ${formatDuration(elapsedBucket)} · 更新 ${timeSec}${idleNotice}</font>`;
+  return `<font color='grey'>⏳ 已用 ${formatDuration(elapsedBucket)} · 更新 ${timeSec}${toolNotice}${idleNotice}</font>`;
 }
 
 export function truncate(text: string, limit: number): string {
@@ -1191,6 +1205,11 @@ export class FakeLarkTransport implements LarkTransport {
         content: buildStreamingStatusLine({ elapsedMs: 0, nowMs: Date.now() }),
       });
     }
+    initialElements.push({
+      tag: 'markdown',
+      element_id: 'bg_panel',
+      content: '',
+    });
     if (withStop) {
       initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
     }
@@ -2591,6 +2610,11 @@ export class CredentialedLarkTransport implements LarkTransport {
           content: buildStreamingStatusLine({ elapsedMs: 0, nowMs: Date.now() }),
         });
       }
+      initialElements.push({
+        tag: 'markdown',
+        element_id: 'bg_panel',
+        content: '',
+      });
       if (withStop) {
         initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
       }
@@ -3217,7 +3241,27 @@ export class CredentialedLarkTransport implements LarkTransport {
         updateBackgroundPanel: async (panelText: string | null): Promise<void> => {
           currentBackgroundPanel = panelText;
           if (!isFinalized) {
-            // Before finalize, do NOT build or push a final card, leaving the live streaming card untouched.
+            try {
+              const contentFn = client.cardkit?.v1?.cardElement?.content;
+              if (typeof contentFn !== 'function') return;
+
+              seq += 1;
+              await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: 'bg_panel',
+                },
+                data: {
+                  content: panelText ?? '',
+                  sequence: seq,
+                },
+              });
+            } catch (err) {
+              logger.warn('[lark-stream] updateBackgroundPanel streaming error', {
+                code: (err as any)?.code,
+                message: err instanceof Error ? err.message : String(err),
+              });
+            }
             return;
           }
           const finalCard = buildFinalCard();

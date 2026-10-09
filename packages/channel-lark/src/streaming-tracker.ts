@@ -806,11 +806,21 @@ export class StreamingReplyTracker {
             }
           }
 
+          let activeRunningTool: string | undefined;
+          for (let i = this.toolStatusEntries.length - 1; i >= 0; i--) {
+            const entry = this.toolStatusEntries[i];
+            if (entry.status === 'started' || entry.status === 'running') {
+              activeRunningTool = entry.toolName;
+              break;
+            }
+          }
+
           const currentStatusLine = this.withStatusBar
             ? buildStreamingStatusLine({
                 elapsedMs: now - this.startTime,
                 nowMs: now,
                 lastActivityAt: this.lastActivityAt,
+                runningTool: activeRunningTool,
               })
             : undefined;
 
