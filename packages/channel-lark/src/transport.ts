@@ -3252,7 +3252,8 @@ export class CredentialedLarkTransport implements LarkTransport {
                   element_id: 'bg_panel',
                 },
                 data: {
-                  content: panelText ?? '',
+                  // Feishu rejects an empty element content update; a single space clears the panel.
+                  content: panelText && panelText.length > 0 ? panelText : ' ',
                   sequence: seq,
                 },
               });
