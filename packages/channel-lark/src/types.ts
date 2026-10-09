@@ -224,7 +224,7 @@ export interface StreamEventSource {
   getBackgroundTasks?(
     sessionId: string,
     options?: { chatContextId?: string }
-  ): Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+  ): Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
 }
 
 export interface BackgroundTask {
