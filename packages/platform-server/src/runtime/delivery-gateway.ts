@@ -127,6 +127,15 @@ export interface DeliveryTurnExecutor {
     dshSessionId: string;
     taskId: string;
   }): Promise<{ stopped: boolean }>;
+  steerTurn?(req: {
+    userId: string;
+    platformSpaceId: string;
+    dshSessionId: string;
+    expectedTurnId: string;
+    message: string;
+    attachments?: readonly any[];
+    clientRequestId?: string;
+  }): Promise<{ ok: boolean; error?: { code: string; message?: string } }>;
 }
 
 export type RuntimeTurnExecutor = DeliveryTurnExecutor;
@@ -156,10 +165,13 @@ export interface DrainableRuntimeGateway extends RuntimeGateway {
   drain(timeoutMs?: number): Promise<boolean>;
   redriveHeld(): Promise<number>;
   recoverQueuedTurns?(): Promise<number>;
-  getCurrentTurnStatus(userId: string, sessionId: string): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number } | null>;
+  getCurrentTurnStatus(userId: string, sessionId: string): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number; turnId?: string } | null>;
   cancelCurrentTurn(userId: string, sessionId: string): Promise<boolean>;
   getBackgroundTasks?(userId: string, sessionId: string, options?: { chatContextId?: string }): Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
   stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
+  steerTurn?(userId: string, sessionId: string, req: { clientRequestId: string; expectedTurnId: string; content: string }): Promise<{ messageId: string; ok: boolean }>;
+  cancelQueuedTurn?(userId: string, sessionId: string, turnId: string): Promise<boolean>;
+  listQueuedTurns?(userId: string, sessionId: string): Promise<Array<{ turnId: string; createdAt: string; contentSnippet: string }>>;
 }
 
 export function isDrainableRuntimeGateway(gateway: unknown): gateway is DrainableRuntimeGateway {
@@ -3289,7 +3301,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   async getCurrentTurnStatus(
     userId: string,
     sessionId: string
-  ): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number } | null> {
+  ): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number; turnId?: string } | null> {
     if (typeof userId !== 'string' || typeof sessionId !== 'string') {
       throw new ValidationError('Invalid arguments for getCurrentTurnStatus');
     }
@@ -3353,6 +3365,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     }
 
     return {
+      turnId: row.turn_id,
       status: row.status as TurnExecutionStatus,
       ...(queuePos !== undefined ? { queuePosition: queuePos } : {}),
     };
@@ -3867,6 +3880,313 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       }
     }
     return { stopped: false };
+  }
+
+  async steerTurn(
+    userId: string,
+    sessionId: string,
+    req: { clientRequestId: string; expectedTurnId: string; content: string }
+  ): Promise<{ messageId: string; ok: boolean }> {
+    if (typeof userId !== 'string' || !userId.trim()) {
+      throw new ValidationError('Invalid userId for steerTurn');
+    }
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+      throw new ValidationError('Invalid sessionId for steerTurn');
+    }
+    const { clientRequestId, expectedTurnId, content } = req;
+    if (typeof clientRequestId !== 'string' || !clientRequestId.trim()) {
+      throw new ValidationError('Field "clientRequestId" must be a non-empty string');
+    }
+    if (typeof expectedTurnId !== 'string' || !expectedTurnId.trim()) {
+      throw new ValidationError('Field "expectedTurnId" must be a non-empty string');
+    }
+    if (typeof content !== 'string' || !content.trim()) {
+      throw new ValidationError('Field "content" must be a non-empty string');
+    }
+
+    const idempotencyKey = `steer:${clientRequestId}`;
+    const requestHash = createHash('sha256').update(JSON.stringify({ sessionId, expectedTurnId, content })).digest('hex');
+
+    // 1. Check idempotency record
+    const existingIdem = this.db.prepare(`
+      SELECT session_id, request_hash, turn_id, response_payload, state
+      FROM idempotency_records
+      WHERE user_id = ? AND idempotency_key = ?
+      LIMIT 1
+    `).get(userId, idempotencyKey) as {
+      session_id: string;
+      request_hash: string;
+      turn_id: string;
+      response_payload?: string | null;
+      state: string;
+    } | undefined;
+
+    if (existingIdem) {
+      if (existingIdem.session_id !== sessionId || existingIdem.request_hash !== requestHash) {
+        throw new PlatformError(
+          'Idempotency-Key was already used with different request parameters or session.',
+          'IDEMPOTENCY_CONFLICT',
+          409
+        );
+      }
+      if (existingIdem.response_payload) {
+        try {
+          const parsed = JSON.parse(existingIdem.response_payload);
+          return { messageId: parsed.messageId, ok: true };
+        } catch {}
+      }
+      // If no payload stored, find user message with turn_id
+      const msgRow = this.db.prepare(`
+        SELECT id FROM web_messages
+        WHERE user_id = ? AND session_id = ? AND metadata LIKE ?
+        ORDER BY created_at DESC LIMIT 1
+      `).get(userId, sessionId, `%"clientRequestId":"${clientRequestId}"%`) as { id: string } | undefined;
+      return { messageId: msgRow?.id || existingIdem.turn_id, ok: true };
+    }
+
+    // 2. Check turn_runs to verify expectedTurnId is currently 'running' for this session
+    const turnRow = this.db.prepare(`
+      SELECT id, status, space_id, route_id, execution_mode
+      FROM turn_runs
+      WHERE turn_id = ? AND route_id = ? AND user_id = ?
+      LIMIT 1
+    `).get(expectedTurnId, sessionId, userId) as {
+      id: string;
+      status: string;
+      space_id: string;
+      route_id: string;
+      execution_mode?: string;
+    } | undefined;
+
+    if (!turnRow || turnRow.status !== 'running') {
+      throw new PlatformError('Turn is not running', 'NOT_RUNNING', 409);
+    }
+
+    // Resolve dshSessionId & spaceId
+    let dshSessionId = sessionId;
+    let platformSpaceId = turnRow.space_id;
+    try {
+      const routeRow = this.db.prepare(
+        'SELECT dsh_session_id, space_id FROM session_routes WHERE id = ? AND user_id = ? LIMIT 1'
+      ).get(sessionId, userId) as { dsh_session_id?: string; space_id?: string } | undefined;
+      if (routeRow?.dsh_session_id) {
+        dshSessionId = routeRow.dsh_session_id;
+      }
+      if (routeRow?.space_id) {
+        platformSpaceId = routeRow.space_id;
+      }
+    } catch {}
+
+    // 3. Call executor steerTurn
+    if (this.executor && typeof this.executor.steerTurn === 'function') {
+      const steerResult = await this.executor.steerTurn({
+        userId,
+        platformSpaceId,
+        dshSessionId,
+        expectedTurnId,
+        message: content,
+        clientRequestId,
+      });
+
+      if (!steerResult || !steerResult.ok) {
+        const errCode = steerResult?.error?.code;
+        if (errCode === 'TURN_NOT_RUNNING' || errCode === 'NOT_RUNNING') {
+          throw new PlatformError('Turn is not running in runtime', 'NOT_RUNNING', 409);
+        }
+        throw new PlatformError(steerResult?.error?.message || 'Steer failed', errCode || 'STEER_FAILED', 409);
+      }
+    }
+
+    // 4. Store steer message in web_messages, web_events, idempotency_records under transaction
+    const steerMessageId = generate32HexId('msg');
+    const steerEventId = generate32HexId('evt');
+    const steerIdemId = generate32HexId('idem');
+    const nowIso = new Date().toISOString();
+    const routeKey = `${userId}:web:${sessionId}`;
+
+    const metadata = JSON.stringify({
+      isSteer: true,
+      attachedTurnId: expectedTurnId,
+      clientRequestId,
+    });
+
+    let inTx = false;
+    this.db.exec('BEGIN IMMEDIATE');
+    inTx = true;
+    try {
+      // 4a. Insert web_messages row
+      this.db.prepare(`
+        INSERT INTO web_messages (
+          id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at
+        ) VALUES (?, ?, ?, 'user', ?, 'delivered', ?, ?, ?, ?)
+      `).run(
+        steerMessageId,
+        sessionId,
+        userId,
+        content,
+        routeKey,
+        expectedTurnId,
+        metadata,
+        nowIso
+      );
+
+      // 4b. Insert web_events row
+      const publicMsg: WebMessageRecord = {
+        id: steerMessageId,
+        role: 'user',
+        content,
+        status: 'delivered',
+        createdAt: nowIso,
+      };
+      this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'message', ?, ?)
+      `).run(
+        steerEventId,
+        sessionId,
+        userId,
+        JSON.stringify({ message: publicMsg }),
+        nowIso
+      );
+
+      // 4c. Insert idempotency_records row
+      const responsePayload = JSON.stringify({ messageId: steerMessageId, ok: true });
+      this.db.prepare(`
+        INSERT INTO idempotency_records (
+          id, user_id, idempotency_key, session_id, delivery_id, turn_id, request_hash, state, response_payload, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)
+      `).run(
+        steerIdemId,
+        userId,
+        idempotencyKey,
+        sessionId,
+        steerMessageId,
+        expectedTurnId,
+        requestHash,
+        responsePayload,
+        nowIso,
+        nowIso
+      );
+
+      this.db.exec('COMMIT');
+      inTx = false;
+
+      return { messageId: steerMessageId, ok: true };
+    } catch (err) {
+      if (inTx) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch (rbErr) {
+          this.recordSettledError(rbErr);
+        }
+      }
+      throw err;
+    }
+  }
+
+  async cancelQueuedTurn(userId: string, sessionId: string, turnId: string): Promise<boolean> {
+    if (typeof userId !== 'string' || typeof sessionId !== 'string' || typeof turnId !== 'string') {
+      throw new ValidationError('Invalid arguments for cancelQueuedTurn');
+    }
+
+    const nowIso = new Date().toISOString();
+    let inTx = false;
+    this.db.exec('BEGIN IMMEDIATE');
+    inTx = true;
+    try {
+      // 1. Atomic CAS on turn_runs: must be status = 'queued'
+      const turnRes = this.db.prepare(`
+        UPDATE turn_runs
+        SET status = 'interrupted', error = 'Cancelled by user from queue', finished_at = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE turn_id = ? AND route_id = ? AND user_id = ? AND status = 'queued'
+      `).run(nowIso, turnId, sessionId, userId);
+
+      if (safeChangesCount(turnRes.changes) === 0) {
+        this.db.exec('ROLLBACK');
+        inTx = false;
+        return false;
+      }
+
+      // 2. Update delivery_inbox: set status = 'cancelled'
+      this.db.prepare(`
+        UPDATE delivery_inbox
+        SET status = 'cancelled', error = 'Cancelled by user from queue', updated_at = CURRENT_TIMESTAMP
+        WHERE (turn_id = ? OR delivery_id = ?) AND user_id = ? AND route_id = ? AND status IN ('held', 'processing')
+      `).run(turnId, turnId, userId, sessionId);
+
+      // 3. Clean up turn_execution_queue table if it exists
+      try {
+        const hasExecQueue = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='turn_execution_queue'").get();
+        if (hasExecQueue) {
+          this.db.prepare(`
+            DELETE FROM turn_execution_queue
+            WHERE turn_id = ? AND user_id = ? AND route_id = ?
+          `).run(turnId, userId, sessionId);
+        }
+      } catch {}
+
+      // 4. Update idempotency records
+      this.db.prepare(`
+        UPDATE idempotency_records
+        SET state = 'failed', updated_at = CURRENT_TIMESTAMP
+        WHERE turn_id = ? AND user_id = ?
+      `).run(turnId, userId);
+
+      // 5. Emit turn_cancelled event
+      this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'turn_cancelled', ?, ?)
+      `).run(
+        generate32HexId('evt'),
+        sessionId,
+        userId,
+        JSON.stringify({ code: 'USER_CANCELLED', turnId }),
+        nowIso
+      );
+
+      this.db.exec('COMMIT');
+      inTx = false;
+
+      this.turnTimeouts.delete(turnId);
+      this.notifyScheduler();
+      return true;
+    } catch (err) {
+      if (inTx) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch (rbErr) {
+          this.recordSettledError(rbErr);
+        }
+      }
+      throw err;
+    }
+  }
+
+  async listQueuedTurns(
+    userId: string,
+    sessionId: string
+  ): Promise<Array<{ turnId: string; createdAt: string; contentSnippet: string }>> {
+    if (typeof userId !== 'string' || typeof sessionId !== 'string') {
+      throw new ValidationError('Invalid arguments for listQueuedTurns');
+    }
+
+    const rows = this.db.prepare(`
+      SELECT tr.turn_id, tr.created_at, wm.content
+      FROM turn_runs tr
+      LEFT JOIN web_messages wm ON wm.turn_id = tr.turn_id AND wm.user_id = tr.user_id AND wm.role = 'user'
+      WHERE tr.user_id = ? AND tr.route_id = ? AND tr.status = 'queued'
+      ORDER BY tr.created_at ASC
+    `).all(userId, sessionId) as Array<{ turn_id: string; created_at: string; content?: string | null }>;
+
+    return rows.map((r) => {
+      const content = r.content || '';
+      const snippet = content.length > 80 ? content.slice(0, 80) : content;
+      return {
+        turnId: r.turn_id,
+        createdAt: r.created_at,
+        contentSnippet: snippet,
+      };
+    });
   }
 
   /**

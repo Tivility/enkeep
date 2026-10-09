@@ -257,6 +257,35 @@ export class CompositeDeliveryTurnExecutor implements DeliveryTurnExecutor {
     }
     return { stopped: false };
   }
+
+  async steerTurn(req: {
+    userId: string;
+    platformSpaceId: string;
+    dshSessionId: string;
+    expectedTurnId: string;
+    message: string;
+    attachments?: readonly any[];
+    clientRequestId?: string;
+  }): Promise<{ ok: boolean; error?: { code: string; message?: string } }> {
+    let mode: ExecutionMode = 'container';
+    if (this.db && req.platformSpaceId && req.userId) {
+      const spaceRow = this.db
+        .prepare('SELECT execution_mode FROM spaces WHERE id = ? AND user_id = ?')
+        .get(req.platformSpaceId, req.userId) as { execution_mode?: string } | undefined;
+      if (spaceRow?.execution_mode) {
+        mode = spaceRow.execution_mode as ExecutionMode;
+      }
+    }
+    const provider = this.registry.getProvider(mode);
+    if (provider?.turnExecutor && typeof provider.turnExecutor.steerTurn === 'function') {
+      try {
+        return await provider.turnExecutor.steerTurn(req);
+      } catch (err: any) {
+        return { ok: false, error: { code: err?.code || 'STEER_FAILED', message: err?.message } };
+      }
+    }
+    return { ok: false, error: { code: 'TURN_NOT_RUNNING' } };
+  }
 }
 
 /**

@@ -2542,7 +2542,7 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
 
       // In running state
       const runningStatus = await gateway.getCurrentTurnStatus('u1', 'ses1');
-      expect(runningStatus).toEqual({ status: 'running' });
+      expect(runningStatus).toMatchObject({ status: 'running' });
 
       // Finish execution
       finishExecution!();

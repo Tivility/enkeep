@@ -22,6 +22,15 @@ export interface BackgroundTaskDelegates {
     dshSessionId: string;
     taskId: string;
   }): Promise<{ stopped: boolean }>;
+  steerTurn(req: {
+    userId: string;
+    platformSpaceId: string;
+    dshSessionId: string;
+    expectedTurnId: string;
+    message: string;
+    attachments?: readonly any[];
+    clientRequestId?: string;
+  }): Promise<{ ok: boolean; error?: { code: string; message?: string } }>;
 }
 
 export type RuntimeSpaceResolver = (
@@ -32,9 +41,11 @@ export type RuntimeSpaceResolver = (
   handle: UserRuntimeHandle | {
     listBackgroundTasks?: (sessionId: string) => Promise<BackgroundTask[]>;
     stopBackgroundTask?: (sessionId: string, taskId: string) => Promise<{ stopped: boolean }>;
+    steerTurn?: (sessionId: string, expectedTurnId: string, message: string, attachments?: readonly any[], clientRequestId?: string) => Promise<import('@enkeep/runtime-runner').ExecCliEnvelope>;
     rawHandle?: {
       listBackgroundTasks?: (sessionId: string) => Promise<BackgroundTask[]>;
       stopBackgroundTask?: (sessionId: string, taskId: string) => Promise<{ stopped: boolean }>;
+      steerTurn?: (sessionId: string, expectedTurnId: string, message: string, attachments?: readonly any[], clientRequestId?: string) => Promise<import('@enkeep/runtime-runner').ExecCliEnvelope>;
     };
   };
   isHost?: boolean;
@@ -102,6 +113,52 @@ export function createBackgroundTaskDelegates(
         return await handle.rawHandle.stopBackgroundTask(dshSessionId, taskId);
       }
       return { stopped: false };
+    },
+
+    async steerTurn(req: {
+      userId: string;
+      platformSpaceId: string;
+      dshSessionId: string;
+      expectedTurnId: string;
+      message: string;
+      attachments?: readonly any[];
+      clientRequestId?: string;
+    }): Promise<{ ok: boolean; error?: { code: string; message?: string } }> {
+      const { userId, platformSpaceId, dshSessionId, expectedTurnId, message, attachments, clientRequestId } = req;
+      if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+        throw new Error('FAIL-CLOSED: Mandatory userId missing or empty in steerTurn');
+      }
+      if (!platformSpaceId || typeof platformSpaceId !== 'string' || platformSpaceId.trim().length === 0) {
+        throw new Error('FAIL-CLOSED: Mandatory platformSpaceId missing or empty in steerTurn');
+      }
+      if (!dshSessionId || typeof dshSessionId !== 'string' || dshSessionId.trim().length === 0) {
+        throw new Error('FAIL-CLOSED: Mandatory dshSessionId missing or empty in steerTurn');
+      }
+      if (!expectedTurnId || typeof expectedTurnId !== 'string' || expectedTurnId.trim().length === 0) {
+        throw new Error('FAIL-CLOSED: Mandatory expectedTurnId missing or empty in steerTurn');
+      }
+      if (!message || typeof message !== 'string' || message.trim().length === 0) {
+        throw new Error('FAIL-CLOSED: Mandatory message missing or empty in steerTurn');
+      }
+
+      const { handle } = await resolveRuntimeForSpace(userId, platformSpaceId);
+      const steerFn = typeof handle.steerTurn === 'function'
+        ? handle.steerTurn.bind(handle)
+        : (handle.rawHandle && typeof handle.rawHandle.steerTurn === 'function'
+            ? handle.rawHandle.steerTurn.bind(handle.rawHandle)
+            : undefined);
+
+      if (steerFn) {
+        try {
+          const res = await steerFn(dshSessionId, expectedTurnId, message, attachments, clientRequestId);
+          const isOk = res?.status === 'ok' || (res as any)?.ok === true;
+          const errObj = !isOk ? { code: res?.code || 'STEER_FAILED', message: res?.error } : undefined;
+          return { ok: isOk, error: errObj };
+        } catch (err: any) {
+          return { ok: false, error: { code: err?.code || 'STEER_FAILED', message: err?.message } };
+        }
+      }
+      return { ok: false, error: { code: 'TURN_NOT_RUNNING' } };
     },
   };
 }

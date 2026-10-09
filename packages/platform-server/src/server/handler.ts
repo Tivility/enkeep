@@ -173,6 +173,7 @@ const ALLOWED_CIRCUIT_BREAKER_RESET_KEYS = new Set([
 ]);
 const ALLOWED_EDIT_MESSAGE_KEYS = new Set(["content", "attachments", "title", "targetSpaceId", "replyToMessageId"]);
 const ALLOWED_MESSAGE_KEYS = new Set(["content", "attachments", "metadata", "replyToMessageId"]);
+const ALLOWED_STEER_KEYS = new Set(["clientRequestId", "expectedTurnId", "content"]);
 const ALLOWED_CREATE_TASK_KEYS = new Set([
   "title",
   "prompt",
@@ -3074,6 +3075,85 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           }
           const cancelled = await runtimeGateway.cancelCurrentTurn(user.id, sessionId);
           sendJsonResponse(res, 200, createSuccessEnvelope({ cancelled }));
+          return;
+        }
+
+        // 6.1.7-steer /api/sessions/:sessionId/steer
+        if (subPath === "/steer") {
+          if (method !== "POST") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          validateCsrf(req, { csrfToken });
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          const body = await parseJsonBody(req, maxBodyBytes);
+          const unknownKeys = getUnknownKeys(body, ALLOWED_STEER_KEYS);
+          if (unknownKeys.length > 0) {
+            throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+          }
+
+          const { clientRequestId, expectedTurnId, content } = body || {};
+          if (typeof clientRequestId !== "string" || !clientRequestId.trim()) {
+            throw new ValidationError('Field "clientRequestId" must be a non-empty string');
+          }
+          if (typeof expectedTurnId !== "string" || !expectedTurnId.trim()) {
+            throw new ValidationError('Field "expectedTurnId" must be a non-empty string');
+          }
+          const validatedContent = validateMessageContent(content);
+
+          if (!runtimeGateway.steerTurn) {
+            throw new PlatformError("Steer is not supported by runtime gateway", "NOT_IMPLEMENTED", 501);
+          }
+
+          const steerRes = await runtimeGateway.steerTurn(user.id, sessionId, {
+            clientRequestId: clientRequestId.trim(),
+            expectedTurnId: expectedTurnId.trim(),
+            content: validatedContent,
+          });
+          sendJsonResponse(res, 200, createSuccessEnvelope(steerRes));
+          return;
+        }
+
+        // 6.1.7-queue /api/sessions/:sessionId/queue
+        if (subPath === "/queue") {
+          if (method !== "GET") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          if (!runtimeGateway.listQueuedTurns) {
+            throw new PlatformError("Queue listing is not supported by runtime gateway", "NOT_IMPLEMENTED", 501);
+          }
+          const items = await runtimeGateway.listQueuedTurns(user.id, sessionId);
+          sendJsonResponse(res, 200, createSuccessEnvelope({ items }));
+          return;
+        }
+
+        // 6.1.7-queue-cancel /api/sessions/:sessionId/queue/:turnId/cancel
+        const queueCancelMatch = subPath.match(/^\/queue\/([^\/]+)\/cancel$/);
+        if (queueCancelMatch) {
+          if (method !== "POST") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          validateCsrf(req, { csrfToken });
+          const rawTurnId = queueCancelMatch[1];
+          const turnId = validatePathId(rawTurnId, "turnId");
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          if (!runtimeGateway.cancelQueuedTurn) {
+            throw new PlatformError("Cancel queue is not supported by runtime gateway", "NOT_IMPLEMENTED", 501);
+          }
+          const cancelled = await runtimeGateway.cancelQueuedTurn(user.id, sessionId, turnId);
+          if (!cancelled) {
+            throw new PlatformError("Turn is not in queue or already running/completed", "NOT_IN_QUEUE", 409);
+          }
+          sendJsonResponse(res, 200, createSuccessEnvelope({ cancelled: true, turnId }));
           return;
         }
 
