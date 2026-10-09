@@ -247,6 +247,7 @@ const MANAGEMENT_LOCALES = {
     'files.btnNewFile': '+ New File',
     'files.btnUpload': 'Upload Files',
     'files.btnCancelUpload': 'Cancel',
+    'files.btnCopyPath': 'Copy Path',
     'files.btnDownload': 'Download',
     'files.btnDownloadFile': 'Download {name}',
     'files.btnDownloadSelected': 'Download File',
@@ -263,6 +264,9 @@ const MANAGEMENT_LOCALES = {
     'files.emptyDir': 'Empty Directory',
     'files.emptyDirSub': 'No files or directories found in this container space volume.',
     'files.editorTitle': 'File Editor',
+    'files.tabEdit': 'Edit',
+    'files.tabPreview': 'Preview',
+    'files.unsupportedType': 'This file type does not support online viewing.',
     'files.btnSave': 'Save File',
     'files.btnClose': 'Close Editor',
     'files.conflictWarning': 'Conflict: File was modified by another operation. Reload before saving.',
@@ -777,6 +781,7 @@ const MANAGEMENT_LOCALES = {
     'files.btnNewFile': '+ 新建文件',
     'files.btnUpload': '上传文件',
     'files.btnCancelUpload': '取消',
+    'files.btnCopyPath': '复制路径',
     'files.btnDownload': '下载',
     'files.btnDownloadFile': '下载 {name}',
     'files.btnDownloadSelected': '下载文件',
@@ -793,6 +798,9 @@ const MANAGEMENT_LOCALES = {
     'files.emptyDir': '目录为空',
     'files.emptyDirSub': '此容器空间卷中未找到任何文件或目录。',
     'files.editorTitle': '文件编辑器',
+    'files.tabEdit': '编辑',
+    'files.tabPreview': '预览',
+    'files.unsupportedType': '该文件类型不支持在线查看',
     'files.btnSave': '保存文件',
     'files.btnClose': '关闭编辑器',
     'files.conflictWarning': '冲突：文件已被其他操作修改，请重新加载后再保存。',
@@ -4003,6 +4011,49 @@ function enqueueFilesUpload(fileList, spaceId, targetPath) {
   processFileUploadQueue();
 }
 
+function getFilePreviewKind(filePath) {
+  if (!filePath || typeof filePath !== 'string') return 'binary';
+  const lastDot = filePath.lastIndexOf('.');
+  const ext = lastDot !== -1 ? filePath.slice(lastDot + 1).toLowerCase() : '';
+
+  // 1. Image
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) {
+    return 'image';
+  }
+
+  // 2. Markdown
+  if (['md', 'markdown'].includes(ext)) {
+    return 'markdown';
+  }
+
+  // 3. Text / Code / dotfiles / files without extension
+  const textExtensions = [
+    'txt', 'text', 'log', 'csv', 'tsv',
+    'js', 'mjs', 'cjs', 'ts', 'mts', 'cts', 'jsx', 'tsx',
+    'json', 'json5', 'jsonc', 'yaml', 'yml', 'toml', 'ini', 'conf', 'config', 'properties', 'env',
+    'html', 'htm', 'xhtml', 'xml', 'svg', 'css', 'scss', 'sass', 'less',
+    'py', 'pyw', 'rb', 'php', 'java', 'c', 'h', 'cpp', 'hpp', 'cc', 'cxx', 'cs', 'go', 'rs', 'swift', 'kt', 'kts', 'scala', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd', 'sql', 'r', 'lua', 'pl', 'pm', 'graphql', 'gql', 'proto', 'dockerfile', 'makefile'
+  ];
+
+  const lowerName = filePath.split('/').pop().toLowerCase();
+  if (
+    textExtensions.includes(ext) ||
+    lowerName === 'dockerfile' ||
+    lowerName === 'makefile' ||
+    lowerName === 'license' ||
+    lowerName === 'readme' ||
+    lowerName === 'gemfile' ||
+    lowerName === 'procfile' ||
+    lowerName.startsWith('.') ||
+    ext === ''
+  ) {
+    return 'text';
+  }
+
+  // 4. Binary fallback (pdf, zip, tar, gz, db, sqlite, exe, mp3, mp4, etc.)
+  return 'binary';
+}
+
 async function renderFilesView(container) {
   // Always ensure spaces are refreshed for space selection
   try {
@@ -4467,6 +4518,20 @@ async function renderFilesView(container) {
           renderManagementView(state.currentRoute);
         } else {
           // Open file in Editor/Viewer
+          const kind = getFilePreviewKind(entry.name);
+          if (kind === 'image' || kind === 'binary') {
+            state.filesActiveFile = {
+              path: itemRelPath,
+              content: '',
+              size: entry.size,
+              mtimeMs: entry.mtimeMs,
+              etag: entry.etag,
+              isNew: false,
+            };
+            renderManagementView(state.currentRoute);
+            return;
+          }
+
           try {
             const fileRes = await apiRequest(
               `/api/spaces/${encodeURIComponent(activeSpaceId)}/files/content?path=${encodeURIComponent(itemRelPath)}`
@@ -4521,6 +4586,26 @@ async function renderFilesView(container) {
       // Actions column
       const tdAct = document.createElement('td');
       tdAct.className = 'file-actions-cell';
+
+      // Copy Path button (files and directories, relative path)
+      const btnCopyPath = document.createElement('button');
+      btnCopyPath.type = 'button';
+      btnCopyPath.className = 'btn btn-secondary btn-xs';
+      btnCopyPath.textContent = t('files.btnCopyPath', null, 'Copy Path');
+      btnCopyPath.title = `${t('files.btnCopyPath', null, 'Copy Path')}: ${itemRelPath}`;
+      btnCopyPath.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          navigator.clipboard.writeText(itemRelPath).then(() => {
+            showToast(t('common.copied', null, 'Copied!'), 'success');
+          }).catch(() => {
+            showToast(t('common.copied', null, 'Copied!'), 'success');
+          });
+        } else {
+          showToast(t('common.copied', null, 'Copied!'), 'success');
+        }
+      });
+      tdAct.appendChild(btnCopyPath);
 
       // Download button (files only, directories do not download)
       if (!isDir) {
@@ -4620,11 +4705,97 @@ async function renderFilesView(container) {
     const titleRow = document.createElement('div');
     titleRow.className = 'files-editor-title-row';
 
+    const pathWrap = document.createElement('div');
+    pathWrap.className = 'files-editor-path-wrap';
+
     const pathSpan = document.createElement('span');
     pathSpan.id = 'files-active-path';
     pathSpan.className = 'files-editor-path';
     pathSpan.textContent = activeFile.path;
-    titleRow.appendChild(pathSpan);
+    pathWrap.appendChild(pathSpan);
+
+    const btnCopyPathHeader = document.createElement('button');
+    btnCopyPathHeader.type = 'button';
+    btnCopyPathHeader.className = 'btn btn-secondary btn-xs';
+    btnCopyPathHeader.textContent = t('files.btnCopyPath', null, 'Copy Path');
+    btnCopyPathHeader.title = `${t('files.btnCopyPath', null, 'Copy Path')}: ${activeFile.path}`;
+    btnCopyPathHeader.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(activeFile.path).then(() => {
+          showToast(t('common.copied', null, 'Copied!'), 'success');
+        }).catch(() => {
+          showToast(t('common.copied', null, 'Copied!'), 'success');
+        });
+      } else {
+        showToast(t('common.copied', null, 'Copied!'), 'success');
+      }
+    });
+    pathWrap.appendChild(btnCopyPathHeader);
+
+    titleRow.appendChild(pathWrap);
+
+    const headerRightControls = document.createElement('div');
+    headerRightControls.className = 'files-editor-header-controls';
+
+    const previewKind = getFilePreviewKind(activeFile.path);
+
+    // Markdown tabs (Edit / Preview)
+    let isMarkdownPreview = Boolean(activeFile.previewMode);
+    let mdPreviewContainer = null;
+    let mdEditContainer = null;
+
+    if (previewKind === 'markdown') {
+      const tabsGroup = document.createElement('div');
+      tabsGroup.className = 'btn-group';
+
+      const btnTabEdit = document.createElement('button');
+      btnTabEdit.type = 'button';
+      btnTabEdit.className = `btn btn-xs ${!isMarkdownPreview ? 'btn-primary' : 'btn-secondary'}`;
+      btnTabEdit.textContent = t('files.tabEdit', null, 'Edit');
+
+      const btnTabPreview = document.createElement('button');
+      btnTabPreview.type = 'button';
+      btnTabPreview.className = `btn btn-xs ${isMarkdownPreview ? 'btn-primary' : 'btn-secondary'}`;
+      btnTabPreview.textContent = t('files.tabPreview', null, 'Preview');
+
+      btnTabEdit.addEventListener('click', () => {
+        if (isMarkdownPreview) {
+          isMarkdownPreview = false;
+          activeFile.previewMode = false;
+          btnTabEdit.className = 'btn btn-xs btn-primary';
+          btnTabPreview.className = 'btn btn-xs btn-secondary';
+          if (mdEditContainer) mdEditContainer.classList.remove('hidden');
+          if (mdPreviewContainer) mdPreviewContainer.classList.add('hidden');
+          if (btnSave) btnSave.classList.remove('hidden');
+        }
+      });
+
+      btnTabPreview.addEventListener('click', () => {
+        if (!isMarkdownPreview) {
+          isMarkdownPreview = true;
+          activeFile.previewMode = true;
+          btnTabEdit.className = 'btn btn-xs btn-secondary';
+          btnTabPreview.className = 'btn btn-xs btn-primary';
+          if (mdEditContainer) mdEditContainer.classList.add('hidden');
+          if (mdPreviewContainer) {
+            mdPreviewContainer.classList.remove('hidden');
+            mdPreviewContainer.textContent = '';
+            const currentContent = textarea ? textarea.value : (activeFile.content || '');
+            if (typeof renderMarkdownToElement === 'function') {
+              renderMarkdownToElement(mdPreviewContainer, currentContent);
+            } else {
+              mdPreviewContainer.textContent = currentContent;
+            }
+          }
+          if (btnSave) btnSave.classList.add('hidden');
+        }
+      });
+
+      tabsGroup.appendChild(btnTabEdit);
+      tabsGroup.appendChild(btnTabPreview);
+      headerRightControls.appendChild(tabsGroup);
+    }
 
     const btnClose = document.createElement('button');
     btnClose.type = 'button';
@@ -4634,7 +4805,8 @@ async function renderFilesView(container) {
       state.filesActiveFile = null;
       renderManagementView(state.currentRoute);
     });
-    titleRow.appendChild(btnClose);
+    headerRightControls.appendChild(btnClose);
+    titleRow.appendChild(headerRightControls);
     editorHeader.appendChild(titleRow);
 
     // Meta bar
@@ -4660,126 +4832,207 @@ async function renderFilesView(container) {
     editorHeader.appendChild(metaBar);
     editorPanel.appendChild(editorHeader);
 
-    // Content Textarea
-    const textarea = document.createElement('textarea');
-    textarea.id = 'files-editor-textarea';
-    textarea.className = 'files-editor-textarea';
-    textarea.value = activeFile.content;
-    textarea.placeholder = getLocale() === 'zh-CN' ? '输入 UTF-8 文件内容...' : 'Enter UTF-8 file content...';
-    editorPanel.appendChild(textarea);
+    // Body rendering based on previewKind
+    let textarea = null;
+    let btnSave = null;
 
-    // Editor Footer Actions
-    const editorFooter = document.createElement('div');
-    editorFooter.className = 'files-editor-footer';
+    if (previewKind === 'image') {
+      const imgContainer = document.createElement('div');
+      imgContainer.className = 'files-preview-image-container';
 
-    const footerLeft = document.createElement('span');
-    footerLeft.className = 'text-muted';
-    footerLeft.textContent = activeFile.isNew
-      ? (getLocale() === 'zh-CN' ? '新建文件 (未保存草稿)' : 'New File (Unsaved Draft)')
-      : (getLocale() === 'zh-CN' ? 'UTF-8 常规文件' : 'UTF-8 Regular File');
-    editorFooter.appendChild(footerLeft);
+      const imgEl = document.createElement('img');
+      imgEl.className = 'files-preview-image';
+      imgEl.alt = activeFile.path.split('/').pop() || 'image';
+      imgEl.src = `/api/spaces/${encodeURIComponent(activeSpaceId)}/files/download?path=${encodeURIComponent(activeFile.path)}`;
 
-    const footerRight = document.createElement('div');
-    footerRight.className = 'files-toolbar-right';
+      imgContainer.appendChild(imgEl);
+      editorPanel.appendChild(imgContainer);
+    } else if (previewKind === 'binary') {
+      const binContainer = document.createElement('div');
+      binContainer.className = 'files-empty-state files-empty-state-binary';
 
-    // Download button (if not new file)
-    if (!activeFile.isNew) {
-      const btnDownloadActive = document.createElement('button');
-      btnDownloadActive.type = 'button';
-      btnDownloadActive.id = 'btn-files-download-active';
-      btnDownloadActive.className = 'btn btn-secondary btn-sm';
-      btnDownloadActive.textContent = t('files.btnDownloadSelected', null, 'Download File');
-      btnDownloadActive.addEventListener('click', () => {
+      const binNotice = document.createElement('p');
+      binNotice.className = 'text-muted';
+      binNotice.textContent = t('files.unsupportedType', null, 'This file type does not support online viewing.');
+      binContainer.appendChild(binNotice);
+
+      const btnBinDownload = document.createElement('button');
+      btnBinDownload.type = 'button';
+      btnBinDownload.className = 'btn btn-primary btn-sm';
+      btnBinDownload.textContent = t('files.btnDownloadSelected', null, 'Download File');
+      btnBinDownload.addEventListener('click', () => {
         const fileName = activeFile.path.split('/').pop() || 'file';
         const downloadUrl = `/api/spaces/${encodeURIComponent(activeSpaceId)}/files/download?path=${encodeURIComponent(activeFile.path)}`;
         triggerNativeDownload(downloadUrl, fileName);
       });
-      footerRight.appendChild(btnDownloadActive);
-    }
+      binContainer.appendChild(btnBinDownload);
 
-    // Reload button (if not new file)
-    if (!activeFile.isNew) {
-      const btnReload = document.createElement('button');
-      btnReload.type = 'button';
-      btnReload.className = 'btn btn-secondary btn-sm';
-      btnReload.textContent = getLocale() === 'zh-CN' ? '↺ 重新加载' : '↺ Reload';
-      btnReload.addEventListener('click', async () => {
-        try {
-          const res = await apiRequest(
-            `/api/spaces/${encodeURIComponent(activeSpaceId)}/files/content?path=${encodeURIComponent(activeFile.path)}`
-          );
-          if (res && res.data) {
-            activeFile.content = res.data.content;
-            activeFile.size = res.data.size;
-            activeFile.mtimeMs = res.data.mtimeMs;
-            activeFile.etag = res.data.etag;
-            textarea.value = res.data.content;
-            showToast(getLocale() === 'zh-CN' ? '已从服务端重新加载文件' : 'Reloaded file from server', 'info');
-          }
-        } catch (err) {
-          showToast(getSafeErrorMessage(err, 'Failed to reload file from server.'), 'error');
-        }
-      });
-      footerRight.appendChild(btnReload);
-    }
-
-    // Save button
-    const btnSave = document.createElement('button');
-    btnSave.type = 'button';
-    btnSave.id = 'btn-files-save';
-    btnSave.className = 'btn btn-primary btn-sm';
-    btnSave.textContent = t('files.btnSave', null, '💾 Save Changes');
-    btnSave.addEventListener('click', async () => {
-      const updatedContent = textarea.value;
-
-      if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-        showToast(tr('toast.cryptoSendUnavailable', null, 'Secure cryptographic context (crypto.randomUUID) is unavailable. Save aborted.'), 'error');
-        return;
+      editorPanel.appendChild(binContainer);
+    } else if (previewKind === 'markdown') {
+      mdEditContainer = document.createElement('div');
+      if (isMarkdownPreview) {
+        mdEditContainer.classList.add('hidden');
       }
-      const headers = {
-        'Idempotency-Key': crypto.randomUUID(),
-      };
 
-      const body = activeFile.isNew
-        ? {
-            path: activeFile.path,
-            content: updatedContent,
-            requireAbsent: true,
+      textarea = document.createElement('textarea');
+      textarea.id = 'files-editor-textarea';
+      textarea.className = 'files-editor-textarea';
+      textarea.value = activeFile.content;
+      textarea.placeholder = getLocale() === 'zh-CN' ? '输入 UTF-8 文件内容...' : 'Enter UTF-8 file content...';
+      mdEditContainer.appendChild(textarea);
+      editorPanel.appendChild(mdEditContainer);
+
+      mdPreviewContainer = document.createElement('div');
+      mdPreviewContainer.className = `message-content files-markdown-preview-body ${!isMarkdownPreview ? 'hidden' : ''}`;
+
+      if (isMarkdownPreview) {
+        if (typeof renderMarkdownToElement === 'function') {
+          renderMarkdownToElement(mdPreviewContainer, activeFile.content || '');
+        } else {
+          mdPreviewContainer.textContent = activeFile.content || '';
+        }
+      }
+      editorPanel.appendChild(mdPreviewContainer);
+    } else {
+      // Regular text / code
+      textarea = document.createElement('textarea');
+      textarea.id = 'files-editor-textarea';
+      textarea.className = 'files-editor-textarea';
+      textarea.value = activeFile.content;
+      textarea.placeholder = getLocale() === 'zh-CN' ? '输入 UTF-8 文件内容...' : 'Enter UTF-8 file content...';
+      editorPanel.appendChild(textarea);
+    }
+
+    // Editor Footer Actions (hidden for binary)
+    if (previewKind !== 'binary') {
+      const editorFooter = document.createElement('div');
+      editorFooter.className = 'files-editor-footer';
+
+      const footerLeft = document.createElement('span');
+      footerLeft.className = 'text-muted';
+      if (activeFile.isNew) {
+        footerLeft.textContent = getLocale() === 'zh-CN' ? '新建文件 (未保存草稿)' : 'New File (Unsaved Draft)';
+      } else if (previewKind === 'image') {
+        footerLeft.textContent = getLocale() === 'zh-CN' ? '图片预览' : 'Image Preview';
+      } else if (previewKind === 'markdown') {
+        footerLeft.textContent = getLocale() === 'zh-CN' ? 'Markdown 文档' : 'Markdown Document';
+      } else {
+        footerLeft.textContent = getLocale() === 'zh-CN' ? 'UTF-8 常规文件' : 'UTF-8 Regular File';
+      }
+      editorFooter.appendChild(footerLeft);
+
+      const footerRight = document.createElement('div');
+      footerRight.className = 'files-toolbar-right';
+
+      // Download button (if not new file)
+      if (!activeFile.isNew) {
+        const btnDownloadActive = document.createElement('button');
+        btnDownloadActive.type = 'button';
+        btnDownloadActive.id = 'btn-files-download-active';
+        btnDownloadActive.className = 'btn btn-secondary btn-sm';
+        btnDownloadActive.textContent = t('files.btnDownloadSelected', null, 'Download File');
+        btnDownloadActive.addEventListener('click', () => {
+          const fileName = activeFile.path.split('/').pop() || 'file';
+          const downloadUrl = `/api/spaces/${encodeURIComponent(activeSpaceId)}/files/download?path=${encodeURIComponent(activeFile.path)}`;
+          triggerNativeDownload(downloadUrl, fileName);
+        });
+        footerRight.appendChild(btnDownloadActive);
+      }
+
+      // Reload button (if not new file and text/markdown)
+      if (!activeFile.isNew && (previewKind === 'text' || previewKind === 'markdown')) {
+        const btnReload = document.createElement('button');
+        btnReload.type = 'button';
+        btnReload.className = 'btn btn-secondary btn-sm';
+        btnReload.textContent = getLocale() === 'zh-CN' ? '↺ 重新加载' : '↺ Reload';
+        btnReload.addEventListener('click', async () => {
+          try {
+            const res = await apiRequest(
+              `/api/spaces/${encodeURIComponent(activeSpaceId)}/files/content?path=${encodeURIComponent(activeFile.path)}`
+            );
+            if (res && res.data) {
+              activeFile.content = res.data.content;
+              activeFile.size = res.data.size;
+              activeFile.mtimeMs = res.data.mtimeMs;
+              activeFile.etag = res.data.etag;
+              if (textarea) textarea.value = res.data.content;
+              if (isMarkdownPreview && mdPreviewContainer) {
+                mdPreviewContainer.textContent = '';
+                if (typeof renderMarkdownToElement === 'function') {
+                  renderMarkdownToElement(mdPreviewContainer, res.data.content || '');
+                } else {
+                  mdPreviewContainer.textContent = res.data.content || '';
+                }
+              }
+              showToast(getLocale() === 'zh-CN' ? '已从服务端重新加载文件' : 'Reloaded file from server', 'info');
+            }
+          } catch (err) {
+            showToast(getSafeErrorMessage(err, 'Failed to reload file from server.'), 'error');
           }
-        : {
-            path: activeFile.path,
-            content: updatedContent,
-            expectedEtag: activeFile.etag,
+        });
+        footerRight.appendChild(btnReload);
+      }
+
+      // Save button (only for text and markdown, hidden in image preview and markdown preview mode)
+      if (previewKind === 'text' || previewKind === 'markdown') {
+        btnSave = document.createElement('button');
+        btnSave.type = 'button';
+        btnSave.id = 'btn-files-save';
+        btnSave.className = `btn btn-primary btn-sm ${isMarkdownPreview ? 'hidden' : ''}`;
+        btnSave.textContent = t('files.btnSave', null, '💾 Save Changes');
+        btnSave.addEventListener('click', async () => {
+          const updatedContent = textarea ? textarea.value : (activeFile.content || '');
+
+          if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+            showToast(tr('toast.cryptoSendUnavailable', null, 'Secure cryptographic context (crypto.randomUUID) is unavailable. Save aborted.'), 'error');
+            return;
+          }
+          const headers = {
+            'Idempotency-Key': crypto.randomUUID(),
           };
 
-      try {
-        const saveRes = await apiRequest(`/api/spaces/${encodeURIComponent(activeSpaceId)}/files/content`, {
-          method: 'PUT',
-          headers,
-          body,
+          const body = activeFile.isNew
+            ? {
+                path: activeFile.path,
+                content: updatedContent,
+                requireAbsent: true,
+              }
+            : {
+                path: activeFile.path,
+                content: updatedContent,
+                expectedEtag: activeFile.etag,
+              };
+
+          try {
+            const saveRes = await apiRequest(`/api/spaces/${encodeURIComponent(activeSpaceId)}/files/content`, {
+              method: 'PUT',
+              headers,
+              body,
+            });
+
+            if (saveRes && saveRes.data) {
+              activeFile.content = updatedContent;
+              activeFile.size = saveRes.data.size;
+              activeFile.mtimeMs = saveRes.data.mtimeMs;
+              activeFile.etag = saveRes.data.etag;
+              activeFile.isNew = false;
+              showToast(getLocale() === 'zh-CN' ? `成功保存 "${activeFile.path}"` : `Saved "${activeFile.path}" successfully`, 'success');
+              renderManagementView(state.currentRoute);
+            }
+          } catch (err) {
+            if (err && err.status === 409) {
+              showToast(t('files.conflictWarning', null, 'Conflict: File was modified by another operation. Reload before saving.'), 'error');
+            } else {
+              showToast(getSafeErrorMessage(err, 'Failed to save file.'), 'error');
+            }
+          }
         });
-
-        if (saveRes && saveRes.data) {
-          activeFile.content = updatedContent;
-          activeFile.size = saveRes.data.size;
-          activeFile.mtimeMs = saveRes.data.mtimeMs;
-          activeFile.etag = saveRes.data.etag;
-          activeFile.isNew = false;
-          showToast(getLocale() === 'zh-CN' ? `成功保存 "${activeFile.path}"` : `Saved "${activeFile.path}" successfully`, 'success');
-          renderManagementView(state.currentRoute);
-        }
-      } catch (err) {
-        if (err && err.status === 409) {
-          showToast(t('files.conflictWarning', null, 'Conflict: File was modified by another operation. Reload before saving.'), 'error');
-        } else {
-          showToast(getSafeErrorMessage(err, 'Failed to save file.'), 'error');
-        }
+        footerRight.appendChild(btnSave);
       }
-    });
-    footerRight.appendChild(btnSave);
 
-    editorFooter.appendChild(footerRight);
-    editorPanel.appendChild(editorFooter);
+      editorFooter.appendChild(footerRight);
+      editorPanel.appendChild(editorFooter);
+    }
   }
 
   filesGrid.appendChild(editorPanel);
@@ -18802,20 +19055,42 @@ function setupComposerPasteHandler() {
     if (!e.clipboardData) return;
 
     const items = e.clipboardData.items;
+    const pastedImages = [];
     if (items && items.length > 0) {
+      let imgIndex = 0;
       for (const item of items) {
         if (item.type && item.type.startsWith('image/')) {
           const blob = item.getAsFile();
           if (blob) {
-            e.preventDefault();
             const timestamp = Date.now();
-            const filename = `pasted-image-${timestamp}.png`;
+            const filename = `pasted-image-${timestamp}${imgIndex > 0 ? `-${imgIndex}` : ''}.png`;
             const imageFile = new File([blob], filename, { type: blob.type || 'image/png' });
-            handleFilesSelected([imageFile]);
-            return;
+            pastedImages.push(imageFile);
+            imgIndex++;
           }
         }
       }
+    }
+
+    // Check if there are images to handle
+    if (pastedImages.length > 0) {
+      e.preventDefault();
+      handleFilesSelected(pastedImages);
+
+      // Also read text/plain if present
+      const text = e.clipboardData.getData('text/plain');
+      if (text) {
+        const start = chatInput.selectionStart ?? chatInput.value.length;
+        const end = chatInput.selectionEnd ?? chatInput.value.length;
+        if (typeof chatInput.setRangeText === 'function') {
+          chatInput.setRangeText(text, start, end, 'end');
+        } else {
+          chatInput.value = chatInput.value.slice(0, start) + text + chatInput.value.slice(end);
+        }
+        adjustTextareaHeight(chatInput);
+        updateCharCount();
+      }
+      return;
     }
 
     if (e.clipboardData.files && e.clipboardData.files.length > 0) {
@@ -20601,6 +20876,7 @@ if (typeof window !== 'undefined') {
   window.formatDate = formatDate;
   window.formatNumber = formatNumber;
   window.formatBytes = formatBytes;
+  window.getFilePreviewKind = getFilePreviewKind;
   window.getLocalizedEnum = getLocalizedEnum;
   window.captureFormState = captureFormState;
   window.restoreFormState = restoreFormState;
