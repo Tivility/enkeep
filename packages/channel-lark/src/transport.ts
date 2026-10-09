@@ -268,6 +268,10 @@ export interface SentReplyRecord {
   readonly uuid?: string;
   readonly timestamp: string;
   readonly messageId: string;
+  readonly msgType?: string;
+  readonly imageKey?: string;
+  readonly fileKey?: string;
+  readonly fileName?: string;
 }
 
 export interface FakeReactionRecord {
@@ -1119,6 +1123,104 @@ export class FakeLarkTransport implements LarkTransport {
       replyToMessageId: params.replyToMessageId,
       content: params.content,
       format: params.format ?? 'plain',
+      uuid: params.uuid,
+      timestamp: new Date().toISOString(),
+      messageId: replyMsgId,
+    };
+    this._sentReplies.push(record);
+
+    return {
+      success: true,
+      messageId: replyMsgId,
+    };
+  }
+
+  async uploadAndSendImage(params: {
+    chatId: string;
+    imageBuffer: Buffer;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    uuid?: string;
+  }): Promise<OutboundReplyResult> {
+    if (!this._connected) {
+      return {
+        success: false,
+        error: 'FakeLarkTransport is not connected',
+      };
+    }
+
+    if (this.failNextSend) {
+      this.failNextSend = false;
+      return {
+        success: false,
+        error: this.failNextSendReason,
+      };
+    }
+
+    const imgKey = `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.registerMockImage(imgKey, params.imageBuffer);
+
+    const replyMsgId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const record: SentReplyRecord = {
+      chatId: params.chatId,
+      rootId: params.rootId,
+      threadId: params.threadId,
+      replyToMessageId: params.replyToMessageId,
+      content: JSON.stringify({ image_key: imgKey }),
+      msgType: 'image',
+      imageKey: imgKey,
+      uuid: params.uuid,
+      timestamp: new Date().toISOString(),
+      messageId: replyMsgId,
+    };
+    this._sentReplies.push(record);
+
+    return {
+      success: true,
+      messageId: replyMsgId,
+    };
+  }
+
+  async uploadAndSendFile(params: {
+    chatId: string;
+    fileBuffer: Buffer;
+    fileName: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    fileType?: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
+    durationMs?: number;
+    uuid?: string;
+  }): Promise<OutboundReplyResult> {
+    if (!this._connected) {
+      return {
+        success: false,
+        error: 'FakeLarkTransport is not connected',
+      };
+    }
+
+    if (this.failNextSend) {
+      this.failNextSend = false;
+      return {
+        success: false,
+        error: this.failNextSendReason,
+      };
+    }
+
+    const fileKey = `file_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.registerMockFile(fileKey, params.fileBuffer);
+
+    const replyMsgId = `om_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const record: SentReplyRecord = {
+      chatId: params.chatId,
+      rootId: params.rootId,
+      threadId: params.threadId,
+      replyToMessageId: params.replyToMessageId,
+      content: JSON.stringify({ file_key: fileKey, file_name: params.fileName }),
+      msgType: 'file',
+      fileKey,
+      fileName: params.fileName,
       uuid: params.uuid,
       timestamp: new Date().toISOString(),
       messageId: replyMsgId,
@@ -2510,6 +2612,297 @@ export class CredentialedLarkTransport implements LarkTransport {
             receive_id: params.chatId,
             content: textContent,
             msg_type: 'text',
+            uuid: params.uuid,
+          },
+        });
+
+        if (res?.code === 0 || res?.data?.message_id) {
+          return {
+            success: true,
+            messageId: res.data?.message_id,
+          };
+        } else {
+          return {
+            success: false,
+            error: res?.msg || `Lark API create message failed with code ${res?.code}`,
+          };
+        }
+      }
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : 'Unknown Lark API error',
+      };
+    }
+  }
+
+  /**
+   * Upload image buffer via im.v1.image.create and send image message.
+   */
+  async uploadAndSendImage(params: {
+    chatId: string;
+    imageBuffer: Buffer;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    uuid?: string;
+  }): Promise<OutboundReplyResult> {
+    if (!this.apiClient) {
+      return {
+        success: false,
+        error: `Live Lark reply skipped (${REAL_LARK_CREDENTIAL_ACCEPTANCE}): ${REAL_LARK_CREDENTIAL_SKIP_REASON}`,
+      };
+    }
+
+    try {
+      const imageApi = this.apiClient.im?.v1?.image || this.apiClient.im?.image;
+      if (!imageApi || typeof imageApi.create !== 'function') {
+        return {
+          success: false,
+          error: 'Lark API im.v1.image.create is not available',
+        };
+      }
+
+      const uploadRes = await imageApi.create({
+        data: {
+          image_type: 'message',
+          image: params.imageBuffer,
+        },
+      });
+
+      const imageKey = uploadRes?.image_key ?? uploadRes?.data?.image_key;
+      if (!imageKey) {
+        return {
+          success: false,
+          error: uploadRes?.msg || 'Failed to obtain image_key from Lark API upload response',
+        };
+      }
+
+      const imageContent = JSON.stringify({ image_key: imageKey });
+      const target = resolveReplyTarget({
+        rootId: params.rootId,
+        threadId: params.threadId,
+        replyToMessageId: params.replyToMessageId,
+      });
+
+      if (target.messageId) {
+        const doReply = async (replyInThread: boolean, msgId: string) => {
+          const replyFn =
+            this.apiClient.im?.message?.reply || this.apiClient.im?.v1?.message?.reply;
+          return await replyFn({
+            path: {
+              message_id: msgId,
+            },
+            params: params.uuid ? { uuid: params.uuid } : undefined,
+            data: {
+              content: imageContent,
+              msg_type: 'image',
+              reply_in_thread: replyInThread,
+              uuid: params.uuid,
+            },
+          });
+        };
+
+        const fallbackTarget =
+          params.replyToMessageId && !params.replyToMessageId.startsWith('omt_')
+            ? params.replyToMessageId
+            : target.messageId;
+
+        let res: any;
+        try {
+          res = await doReply(target.replyInThread, target.messageId);
+        } catch (firstErr) {
+          const errCode = getLarkApiErrorCode(firstErr);
+          if (target.replyInThread && errCode && LARK_THREAD_REPLY_UNSUPPORTED_CODES.has(errCode) && fallbackTarget) {
+            res = await doReply(false, fallbackTarget);
+          } else {
+            throw firstErr;
+          }
+        }
+
+        if (target.replyInThread && res?.code && LARK_THREAD_REPLY_UNSUPPORTED_CODES.has(res.code) && fallbackTarget) {
+          res = await doReply(false, fallbackTarget);
+        }
+
+        if (res?.code === 0 || res?.data?.message_id) {
+          return {
+            success: true,
+            messageId: res.data?.message_id,
+          };
+        } else {
+          return {
+            success: false,
+            error: res?.msg || `Lark API reply failed with code ${res?.code}`,
+          };
+        }
+      } else {
+        const createFn =
+          this.apiClient.im?.message?.create || this.apiClient.im?.v1?.message?.create;
+        const res = await createFn({
+          params: {
+            receive_id_type: 'chat_id',
+            ...(params.uuid ? { uuid: params.uuid } : {}),
+          },
+          data: {
+            receive_id: params.chatId,
+            content: imageContent,
+            msg_type: 'image',
+            uuid: params.uuid,
+          },
+        });
+
+        if (res?.code === 0 || res?.data?.message_id) {
+          return {
+            success: true,
+            messageId: res.data?.message_id,
+          };
+        } else {
+          return {
+            success: false,
+            error: res?.msg || `Lark API create message failed with code ${res?.code}`,
+          };
+        }
+      }
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : 'Unknown Lark API error',
+      };
+    }
+  }
+
+  /**
+   * Upload file buffer via im.v1.file.create and send file message.
+   */
+  async uploadAndSendFile(params: {
+    chatId: string;
+    fileBuffer: Buffer;
+    fileName: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    fileType?: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
+    durationMs?: number;
+    uuid?: string;
+  }): Promise<OutboundReplyResult> {
+    if (!this.apiClient) {
+      return {
+        success: false,
+        error: `Live Lark reply skipped (${REAL_LARK_CREDENTIAL_ACCEPTANCE}): ${REAL_LARK_CREDENTIAL_SKIP_REASON}`,
+      };
+    }
+
+    try {
+      const fileApi = this.apiClient.im?.v1?.file || this.apiClient.im?.file;
+      if (!fileApi || typeof fileApi.create !== 'function') {
+        return {
+          success: false,
+          error: 'Lark API im.v1.file.create is not available',
+        };
+      }
+
+      let detectedFileType: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream' = params.fileType ?? 'stream';
+      if (!params.fileType && params.fileName) {
+        const ext = path.extname(params.fileName).toLowerCase();
+        if (ext === '.pdf') detectedFileType = 'pdf';
+        else if (ext === '.doc' || ext === '.docx') detectedFileType = 'doc';
+        else if (ext === '.xls' || ext === '.xlsx') detectedFileType = 'xls';
+        else if (ext === '.ppt' || ext === '.pptx') detectedFileType = 'ppt';
+        else if (ext === '.mp4') detectedFileType = 'mp4';
+        else if (ext === '.opus') detectedFileType = 'opus';
+        else detectedFileType = 'stream';
+      }
+
+      const uploadData: any = {
+        file_type: detectedFileType,
+        file_name: params.fileName,
+        file: params.fileBuffer,
+      };
+      if (params.durationMs != null) {
+        uploadData.duration = params.durationMs;
+      }
+
+      const uploadRes = await fileApi.create({
+        data: uploadData,
+      });
+
+      const fileKey = uploadRes?.file_key ?? uploadRes?.data?.file_key;
+      if (!fileKey) {
+        return {
+          success: false,
+          error: uploadRes?.msg || 'Failed to obtain file_key from Lark API upload response',
+        };
+      }
+
+      const fileContent = JSON.stringify({ file_key: fileKey });
+      const target = resolveReplyTarget({
+        rootId: params.rootId,
+        threadId: params.threadId,
+        replyToMessageId: params.replyToMessageId,
+      });
+
+      if (target.messageId) {
+        const doReply = async (replyInThread: boolean, msgId: string) => {
+          const replyFn =
+            this.apiClient.im?.message?.reply || this.apiClient.im?.v1?.message?.reply;
+          return await replyFn({
+            path: {
+              message_id: msgId,
+            },
+            params: params.uuid ? { uuid: params.uuid } : undefined,
+            data: {
+              content: fileContent,
+              msg_type: 'file',
+              reply_in_thread: replyInThread,
+              uuid: params.uuid,
+            },
+          });
+        };
+
+        const fallbackTarget =
+          params.replyToMessageId && !params.replyToMessageId.startsWith('omt_')
+            ? params.replyToMessageId
+            : target.messageId;
+
+        let res: any;
+        try {
+          res = await doReply(target.replyInThread, target.messageId);
+        } catch (firstErr) {
+          const errCode = getLarkApiErrorCode(firstErr);
+          if (target.replyInThread && errCode && LARK_THREAD_REPLY_UNSUPPORTED_CODES.has(errCode) && fallbackTarget) {
+            res = await doReply(false, fallbackTarget);
+          } else {
+            throw firstErr;
+          }
+        }
+
+        if (target.replyInThread && res?.code && LARK_THREAD_REPLY_UNSUPPORTED_CODES.has(res.code) && fallbackTarget) {
+          res = await doReply(false, fallbackTarget);
+        }
+
+        if (res?.code === 0 || res?.data?.message_id) {
+          return {
+            success: true,
+            messageId: res.data?.message_id,
+          };
+        } else {
+          return {
+            success: false,
+            error: res?.msg || `Lark API reply failed with code ${res?.code}`,
+          };
+        }
+      } else {
+        const createFn =
+          this.apiClient.im?.message?.create || this.apiClient.im?.v1?.message?.create;
+        const res = await createFn({
+          params: {
+            receive_id_type: 'chat_id',
+            ...(params.uuid ? { uuid: params.uuid } : {}),
+          },
+          data: {
+            receive_id: params.chatId,
+            content: fileContent,
+            msg_type: 'file',
             uuid: params.uuid,
           },
         });

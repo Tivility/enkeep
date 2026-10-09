@@ -233,7 +233,7 @@ describe('B-01, B-03, B-04, B-05: Outbound File Channel Adapter & Routing Integr
     );
   });
 
-  it('Lark turn in Step B records failed status with "渠道暂不支持文件发送"', async () => {
+  it('Lark turn origin -> dispatches to Lark gateway deliverFile and returns sent status', async () => {
     const sessionRouteId = 'ses_lark_main_01';
     const turnId = 'turn_lark_001';
     const accountId = 'acc_lark_01';
@@ -249,7 +249,22 @@ describe('B-01, B-03, B-04, B-05: Outbound File Channel Adapter & Routing Integr
       VALUES ('${turnId}', '${userId}', '${sessionRouteId}', '${accountId}', 'lark', 'oc_test_chat', 'oc_test_chat');
     `);
 
-    const adapter = new DefaultOutboundFileChannelAdapter({ db });
+    const mockDeliverFile = vi.fn().mockResolvedValue({
+      success: true,
+      deliveryStatus: 'sent',
+      outboxItem: { id: 'out_lark_test_001' },
+    });
+
+    const mockChannelRuntime = {
+      getActiveGateway: vi.fn().mockReturnValue({
+        deliverFile: mockDeliverFile,
+      }),
+    };
+
+    const adapter = new DefaultOutboundFileChannelAdapter({
+      db,
+      channelRuntimeManager: mockChannelRuntime as any,
+    });
     const res = await adapter.deliverFile({
       userId,
       recipient: sessionRouteId,
@@ -267,13 +282,15 @@ describe('B-01, B-03, B-04, B-05: Outbound File Channel Adapter & Routing Integr
       sessionId: sessionRouteId,
     });
 
-    expect(res.deliveryStatus).toBe('failed');
-    expect(res.deliveryError).toBe('渠道暂不支持文件发送');
-
-    const outboxRow = db.prepare('SELECT * FROM channel_outbox WHERE account_id = ?').get(accountId) as any;
-    expect(outboxRow).toBeDefined();
-    expect(outboxRow.status).toBe('failed');
-    expect(outboxRow.payload_json).toContain('渠道暂不支持文件发送');
+    expect(res.deliveryStatus).toBe('sent');
+    expect(mockDeliverFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: sessionRouteId,
+        chatId: 'oc_test_chat',
+        turnId,
+        fileName: 'doc.pdf',
+      })
+    );
   });
 
   it('Unknown delivery status records are excluded from redrive selection', () => {
