@@ -264,6 +264,7 @@
             <footer class="chat-composer">
               <div id="composer-reply-banner" class="composer-reply-banner hidden" role="region" aria-label="Reply context"></div>
               <div id="composer-attachment-tray" class="composer-attachment-tray hidden" role="region" aria-label="Attached files" data-i18n-aria-label="chat.attachmentsTrayAria"></div>
+              <div id="composer-queue-tray" class="composer-queue-tray hidden" role="region" aria-label="Queued messages" data-i18n-aria-label="chat.queuedTurnsHeader"></div>
               <div class="composer-box" id="composer-box">
                 <textarea id="chat-input" class="chat-textarea" placeholder="Type a message or instruction for Enkeep agent..." data-i18n-placeholder="chat.inputPlaceholder" rows="2" disabled></textarea>
                 <div class="composer-controls">
@@ -281,7 +282,10 @@
                       <span class="composer-hint text-muted" data-i18n="chat.composerHint">Press Enter to send, Shift+Enter for new line</span>
                     </div>
                   </div>
-                  <button id="btn-send-message" class="btn btn-primary btn-send" disabled data-i18n="chat.send">Send</button>
+                  <div class="composer-actions-right flex-row-center">
+                    <button id="btn-steer-message" class="btn btn-warning btn-send hidden" disabled title="Steer Current Turn" data-i18n-title="chat.steerCurrent" data-i18n="chat.steerCurrent">Steer Current Turn</button>
+                    <button id="btn-send-message" class="btn btn-primary btn-send" disabled data-i18n="chat.send">Send</button>
+                  </div>
                 </div>
               </div>
             </footer>
