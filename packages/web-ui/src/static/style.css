@@ -4485,6 +4485,26 @@ aside.workspace-sidebar.is-collapsed {
   font-size: 0.875rem;
 }
 
+.channel-verify-section {
+  margin-top: 1rem;
+  width: 100%;
+  max-width: 360px;
+}
+
+.channel-verify-title {
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.channel-verify-desc {
+  margin-bottom: 0.5rem;
+}
+
+.channel-verify-input-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .channel-toolbar-row {
   display: flex;
   gap: 0.5rem;
