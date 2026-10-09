@@ -58,6 +58,7 @@ export const DAEMON_OPS = {
   BACKGROUND_TASKS: 'backgroundTasks',
   LIST_BACKGROUND_TASKS: 'listBackgroundTasks',
   STOP_BACKGROUND_TASK: 'stopBackgroundTask',
+  STEER: 'steer',
 } as const;
 
 export type DaemonOp = (typeof DAEMON_OPS)[keyof typeof DAEMON_OPS];
@@ -88,6 +89,7 @@ export const DAEMON_ERROR_CODES = {
   SESSION_BUSY: 'SESSION_BUSY',
   SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
   TURN_NOT_FOUND: 'TURN_NOT_FOUND',
+  TURN_NOT_RUNNING: 'TURN_NOT_RUNNING',
   TURN_ALREADY_EXISTS: 'TURN_ALREADY_EXISTS',
   SHUTTING_DOWN: 'SHUTTING_DOWN',
   PLUGIN_ACTIVATION_FAILED: 'PLUGIN_ACTIVATION_FAILED',
@@ -329,6 +331,17 @@ export interface StopBackgroundTaskRequest extends DaemonRequestBase {
   readonly taskId: string;
 }
 
+export interface SteerRequest extends DaemonRequestBase {
+  readonly op: 'steer';
+  readonly sessionId: string;
+  readonly expectedTurnId: string;
+  readonly message: string;
+  readonly attachments?: readonly any[];
+  readonly clientRequestId?: string;
+  readonly workspaceFolder?: string;
+  readonly spaceId?: string;
+}
+
 export type DaemonRequest =
   | SubmitTurnRequest
   | CancelRequest
@@ -349,7 +362,8 @@ export type DaemonRequest =
   | CompactSessionRequest
   | ActivityStatusRequest
   | ListBackgroundTasksRequest
-  | StopBackgroundTaskRequest;
+  | StopBackgroundTaskRequest
+  | SteerRequest;
 
 // ---------------------------------------------------------------------------
 // Response Envelopes
@@ -596,6 +610,15 @@ export interface StopBackgroundTaskResponse extends DaemonResponseBase {
   readonly stopped: boolean;
 }
 
+export interface SteerResponse extends DaemonResponseBase {
+  readonly op: 'steer';
+  readonly ok: boolean;
+  readonly steered: boolean;
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly clientRequestId?: string;
+}
+
 export interface DaemonErrorResponse extends DaemonResponseBase {
   readonly ok: false;
   readonly error: {
@@ -626,6 +649,7 @@ export type DaemonResponse =
   | ActivityStatusResponse
   | ListBackgroundTasksResponse
   | StopBackgroundTaskResponse
+  | SteerResponse
   | DaemonErrorResponse;
 
 // ---------------------------------------------------------------------------
@@ -820,6 +844,28 @@ export function decodeDaemonRequest(raw: string | Buffer): DaemonRequest {
     }
   }
 
+  if (op === DAEMON_OPS.STEER || op === 'steer') {
+    const { sessionId, expectedTurnId, message } = parsed as any;
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+      throw new DaemonProtocolError(
+        DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+        'Steer request missing mandatory non-empty string "sessionId"'
+      );
+    }
+    if (typeof expectedTurnId !== 'string' || !expectedTurnId.trim()) {
+      throw new DaemonProtocolError(
+        DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+        'Steer request missing mandatory non-empty string "expectedTurnId"'
+      );
+    }
+    if (typeof message !== 'string' || !message.trim()) {
+      throw new DaemonProtocolError(
+        DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+        'Steer request missing mandatory non-empty string "message"'
+      );
+    }
+  }
+
   return parsed as unknown as DaemonRequest;
 }
 
@@ -865,6 +911,31 @@ export function decodeDaemonMessage(raw: string | Buffer): DaemonMessage {
           DAEMON_ERROR_CODES.INVALID_PARAMETERS,
           err instanceof Error ? err.message : String(err),
           err
+        );
+      }
+    }
+  }
+
+  if (parsed.op === DAEMON_OPS.STEER || parsed.op === 'steer') {
+    // If it is a Request (not a Response, which has `ok: boolean`), validate request fields
+    if ((parsed as any).ok === undefined) {
+      const { sessionId, expectedTurnId, message } = parsed as any;
+      if (typeof sessionId !== 'string' || !sessionId.trim()) {
+        throw new DaemonProtocolError(
+          DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          'Steer request missing mandatory non-empty string "sessionId"'
+        );
+      }
+      if (typeof expectedTurnId !== 'string' || !expectedTurnId.trim()) {
+        throw new DaemonProtocolError(
+          DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          'Steer request missing mandatory non-empty string "expectedTurnId"'
+        );
+      }
+      if (typeof message !== 'string' || !message.trim()) {
+        throw new DaemonProtocolError(
+          DAEMON_ERROR_CODES.INVALID_PARAMETERS,
+          'Steer request missing mandatory non-empty string "message"'
         );
       }
     }

@@ -700,6 +700,50 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
           throw cancelErr;
         }
       },
+      steerTurn: async (
+        sessionId: string,
+        expectedTurnId: string,
+        message: string,
+        attachments?: readonly any[],
+        clientRequestId?: string
+      ) => {
+        if (!isProcessAlive(pid)) {
+          return {
+            status: 'error',
+            code: 'NOT_RUNNING',
+            turnId: expectedTurnId,
+            sessionId,
+            error: 'Runtime process is not alive',
+          };
+        }
+        try {
+          const res = await transport.steerTurn(sessionId, expectedTurnId, message, attachments, clientRequestId);
+          return {
+            status: res.ok && res.steered ? 'ok' : 'error',
+            turnId: res.turnId ?? expectedTurnId,
+            sessionId: res.sessionId ?? sessionId,
+            code: res.ok && res.steered ? 'STEERED' : 'NOT_RUNNING',
+          };
+        } catch (err: unknown) {
+          const errCode =
+            err instanceof DaemonProtocolError
+              ? err.code
+              : typeof err === 'object' && err !== null && 'code' in err
+                ? String((err as { code: unknown }).code)
+                : undefined;
+          const errMsg = err instanceof Error ? err.message : 'Steer turn failed';
+          if (errCode === 'TURN_NOT_RUNNING' || errMsg.includes('not running')) {
+            return {
+              status: 'error',
+              code: 'NOT_RUNNING',
+              turnId: expectedTurnId,
+              sessionId,
+              error: errMsg,
+            };
+          }
+          throw err;
+        }
+      },
       inspectTurn: async (turnId: string) => {
         try {
           const res = await transport.inspectTurn(turnId);

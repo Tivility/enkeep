@@ -1218,6 +1218,54 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           throw err;
         }
       },
+      steerTurn: async (
+        sessionId: string,
+        expectedTurnId: string,
+        message: string,
+        attachments?: readonly any[],
+        clientRequestId?: string
+      ): Promise<ExecCliEnvelope> => {
+        if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+          throw new Error('sessionId is required for steerTurn');
+        }
+        if (!expectedTurnId || typeof expectedTurnId !== 'string' || expectedTurnId.trim().length === 0) {
+          throw new Error('expectedTurnId is required for steerTurn');
+        }
+        if (!message || typeof message !== 'string' || message.trim().length === 0) {
+          throw new Error('message is required for steerTurn');
+        }
+        try {
+          const transport = await getOrStartTransport();
+          if (!transport.steerTurn) {
+            throw new DockerDaemonError('Transport does not support steerTurn');
+          }
+          const res = await transport.steerTurn(sessionId, expectedTurnId, message, attachments, clientRequestId);
+          return {
+            status: res.ok && res.steered ? 'ok' : 'error',
+            turnId: res.turnId ?? expectedTurnId,
+            sessionId: res.sessionId ?? sessionId,
+            code: res.ok && res.steered ? 'STEERED' : 'NOT_RUNNING',
+          };
+        } catch (err: unknown) {
+          const errCode =
+            err instanceof DaemonProtocolError
+              ? err.code
+              : typeof err === 'object' && err !== null && 'code' in err
+                ? String((err as { code: unknown }).code)
+                : undefined;
+          const errMsg = err instanceof Error ? err.message : 'Steer turn failed';
+          if (errCode === 'TURN_NOT_RUNNING' || errMsg.includes('not running')) {
+            return {
+              status: 'error',
+              code: 'NOT_RUNNING',
+              turnId: expectedTurnId,
+              sessionId,
+              error: errMsg,
+            };
+          }
+          throw err;
+        }
+      },
       inspectTurn: async (turnId: string): Promise<ExecCliEnvelope> => {
         if (!turnId || typeof turnId !== 'string' || turnId.trim().length === 0) {
           throw new Error('turnId is required for inspectTurn');
