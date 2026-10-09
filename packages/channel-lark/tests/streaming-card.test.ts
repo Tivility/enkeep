@@ -21,6 +21,7 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
     cardCreateThrows?: boolean;
     replyResult?: any;
     contentErrCodes?: number[];
+    contentResCodes?: number[];
     cardUpdateResult?: any;
     cardUpdateThrows?: boolean;
     patchResult?: any;
@@ -67,11 +68,15 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
             content: async (payload: any) => {
               calls.cardElementContent.push(payload);
               const currentErrCode = overrides.contentErrCodes?.[contentCallIndex];
+              const currentResCode = overrides.contentResCodes?.[contentCallIndex];
               contentCallIndex++;
               if (currentErrCode) {
                 const err: any = new Error(`Lark error code ${currentErrCode}`);
                 err.code = currentErrCode;
                 throw err;
+              }
+              if (currentResCode !== undefined) {
+                return { code: currentResCode, msg: `Lark response error ${currentResCode}`, data: {} };
               }
               return { code: 0, data: {} };
             },
@@ -283,6 +288,181 @@ describe('Task 2a: Feishu/Lark Streaming Card & Markdown Protocol', () => {
       expect(calls.cardSettings[0].data.sequence).toBe(3);
       expect(calls.cardElementContent[1].data.sequence).toBe(4);
       expect(calls.cardElementContent[1].data.content).toBe('Retrying stream');
+    });
+
+    it('status line update after a 300309 response re-enables and succeeds', async () => {
+      const { client, calls } = createMockApiClient({
+        contentResCodes: [300309],
+      });
+
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_stream_status_300309',
+          userId: 'usr_1',
+          appId: 'cli_mock_stream',
+          appSecret: 'sec_mock_stream',
+        },
+        clientFactory: {
+          createClient: () => client,
+        } as LarkSdkClientFactory,
+      });
+
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_test_chat_status',
+        replyToMessageId: 'om_parent_status',
+        withStatusBar: true,
+      });
+      expect(session).not.toBeNull();
+      if (!session) throw new Error('Session is null');
+
+      if (session.pushStatusLine) {
+        await session.pushStatusLine('⏱ 运行中 (已用 10m)');
+      }
+
+      expect(calls.cardElementContent.length).toBe(2);
+      expect(calls.cardElementContent[0].path.element_id).toBe('streaming_status_bar');
+      expect(calls.cardElementContent[0].data.sequence).toBe(2);
+      expect(calls.cardSettings.length).toBe(1);
+      const settingsData = JSON.parse(calls.cardSettings[0].data.settings);
+      expect(settingsData.config.streaming_mode).toBe(true);
+      expect(calls.cardSettings[0].data.sequence).toBe(3);
+      expect(calls.cardElementContent[1].path.element_id).toBe('streaming_status_bar');
+      expect(calls.cardElementContent[1].data.sequence).toBe(4);
+      expect(calls.cardElementContent[1].data.content).toBe('⏱ 运行中 (已用 10m)');
+    });
+
+    it('bg_panel update re-enables streaming and retries on 200850 response body res.code without throw', async () => {
+      const { client, calls } = createMockApiClient({
+        contentResCodes: [200850],
+      });
+
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_stream_bg_panel',
+          userId: 'usr_1',
+          appId: 'cli_mock_stream',
+          appSecret: 'sec_mock_stream',
+        },
+        clientFactory: {
+          createClient: () => client,
+        } as LarkSdkClientFactory,
+      });
+
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_test_chat_bg',
+        replyToMessageId: 'om_parent_bg',
+      });
+      expect(session).not.toBeNull();
+      if (!session) throw new Error('Session is null');
+
+      if (session.updateBackgroundPanel) {
+        await session.updateBackgroundPanel('⏳ 后台任务执行中...');
+      }
+
+      expect(calls.cardElementContent.length).toBe(2);
+      expect(calls.cardElementContent[0].path.element_id).toBe('bg_panel');
+      expect(calls.cardElementContent[0].data.sequence).toBe(2);
+      expect(calls.cardSettings.length).toBe(1);
+      const settingsData = JSON.parse(calls.cardSettings[0].data.settings);
+      expect(settingsData.config.streaming_mode).toBe(true);
+      expect(calls.cardSettings[0].data.sequence).toBe(3);
+      expect(calls.cardElementContent[1].path.element_id).toBe('bg_panel');
+      expect(calls.cardElementContent[1].data.sequence).toBe(4);
+      expect(calls.cardElementContent[1].data.content).toBe('⏳ 后台任务执行中...');
+    });
+
+    it('sequences are strictly monotonic and serialized across concurrent element updates', async () => {
+      const { client, calls } = createMockApiClient();
+
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_stream_concurrent',
+          userId: 'usr_1',
+          appId: 'cli_mock_stream',
+          appSecret: 'sec_mock_stream',
+        },
+        clientFactory: {
+          createClient: () => client,
+        } as LarkSdkClientFactory,
+      });
+
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_test_chat_conc',
+        replyToMessageId: 'om_parent_conc',
+        withStatusBar: true,
+      });
+      expect(session).not.toBeNull();
+      if (!session) throw new Error('Session is null');
+
+      // Fire concurrent updates simultaneously
+      await Promise.all([
+        session.pushText('Text update 1'),
+        session.pushStatusLine ? session.pushStatusLine('Status update 1') : Promise.resolve(),
+        session.updateBackgroundPanel ? session.updateBackgroundPanel('Panel update 1') : Promise.resolve(),
+        session.pushThinking ? session.pushThinking('Thinking update 1') : Promise.resolve(),
+        session.pushToolStatus ? session.pushToolStatus('Tool update 1') : Promise.resolve(),
+      ]);
+
+      expect(calls.cardElementContent.length).toBe(5);
+      const seqs = calls.cardElementContent.map((c: any) => c.data.sequence);
+      // Strictly monotonic increasing
+      for (let i = 0; i < seqs.length; i++) {
+        expect(seqs[i]).toBe(i + 2);
+      }
+    });
+
+    it('logs other non-zero error codes only once per card per code', async () => {
+      const { client } = createMockApiClient({
+        contentResCodes: [999999, 999999, 888888, 999999],
+      });
+
+      const warnSpy = vi.fn();
+      const customLogger = {
+        error: vi.fn(),
+        warn: warnSpy,
+        info: vi.fn(),
+        debug: vi.fn(),
+        trace: vi.fn(),
+      };
+
+      const transport = new CredentialedLarkTransport({
+        account: {
+          id: 'acc_stream_log_once',
+          userId: 'usr_1',
+          appId: 'cli_mock_stream',
+          appSecret: 'sec_mock_stream',
+        },
+        clientFactory: {
+          createClient: () => client,
+        } as LarkSdkClientFactory,
+        logger: customLogger as any,
+      });
+
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_test_chat_log',
+        replyToMessageId: 'om_parent_log',
+      });
+      expect(session).not.toBeNull();
+      if (!session) throw new Error('Session is null');
+
+      await session.pushText('T1');
+      await session.pushText('T2');
+      await session.pushText('T3');
+      await session.pushText('T4');
+
+      const code999Logs = warnSpy.mock.calls.filter((call) => call[1]?.code === 999999);
+      const code888Logs = warnSpy.mock.calls.filter((call) => call[1]?.code === 888888);
+
+      expect(code999Logs.length).toBe(1);
+      expect(code888Logs.length).toBe(1);
     });
 
     it('falls back to im.v1.message.patch if cardkit.v1.card.update fails during finalize', async () => {

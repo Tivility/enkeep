@@ -1502,6 +1502,7 @@ export interface CredentialedLarkTransportOptions {
   clientFactory?: LarkSdkClientFactory;
   autoConnect?: boolean;
   apiClient?: any;
+  logger?: lark.Logger;
 }
 
 /**
@@ -1520,19 +1521,21 @@ export class CredentialedLarkTransport implements LarkTransport {
   private wsClient: ILarkWSClient | null = null;
   private apiClient: any = null;
   private _resolvedBotOpenId?: string;
-  private readonly logger = new SanitizedLarkLogger();
+  private readonly logger: lark.Logger;
 
   constructor(options: LarkAccountConfig | CredentialedLarkTransportOptions) {
     if ('account' in options) {
       this.account = options.account;
       this.credentialResolver = options.credentialResolver;
       this.clientFactory = options.clientFactory;
+      this.logger = options.logger ?? new SanitizedLarkLogger();
       if (options.apiClient) {
         this.apiClient = options.apiClient;
         this._connected = true;
       }
     } else {
       this.account = options;
+      this.logger = new SanitizedLarkLogger();
     }
     this._resolvedBotOpenId = this.account.botOpenId;
   }
@@ -2774,6 +2777,155 @@ export class CredentialedLarkTransport implements LarkTransport {
       let lastThinkingText: string | undefined;
       let currentBackgroundPanel: string | null = null;
       let isFinalized = false;
+      const loggedErrorCodes = new Set<number>();
+      let cardUpdateQueue = Promise.resolve();
+
+      const STREAMING_CLOSED_CODES = new Set<number>([200850, 300309]);
+
+      const reenableStreamingMode = async (): Promise<boolean> => {
+        const settingsFn = client.cardkit?.v1?.card?.settings;
+        if (typeof settingsFn !== 'function') return false;
+        seq += 1;
+        try {
+          await settingsFn({
+            path: { card_id: cardId },
+            data: {
+              settings: JSON.stringify({ config: { streaming_mode: true } }),
+              sequence: seq,
+            },
+          });
+          return true;
+        } catch (settingsErr) {
+          logger.warn('[lark-stream] settings streaming_mode retry failed', {
+            code: (settingsErr as any)?.code,
+            message: settingsErr instanceof Error ? settingsErr.message : String(settingsErr),
+          });
+          return false;
+        }
+      };
+
+      const sendElementContent = async (elementId: string, content: string): Promise<void> => {
+        const contentFn = client.cardkit?.v1?.cardElement?.content;
+        if (typeof contentFn !== 'function') return;
+
+        seq += 1;
+        let res: any;
+        try {
+          res = await contentFn({
+            path: {
+              card_id: cardId,
+              element_id: elementId,
+            },
+            data: {
+              content,
+              sequence: seq,
+            },
+          });
+        } catch (firstErr) {
+          const errCode = getLarkApiErrorCode(firstErr);
+          if (errCode && STREAMING_CLOSED_CODES.has(errCode)) {
+            await reenableStreamingMode();
+            seq += 1;
+            try {
+              await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: elementId,
+                },
+                data: {
+                  content,
+                  sequence: seq,
+                },
+              });
+            } catch (retryErr) {
+              const retryCode = getLarkApiErrorCode(retryErr);
+              if (retryCode !== undefined && !loggedErrorCodes.has(retryCode)) {
+                loggedErrorCodes.add(retryCode);
+                logger.warn(`[lark-stream] cardElement.content (${elementId}) retry failed`, {
+                  code: retryCode,
+                  message: retryErr instanceof Error ? retryErr.message : String(retryErr),
+                });
+              }
+            }
+            return;
+          }
+
+          if (errCode !== undefined && !loggedErrorCodes.has(errCode)) {
+            loggedErrorCodes.add(errCode);
+            logger.warn(`[lark-stream] cardElement.content (${elementId}) failed`, {
+              code: errCode,
+              message: firstErr instanceof Error ? firstErr.message : String(firstErr),
+            });
+          }
+          return;
+        }
+
+        const resCode = res?.code !== undefined && res?.code !== 0 ? res.code : undefined;
+        if (resCode !== undefined) {
+          if (STREAMING_CLOSED_CODES.has(resCode)) {
+            await reenableStreamingMode();
+            seq += 1;
+            try {
+              const retryRes = await contentFn({
+                path: {
+                  card_id: cardId,
+                  element_id: elementId,
+                },
+                data: {
+                  content,
+                  sequence: seq,
+                },
+              });
+              const secondResCode = retryRes?.code !== undefined && retryRes?.code !== 0 ? retryRes.code : undefined;
+              if (secondResCode !== undefined && !loggedErrorCodes.has(secondResCode)) {
+                loggedErrorCodes.add(secondResCode);
+                logger.warn(`[lark-stream] cardElement.content (${elementId}) retry returned non-zero code`, {
+                  code: secondResCode,
+                  message: retryRes?.msg,
+                });
+              }
+            } catch (retryErr) {
+              const retryCode = getLarkApiErrorCode(retryErr);
+              if (retryCode !== undefined && !loggedErrorCodes.has(retryCode)) {
+                loggedErrorCodes.add(retryCode);
+                logger.warn(`[lark-stream] cardElement.content (${elementId}) retry failed`, {
+                  code: retryCode,
+                  message: retryErr instanceof Error ? retryErr.message : String(retryErr),
+                });
+              }
+            }
+            return;
+          }
+
+          if (!loggedErrorCodes.has(resCode)) {
+            loggedErrorCodes.add(resCode);
+            logger.warn(`[lark-stream] cardElement.content (${elementId}) returned non-zero code`, {
+              code: resCode,
+              message: res?.msg,
+            });
+          }
+        }
+      };
+
+      const updateElementSafely = (elementId: string, content: string): Promise<void> => {
+        const op = async () => {
+          try {
+            await sendElementContent(elementId, content);
+          } catch (err) {
+            const errCode = getLarkApiErrorCode(err);
+            if (errCode !== undefined && !loggedErrorCodes.has(errCode)) {
+              loggedErrorCodes.add(errCode);
+              logger.warn(`[lark-stream] updateElementSafely (${elementId}) unexpected error`, {
+                code: errCode,
+                message: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+        };
+        const next = cardUpdateQueue.then(op, op);
+        cardUpdateQueue = next;
+        return next;
+      };
 
       const buildFinalCard = () => {
         let cleanFinalText = lastFinalText;
@@ -2987,215 +3139,26 @@ export class CredentialedLarkTransport implements LarkTransport {
         cardId,
         messageId: boundMessageId,
         pushText: async (accumulatedText: string, toolStatus?: string, thinkingText?: string, statusLine?: string): Promise<void> => {
-          try {
-            const contentFn = client.cardkit?.v1?.cardElement?.content;
-            if (typeof contentFn !== 'function') return;
-
-            seq += 1;
-            let res: any;
-            try {
-              res = await contentFn({
-                path: {
-                  card_id: cardId,
-                  element_id: 'main_content',
-                },
-                data: {
-                  content: accumulatedText,
-                  sequence: seq,
-                },
-              });
-            } catch (contentErr) {
-              const errCode = getLarkApiErrorCode(contentErr);
-              if (errCode === 200850 || errCode === 300309) {
-                // Re-enable streaming mode and retry once
-                seq += 1;
-                const settingsFn = client.cardkit?.v1?.card?.settings;
-                if (typeof settingsFn === 'function') {
-                  try {
-                    await settingsFn({
-                      path: { card_id: cardId },
-                      data: {
-                        settings: JSON.stringify({ config: { streaming_mode: true } }),
-                        sequence: seq,
-                      },
-                    });
-                  } catch (settingsErr) {
-                    logger.warn('[lark-stream] settings streaming_mode retry failed', {
-                      code: (settingsErr as any)?.code,
-                      message: settingsErr instanceof Error ? settingsErr.message : String(settingsErr),
-                    });
-                  }
-                }
-                seq += 1;
-                await contentFn({
-                  path: {
-                    card_id: cardId,
-                    element_id: 'main_content',
-                  },
-                  data: {
-                    content: accumulatedText,
-                    sequence: seq,
-                  },
-                });
-                return;
-              }
-              logger.warn('[lark-stream] pushText failed', {
-                code: errCode,
-                message: contentErr instanceof Error ? contentErr.message : String(contentErr),
-              });
-              return;
-            }
-
-            // Check non-throwing error code in response
-            if (res?.code === 200850 || res?.code === 300309) {
-              seq += 1;
-              const settingsFn = client.cardkit?.v1?.card?.settings;
-              if (typeof settingsFn === 'function') {
-                try {
-                  await settingsFn({
-                    path: { card_id: cardId },
-                    data: {
-                      settings: JSON.stringify({ config: { streaming_mode: true } }),
-                      sequence: seq,
-                    },
-                  });
-                } catch (settingsErr) {
-                  logger.warn('[lark-stream] settings streaming_mode retry failed', {
-                    code: (settingsErr as any)?.code,
-                    message: settingsErr instanceof Error ? settingsErr.message : String(settingsErr),
-                  });
-                }
-              }
-              seq += 1;
-              await contentFn({
-                path: {
-                  card_id: cardId,
-                  element_id: 'main_content',
-                },
-                data: {
-                  content: accumulatedText,
-                  sequence: seq,
-                },
-              });
-            }
-
-            if (toolStatus) {
-              seq += 1;
-              await contentFn({
-                path: {
-                  card_id: cardId,
-                  element_id: 'tool_status_content',
-                },
-                data: {
-                  content: toolStatus,
-                  sequence: seq,
-                },
-              });
-            }
-
-            if (thinkingText) {
-              seq += 1;
-              await contentFn({
-                path: {
-                  card_id: cardId,
-                  element_id: 'thinking_content',
-                },
-                data: {
-                  content: thinkingText,
-                  sequence: seq,
-                },
-              });
-            }
-
-            if (withStatusBar && statusLine) {
-              seq += 1;
-              await contentFn({
-                path: {
-                  card_id: cardId,
-                  element_id: 'streaming_status_bar',
-                },
-                data: {
-                  content: statusLine,
-                  sequence: seq,
-                },
-              });
-            }
-          } catch (err) {
-            logger.warn('[lark-stream] pushText error', {
-              code: (err as any)?.code,
-              message: err instanceof Error ? err.message : String(err),
-            });
+          await updateElementSafely('main_content', accumulatedText);
+          if (toolStatus) {
+            await updateElementSafely('tool_status_content', toolStatus);
+          }
+          if (thinkingText) {
+            await updateElementSafely('thinking_content', thinkingText);
+          }
+          if (withStatusBar && statusLine) {
+            await updateElementSafely('streaming_status_bar', statusLine);
           }
         },
         pushToolStatus: async (statusText: string): Promise<void> => {
-          try {
-            const contentFn = client.cardkit?.v1?.cardElement?.content;
-            if (typeof contentFn !== 'function') return;
-
-            seq += 1;
-            await contentFn({
-              path: {
-                card_id: cardId,
-                element_id: 'tool_status_content',
-              },
-              data: {
-                content: statusText,
-                sequence: seq,
-              },
-            });
-          } catch (err) {
-            logger.warn('[lark-stream] pushToolStatus error', {
-              code: (err as any)?.code,
-              message: err instanceof Error ? err.message : String(err),
-            });
-          }
+          await updateElementSafely('tool_status_content', statusText);
         },
         pushThinking: async (thinkingText: string): Promise<void> => {
-          try {
-            const contentFn = client.cardkit?.v1?.cardElement?.content;
-            if (typeof contentFn !== 'function') return;
-
-            seq += 1;
-            await contentFn({
-              path: {
-                card_id: cardId,
-                element_id: 'thinking_content',
-              },
-              data: {
-                content: thinkingText,
-                sequence: seq,
-              },
-            });
-          } catch (err) {
-            logger.warn('[lark-stream] pushThinking error', {
-              code: (err as any)?.code,
-              message: err instanceof Error ? err.message : String(err),
-            });
-          }
+          await updateElementSafely('thinking_content', thinkingText);
         },
         pushStatusLine: async (statusText: string): Promise<void> => {
           if (!withStatusBar) return;
-          try {
-            const contentFn = client.cardkit?.v1?.cardElement?.content;
-            if (typeof contentFn !== 'function') return;
-
-            seq += 1;
-            await contentFn({
-              path: {
-                card_id: cardId,
-                element_id: 'streaming_status_bar',
-              },
-              data: {
-                content: statusText,
-                sequence: seq,
-              },
-            });
-          } catch (err) {
-            logger.warn('[lark-stream] pushStatusLine error', {
-              code: (err as any)?.code,
-              message: err instanceof Error ? err.message : String(err),
-            });
-          }
+          await updateElementSafely('streaming_status_bar', statusText);
         },
         finalize: async (
           finalText: string,
@@ -3241,28 +3204,9 @@ export class CredentialedLarkTransport implements LarkTransport {
         updateBackgroundPanel: async (panelText: string | null): Promise<void> => {
           currentBackgroundPanel = panelText;
           if (!isFinalized) {
-            try {
-              const contentFn = client.cardkit?.v1?.cardElement?.content;
-              if (typeof contentFn !== 'function') return;
-
-              seq += 1;
-              await contentFn({
-                path: {
-                  card_id: cardId,
-                  element_id: 'bg_panel',
-                },
-                data: {
-                  // Feishu rejects an empty element content update; a single space clears the panel.
-                  content: panelText && panelText.length > 0 ? panelText : ' ',
-                  sequence: seq,
-                },
-              });
-            } catch (err) {
-              logger.warn('[lark-stream] updateBackgroundPanel streaming error', {
-                code: (err as any)?.code,
-                message: err instanceof Error ? err.message : String(err),
-              });
-            }
+            // Feishu rejects an empty element content update; a single space clears the panel.
+            const content = panelText && panelText.length > 0 ? panelText : ' ';
+            await updateElementSafely('bg_panel', content);
             return;
           }
           const finalCard = buildFinalCard();
