@@ -518,6 +518,25 @@ export class RuntimeDaemon extends EventEmitter {
           }
         } else if (parentSid && ((subject as any)?.header?.origin === 'subagent' || (subject as any)?.meta?.origin === 'subagent')) {
           const nowIso = new Date(event.time || Date.now()).toISOString();
+          let originTurnId: string | undefined = undefined;
+          if (parentSid) {
+            const cur = this.currentTurns.get(parentSid);
+            if (cur?.turnId) {
+              originTurnId = cur.turnId;
+            } else {
+              const entry = this.agents.get(parentSid);
+              if (entry?.currentTurn?.turnId) {
+                originTurnId = entry.currentTurn.turnId;
+              }
+            }
+            if (!originTurnId) {
+              const eventRelay = this.bootedRuntime?.context?.get?.('eventRelay') as any;
+              if (eventRelay && typeof eventRelay.resolveOriginTurnId === 'function') {
+                originTurnId = eventRelay.resolveOriginTurnId(`${parentSid}:${sessionIdStr}`) ||
+                  eventRelay.resolveOriginTurnId(sessionIdStr);
+              }
+            }
+          }
           task = {
             id: sessionIdStr,
             parentSessionId: parentSid,
@@ -526,6 +545,7 @@ export class RuntimeDaemon extends EventEmitter {
             status: 'running',
             startedAt: nowIso,
             lastActivityAt: nowIso,
+            originTurnId,
           };
           if (event.type === 'step/start') {
             task.progress = { step: 1 };
@@ -545,6 +565,25 @@ export class RuntimeDaemon extends EventEmitter {
       if (rawEvent?.type === 'tool-workflow/run-start' && rawEvent.data) {
         const runId = String(rawEvent.data.runId);
         const parentSid = sessionIdStr || '';
+        let originTurnId: string | undefined = undefined;
+        if (parentSid) {
+          const cur = this.currentTurns.get(parentSid);
+          if (cur?.turnId) {
+            originTurnId = cur.turnId;
+          } else {
+            const entry = this.agents.get(parentSid);
+            if (entry?.currentTurn?.turnId) {
+              originTurnId = entry.currentTurn.turnId;
+            }
+          }
+          if (!originTurnId) {
+            const eventRelay = this.bootedRuntime?.context?.get?.('eventRelay') as any;
+            if (eventRelay && typeof eventRelay.resolveOriginTurnId === 'function') {
+              originTurnId = eventRelay.resolveOriginTurnId(`${parentSid}:${runId}`) ||
+                eventRelay.resolveOriginTurnId(runId);
+            }
+          }
+        }
         const nowIso = new Date().toISOString();
         this.backgroundTasksTracker.set(runId, {
           id: runId,
@@ -555,6 +594,7 @@ export class RuntimeDaemon extends EventEmitter {
           startedAt: nowIso,
           lastActivityAt: nowIso,
           progress: { agentsDone: 0, agentsTotal: 0 },
+          originTurnId,
         });
       } else if (rawEvent?.type === 'tool-workflow/agent-start' && rawEvent.data) {
         const runId = String(rawEvent.data.runId);
@@ -669,6 +709,26 @@ export class RuntimeDaemon extends EventEmitter {
         const isContinuable = info.mode === 'continuable' || info.continuable === true;
         const isBg = info.runInBackground === true || info.background === true || isContinuable;
 
+        let originTurnId: string | undefined = undefined;
+        if (parentSession) {
+          const cur = daemon.currentTurns.get(parentSession);
+          if (cur?.turnId) {
+            originTurnId = cur.turnId;
+          } else {
+            const entry = daemon.agents.get(parentSession);
+            if (entry?.currentTurn?.turnId) {
+              originTurnId = entry.currentTurn.turnId;
+            }
+          }
+          if (!originTurnId) {
+            const eventRelay = daemon.bootedRuntime?.context?.get?.('eventRelay') as any;
+            if (eventRelay && typeof eventRelay.resolveOriginTurnId === 'function') {
+              originTurnId = eventRelay.resolveOriginTurnId(`${parentSession}:${idStr}`) ||
+                eventRelay.resolveOriginTurnId(idStr);
+            }
+          }
+        }
+
         daemon.liveSubagentsTracker.set(idStr, {
           id: idStr,
           provider: info.provider ? String(info.provider) : undefined,
@@ -689,10 +749,14 @@ export class RuntimeDaemon extends EventEmitter {
             lastActivityAt: nowIso,
             mode: isContinuable ? 'continuable' : (info.mode === 'one-shot' ? 'one-shot' : undefined),
             isBackground: isBg,
+            originTurnId,
           });
         } else {
           if (parentSession && !existing.parentSessionId) {
             existing.parentSessionId = parentSession;
+          }
+          if (originTurnId && !existing.originTurnId) {
+            existing.originTurnId = originTurnId;
           }
           if (!daemon.stoppedTaskIds.has(idStr) && existing.status !== 'cancelled') {
             existing.status = 'running';
@@ -771,6 +835,25 @@ export class RuntimeDaemon extends EventEmitter {
       const runId = String(info?.runId || info?.id || '');
       if (runId) {
         const parentSid = String(info?.parentSession || info?.sessionId || '');
+        let originTurnId: string | undefined = undefined;
+        if (parentSid) {
+          const cur = this.currentTurns.get(parentSid);
+          if (cur?.turnId) {
+            originTurnId = cur.turnId;
+          } else {
+            const entry = this.agents.get(parentSid);
+            if (entry?.currentTurn?.turnId) {
+              originTurnId = entry.currentTurn.turnId;
+            }
+          }
+          if (!originTurnId) {
+            const eventRelay = this.bootedRuntime?.context?.get?.('eventRelay') as any;
+            if (eventRelay && typeof eventRelay.resolveOriginTurnId === 'function') {
+              originTurnId = eventRelay.resolveOriginTurnId(`${parentSid}:${runId}`) ||
+                eventRelay.resolveOriginTurnId(runId);
+            }
+          }
+        }
         const nowIso = new Date().toISOString();
         if (!this.backgroundTasksTracker.has(runId)) {
           this.backgroundTasksTracker.set(runId, {
@@ -782,6 +865,7 @@ export class RuntimeDaemon extends EventEmitter {
             startedAt: nowIso,
             lastActivityAt: nowIso,
             progress: { agentsDone: 0, agentsTotal: 0 },
+            originTurnId,
           });
         }
       }
@@ -1780,6 +1864,8 @@ export class RuntimeDaemon extends EventEmitter {
 
     const allTaskIds = sessionTasks.map((t) => t.id);
 
+    const eventRelay = ctx?.get?.('eventRelay') as any;
+
     return sessionTasks.map((task) => {
       const shortId = computeTaskShortId(task.id, allTaskIds);
       const lastActTime = Date.parse(task.lastActivityAt);
@@ -1787,6 +1873,12 @@ export class RuntimeDaemon extends EventEmitter {
         task.status === 'running' &&
         !isNaN(lastActTime) &&
         now - lastActTime > 10 * 60 * 1000;
+
+      let originTurnId = task.originTurnId;
+      if (!originTurnId && task.parentSessionId && eventRelay && typeof eventRelay.resolveOriginTurnId === 'function') {
+        originTurnId = eventRelay.resolveOriginTurnId(`${task.parentSessionId}:${task.id}`) ||
+          eventRelay.resolveOriginTurnId(task.id);
+      }
 
       return {
         id: task.id,
@@ -1799,7 +1891,7 @@ export class RuntimeDaemon extends EventEmitter {
         lastActivityAt: task.lastActivityAt,
         stalled,
         progress: task.progress,
-        originTurnId: task.originTurnId,
+        originTurnId,
         originChatContextId: task.originChatContextId,
       };
     });

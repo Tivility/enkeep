@@ -6,6 +6,7 @@ import {
   ValidationError,
   resolveTopLevelCacheRetention,
   resolveTopLevelContextWindow,
+  getChatLevelNativeContextId,
   type PlatformStorage,
   type EffectiveModelSelection,
   type ExecutionMode,
@@ -3659,8 +3660,129 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       }
     }
 
-    // Enrich with originTurnId and originChatContextId from DB
+    // Enrich with originTurnId and originChatContextId from DB / chained resolver / fallback
     if (this.db) {
+      const resolveTurnOriginRecursive = (
+        turnId: string,
+        effectiveSessionId: string | undefined,
+        visited: Set<string>,
+        depth: number
+      ): { channel?: string; nativeContextId?: string } | null => {
+        if (!turnId || typeof turnId !== 'string') return null;
+        const trimmedTurnId = turnId.trim();
+        if (!trimmedTurnId) return null;
+        if (depth >= 8) return null;
+        if (visited.has(trimmedTurnId)) return null;
+        visited.add(trimmedTurnId);
+
+        try {
+          const row = this.db!.prepare('SELECT channel, native_context_id, session_id FROM channel_turn_origins WHERE turn_id = ? LIMIT 1')
+            .get(trimmedTurnId) as { channel?: string; native_context_id?: string; session_id?: string } | undefined;
+          if (row?.native_context_id) {
+            return {
+              channel: row.channel,
+              nativeContextId: row.native_context_id,
+            };
+          }
+        } catch {}
+
+        try {
+          const eventRow = (
+            effectiveSessionId
+              ? this.db!.prepare(
+                  `SELECT session_id,
+                          COALESCE(
+                            json_extract(payload, '$.originTurnId'),
+                            json_extract(payload, '$.origin_turn_id')
+                          ) AS origin_turn_id
+                   FROM web_events
+                   WHERE session_id = ?
+                     AND json_valid(payload) = 1
+                     AND (
+                       json_extract(payload, '$.turnId') = ?
+                       OR json_extract(payload, '$.turn_id') = ?
+                     )
+                     AND (
+                       (json_extract(payload, '$.originTurnId') IS NOT NULL AND json_extract(payload, '$.originTurnId') != '')
+                       OR (json_extract(payload, '$.origin_turn_id') IS NOT NULL AND json_extract(payload, '$.origin_turn_id') != '')
+                     )
+                   ORDER BY rowid DESC
+                   LIMIT 1`
+                ).get(effectiveSessionId, trimmedTurnId, trimmedTurnId)
+              : this.db!.prepare(
+                  `SELECT session_id,
+                          COALESCE(
+                            json_extract(payload, '$.originTurnId'),
+                            json_extract(payload, '$.origin_turn_id')
+                          ) AS origin_turn_id
+                   FROM web_events
+                   WHERE json_valid(payload) = 1
+                     AND (
+                       json_extract(payload, '$.turnId') = ?
+                       OR json_extract(payload, '$.turn_id') = ?
+                     )
+                     AND (
+                       (json_extract(payload, '$.originTurnId') IS NOT NULL AND json_extract(payload, '$.originTurnId') != '')
+                       OR (json_extract(payload, '$.origin_turn_id') IS NOT NULL AND json_extract(payload, '$.origin_turn_id') != '')
+                     )
+                   ORDER BY rowid DESC
+                   LIMIT 1`
+                ).get(trimmedTurnId, trimmedTurnId)
+          ) as { session_id?: string; origin_turn_id?: string } | undefined;
+
+          if (eventRow?.origin_turn_id && typeof eventRow.origin_turn_id === 'string') {
+            const nextOrigin = eventRow.origin_turn_id.trim();
+            if (nextOrigin) {
+              const nextSessionId = effectiveSessionId ?? eventRow.session_id;
+              return resolveTurnOriginRecursive(nextOrigin, nextSessionId, visited, depth + 1);
+            }
+          }
+        } catch {}
+
+        return null;
+      };
+
+      const resolveFallbackChatOrigin = (effectiveSessionId: string): { channel?: string; nativeContextId?: string } | null => {
+        try {
+          const cutoffIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+          let rows = this.db!.prepare(
+            `SELECT channel, account_id, chat_id, thread_id, root_id, native_context_id FROM channel_turn_origins
+             WHERE session_id = ?
+               AND (
+                 datetime(created_at) >= datetime('now', '-24 hours')
+                 OR created_at >= ?
+               )
+             ORDER BY created_at DESC, rowid DESC`
+          ).all(effectiveSessionId, cutoffIso) as any[];
+
+          if (!rows || rows.length === 0) {
+            rows = this.db!.prepare(
+              `SELECT channel, account_id, chat_id, thread_id, root_id, native_context_id FROM channel_turn_origins
+               WHERE session_id = ?
+               ORDER BY created_at DESC, rowid DESC`
+            ).all(effectiveSessionId) as any[];
+          }
+
+          if (!rows || rows.length === 0) return null;
+
+          const first = rows[0];
+          const firstChatLevelId = getChatLevelNativeContextId(first.native_context_id || first.chat_id, first.channel || 'lark');
+          for (let i = 1; i < rows.length; i++) {
+            const r = rows[i];
+            const rChatLevelId = getChatLevelNativeContextId(r.native_context_id || r.chat_id, r.channel || 'lark');
+            if (rChatLevelId !== firstChatLevelId || r.channel !== first.channel || r.account_id !== first.account_id) {
+              return null;
+            }
+          }
+          return {
+            channel: first.channel,
+            nativeContextId: first.native_context_id,
+          };
+        } catch {
+          return null;
+        }
+      };
+
       for (const item of items) {
         if (!item.originTurnId) {
           try {
@@ -3672,21 +3794,29 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
           } catch {}
         }
+
         if (item.originTurnId && !item.originChatContextId) {
-          try {
-            const chanRow = this.db.prepare(
-              'SELECT native_context_id FROM channel_turn_origins WHERE turn_id = ? LIMIT 1'
-            ).get(item.originTurnId) as { native_context_id?: string } | undefined;
-            if (chanRow?.native_context_id) {
-              item.originChatContextId = chanRow.native_context_id;
+          const resolved = resolveTurnOriginRecursive(item.originTurnId, sessionId, new Set<string>(), 0) ||
+            resolveTurnOriginRecursive(item.originTurnId, dshSessionId, new Set<string>(), 0);
+          if (resolved?.nativeContextId) {
+            item.originChatContextId = resolved.nativeContextId;
+          } else {
+            const fallback = resolveFallbackChatOrigin(sessionId) || resolveFallbackChatOrigin(dshSessionId);
+            if (fallback?.nativeContextId) {
+              item.originChatContextId = fallback.nativeContextId;
             }
-          } catch {}
+          }
         }
       }
     }
 
     if (options?.chatContextId) {
-      items = items.filter((t) => t.originChatContextId === options.chatContextId);
+      const targetChatLevelId = getChatLevelNativeContextId(options.chatContextId, 'lark');
+      items = items.filter((t) => {
+        if (!t.originChatContextId) return false;
+        const itemChatLevelId = getChatLevelNativeContextId(t.originChatContextId, 'lark');
+        return itemChatLevelId === targetChatLevelId || t.originChatContextId === options.chatContextId;
+      });
     }
 
     return { items, updatedAt };
