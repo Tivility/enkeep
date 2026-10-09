@@ -12,6 +12,7 @@ export * from './context-token-store.js';
 export * from './gateway-types.js';
 export * from './gateway.js';
 export * from './markdown.js';
+export * from './onboarding/qr.js';
 
 // Disambiguate common constants exported in both transport/http and crypto
 export { ILINK_APP_ID, ILINK_APP_CLIENT_VERSION } from './http.js';

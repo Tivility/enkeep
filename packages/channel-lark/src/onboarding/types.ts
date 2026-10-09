@@ -10,6 +10,7 @@
 
 export type OnboardingJobStatus =
   | 'waiting_for_scan'
+  | 'need_verifycode'
   | 'configuring'
   | 'awaiting_approval'
   | 'verifying'

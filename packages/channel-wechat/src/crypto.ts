@@ -222,7 +222,7 @@ export async function uploadBufferToCdn(
       const resp = await fetchFn(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
-        body: encrypted,
+        body: encrypted as any,
         signal,
       });
 
