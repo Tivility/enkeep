@@ -10,6 +10,7 @@ import {
   executeDeploy,
   executeRollback,
   executeVerify,
+  parseEstablishedExternalConnections,
 } from '../scripts/deploy-release.mjs';
 import { planPruneWorktrees, executePrune } from '../scripts/prune-release-worktrees.mjs';
 import * as fs from 'node:fs';
@@ -272,6 +273,29 @@ describe('Deploy Tooling Enhancements', () => {
   describe('P-04: Tree Comparison Optimization', () => {
     it('returns false when testedCommit is empty', () => {
       expect(checkTreeMatch('/tmp', 'origin/main', '')).toBe(false);
+    });
+  });
+
+  describe('External Connection Parsing', () => {
+    it('accurately parses established external connections and ignores loopback connections', () => {
+      const syntheticLsofOutput = [
+        'COMMAND   PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME',
+        'node    12345 user   57u  IPv4 0x3e700e357ba9f1ef      0t0  TCP 192.168.1.50:55771->43.163.179.90:443 (ESTABLISHED)',
+        'node    12345 user   58u  IPv4 0xebfb7dbdf6d9a0f1      0t0  TCP 192.168.1.50:55777->43.163.165.187:443 (ESTABLISHED)',
+        'node    12345 user   59u  IPv4 0x7eb87656604c7712      0t0  TCP 127.0.0.1:55000->127.0.0.1:3900 (ESTABLISHED)',
+        'node    12345 user   60u  IPv6 0x7eb87656604c7713      0t0  TCP [::1]:55000->[::1]:3900 (ESTABLISHED)',
+        'node    12345 user   61u  IPv4 0x5459ba42fe07f073      0t0  TCP 127.0.0.1:55001->localhost:3900 (ESTABLISHED)',
+        'node    12345 user   67u  IPv4 0xec0076c9c3fa477c      0t0  TCP 192.168.1.50:55010->34.120.84.45:443 (ESTABLISHED)',
+        'node    12345 user   71u  IPv4 0xec0076c9c3fa477d      0t0  TCP 192.168.1.50:55011->34.120.84.45:443 (CLOSE_WAIT)',
+      ].join('\n');
+
+      const count = parseEstablishedExternalConnections(syntheticLsofOutput);
+      expect(count).toBe(3); // 2 to 43.* + 1 to 34.*, ignoring loopbacks and non-ESTABLISHED
+    });
+
+    it('returns 0 for empty or invalid output', () => {
+      expect(parseEstablishedExternalConnections('')).toBe(0);
+      expect(parseEstablishedExternalConnections(null as any)).toBe(0);
     });
   });
 });

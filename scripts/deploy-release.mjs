@@ -309,21 +309,33 @@ function statSafe(p) {
   }
 }
 
-export function countEstablishedConnections(port) {
-  try {
-    // Check lsof for established connections on port
-    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:ESTABLISHED 2>/dev/null || true`, { encoding: 'utf8' }).trim();
-    if (!out) return 0;
-    const lines = out.split('\n').filter(Boolean);
-    // Ignore header if present
-    const dataLines = lines.filter(l => !l.startsWith('COMMAND'));
-    return dataLines.length;
-  } catch {
-    return 0;
+export function parseEstablishedExternalConnections(lsofOutput) {
+  if (!lsofOutput || typeof lsofOutput !== 'string') return 0;
+  const lines = lsofOutput.split('\n').map(l => l.trim()).filter(Boolean);
+  let count = 0;
+  for (const line of lines) {
+    if (line.startsWith('COMMAND')) continue;
+    if (!line.includes('ESTABLISHED')) continue;
+    const parts = line.split(/\s+/);
+    // Find column with "->"
+    const nameCol = parts.find(p => p.includes('->'));
+    if (!nameCol) continue;
+    const [local, remote] = nameCol.split('->');
+    if (!remote) continue;
+    if (
+      remote.startsWith('127.0.0.1:') ||
+      remote.startsWith('[::1]:') ||
+      remote.startsWith('::1:') ||
+      remote.startsWith('localhost:')
+    ) {
+      continue;
+    }
+    count++;
   }
+  return count;
 }
 
-export function getPortProcessPpid(port) {
+export function getPortProcessPid(port) {
   try {
     const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN 2>/dev/null || true`, { encoding: 'utf8' }).trim();
     if (!out) return null;
@@ -332,6 +344,27 @@ export function getPortProcessPpid(port) {
     if (dataLines.length === 0) return null;
     const parts = dataLines[0].split(/\s+/);
     const pid = parts[1];
+    if (!pid) return null;
+    return parseInt(pid, 10);
+  } catch {
+    return null;
+  }
+}
+
+export function countEstablishedConnections(port) {
+  try {
+    const pid = getPortProcessPid(port);
+    if (!pid) return 0;
+    const out = execSync(`lsof -Pan -p ${pid} -iTCP -sTCP:ESTABLISHED 2>/dev/null || true`, { encoding: 'utf8' }).trim();
+    return parseEstablishedExternalConnections(out);
+  } catch {
+    return 0;
+  }
+}
+
+export function getPortProcessPpid(port) {
+  try {
+    const pid = getPortProcessPid(port);
     if (!pid) return null;
     const ppidOut = execSync(`ps -o ppid= -p ${pid} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
     return parseInt(ppidOut, 10);
