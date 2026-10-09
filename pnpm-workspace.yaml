@@ -22,3 +22,8 @@ allowBuilds:
   koffi: true
   node-pty: true
   protobufjs: true
+
+minimumReleaseAgeExclude:
+  - '@tivility/dsh-compaction-window@0.1.0'
+  - '@tivility/dsh-tool-subagent-memory@0.1.0'
+  - '@tivility/dsh-tool-workflow-memory@0.1.0'

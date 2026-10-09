@@ -112,7 +112,7 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
     const subagentProps = (subagentTool?.parameters as any)?.properties;
     expect(subagentProps?.global_memory).toBeDefined();
     expect(subagentProps?.global_memory?.type).toBe('boolean');
-    expect(subagentProps?.global_memory?.description).toBe("include the user's global memory in the child's context");
+    expect(subagentProps?.global_memory?.description).toContain("user's global memory");
 
     // Verify subagent_fork tool does not have global_memory
     const forkTool = toolsRegistry.get('subagent_fork', parentAgent);
@@ -123,7 +123,7 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
     // Verify workflow tool schema and description
     const workflowTool = toolsRegistry.get('workflow', parentAgent);
     expect(workflowTool).toBeDefined();
-    expect(workflowTool?.description).toContain('`globalMemory` (boolean, default false');
+    expect(workflowTool?.description).toContain('`globalMemory: true`');
   });
 
   it('2. Top-level session injects global memory unchanged', async () => {

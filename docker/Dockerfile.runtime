@@ -38,8 +38,6 @@ COPY packages/dsh-tool-browser/ ./packages/dsh-tool-browser/
 COPY packages/dsh-mcp-governance/ ./packages/dsh-mcp-governance/
 COPY packages/dsh-memory/ ./packages/dsh-memory/
 COPY packages/dsh-tool-cli/ ./packages/dsh-tool-cli/
-COPY packages/dsh-tool-subagent-memory/ ./packages/dsh-tool-subagent-memory/
-COPY packages/dsh-tool-workflow-memory/ ./packages/dsh-tool-workflow-memory/
 COPY packages/dsh-enkeep-bundle/ ./packages/dsh-enkeep-bundle/
 COPY packages/runtime-runner/ ./packages/runtime-runner/
 
@@ -65,8 +63,6 @@ RUN pnpm --filter '@enkeep/protocol' \
          --filter '@enkeep/dsh-mcp-governance' \
          --filter '@enkeep/dsh-memory' \
          --filter '@enkeep/dsh-tool-cli' \
-         --filter '@enkeep/dsh-tool-subagent-memory' \
-         --filter '@enkeep/dsh-tool-workflow-memory' \
          --filter '@enkeep/dsh-enkeep-bundle' \
          --filter '@enkeep/runtime-runner' \
          run build
