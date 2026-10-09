@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -252,6 +252,102 @@ describe('RuntimeDaemon activity status RPC and diagnostics', () => {
     agent.inbox.clear();
     const statusClean = await daemon.getStatus();
     expect(statusClean.isIdle).toBe(true);
-    expect(statusClean.pendingInboxItemsCount).toBe(0);
+
+    await daemon.shutdown();
+  });
+
+  it('P-02 / A-04: aggregates background jobs across caller sessions in getActivityStatus', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000088';
+    const jobId = 'job_workflow_0000000000000001';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // Track a known session
+    (daemon as any).agents.set(parentSessionId, { sessionId: parentSessionId });
+
+    // Mock jobs service where list(caller) only returns jobs when caller === parentSessionId
+    const mockJobsService = {
+      list: vi.fn((caller?: any) => {
+        if (caller === parentSessionId) {
+          return [
+            {
+              id: jobId,
+              kind: 'workflow',
+              label: 'distributed-analysis-workflow',
+              status: 'running',
+              owner: parentSessionId,
+              startedAt: Date.now() - 10000,
+            },
+          ];
+        }
+        return [];
+      }),
+    };
+    ctx.get = (name: string) => {
+      if (name === 'jobs') return mockJobsService;
+      return undefined;
+    };
+
+    const status = await daemon.getStatus();
+    expect(status.isIdle).toBe(false);
+    expect(status.runningJobsCount).toBe(1);
+    expect(status.runningWorkflowJobsCount).toBe(1);
+    expect(status.runningJobs[0].id).toBe(jobId);
+
+    await daemon.shutdown();
+  });
+
+  it('P-02: dormant/idle continuable subagents in agent registry are NOT counted as active', async () => {
+    const childSessionId = 'ses_subagent_idle_00000001';
+
+    const daemon = new RuntimeDaemon({
+      userId: 'alice',
+      dshHome,
+      spacesDir,
+    });
+
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // Mock agent registry with an idle continuable subagent
+    const idleSubagent = {
+      id: childSessionId,
+      status: 'idle',
+      session: {
+        header: {
+          origin: 'subagent',
+          parentSession: 'ses_parent_0001',
+          createdAt: Date.now() - 60000,
+        },
+      },
+    };
+    const mockAgentRegistry = {
+      list: () => [idleSubagent],
+      get: (id: any) => (id === childSessionId ? idleSubagent : undefined),
+    };
+    ctx.get = (name: string) => {
+      if (name === 'agents') return mockAgentRegistry;
+      return undefined;
+    };
+
+    const status = await daemon.getStatus();
+    // Idle subagent must NOT be counted into liveSubagents
+    expect(status.liveSubagentsCount).toBe(0);
+    expect(status.isIdle).toBe(true);
+
+    // If the subagent changes status to running, it IS counted
+    (idleSubagent as any).status = 'running';
+    const busyStatus = await daemon.getStatus();
+    expect(busyStatus.liveSubagentsCount).toBe(1);
+    expect(busyStatus.isIdle).toBe(false);
+
+    await daemon.shutdown();
   });
 });

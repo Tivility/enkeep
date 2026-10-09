@@ -14930,11 +14930,17 @@ function updateSessionBackgroundBadge(tasks = state.backgroundTasks) {
 async function loadSessionBackgroundTasks(sessionId = state.currentSessionId) {
   if (!sessionId || state.currentSessionId !== sessionId) {
     state.backgroundTasks = [];
+    state.backgroundTasksAvailable = true;
     updateSessionBackgroundBadge([]);
     return [];
   }
   try {
     const res = await apiRequest(`/api/sessions/${sessionId}/background`);
+    if (res && res.data && res.data.available === false) {
+      state.backgroundTasksAvailable = false;
+      return state.backgroundTasks;
+    }
+    state.backgroundTasksAvailable = true;
     const tasks = (res && res.data && Array.isArray(res.data.items)) ? res.data.items : [];
     if (state.currentSessionId === sessionId) {
       state.backgroundTasks = tasks;
@@ -14942,7 +14948,8 @@ async function loadSessionBackgroundTasks(sessionId = state.currentSessionId) {
     }
     return tasks;
   } catch {
-    return [];
+    state.backgroundTasksAvailable = false;
+    return state.backgroundTasks;
   }
 }
 
@@ -14969,13 +14976,86 @@ async function openBackgroundTasksModal(sessionId = state.currentSessionId) {
     try {
       const res = await apiRequest(`/api/sessions/${sessionId}/background`);
       const raw = res && res.data;
-      const tasks = (raw && Array.isArray(raw.items)) ? raw.items : null;
 
       if (!contentEl) return;
-      contentEl.replaceChildren();
 
-      if (!tasks) {
-        contentEl.appendChild(
+      const isUnavailable = !raw || raw.available === false;
+      if (isUnavailable) {
+        state.backgroundTasksAvailable = false;
+        // If we previously had tasks, retain them and display warning callout banner
+        if (state.backgroundTasks && state.backgroundTasks.length > 0) {
+          contentEl.replaceChildren();
+          const warningBanner = document.createElement('div');
+          warningBanner.className = 'callout callout-warning';
+          warningBanner.textContent = tr('tasks.bgStatusUnavailable', null, '⚠️ 状态暂不可用');
+          contentEl.appendChild(warningBanner);
+
+          // Render previously retained table
+          const tableContainer = document.createElement('div');
+          tableContainer.className = 'data-table-container';
+          const table = document.createElement('table');
+          table.className = 'data-table';
+          const thead = document.createElement('thead');
+          const trHead = document.createElement('tr');
+          [
+            tr('tasks.bgColKind', null, 'Type'),
+            tr('tasks.bgColId', null, 'ID'),
+            tr('tasks.bgColName', null, 'Name'),
+            tr('tasks.bgColStatus', null, 'Status'),
+            tr('tasks.bgColProgress', null, 'Progress'),
+            tr('tasks.bgColStarted', null, 'Started'),
+            tr('tasks.bgColActions', null, 'Actions'),
+          ].forEach((col) => {
+            const th = document.createElement('th');
+            th.textContent = col;
+            trHead.appendChild(th);
+          });
+          thead.appendChild(trHead);
+          table.appendChild(thead);
+          const tbody = document.createElement('tbody');
+          state.backgroundTasks.forEach((task) => {
+            const trEl = document.createElement('tr');
+            const tdKind = document.createElement('td');
+            tdKind.textContent = task.kind || 'task';
+            trEl.appendChild(tdKind);
+            const tdId = document.createElement('td');
+            tdId.textContent = task.shortId || task.id?.slice(0, 6) || '-';
+            trEl.appendChild(tdId);
+            const tdName = document.createElement('td');
+            tdName.textContent = task.name || '-';
+            trEl.appendChild(tdName);
+            const tdStatus = document.createElement('td');
+            let statusLabel = formatStatus(task.status);
+            const badgeType = task.status === 'running' ? 'warning' : (task.status === 'completed' ? 'success' : 'danger');
+            if (task.stalled) {
+              statusLabel += ` · ${tr('tasks.bgStalledTag', null, '⚠️ 可能卡住')}`;
+            }
+            tdStatus.appendChild(createBadgeElement(statusLabel, badgeType));
+            trEl.appendChild(tdStatus);
+            const tdProgress = document.createElement('td');
+            if (task.progress && typeof task.progress.agentsTotal === 'number' && task.progress.agentsTotal > 0) {
+              tdProgress.textContent = `${task.progress.agentsDone || 0}/${task.progress.agentsTotal} agents`;
+            } else if (task.progress && typeof task.progress.step === 'number') {
+              tdProgress.textContent = `step ${task.progress.step}`;
+            } else {
+              tdProgress.textContent = '-';
+            }
+            trEl.appendChild(tdProgress);
+            const tdStarted = document.createElement('td');
+            tdStarted.textContent = formatTimestamp(task.startedAt);
+            trEl.appendChild(tdStarted);
+            const tdActions = document.createElement('td');
+            tdActions.textContent = '-';
+            trEl.appendChild(tdActions);
+            tbody.appendChild(trEl);
+          });
+          table.appendChild(tbody);
+          tableContainer.appendChild(table);
+          contentEl.appendChild(tableContainer);
+          return;
+        }
+
+        contentEl.replaceChildren(
           createStateCard(
             tr('tasks.bgUnavailableTitle', null, 'Background Tasks Unavailable'),
             tr('tasks.bgUnavailableSubtitle', null, 'Failed to load background tasks for this session.'),
@@ -14984,6 +15064,10 @@ async function openBackgroundTasksModal(sessionId = state.currentSessionId) {
         );
         return;
       }
+
+      state.backgroundTasksAvailable = true;
+      const tasks = Array.isArray(raw.items) ? raw.items : [];
+      contentEl.replaceChildren();
 
       state.backgroundTasks = tasks;
       updateSessionBackgroundBadge(tasks);

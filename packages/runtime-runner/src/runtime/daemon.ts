@@ -871,26 +871,6 @@ export class RuntimeDaemon extends EventEmitter {
       }
     });
 
-    const disposeWorkflowAgentStart = ctx.on('workflow/agent-start' as any, (info: any) => {
-      const runId = String(info?.runId || info?.id || '');
-      const task = this.backgroundTasksTracker.get(runId);
-      if (task) {
-        task.lastActivityAt = new Date().toISOString();
-        task.progress = task.progress || { agentsDone: 0, agentsTotal: 0 };
-        task.progress.agentsTotal = (task.progress.agentsTotal || 0) + 1;
-      }
-    });
-
-    const disposeWorkflowAgentEnd = ctx.on('workflow/agent-end' as any, (info: any) => {
-      const runId = String(info?.runId || info?.id || '');
-      const task = this.backgroundTasksTracker.get(runId);
-      if (task) {
-        task.lastActivityAt = new Date().toISOString();
-        task.progress = task.progress || { agentsDone: 0, agentsTotal: 0 };
-        task.progress.agentsDone = (task.progress.agentsDone || 0) + 1;
-      }
-    });
-
     const disposeWorkflowEnd = ctx.on('workflow/end' as any, (info: any, result: any) => {
       const runId = String(info?.runId || info?.id || '');
       const task = this.backgroundTasksTracker.get(runId);
@@ -920,8 +900,6 @@ export class RuntimeDaemon extends EventEmitter {
       disposeSubagentStart();
       disposeSubagentEnd();
       disposeWorkflowStart();
-      disposeWorkflowAgentStart();
-      disposeWorkflowAgentEnd();
       disposeWorkflowEnd();
     };
   }
@@ -1614,11 +1592,12 @@ export class RuntimeDaemon extends EventEmitter {
 
     // 1. Sync jobs from ctx.jobs
     const jobRegistry = ctx?.get('jobs');
-    const allJobs = typeof jobRegistry?.list === 'function' ? jobRegistry.list() : [];
+    const allJobs = typeof jobRegistry?.list === 'function' ? jobRegistry.list(sessionId as any) : [];
     for (const job of allJobs) {
       const jobId = String(job.id);
-      const owner = job.owner ? String(job.owner) : '';
-      if (owner === sessionId) {
+      const rawOwner = job.owner ?? (job as any).ownerSession;
+      const owner = rawOwner ? (typeof rawOwner === 'object' && rawOwner.id ? String(rawOwner.id) : String(rawOwner)) : '';
+      if (owner === sessionId || (!owner && !job.owner)) {
         const isStopped = this.stoppedTaskIds.has(jobId);
         let task = this.backgroundTasksTracker.get(jobId);
         if (!task) {
@@ -1843,6 +1822,11 @@ export class RuntimeDaemon extends EventEmitter {
     const sessionTasks: BackgroundTaskRecord[] = [];
     for (const [id, task] of this.backgroundTasksTracker.entries()) {
       if (task.parentSessionId === sessionId) {
+        if (this.stoppedTaskIds.has(task.id) || this.stoppedTaskIds.has(id)) {
+          task.status = 'cancelled';
+          if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+        }
+
         // Exclude finished foreground one-shots (not continuable, not run_in_background)
         if (task.kind === 'subagent' && task.status !== 'running') {
           if (task.mode === 'one-shot' && !task.isBackground) {
@@ -1927,13 +1911,6 @@ export class RuntimeDaemon extends EventEmitter {
     let stopped = false;
     const targetSessionId = foundTask ? foundTask.id : taskId;
 
-    // Track as stopped so subsequent lifecycle events or sync do not override status to completed
-    this.stoppedTaskIds.add(targetSessionId);
-    this.stoppedTaskIds.add(taskId);
-    if (foundTask) {
-      this.stoppedTaskIds.add(foundTask.id);
-    }
-
     // 1. If it's a subagent
     const subagentsService = ctx?.get('subagents');
     if (subagentsService && typeof subagentsService.interrupt === 'function') {
@@ -1968,11 +1945,16 @@ export class RuntimeDaemon extends EventEmitter {
       } catch {}
     }
 
-    if (foundTask) {
-      foundTask.status = 'cancelled';
-      foundTask.finishedAt = new Date().toISOString();
-      foundTask.lastActivityAt = new Date().toISOString();
-      stopped = true;
+    // Only if underlying interrupt/cancel/kill succeeded, mark as stopped so subsequent events don't revert
+    if (stopped) {
+      this.stoppedTaskIds.add(targetSessionId);
+      this.stoppedTaskIds.add(taskId);
+      if (foundTask) {
+        this.stoppedTaskIds.add(foundTask.id);
+        // Do not force status to 'cancelled' immediately; status will update upon end events.
+        // However update lastActivityAt to record attempt
+        foundTask.lastActivityAt = new Date().toISOString();
+      }
     }
 
     return { stopped };
@@ -2102,23 +2084,41 @@ export class RuntimeDaemon extends EventEmitter {
     }
 
     // 3. Running jobs (including workflow jobs)
+    // In DSH jobs-local, list(caller) only returns unowned jobs or jobs owned by caller.
+    // Query without caller (unowned) plus query for every known session ID to collect all jobs.
     const jobRegistry = ctx?.get('jobs');
-    const allJobs = typeof jobRegistry?.list === 'function' ? jobRegistry.list() : [];
     const runningJobs: RunningJobActivity[] = [];
-    for (const job of allJobs) {
-      if (job.status === 'running' || job.status === 'stopping') {
-        runningJobs.push({
-          id: String(job.id),
-          kind: String(job.kind),
-          label: String(job.label || ''),
-          owner: job.owner ? String(job.owner) : undefined,
-          startedAt: job.startedAt || 0,
-        });
+    if (jobRegistry && typeof jobRegistry.list === 'function') {
+      const seenJobIds = new Set<string>();
+      const candidateCallers = [undefined, ...allSessionIds];
+      for (const caller of candidateCallers) {
+        try {
+          const jobsForCaller = jobRegistry.list(caller as any);
+          for (const job of jobsForCaller) {
+            const jId = String(job.id);
+            if (!seenJobIds.has(jId)) {
+              seenJobIds.add(jId);
+              if (job.status === 'running' || job.status === 'stopping') {
+                const rawOwner = job.owner ?? (job as any).ownerSession;
+                const ownerStr = rawOwner
+                  ? (typeof rawOwner === 'object' && rawOwner.id ? String(rawOwner.id) : String(rawOwner))
+                  : undefined;
+                runningJobs.push({
+                  id: jId,
+                  kind: String(job.kind),
+                  label: String(job.label || ''),
+                  owner: ownerStr,
+                  startedAt: job.startedAt || 0,
+                });
+              }
+            }
+          }
+        } catch {}
       }
     }
     const runningWorkflowJobsCount = runningJobs.filter((j) => j.kind === 'workflow').length;
 
-    // 4. Live background subagents
+    // 4. Live background subagents (only actively running subagents count toward activity)
     const liveSubagents: LiveSubagentActivity[] = [];
     const seenSubagentKeys = new Set<string>();
 
@@ -2134,7 +2134,10 @@ export class RuntimeDaemon extends EventEmitter {
         (agent as any).session?.header?.origin === 'subagent' ||
         (agent as any).session?.meta?.origin === 'subagent';
 
-      if (isOriginSubagent && !seenSubagentKeys.has(aId)) {
+      // Only count if agent is actively running (not idle or dormant continuable subagent)
+      const isRunning = agent.status === 'running';
+
+      if (isOriginSubagent && isRunning && !seenSubagentKeys.has(aId)) {
         liveSubagents.push({
           id: aId,
           sessionId: aId,

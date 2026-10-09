@@ -76,7 +76,7 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       expect(line).toContain('[workflow] heavy-codegen-flow');
     });
 
-    it('marks task completed during an active turn with "✅ 已完成，结果已并入当前回复"', () => {
+    it('A-07: formats completed task as completed without assuming incorporated into active turn', () => {
       const now = 1760000060000;
       const task: BackgroundTask = {
         id: 'ses_child_0000000000000003',
@@ -91,10 +91,39 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       };
 
       const line = formatBackgroundTaskLine(task, { completedDuringActiveTurn: true, now });
-      expect(line).toBe('[subagent] parallel-researcher · ✅ 已完成，结果已并入当前回复 · 25s');
+      expect(line).toBe('[subagent] parallel-researcher · completed · 25s');
+      expect(line).not.toContain('并入当前回复');
     });
 
-    it('collapses whole panel to "✅ 后台任务已全部完成" when all tasks are complete', () => {
+    it('A-06: collapses to "✅ 后台任务已全部完成" ONLY when all tasks are completed', () => {
+      const tasks: BackgroundTask[] = [
+        {
+          id: 'ses_child_0000000000000001',
+          shortId: 'c001',
+          kind: 'subagent',
+          name: 'worker-1',
+          status: 'completed',
+          startedAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+        },
+        {
+          id: 'ses_child_0000000000000002',
+          shortId: 'c002',
+          kind: 'job',
+          name: 'job-2',
+          status: 'completed',
+          startedAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+        },
+      ];
+
+      const panel = formatBackgroundPanel(tasks);
+      expect(panel).toBe('✅ 后台任务已全部完成');
+    });
+
+    it('A-06: shows categorized breakdown when mixed with failed or cancelled tasks', () => {
       const tasks: BackgroundTask[] = [
         {
           id: 'ses_child_0000000000000001',
@@ -116,10 +145,21 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
           lastActivityAt: new Date().toISOString(),
           stalled: false,
         },
+        {
+          id: 'ses_child_0000000000000003',
+          shortId: 'c003',
+          kind: 'workflow',
+          name: 'flow-3',
+          status: 'failed',
+          startedAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+        },
       ];
 
       const panel = formatBackgroundPanel(tasks);
-      expect(panel).toBe('✅ 后台任务已全部完成');
+      expect(panel).toBe('后台任务已结束 (完成 1，失败 1，已停止 1)');
+      expect(panel).not.toContain('全部完成');
     });
   });
 
@@ -252,14 +292,106 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
         },
       ];
 
-      // Next poll tick
+      // Next poll tick -> callCount is 4
       await vi.advanceTimersByTimeAsync(30_000);
       expect(callCount).toBe(4);
       expect(card.updates[card.updates.length - 1]).toBe('✅ 后台任务已全部完成');
 
+      // Finalize turn -> triggers one final tick to settle and stop polling -> callCount becomes 5
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_poll_1');
+      expect(callCount).toBe(5);
+
       // Further time advancement should NOT trigger any new polls
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(callCount).toBe(4);
+      expect(callCount).toBe(5);
+
+      manager.dispose();
+    });
+
+    it('A-01: retains panel and marks "⚠️ 状态暂不可用" when gateway returns available: false, keeping polling', async () => {
+      const sessionRouteId = 'session_route_test_avail';
+      const chatContextId = 'oc_test_chat_avail';
+      let availableFlag = false;
+
+      const card = createMockCardSession('crd_avail_001', 'om_msg_avail_001');
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => {
+          if (!availableFlag) {
+            return { items: [], updatedAt: new Date().toISOString(), available: false };
+          }
+          return {
+            items: [
+              {
+                id: 'task_avail_001',
+                shortId: 'a001',
+                kind: 'subagent',
+                name: 'worker-avail',
+                status: 'running',
+                startedAt: new Date().toISOString(),
+                lastActivityAt: new Date().toISOString(),
+                stalled: false,
+              },
+            ],
+            updatedAt: new Date().toISOString(),
+            available: true,
+          };
+        },
+        pollIntervalMs: 30_000,
+      });
+
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_avail_1');
+      expect(card.updates[card.updates.length - 1]).toContain('⚠️ 状态暂不可用');
+      expect(card.updates[card.updates.length - 1]).not.toBe('✅ 后台任务已全部完成');
+
+      // Polling continues after 30s
+      availableFlag = true;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates[card.updates.length - 1]).toContain('[subagent] worker-avail · running');
+
+      manager.dispose();
+    });
+
+    it('A-02: keeps polling while turn is active even when tasks list is initially empty', async () => {
+      const sessionRouteId = 'session_route_test_init_empty';
+      const chatContextId = 'oc_test_chat_init_empty';
+      let currentTasks: BackgroundTask[] = [];
+
+      const card = createMockCardSession('crd_init_empty', 'om_msg_init_empty');
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => {
+          return { items: currentTasks, updatedAt: new Date().toISOString(), available: true };
+        },
+        pollIntervalMs: 30_000,
+      });
+
+      // Register card in an active turn (turnId: 'turn_active_1') with no tasks yet
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_active_1');
+
+      // Now subagent is launched later in the turn
+      currentTasks = [
+        {
+          id: 'task_late_001',
+          shortId: 'l001',
+          kind: 'subagent',
+          name: 'late-launched-worker',
+          status: 'running',
+          startedAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+          originTurnId: 'turn_active_1',
+        },
+      ];
+
+      // Next polling tick
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates.length).toBeGreaterThan(0);
+      expect(card.updates[card.updates.length - 1]).toContain('[subagent] late-launched-worker · running');
+
+      // When turn finalizes and task completes
+      currentTasks[0].status = 'completed';
+      currentTasks[0].finishedAt = new Date().toISOString();
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_active_1');
+      expect(card.updates[card.updates.length - 1]).toBe('✅ 后台任务已全部完成');
 
       manager.dispose();
     });

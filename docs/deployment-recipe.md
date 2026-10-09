@@ -88,9 +88,13 @@ sqlite3 <workspace-root>/enkeep/.demo-data/platform.db \
 因此必须使用 `demo-runner preflight` 进行全域只读状态聚合：
 ```bash
 # 全域只读负载与在途状态预检 (聚合平台数据库与所有宿主/容器运行时 Daemon RPC 活动)
+# 支持 --wait 与 --timeout-seconds 阻塞轮询直至排空或超时
 node <release-worktree>/packages/demo-runner/dist/demo-runner.js preflight \
   --data-dir $ENKEEP_DATA_DIR \
-  --due-within-minutes 10
+  --due-within-minutes 10 \
+  --wait \
+  --timeout-seconds 7200 \
+  --interval-seconds 60
 ```
 该命令会自动检查：
 1. 平台状态：活跃/排队轮次 (`turn_runs`, `turn_execution_queue`)、领取的任务与活跃租约 (`task_runs`, `session_execution_leases`)、未终态事务日志 (`file_transfer_journal`, `attachment_snapshot_journal`, `daemon-turns`)、N 分钟内到期的定时任务；
@@ -112,8 +116,8 @@ SELECT count(*) FROM session_execution_leases WHERE status = 'active';-- 必须�
 > **强一致性要求**: `demo-runner preflight` 必须在紧随 `stop`（`launchctl bootout`）之前、且**必须在与 stop/start 相同的单一命令调用行（同一 invocation）**中执行。若预检发现任何平台或运行时活动，命令链立即熔断非零退出，杜绝停机操作丢弃在途自主轮次或后台作业：
 
 ```bash
-# 原子预检停机与启动重载单行调用 (同一 invocation 中严格前置 preflight)
-node <release-worktree>/packages/demo-runner/dist/demo-runner.js preflight --data-dir $ENKEEP_DATA_DIR && \
+# 原子预检停机与启动重载单行调用 (同一 invocation 中严格前置 preflight，可带超时等待排空)
+node <release-worktree>/packages/demo-runner/dist/demo-runner.js preflight --data-dir $ENKEEP_DATA_DIR --wait --timeout-seconds 7200 --interval-seconds 60 && \
   launchctl bootout gui/$(id -u)/<launchd-label> && \
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<launchd-label>.plist
 ```

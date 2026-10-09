@@ -426,7 +426,7 @@ export interface RuntimeGateway {
     userId: string,
     sessionId: string,
     options?: { chatContextId?: string }
-  ): Promise<{ items: any[]; updatedAt: string }>;
+  ): Promise<{ items: any[]; updatedAt: string; available?: boolean }>;
   stopBackgroundTask?(
     userId: string,
     sessionId: string,

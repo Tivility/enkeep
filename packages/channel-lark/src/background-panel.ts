@@ -36,9 +36,7 @@ export function formatBackgroundTaskLine(
   const now = options?.now ?? Date.now();
   let statusText: string = task.status;
 
-  if (options?.completedDuringActiveTurn && task.status === 'completed') {
-    statusText = '✅ 已完成，结果已并入当前回复';
-  } else if (task.status === 'running') {
+  if (task.status === 'running') {
     if (task.stalled) {
       statusText = 'running ⚠️ 可能卡住';
     } else {
@@ -106,12 +104,21 @@ export function formatBackgroundPanel(
   }
 
   const now = options?.now ?? Date.now();
-  const allCompleted = tasks.every(
+  const allTerminated = tasks.every(
     (t) => t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled'
   );
 
-  if (allCompleted) {
-    return '✅ 后台任务已全部完成';
+  if (allTerminated) {
+    const hasFailedOrCancelled = tasks.some(
+      (t) => t.status === 'failed' || t.status === 'cancelled'
+    );
+    if (!hasFailedOrCancelled) {
+      return '✅ 后台任务已全部完成';
+    }
+    const completedCount = tasks.filter((t) => t.status === 'completed').length;
+    const failedCount = tasks.filter((t) => t.status === 'failed').length;
+    const cancelledCount = tasks.filter((t) => t.status === 'cancelled').length;
+    return `后台任务已结束 (完成 ${completedCount}，失败 ${failedCount}，已停止 ${cancelledCount})`;
   }
 
   const lines = tasks.map((task) => {
@@ -126,7 +133,7 @@ export interface LarkBackgroundPanelManagerOptions {
   getBackgroundTasks: (
     sessionId: string,
     options?: { chatContextId?: string }
-  ) => Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+  ) => Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
   pollIntervalMs?: number;
 }
 
@@ -144,13 +151,14 @@ interface ChatSessionState {
   pollTimer: NodeJS.Timeout | null;
   isPolling: boolean;
   hadRunningTasks: boolean;
+  lastPanelText?: string;
 }
 
 export class LarkBackgroundPanelManager {
   private readonly getBackgroundTasksFn: (
     sessionId: string,
     options?: { chatContextId?: string }
-  ) => Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+  ) => Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
   private readonly pollIntervalMs: number;
   private readonly chatStates = new Map<string, ChatSessionState>();
   private isDisposed = false;
@@ -275,11 +283,26 @@ export class LarkBackgroundPanelManager {
       const res = await this.getBackgroundTasksFn(sessionRouteId, {
         chatContextId: chatContextId || undefined,
       });
-      const tasks = res?.items ?? [];
 
       if (!state.latestCard) {
         return;
       }
+
+      // A-01: Runtime query failed / unavailable
+      if (res?.available === false) {
+        let unavailableText = '⚠️ 状态暂不可用';
+        if (state.lastPanelText) {
+          unavailableText = `${state.lastPanelText}\n\n⚠️ 状态暂不可用`;
+        }
+        if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
+          await state.latestCard.cardSession.updateBackgroundPanel(unavailableText);
+        }
+        // Retain polling during failure
+        this.ensurePolling(sessionRouteId, chatContextId);
+        return;
+      }
+
+      const tasks = res?.items ?? [];
 
       // Track tasks launched during this latest turn
       if (state.latestCard.turnId) {
@@ -300,18 +323,21 @@ export class LarkBackgroundPanelManager {
         const panelText = formatBackgroundPanel(tasks, {
           activeTurnCompletedTaskIds: state.activeTurnCompletedTaskIds,
         });
+        state.lastPanelText = panelText;
 
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
           await state.latestCard.cardSession.updateBackgroundPanel(panelText);
         }
       } else if (state.hadRunningTasks) {
+        state.lastPanelText = undefined;
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
           await state.latestCard.cardSession.updateBackgroundPanel('✅ 后台任务已全部完成');
         }
       }
 
-      // Manage 30s polling timer
-      if (hasRunning) {
+      // A-02: Keep polling if tasks are running OR if the current turn has not finalized yet
+      const turnActive = Boolean(state.activeTurnId);
+      if (hasRunning || turnActive) {
         this.ensurePolling(sessionRouteId, chatContextId);
       } else {
         this.stopPolling(sessionRouteId, chatContextId);

@@ -55,6 +55,9 @@ OPTIONS:
   --port <number>             Fixed loopback Platform port for up (default dynamic)
   --data-dir <path>           Explicit platform data root (or env ENKEEP_DATA_DIR)
   --due-within-minutes <N>    Lookahead window in minutes for due scheduled tasks (default: 10)
+  --wait                      Preflight wait loop until quiescent/idle or timeout
+  --timeout-seconds <N>       Preflight wait loop timeout in seconds (default: 0, no wait)
+  --interval-seconds <N>      Preflight wait loop check interval in seconds (default: 60)
   --network-mode <mode>       Container network mode: "none" (default) or "bridge"
   --resource-suffix <suffix>  Resource suffix for Docker containers and volumes (or env ENKEEP_RESOURCE_SUFFIX)
   --dsh-home <dir>            Explicit DSH home directory (or env ENKEEP_DSH_HOME, DSH_HOME)
@@ -337,6 +340,93 @@ export function parseDueWithinMinutes(
   return Number.parseInt(trimmed, 10);
 }
 
+/**
+ * Parses timeout seconds for preflight wait loop from CLI arguments or environment variables.
+ */
+export function parseTimeoutSeconds(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env
+): number {
+  let rawVal: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--timeout-seconds' || arg === '--timeout') {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        throw new Error(`Safety Violation: ${arg} requires a valid number of seconds.`);
+      }
+      rawVal = next;
+      break;
+    } else if (arg.startsWith('--timeout-seconds=')) {
+      rawVal = arg.slice('--timeout-seconds='.length);
+      break;
+    } else if (arg.startsWith('--timeout=')) {
+      rawVal = arg.slice('--timeout='.length);
+      break;
+    }
+  }
+
+  if (rawVal === undefined && env.ENKEEP_PREFLIGHT_TIMEOUT_SECONDS !== undefined && env.ENKEEP_PREFLIGHT_TIMEOUT_SECONDS !== '') {
+    rawVal = env.ENKEEP_PREFLIGHT_TIMEOUT_SECONDS;
+  }
+
+  if (rawVal === undefined) {
+    return 0;
+  }
+
+  const trimmed = rawVal.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Safety Violation: Invalid timeout seconds value "${rawVal}". Must be an integer.`);
+  }
+
+  return Number.parseInt(trimmed, 10);
+}
+
+/**
+ * Parses interval seconds for preflight wait loop from CLI arguments or environment variables.
+ * Default is 60 seconds.
+ */
+export function parseIntervalSeconds(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env
+): number {
+  let rawVal: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--interval-seconds' || arg === '--interval') {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        throw new Error(`Safety Violation: ${arg} requires a valid number of seconds.`);
+      }
+      rawVal = next;
+      break;
+    } else if (arg.startsWith('--interval-seconds=')) {
+      rawVal = arg.slice('--interval-seconds='.length);
+      break;
+    } else if (arg.startsWith('--interval=')) {
+      rawVal = arg.slice('--interval='.length);
+      break;
+    }
+  }
+
+  if (rawVal === undefined && env.ENKEEP_PREFLIGHT_INTERVAL_SECONDS !== undefined && env.ENKEEP_PREFLIGHT_INTERVAL_SECONDS !== '') {
+    rawVal = env.ENKEEP_PREFLIGHT_INTERVAL_SECONDS;
+  }
+
+  if (rawVal === undefined) {
+    return 60;
+  }
+
+  const trimmed = rawVal.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Safety Violation: Invalid interval seconds value "${rawVal}". Must be an integer.`);
+  }
+
+  return Number.parseInt(trimmed, 10);
+}
+
 export async function getStatus(options?: DemoStatusOptions | string): Promise<DemoStatusResult> {
   const pathOptions: DemoPathOptions = typeof options === 'string' ? { repoRoot: options } : (options ?? {});
   const processes = listSignedProcesses(pathOptions);
@@ -565,21 +655,110 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         const platformPort = parsePlatformPort(args);
         const dataDir = parseDataDir(args, process.env);
         const dueWithinMinutes = parseDueWithinMinutes(args, process.env);
-        const result = await runPreflight({
-          dataDir,
-          repoRoot,
-          port: platformPort,
-          dueWithinMinutes,
-        });
+        const isWait = args.includes('--wait');
+        const timeoutSeconds = parseTimeoutSeconds(args, process.env);
+        const intervalSeconds = parseIntervalSeconds(args, process.env);
 
-        if (isJson) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(result.summary);
+        const executeCheck = async () =>
+          await runPreflight({
+            dataDir,
+            repoRoot,
+            port: platformPort,
+            dueWithinMinutes,
+          });
+
+        if (!isWait) {
+          const result = await executeCheck();
+          if (isJson) {
+            console.log(JSON.stringify(result, null, 2));
+          } else {
+            console.log(result.summary);
+          }
+          if (!result.isIdle) {
+            process.exit(1);
+          }
+          break;
         }
 
-        if (!result.isIdle) {
-          process.exit(1);
+        // Wait loop mode
+        const intervalMs = Math.max(1, intervalSeconds) * 1000;
+        const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Infinity;
+        let lastResult: Awaited<ReturnType<typeof executeCheck>> | null = null;
+        let attempt = 0;
+
+        while (true) {
+          attempt++;
+          lastResult = await executeCheck();
+          if (lastResult.isIdle) {
+            if (isJson) {
+              console.log(JSON.stringify(lastResult, null, 2));
+            } else {
+              console.log(lastResult.summary);
+            }
+            break;
+          }
+
+          const now = Date.now();
+          if (now >= deadline) {
+            // Timed out while still non-idle
+            if (isJson) {
+              console.log(JSON.stringify({
+                ...lastResult,
+                timeoutExceeded: true,
+                timeoutSeconds,
+              }, null, 2));
+            } else {
+              console.log(`\n✖ Preflight wait timeout exceeded (${timeoutSeconds}s). Active conversations and background tasks remain in flight:\n`);
+              // Formatted summary of in-flight active conversations and tasks without leaking message contents
+              if (lastResult.platform.runningQueuedTurns > 0) {
+                console.log(`  - Platform Active / Queued Turns: ${lastResult.platform.runningQueuedTurns}`);
+              }
+              if (lastResult.platform.claimedTaskRuns > 0) {
+                console.log(`  - Platform Claimed / Running Tasks: ${lastResult.platform.claimedTaskRuns}`);
+              }
+              if (lastResult.platform.nonTerminalJournals > 0) {
+                console.log(`  - Platform In-Flight Turn Journals: ${lastResult.platform.nonTerminalJournals}`);
+              }
+              if (lastResult.platform.tasksDueWithinNMinutes > 0) {
+                console.log(`  - Platform Due Tasks (within ${dueWithinMinutes}m): ${lastResult.platform.tasksDueWithinNMinutes}`);
+              }
+              for (const r of lastResult.runtimes) {
+                if (!r.isIdle && r.activity) {
+                  const act = r.activity;
+                  console.log(`  - Runtime ${r.runtimeType} "${r.identifier}":`);
+                  if (act.activeTurnsCount > 0) {
+                    console.log(`      Active Turns: ${act.activeTurnsCount} (${act.autonomousTurnsCount} autonomous)`);
+                    for (const t of act.activeTurns) {
+                      console.log(`        * Session: ${t.sessionId}, Turn: ${t.turnId}${t.autonomous ? ' (autonomous)' : ''}`);
+                    }
+                  }
+                  if (act.runningJobsCount > 0) {
+                    console.log(`      Running Background Jobs: ${act.runningJobsCount} (${act.runningWorkflowJobsCount} workflow)`);
+                    for (const j of act.runningJobs) {
+                      console.log(`        * Job: ${j.id} [${j.kind}] ${j.label}${j.owner ? ` (owner: ${j.owner})` : ''}`);
+                    }
+                  }
+                  if (act.liveSubagentsCount > 0) {
+                    console.log(`      Live Subagents: ${act.liveSubagentsCount}`);
+                    for (const s of act.liveSubagents) {
+                      console.log(`        * Subagent: ${s.id}${s.parentSession ? ` (parent: ${s.parentSession})` : ''}`);
+                    }
+                  }
+                  if (act.pendingInboxItemsCount > 0) {
+                    console.log(`      Pending Inbox Items: ${act.pendingInboxItemsCount}`);
+                  }
+                }
+              }
+              console.log(`\nOverall Status: BUSY / TIMED OUT ✖`);
+            }
+            process.exit(1);
+          }
+
+          if (!isJson) {
+            console.log(`[preflight-wait] Attempt ${attempt}: Platform/Runtimes busy. Waiting ${Math.min(intervalSeconds, Math.ceil((deadline - now) / 1000))}s...`);
+          }
+          const sleepMs = Math.min(intervalMs, Math.max(10, deadline - now));
+          await new Promise((resolve) => setTimeout(resolve, sleepMs));
         }
         break;
       }

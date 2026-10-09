@@ -964,7 +964,7 @@ export interface ChatCommandServiceOptions {
       userId: string,
       sessionId: string,
       options?: { chatContextId?: string }
-    ) => Promise<{ items: BackgroundTask[]; updatedAt: string }>;
+    ) => Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
     stopBackgroundTask?: (
       userId: string,
       sessionId: string,
@@ -1507,13 +1507,23 @@ export class ChatCommandService {
     const filterContext = (channel && channel !== 'web') ? (nativeContextId || chatId || undefined) : undefined;
 
     let items: BackgroundTask[] = [];
+    let available = true;
     if (this.gateway && typeof this.gateway.getBackgroundTasks === 'function') {
       try {
         const bgRes = await this.gateway.getBackgroundTasks(userId, sessionId, {
           chatContextId: filterContext ?? undefined,
         });
+        if (bgRes?.available === false) {
+          available = false;
+        }
         items = bgRes?.items ?? [];
-      } catch {}
+      } catch {
+        available = false;
+      }
+    }
+
+    if (!available) {
+      return { replyText: '后台任务状态暂不可用。' };
     }
 
     if (items.length === 0) {
@@ -1552,6 +1562,31 @@ export class ChatCommandService {
     const targetId = parsed.target || parsed.arg;
     if (!targetId) {
       return { replyText: '用法: /bg stop <短ID>' };
+    }
+
+    const { channel, nativeContextId, chatId } = this.resolveChannelContext(params);
+    const filterContext = (channel && channel !== 'web') ? (nativeContextId || chatId || undefined) : undefined;
+
+    // A-08: Filter background tasks in the current chat before stopping
+    if (this.gateway && typeof this.gateway.getBackgroundTasks === 'function') {
+      try {
+        const bgRes = await this.gateway.getBackgroundTasks(userId, sessionId, {
+          chatContextId: filterContext ?? undefined,
+        });
+        if (bgRes?.available === false) {
+          return { replyText: '后台任务状态暂不可用。' };
+        }
+        const allowedTasks = bgRes?.items ?? [];
+        const taskInChat = allowedTasks.find(
+          (t) =>
+            t.shortId.toLowerCase() === targetId.toLowerCase() ||
+            t.id.toLowerCase() === targetId.toLowerCase() ||
+            t.id.toLowerCase().startsWith(targetId.toLowerCase())
+        );
+        if (!taskInChat) {
+          return { replyText: `未找到后台任务 "${targetId}"。` };
+        }
+      } catch {}
     }
 
     let stopped = false;
