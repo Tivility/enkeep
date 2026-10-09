@@ -267,4 +267,108 @@ describe('E-01: Lark Media & File Outbound Dispatch (im.v1)', () => {
       expect(failedItem?.status).toBe('failed');
     });
   });
+
+  describe('3. E-02: Streaming card finalize failure degradation with .md fallback file', () => {
+    it('when session.finalize fails: displays preview on card with notice and sends reply-<turnId>.md file', async () => {
+      const { StreamingReplyTracker } = await import('../src/streaming-tracker.js');
+
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId,
+        replyToMessageId: 'om_parent_thread_msg',
+        threadId: 'omt_target_thread',
+      });
+
+      // Mock finalize failure (e.g. card content limit / CardKit update error)
+      session!.finalize = vi.fn().mockRejectedValue(new Error('CardKit update error (exceeds size limit)'));
+
+      const tracker = new StreamingReplyTracker({
+        transport,
+        streamEventSource: {
+          listAssistantEvents: vi.fn().mockResolvedValue([]),
+        },
+        sessionRouteId: 'ses_stream_fail_test',
+        turnId: 'turn_test_full_id_123456789',
+        cardParams: {
+          chatId,
+          replyToMessageId: 'om_parent_thread_msg',
+          threadId: 'omt_target_thread',
+          turnId: 'turn_test_full_id_123456789',
+        },
+      });
+
+      (tracker as any).cardSession = session;
+      (tracker as any).cardSessionPromise = Promise.resolve(session);
+
+      const longAnswer = '# 详细分析报告\n\n' + '这里是超长回答内容。'.repeat(100);
+      const res = await tracker.finalize(longAnswer, 'completed');
+
+      expect(res.handled).toBe(true);
+      expect(res.degraded).toBe(true);
+
+      // Verify card was updated via pushText with preview and notice
+      const pushCalls = transport.streamingCalls.filter((c) => c.type === 'push');
+      expect(pushCalls.length).toBeGreaterThan(0);
+      const lastPush = pushCalls[pushCalls.length - 1];
+      expect(lastPush.content).toContain('完整内容见附件');
+
+      // Verify fallback .md file was sent via transport.uploadAndSendFile
+      expect(transport.sentReplies.length).toBe(1);
+      const fileReply = transport.sentReplies[0];
+      expect(fileReply.msgType).toBe('file');
+      expect(fileReply.chatId).toBe(chatId);
+      expect(fileReply.replyToMessageId).toBe('om_parent_thread_msg');
+      expect(fileReply.threadId).toBe('omt_target_thread');
+      expect(fileReply.fileName).toBe('reply-23456789.md');
+
+      // Verify file content in transport matches the full answer
+      const downloadRes = await transport.downloadFileResource('om_any', fileReply.fileKey!);
+      expect(downloadRes).toBeDefined();
+      expect(downloadRes?.buffer.toString('utf8')).toBe(longAnswer);
+    });
+
+    it('when session.finalize succeeds: normal flow, does NOT send fallback file', async () => {
+      const { StreamingReplyTracker } = await import('../src/streaming-tracker.js');
+
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId,
+        replyToMessageId: 'om_normal_thread_msg',
+      });
+
+      const tracker = new StreamingReplyTracker({
+        transport,
+        streamEventSource: {
+          listAssistantEvents: vi.fn().mockResolvedValue([]),
+        },
+        sessionRouteId: 'ses_stream_normal_test',
+        turnId: 'turn_normal_987654321',
+        cardParams: {
+          chatId,
+          replyToMessageId: 'om_normal_thread_msg',
+          turnId: 'turn_normal_987654321',
+        },
+      });
+
+      (tracker as any).cardSession = session;
+      (tracker as any).cardSessionPromise = Promise.resolve(session);
+
+      const normalAnswer = '# 正常报告\n\n正常定稿内容。';
+      const res = await tracker.finalize(normalAnswer, 'completed');
+
+      expect(res.handled).toBe(true);
+      expect(res.degraded).toBeFalsy();
+
+      // Verify finalize call was recorded
+      const finalizeCalls = transport.streamingCalls.filter((c) => c.type === 'finalize');
+      expect(finalizeCalls.length).toBe(1);
+
+      // Verify NO fallback file was sent
+      expect(transport.sentReplies.length).toBe(0);
+    });
+  });
 });
