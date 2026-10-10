@@ -88,6 +88,7 @@ export function formatBackgroundTaskLine(
 
 export interface FormatBackgroundPanelOptions {
   activeTurnCompletedTaskIds?: Set<string>;
+  seenRunningTaskIds?: Set<string>;
   now?: number;
 }
 
@@ -104,7 +105,8 @@ export function formatBackgroundPanel(
   }
 
   const now = options?.now ?? Date.now();
-  const allTerminated = tasks.every(
+  // Judge terminal status across all current tasks
+  const allTerminated = tasks.length > 0 && tasks.every(
     (t) => t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled'
   );
 
@@ -147,6 +149,7 @@ interface ChatSessionState {
   latestCard: ChatCardRecord | null;
   previousCards: ChatCardRecord[];
   activeTurnCompletedTaskIds: Set<string>;
+  seenRunningTaskIds: Set<string>;
   activeTurnId?: string;
   pollTimer: NodeJS.Timeout | null;
   isPolling: boolean;
@@ -180,6 +183,7 @@ export class LarkBackgroundPanelManager {
         latestCard: null,
         previousCards: [],
         activeTurnCompletedTaskIds: new Set<string>(),
+        seenRunningTaskIds: new Set<string>(),
         activeTurnId: undefined,
         pollTimer: null,
         isPolling: false,
@@ -313,18 +317,57 @@ export class LarkBackgroundPanelManager {
         }
       }
 
+      // Maintain seenRunningTaskIds: "only records tasks that were running when last seen"
+      // Each poll:
+      // 1. If present in list and status is terminal -> remove from seenRunningTaskIds
+      // 2. If present and running -> add to seenRunningTaskIds
+      const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
+      const currentTaskMap = new Map(tasks.map((t) => [t.id, t]));
+
+      for (const t of tasks) {
+        if (terminalStatuses.has(t.status)) {
+          state.seenRunningTaskIds.delete(t.id);
+        } else if (t.status === 'running') {
+          state.seenRunningTaskIds.add(t.id);
+        }
+      }
+
       const hasRunning = tasks.some((t) => t.status === 'running');
       if (hasRunning) {
         state.hadRunningTasks = true;
       }
 
-      // A-02: Keep polling if tasks are running OR if the current turn has not finalized yet
+      // Check whether any task currently in seenRunningTaskIds is missing from current tasks
+      // (a task in seenRunningTaskIds was running when last seen; if it disappears from the list, it's missing unconfirmed)
+      let hasMissingSeenTask = false;
+      for (const seenId of state.seenRunningTaskIds) {
+        if (!currentTaskMap.has(seenId)) {
+          hasMissingSeenTask = true;
+          break;
+        }
+      }
+
+      // A-02: Keep polling if tasks are running OR turn active OR seen running tasks disappeared unconfirmed
       const turnActive = Boolean(state.activeTurnId);
 
       // Format and update panel on latest card
-      if (tasks.length > 0) {
+      if (hasMissingSeenTask) {
+        // A seen running task disappeared without terminal state: retain previous text and append note, continue polling
+        const baseText = state.lastPanelText || (tasks.length > 0 ? formatBackgroundPanel(tasks, {
+          activeTurnCompletedTaskIds: state.activeTurnCompletedTaskIds,
+          seenRunningTaskIds: state.seenRunningTaskIds,
+        }) : '**🔄 后台任务**');
+        const unconfirmedSuffix = '（部分任务状态未确认）';
+        const panelText = baseText.endsWith(unconfirmedSuffix) ? baseText : `${baseText}\n${unconfirmedSuffix}`;
+        state.lastPanelText = panelText;
+
+        if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
+          await state.latestCard.cardSession.updateBackgroundPanel(panelText);
+        }
+      } else if (tasks.length > 0) {
         const panelText = formatBackgroundPanel(tasks, {
           activeTurnCompletedTaskIds: state.activeTurnCompletedTaskIds,
+          seenRunningTaskIds: state.seenRunningTaskIds,
         });
         state.lastPanelText = panelText;
 
@@ -332,10 +375,7 @@ export class LarkBackgroundPanelManager {
           await state.latestCard.cardSession.updateBackgroundPanel(panelText);
         }
       } else if (state.hadRunningTasks && !turnActive) {
-        // Do not report "all completed" merely because task list is empty.
-        // If tasks have completed or ended, formatBackgroundPanel(tasks) handles it when tasks.length > 0.
-        // If the task list returned empty after previously having running tasks, and the turn is no longer active,
-        // clear the panel rather than falsely declaring "all completed".
+        // If turn has finalized and task list is empty with no seen running tasks unconfirmed, clear panel
         state.lastPanelText = undefined;
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
           await state.latestCard.cardSession.updateBackgroundPanel(null);
@@ -343,7 +383,8 @@ export class LarkBackgroundPanelManager {
         state.hadRunningTasks = false;
       }
 
-      if (hasRunning || turnActive) {
+      const shouldPoll = hasRunning || turnActive || hasMissingSeenTask;
+      if (shouldPoll) {
         this.ensurePolling(sessionRouteId, chatContextId);
       } else {
         this.stopPolling(sessionRouteId, chatContextId);

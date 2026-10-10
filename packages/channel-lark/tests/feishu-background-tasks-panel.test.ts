@@ -396,9 +396,9 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       manager.dispose();
     });
 
-    it('does not falsely report "✅ 后台任务已全部完成" when task list drops to empty', async () => {
-      const sessionRouteId = 'session_route_test_no_false_complete';
-      const chatContextId = 'oc_test_chat_no_false_complete';
+    it('retains panel and appends unconfirmed status when running task disappears without terminal status, continuing polling', async () => {
+      const sessionRouteId = 'session_route_test_unconfirmed';
+      const chatContextId = 'oc_test_chat_unconfirmed';
       let currentTasks: BackgroundTask[] = [
         {
           id: 'task_running_001',
@@ -425,16 +425,187 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_rfc_1');
       expect(card.updates[card.updates.length - 1]).toContain('[workflow] active-workflow · running');
 
-      // Now simulate task query returning empty list (e.g. context filter mismatch or temporary disappearance)
+      // Now simulate task disappearing without terminal status
       currentTasks = [];
       await vi.advanceTimersByTimeAsync(30_000);
 
-      // It must NOT report "✅ 后台任务已全部完成"
+      // It must NOT report "✅ 后台任务已全部完成", but append unconfirmed note and retain text
+      expect(card.updates[card.updates.length - 1]).not.toBe('✅ 后台任务已全部完成');
+      expect(card.updates[card.updates.length - 1]).toContain('（部分任务状态未确认）');
+
+      // Turn finalized while still unconfirmed -> remains unconfirmed, polling continues
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_rfc_1');
+      expect(card.updates[card.updates.length - 1]).toContain('（部分任务状态未确认）');
+
+      // Later task reappears with terminal status completed
+      currentTasks = [
+        {
+          id: 'task_running_001',
+          shortId: 'r001',
+          kind: 'workflow',
+          name: 'active-workflow',
+          status: 'completed',
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+          originTurnId: 'turn_rfc_1',
+        },
+      ];
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates[card.updates.length - 1]).toBe('✅ 后台任务已全部完成');
+
+      manager.dispose();
+    });
+
+    it('task completes -> summary -> disappears hours later -> no unconfirmed status and stops polling', async () => {
+      const sessionRouteId = 'session_route_test_completed_disappear';
+      const chatContextId = 'oc_test_chat_completed_disappear';
+      let currentTasks: BackgroundTask[] = [
+        {
+          id: 'task_complete_001',
+          shortId: 'c001',
+          kind: 'subagent',
+          name: 'worker-disappear-test',
+          status: 'running',
+          startedAt: new Date(Date.now() - 10000).toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+        },
+      ];
+
+      const card = createMockCardSession('crd_cd_001', 'om_msg_cd_001');
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => {
+          return { items: currentTasks, updatedAt: new Date().toISOString(), available: true };
+        },
+        pollIntervalMs: 30_000,
+      });
+
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_cd_1');
+      expect(card.updates[card.updates.length - 1]).toContain('worker-disappear-test · running');
+
+      // 1. Task completes -> poll tick -> shows summary
+      currentTasks = [
+        {
+          ...currentTasks[0],
+          status: 'completed',
+          finishedAt: new Date().toISOString(),
+        },
+      ];
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates[card.updates.length - 1]).toBe('✅ 后台任务已全部完成');
+
+      // Turn finalizes
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_cd_1');
+
+      // 2. 2 hours later, task is removed from backend list (empty items)
+      currentTasks = [];
+      await vi.advanceTimersByTimeAsync(7200_000);
+
+      // Should not have entered unconfirmed status
+      for (const update of card.updates) {
+        expect(update).not.toContain('部分任务状态未确认');
+      }
+
+      manager.dispose();
+    });
+
+    it('running task disappears while still running -> marks unconfirmed and continues polling', async () => {
+      const sessionRouteId = 'session_route_test_running_disappear';
+      const chatContextId = 'oc_test_chat_running_disappear';
+      let pollCount = 0;
+      let currentTasks: BackgroundTask[] = [
+        {
+          id: 'task_disappear_001',
+          shortId: 'd001',
+          kind: 'subagent',
+          name: 'worker-abrupt-exit',
+          status: 'running',
+          startedAt: new Date(Date.now() - 10000).toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+        },
+      ];
+
+      const card = createMockCardSession('crd_rd_001', 'om_msg_rd_001');
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => {
+          pollCount++;
+          return { items: currentTasks, updatedAt: new Date().toISOString(), available: true };
+        },
+        pollIntervalMs: 30_000,
+      });
+
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_rd_1');
+      expect(card.updates[card.updates.length - 1]).toContain('worker-abrupt-exit · running');
+
+      // Finalize turn, but task was still running
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_rd_1');
+
+      // Task abruptly disappears from list while it was running
+      currentTasks = [];
+      const pollCountBefore = pollCount;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates[card.updates.length - 1]).toContain('部分任务状态未确认');
+
+      // Should continue polling because of unconfirmed disappeared running task
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(pollCount).toBeGreaterThan(pollCountBefore + 1);
+
+      manager.dispose();
+    });
+
+    it('judges overall completion by tasks in list, ignoring older completed tasks when running exists', async () => {
+      const sessionRouteId = 'session_route_test_seen_vs_old';
+      const chatContextId = 'oc_test_chat_seen_vs_old';
+      const oldCompletedTask: BackgroundTask = {
+        id: 'old_task_001',
+        shortId: 'o001',
+        kind: 'job',
+        name: 'old-completed-job',
+        status: 'completed',
+        startedAt: new Date(Date.now() - 3600000).toISOString(),
+        finishedAt: new Date(Date.now() - 3500000).toISOString(),
+        lastActivityAt: new Date().toISOString(),
+        stalled: false,
+      };
+
+      const newRunningTask: BackgroundTask = {
+        id: 'new_task_002',
+        shortId: 'n002',
+        kind: 'subagent',
+        name: 'new-active-subagent',
+        status: 'running',
+        startedAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
+        stalled: false,
+      };
+
+      let currentTasks = [oldCompletedTask, newRunningTask];
+      const card = createMockCardSession('crd_seen_001', 'om_msg_seen_001');
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => {
+          return { items: currentTasks, updatedAt: new Date().toISOString(), available: true };
+        },
+        pollIntervalMs: 30_000,
+      });
+
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_seen_1');
+      // Must display running status, NOT "all completed" just because old completed task exists
+      expect(card.updates[card.updates.length - 1]).toContain('new-active-subagent · running');
       expect(card.updates[card.updates.length - 1]).not.toBe('✅ 后台任务已全部完成');
 
-      // Finalize turn while task list is still empty -> panel cleared (null) rather than false complete
-      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_rfc_1');
-      expect(card.updates[card.updates.length - 1]).toBeNull();
+      // Now new task completes as failed
+      currentTasks = [
+        {
+          ...newRunningTask,
+          status: 'failed',
+          finishedAt: new Date().toISOString(),
+        },
+      ];
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates[card.updates.length - 1]).toBe('后台任务已结束 (完成 0，失败 1，已停止 0)');
 
       manager.dispose();
     });

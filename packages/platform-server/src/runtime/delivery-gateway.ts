@@ -3866,8 +3866,67 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
     if (options?.chatContextId) {
       const targetChatLevelId = getChatLevelNativeContextId(options.chatContextId, 'lark');
+      let boundChatLevelId: string | null = null;
+      if (this.db) {
+        try {
+          // Resolve platform route id first (sessionId may be platform route id or dshSessionId)
+          let platformRouteId = sessionId;
+          const routeRow = this.db.prepare(
+            'SELECT id, channel FROM session_routes WHERE id = ? OR dsh_session_id = ? LIMIT 1'
+          ).get(sessionId, dshSessionId) as { id?: string; channel?: string } | undefined;
+          if (routeRow?.id) {
+            platformRouteId = routeRow.id;
+          }
+
+          // 1. Prefer channel_bindings WHERE session_route_id = <platform route id>
+          // (for topic sessions, session_routes.native_context_id stores session id itself, not chat)
+          const bindingRow = this.db.prepare(
+            'SELECT native_context_id FROM channel_bindings WHERE session_route_id = ? LIMIT 1'
+          ).get(platformRouteId) as { native_context_id?: string } | undefined;
+          if (bindingRow?.native_context_id) {
+            boundChatLevelId = getChatLevelNativeContextId(bindingRow.native_context_id, 'lark');
+          }
+
+          // 2. If not found in channel_bindings, inspect channel_turn_origins for this session
+          if (!boundChatLevelId) {
+            const turnOriginRows = this.db.prepare(
+              'SELECT native_context_id, channel FROM channel_turn_origins WHERE session_id = ?'
+            ).all(platformRouteId) as Array<{ native_context_id?: string; channel?: string }>;
+            const uniqueChatLevelIds = new Set<string>();
+            for (const r of turnOriginRows) {
+              if (r.native_context_id) {
+                const chatLevel = getChatLevelNativeContextId(r.native_context_id, r.channel || 'lark');
+                if (chatLevel) {
+                  uniqueChatLevelIds.add(chatLevel);
+                }
+              }
+            }
+            if (uniqueChatLevelIds.size === 1) {
+              boundChatLevelId = Array.from(uniqueChatLevelIds)[0];
+            }
+          }
+        } catch (err) {
+          const errType = err && typeof err === 'object' && 'name' in err ? String((err as any).name) : typeof err;
+          console.warn(`[delivery-gateway] failed to resolve boundChatLevelId: ${errType}`);
+        }
+      }
+
       items = items.filter((t) => {
-        if (!t.originChatContextId) return false;
+        if (!t.originChatContextId) {
+          // If task has no originTurnId and cannot be traced, but originChatContextId was not set,
+          // check if this is an untraced child task (such as workflow-derived subagent without originTurnId)
+          // or fallback candidate. If it belongs to this session and session route matches, retain.
+          if (boundChatLevelId && (boundChatLevelId === targetChatLevelId || boundChatLevelId === options.chatContextId)) {
+            // Note: if fallback resolution was attempted and found conflicting chats across channel_turn_origins,
+            // fallback returns null. But for workflow-derived subagents without turn id, if session route matches,
+            // we retain it if originTurnId is missing.
+            if (t.originTurnId) {
+              return false;
+            }
+            return true;
+          }
+          return false;
+        }
         const itemChatLevelId = getChatLevelNativeContextId(t.originChatContextId, 'lark');
         return itemChatLevelId === targetChatLevelId || t.originChatContextId === options.chatContextId;
       });
