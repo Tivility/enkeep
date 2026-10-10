@@ -20,9 +20,9 @@ describe('Enkeep Web UI Theme Subsystem Unit & Contrast Tests', () => {
   // ----------------------------------------------------
   describe('1. Static HTML & Bootstrap Architecture', () => {
     it('loads theme-bootstrap.js in <head> before stylesheets to eliminate FOUC', () => {
-      expect(indexHtml).toContain('<script src="/static/theme-bootstrap.js"></script>');
-      const scriptIndex = indexHtml.indexOf('<script src="/static/theme-bootstrap.js"></script>');
-      const cssIndex = indexHtml.indexOf('<link rel="stylesheet" href="/static/style.css">');
+      expect(indexHtml).toMatch(/<script\s+src="\/static\/theme-bootstrap\.js(\?v=[0-9a-f]{12})?"><\/script>/);
+      const scriptIndex = indexHtml.search(/<script\s+src="\/static\/theme-bootstrap\.js/);
+      const cssIndex = indexHtml.search(/<link\s+rel="stylesheet"\s+href="\/static\/style\.css/);
       expect(scriptIndex).toBeGreaterThan(0);
       expect(cssIndex).toBeGreaterThan(scriptIndex);
     });
