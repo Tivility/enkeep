@@ -819,12 +819,9 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
         }
       },
       listBackgroundTasks: async (sessionId: string) => {
-        try {
-          const res = await transport.listBackgroundTasks(sessionId);
-          return res.items ?? [];
-        } catch {
-          return [];
-        }
+        // Errors propagate so callers report "status unavailable" instead of an empty list.
+        const res = await transport.listBackgroundTasks(sessionId);
+        return res.items ?? [];
       },
       stopBackgroundTask: async (sessionId: string, taskId: string) => {
         try {

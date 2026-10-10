@@ -195,15 +195,16 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
   });
 
   it('GET /api/sessions/:sessionId/background supports chatContextId query filtering', async () => {
-    // Match native context
+    // Match native context. The session's turns all originate from one chat, so a task
+    // without a traceable origin (the workflow) is attributed to that chat as well.
     const filteredRes = await fetch(
       `${baseUrl}/api/sessions/${sessionId}/background?chatContextId=${encodeURIComponent(syntheticNativeContextId)}`,
       { headers: { Cookie: aliceCookie } }
     );
     expect(filteredRes.status).toBe(200);
     const filteredJson = await filteredRes.json();
-    expect(filteredJson.data.items).toHaveLength(1);
-    expect(filteredJson.data.items[0].id).toBe(syntheticChildId);
+    expect(filteredJson.data.items).toHaveLength(2);
+    expect(filteredJson.data.items.map((t: any) => t.id)).toContain(syntheticChildId);
 
     // Unmatched native context
     const emptyRes = await fetch(
@@ -264,7 +265,8 @@ describe('Background Tasks API, Origin Mapping & Chat Commands', () => {
       } as any,
     });
     expect(channelRes.replyText).toContain('[0099] Synthetic Background Worker · running');
-    expect(channelRes.replyText).not.toContain('[0055]');
+    // The untraced workflow belongs to this session's only chat, so it is listed here too.
+    expect(channelRes.replyText).toContain('[0055]');
 
     // 3. Channel context with no matching tasks
     const unmatchRes = await chatCommandService.execute({

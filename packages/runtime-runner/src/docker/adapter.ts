@@ -1357,16 +1357,13 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
         }
       },
       listBackgroundTasks: async (sessionId: string) => {
-        try {
-          const transport = await getOrStartTransport();
-          if (!transport.listBackgroundTasks) {
-            return [];
-          }
-          const res = await transport.listBackgroundTasks(sessionId);
-          return res.items ?? [];
-        } catch {
+        // Errors propagate so callers report "status unavailable" instead of an empty list.
+        const transport = await getOrStartTransport();
+        if (!transport.listBackgroundTasks) {
           return [];
         }
+        const res = await transport.listBackgroundTasks(sessionId);
+        return res.items ?? [];
       },
       stopBackgroundTask: async (sessionId: string, taskId: string) => {
         try {

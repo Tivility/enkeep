@@ -217,13 +217,10 @@ export class CompositeDeliveryTurnExecutor implements DeliveryTurnExecutor {
     }
     const provider = this.registry.getProvider(mode);
     if (provider?.turnExecutor && typeof provider.turnExecutor.listBackgroundTasks === 'function') {
-      try {
-        const res = await provider.turnExecutor.listBackgroundTasks(req);
-        if (Array.isArray(res)) {
-          return res;
-        }
-      } catch {
-        // continue
+      // Runtime errors propagate: the delivery gateway reports them as "status unavailable".
+      const res = await provider.turnExecutor.listBackgroundTasks(req);
+      if (Array.isArray(res)) {
+        return res;
       }
     }
     return [];
