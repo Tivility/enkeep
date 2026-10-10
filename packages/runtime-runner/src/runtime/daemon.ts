@@ -332,6 +332,14 @@ export class RuntimeDaemon extends EventEmitter {
   private eventRelayCleanup?: () => void;
   private pendingApprovalsTracker = new Map<string, { sessionId: string; toolName: string; approvalId: string }>();
   private readonly liveSubagentsTracker = new Map<string, LiveSubagentActivity>();
+  /**
+   * Subagent lineage read from persisted session headers, keyed by parent session id.
+   * Refreshed in the background at most every {@link LINEAGE_REFRESH_MS}; listing reads
+   * only this snapshot because a full header scan grows with session count.
+   */
+  private subagentLineage: Map<string, Array<{ id: string; createdAt?: number; label?: string }>> = new Map();
+  private subagentLineageAt = 0;
+  private subagentLineageRefresh: Promise<void> | null = null;
   private readonly backgroundTasksTracker = new Map<string, BackgroundTaskRecord>();
   private readonly stoppedTaskIds = new Set<string>();
   private readonly workflowAgentChildIds = new Set<string>();
@@ -2051,6 +2059,38 @@ export class RuntimeDaemon extends EventEmitter {
    * - lastActivityAt from latest child event
    * - completed tasks retained for 2h
    */
+  /**
+   * Starts a background refresh of {@link subagentLineage} when the snapshot is older than
+   * five minutes and no refresh is running. Never awaited by request handlers.
+   * @param sessionQuery - the DSH session query service, if mounted.
+   */
+  private refreshSubagentLineageInBackground(sessionQuery: any): void {
+    const LINEAGE_REFRESH_MS = 5 * 60 * 1000;
+    if (!sessionQuery || typeof sessionQuery.listSessions !== 'function') return;
+    if (this.subagentLineageRefresh || Date.now() - this.subagentLineageAt < LINEAGE_REFRESH_MS) return;
+    this.subagentLineageRefresh = (async () => {
+      try {
+        const records = await sessionQuery.listSessions();
+        const byParent = new Map<string, Array<{ id: string; createdAt?: number; label?: string }>>();
+        for (const sRec of records) {
+          const header = sRec?.header;
+          if (!header || header.origin !== 'subagent' || !header.parentSession) continue;
+          const parent = String(header.parentSession);
+          const list = byParent.get(parent) ?? [];
+          list.push({ id: String(header.id), createdAt: Number(header.createdAt) || undefined, label: header.label });
+          byParent.set(parent, list);
+        }
+        this.subagentLineage = byParent;
+      } catch (err) {
+        // A failed scan keeps the previous snapshot; the next listing retries after the interval.
+        process.stderr.write(`[RuntimeDaemon] subagent lineage refresh failed: ${err instanceof Error ? err.name : typeof err}\n`);
+      } finally {
+        this.subagentLineageAt = Date.now();
+        this.subagentLineageRefresh = null;
+      }
+    })();
+  }
+
   public async listBackgroundTasks(sessionId: string): Promise<BackgroundTask[]> {
     const ctx = this.bootedRuntime?.context;
     const now = Date.now();
@@ -2125,6 +2165,10 @@ export class RuntimeDaemon extends EventEmitter {
           const isStopped = this.stoppedTaskIds.has(childId);
           if (!task) {
             const nowIso = new Date(child.createdAt || now).toISOString();
+            // Historical children older than the retention window are not background work to show.
+            if (!isLive && !isStopped && now - Date.parse(nowIso) > RETENTION_MS) {
+              continue;
+            }
             task = {
               id: childId,
               parentSessionId: sessionId,
@@ -2159,38 +2203,35 @@ export class RuntimeDaemon extends EventEmitter {
       } catch {}
     }
 
-    // 2b. Sync from ctx.sessionQuery
+    // 2b. Sync from the persisted-lineage snapshot (refreshed in the background, never awaited here)
     const sessionQuery = ctx?.get('sessionQuery');
-    if (sessionQuery && typeof sessionQuery.listSessions === 'function') {
-      try {
-        const querySessions = await sessionQuery.listSessions();
-        for (const sRec of querySessions) {
-          const sId = String(sRec.header.id);
-          const origin = sRec.header.origin;
-          const parent = sRec.header.parentSession;
-          if (origin === 'subagent' && String(parent) === sessionId) {
-            let task = this.backgroundTasksTracker.get(sId);
-            const startedIso = new Date(sRec.header.createdAt || now).toISOString();
-            const isStopped = this.stoppedTaskIds.has(sId);
-            if (!task) {
-              task = {
-                id: sId,
-                parentSessionId: sessionId,
-                kind: 'subagent',
-                name: String((sRec.header as any)?.label || 'subagent').slice(0, 60),
-                status: isStopped ? 'cancelled' : (this.liveSubagentsTracker.has(sId) || this.agents.has(sId)) ? 'running' : 'completed',
-                startedAt: startedIso,
-                finishedAt: isStopped ? startedIso : undefined,
-                lastActivityAt: startedIso,
-              };
-              this.backgroundTasksTracker.set(sId, task);
-            } else if (isStopped || task.status === 'cancelled') {
-              task.status = 'cancelled';
-              if (!task.finishedAt) task.finishedAt = new Date().toISOString();
-            }
-          }
+    this.refreshSubagentLineageInBackground(sessionQuery);
+    for (const rec of this.subagentLineage.get(sessionId) ?? []) {
+      const sId = rec.id;
+      let task = this.backgroundTasksTracker.get(sId);
+      const startedIso = new Date(rec.createdAt || now).toISOString();
+      const isStopped = this.stoppedTaskIds.has(sId);
+      if (!task) {
+        const isLive = this.liveSubagentsTracker.has(sId) || this.agents.has(sId);
+        // Historical children older than the retention window are not background work to show.
+        if (!isLive && !isStopped && now - Date.parse(startedIso) > RETENTION_MS) {
+          continue;
         }
-      } catch {}
+        task = {
+          id: sId,
+          parentSessionId: sessionId,
+          kind: 'subagent',
+          name: String(rec.label || 'subagent').slice(0, 60),
+          status: isStopped ? 'cancelled' : isLive ? 'running' : 'completed',
+          startedAt: startedIso,
+          finishedAt: isStopped || !isLive ? startedIso : undefined,
+          lastActivityAt: startedIso,
+        };
+        this.backgroundTasksTracker.set(sId, task);
+      } else if (isStopped || task.status === 'cancelled') {
+        task.status = 'cancelled';
+        if (!task.finishedAt) task.finishedAt = new Date().toISOString();
+      }
     }
 
     // 2c. Sync from ctx.sessions
@@ -2233,15 +2274,11 @@ export class RuntimeDaemon extends EventEmitter {
 
     // 2d. Enrich all subagent tasks with step count & descriptor metadata from events
     for (const [id, task] of this.backgroundTasksTracker.entries()) {
-      if (task.parentSessionId === sessionId && task.kind === 'subagent') {
+      if (task.parentSessionId === sessionId && task.kind === 'subagent' && task.status === 'running') {
+        // Only in-memory events: reading persisted logs per child scales with history and
+        // blocked this RPC past the platform timeout.
         const liveSession = sessionRegistry?.get?.(id as any) as any;
-        let events = liveSession?.events;
-        if ((!events || events.length === 0) && sessionQuery && typeof sessionQuery.readSession === 'function') {
-          try {
-            const loaded = await sessionQuery.readSession(id as any);
-            events = loaded.events;
-          } catch {}
-        }
+        const events = liveSession?.events;
         if (Array.isArray(events) && events.length > 0) {
           const stepEvents = events.filter((e: any) => e.type === 'step/start');
           const stepCount = stepEvents.length;

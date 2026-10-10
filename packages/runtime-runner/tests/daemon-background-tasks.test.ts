@@ -881,4 +881,43 @@ describe('RuntimeDaemon Background Tasks RPC & Tracking', () => {
 
     await daemon.shutdown();
   });
+
+  it('lists tasks without waiting for a slow persisted-session scan', async () => {
+    const parentSessionId = 'ses_00000000000000000000000000000031';
+    const daemon = new RuntimeDaemon({ userId: 'alice', dshHome, spacesDir, contextWindow: 2000, maxTokens: 512 });
+    await daemon.start();
+    const ctx = (daemon as any).bootedRuntime.context;
+
+    // A session-query service whose full listing takes far longer than any RPC budget.
+    let releaseScan: () => void = () => {};
+    const slowScan = new Promise<void>((resolve) => { releaseScan = resolve; });
+    const historicalChild = 'ses_00000000000000000000000000000032';
+    const fakeQuery = {
+      listSessions: vi.fn(async () => {
+        await slowScan;
+        return [{ header: { id: historicalChild, origin: 'subagent', parentSession: parentSessionId, createdAt: Date.now() } }];
+      }),
+      readSession: vi.fn(async () => { throw new Error('must not read persisted logs on the listing path'); }),
+    };
+    const realGet = ctx.get.bind(ctx);
+    const getSpy = vi.spyOn(ctx, 'get').mockImplementation((name: any) => (name === 'sessionQuery' ? fakeQuery : realGet(name)));
+
+    ctx.emit('subagent/start', { id: 'ses_00000000000000000000000000000033', runId: 'run-live', provider: 'spawn', label: 'Live Worker', parentSession: parentSessionId });
+
+    const started = Date.now();
+    const first = await daemon.listBackgroundTasks(parentSessionId);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(first.map((t) => t.id)).toEqual(['ses_00000000000000000000000000000033']);
+    expect(fakeQuery.readSession).not.toHaveBeenCalled();
+
+    // Once the background scan completes, its lineage is used by later listings.
+    releaseScan();
+    await (daemon as any).subagentLineageRefresh;
+    const second = await daemon.listBackgroundTasks(parentSessionId);
+    expect(second.map((t) => t.id).sort()).toEqual([historicalChild, 'ses_00000000000000000000000000000033'].sort());
+    expect(fakeQuery.listSessions).toHaveBeenCalledTimes(1);
+
+    getSpy.mockRestore();
+    await daemon.shutdown();
+  });
 });
