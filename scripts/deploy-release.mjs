@@ -17,6 +17,7 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { execSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 
 const FORBIDDEN_ROOTS = ['/etc', '/usr', '/System', '/root', '/bin', '/sbin'];
 
@@ -164,6 +165,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     skipTests: false,
     pruneOld: false,
     reuse: false,
+    mode: undefined,
     only: undefined,
     baseRef: undefined,
     help: false,
@@ -177,6 +179,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     else if (a === '--skip-tests') cliOpts.skipTests = true;
     else if (a === '--prune-old') cliOpts.pruneOld = true;
     else if (a === '--reuse') cliOpts.reuse = true;
+    else if (a === '--mode' && cliArgs[i + 1]) cliOpts.mode = cliArgs[++i];
     else if (a === '--only' && cliArgs[i + 1]) cliOpts.only = cliArgs[++i];
     else if (a === '--base-ref' && cliArgs[i + 1]) cliOpts.baseRef = cliArgs[++i];
     else if (a === '--env-file' && cliArgs[i + 1]) envFile = cliArgs[++i];
@@ -255,6 +258,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     skipTests: cliOpts.skipTests,
     pruneOld: cliOpts.pruneOld,
     reuse: cliOpts.reuse,
+    mode: getVal('MODE', cliOpts.mode),
     only: cliOpts.only,
     baseRef: getVal('BASE_REF', cliOpts.baseRef),
     help: cliOpts.help,
@@ -296,6 +300,29 @@ export function validateConfig(config) {
       }
     }
     const pathProps = ['plistPath'];
+    if (config.repoRoot) pathProps.push('repoRoot');
+    for (const p of pathProps) {
+      const check = isSafePath(config[p]);
+      if (!check.safe) {
+        throw new Error(`Safety violation for ${p}: ${check.reason}`);
+      }
+    }
+    return;
+  }
+
+  if (config.only === 'runtime') {
+    const requiredForRuntime = [
+      ['plistPath', 'PLIST_PATH'],
+      ['dataDir', 'DATA_DIR'],
+      ['port', 'PORT'],
+      ['runtimeImagePrefix', 'RUNTIME_IMAGE_PREFIX'],
+    ];
+    for (const [prop, envName] of requiredForRuntime) {
+      if (config[prop] === undefined || config[prop] === null || config[prop] === '') {
+        throw new Error(`Missing required configuration: ${prop} (Set via --${prop.replace(/[A-Z]/g, m => '-' + m.toLowerCase())} or ${envName} in env file)`);
+      }
+    }
+    const pathProps = ['plistPath', 'dataDir'];
     if (config.repoRoot) pathProps.push('repoRoot');
     for (const p of pathProps) {
       const check = isSafePath(config[p]);
@@ -751,6 +778,188 @@ export function extractAssetsFromIndexHtml(htmlContent) {
   return assets;
 }
 
+export function setRuntimeTargetVersionInDb(dbPath, imageTag, daemonCliPath = null) {
+  if (!dbPath) {
+    throw new Error(`Platform DB path is required`);
+  }
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runtime_target_version (
+        id TEXT PRIMARY KEY NOT NULL,
+        image TEXT,
+        daemon_cli_path TEXT,
+        updated_by TEXT,
+        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+      );
+    `);
+    const stmt = db.prepare(`
+      INSERT INTO runtime_target_version (id, image, daemon_cli_path, updated_by, updated_at)
+      VALUES ('default', ?, ?, 'deploy_script', CURRENT_TIMESTAMP)
+      ON CONFLICT(id) DO UPDATE SET
+        image = excluded.image,
+        daemon_cli_path = excluded.daemon_cli_path,
+        updated_by = excluded.updated_by,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+    stmt.run(imageTag, daemonCliPath);
+  } finally {
+    db.close();
+  }
+}
+
+export async function fetchUpgradeStatusSummary(port) {
+  try {
+    const out = execSync(`curl -s -f "http://127.0.0.1:${port}/api/admin/runtime/upgrade-status"`, { encoding: 'utf8' });
+    const json = JSON.parse(out);
+    if (json && json.success && Array.isArray(json.data)) {
+      return json.data;
+    }
+  } catch {}
+  return [];
+}
+
+export async function executeRuntimeDeploy(config, options = {}) {
+  const {
+    releaseId,
+    targetRef = 'origin/main',
+    repoRoot,
+    releaseRoot,
+    dataDir,
+    plistPath,
+    port,
+    runtimeImagePrefix,
+    dockerfilePath = 'docker/Dockerfile.runtime',
+    testedCommit,
+    testCmds,
+    dryRun,
+    skipTests,
+    reuse,
+  } = config;
+
+  console.log('================================================================');
+  console.log('  Enkeep Runtime Only Upgrade (Way 2 - Background Auto-Upgrade) ');
+  console.log('================================================================');
+
+  let plistContent = '';
+  if (plistPath && existsSync(plistPath)) {
+    plistContent = readFileSync(plistPath, 'utf8');
+  }
+
+  const onlineWt = extractWorktreePathFromPlist(plistContent);
+  const effReleaseRoot = releaseRoot || (onlineWt ? resolve(onlineWt, '..') : undefined);
+  const effRepoRoot = repoRoot || onlineWt;
+  const dbPath = join(dataDir, 'platform.db');
+  const branchName = `release/${releaseId}`;
+  const worktreePath = effReleaseRoot ? join(effReleaseRoot, `release-worktree-${releaseId}`) : undefined;
+
+  console.log(`Target Ref:              ${targetRef}`);
+  console.log(`Release Branch:          ${branchName}`);
+  console.log(`Worktree Path:           ${worktreePath || '(unresolved)'}`);
+  console.log(`Data Directory:          ${dataDir}`);
+  console.log(`Port:                    ${port}`);
+  console.log(`Runtime Image Prefix:    ${runtimeImagePrefix}`);
+  console.log(`Mode:                    ${dryRun ? 'DRY-RUN' : 'LIVE EXECUTION'}`);
+  console.log('----------------------------------------------------------------');
+
+  if (dryRun) {
+    console.log('\n[DRY-RUN] Plan:');
+    console.log(`  1. Setup release branch ${branchName} and worktree ${worktreePath}`);
+    console.log(`  2. Install dependencies and build worktree`);
+    console.log(`  3. Build docker runtime image with tag`);
+    console.log(`  4. Set target runtime version in DB (${dbPath}) or via admin API`);
+    console.log(`  5. Print upgrade status summary and exit without waiting`);
+    return { success: true, dryRun: true };
+  }
+
+  // Live execution
+  if (!effRepoRoot || !existsSync(effRepoRoot)) {
+    throw new Error(`Repo root directory not found: ${effRepoRoot}`);
+  }
+  if (!worktreePath) {
+    throw new Error(`Could not determine release worktree path`);
+  }
+
+  runDeployStep('Setup Release Branch and Worktree', () => {
+    let branchExists = false;
+    try {
+      execSync(`git show-ref --verify --quiet "refs/heads/${branchName}"`, { cwd: effRepoRoot });
+      branchExists = true;
+    } catch {
+      branchExists = false;
+    }
+
+    if (branchExists && !reuse) {
+      throw new Error(`Release branch '${branchName}' already exists. Use --reuse to deploy from existing branch.`);
+    }
+
+    if (!branchExists) {
+      execSync(`git branch "${branchName}" "${targetRef}"`, { cwd: effRepoRoot, stdio: 'inherit' });
+    }
+
+    if (!existsSync(worktreePath)) {
+      execSync(`git worktree add "${worktreePath}" "${branchName}"`, { cwd: effRepoRoot, stdio: 'inherit' });
+    } else {
+      execSync(`git checkout "${branchName}"`, { cwd: worktreePath, stdio: 'inherit' });
+      if (!reuse) {
+        execSync(`git reset --hard "${targetRef}"`, { cwd: worktreePath, stdio: 'inherit' });
+      }
+    }
+  });
+
+  let targetSha = '0000000';
+  try {
+    targetSha = execSync(`git rev-parse --short "${branchName}"`, { cwd: effRepoRoot, encoding: 'utf8' }).trim();
+  } catch {}
+  const imageTag = `${runtimeImagePrefix}${releaseId}-${targetSha}`;
+
+  runDeployStep('Install & Build Worktree', () => {
+    execSync('pnpm install --frozen-lockfile', { cwd: worktreePath, stdio: 'inherit' });
+    execSync('pnpm run build:root && pnpm -r run build', { cwd: worktreePath, stdio: 'inherit' });
+  });
+
+  const treeMatches = checkTreeMatch(effRepoRoot, targetRef, testedCommit);
+  let shouldRunTests = !skipTests;
+  if (treeMatches) {
+    console.log(`\n[P-04 Optimization] Target tree matches tested commit ${testedCommit}. Skipping re-running test suite.`);
+    shouldRunTests = false;
+  }
+
+  if (shouldRunTests && testCmds && testCmds.length > 0) {
+    runDeployStep('Run Targeted Unit Tests', () => {
+      for (const cmd of testCmds) {
+        console.log(`Running test command: ${cmd}`);
+        execSync(cmd, { cwd: worktreePath, stdio: 'inherit' });
+      }
+    });
+  }
+
+  runDeployStep('Build Runtime Docker Image', () => {
+    execSync(`docker build -f "${dockerfilePath}" -t "${imageTag}" .`, { cwd: worktreePath, stdio: 'inherit' });
+  });
+
+  runDeployStep('Configure Target Runtime Version', () => {
+    console.log(`Setting target runtime version in platform database: ${imageTag}`);
+    setRuntimeTargetVersionInDb(dbPath, imageTag);
+    console.log('✓ Target runtime version persisted.');
+  });
+
+  console.log('\n--- Runtime Upgrade Status Summary ---');
+  const statuses = await fetchUpgradeStatusSummary(port);
+  if (statuses.length === 0) {
+    console.log('No active user runtimes detected (target version configured for next boot).');
+  } else {
+    for (const st of statuses) {
+      console.log(`- User [${st.userId}] (${st.mode}): current=${st.currentImage || st.currentDaemonCliPath || 'unknown'}, target=${st.targetImage || st.targetDaemonCliPath || 'unknown'}, outdated=${st.isOutdated}, idle=${st.isIdle}, pendingReason=${st.pendingReason}`);
+    }
+  }
+
+  console.log('\n================================================================');
+  console.log(`✓ Runtime target version set to ${imageTag}. Idle autoupgrader will upgrade users sequentially.`);
+  console.log('================================================================');
+  return { success: true, imageTag };
+}
+
 export async function executeFrontendDeploy(config) {
   const { plistPath, repoRoot, targetRef = 'origin/main', baseRef, port, dryRun } = config;
 
@@ -873,21 +1082,7 @@ export async function executeFrontendDeploy(config) {
   return { classification, paths, success: true };
 }
 
-export async function executeDeploy(config) {
-  validateConfig(config);
-
-  if (config.only === 'rollback') {
-    return executeRollback(config);
-  }
-
-  if (config.only === 'verify') {
-    return executeVerify(config);
-  }
-
-  if (config.only === 'frontend') {
-    return executeFrontendDeploy(config);
-  }
-
+export async function executePlatformDeploy(config, options = {}) {
   const {
     releaseId,
     targetRef,
@@ -1041,10 +1236,14 @@ export async function executeDeploy(config) {
 
     // From this point onward, any failure triggers automatic rollback
     try {
-      console.log('Tearing down active containers (preserving volumes)...');
-      execSync(`node "${join(worktreePath, 'packages/demo-runner/dist/demo-runner.js')}" down --repo-root "${repoRoot}"`, { cwd: worktreePath, stdio: 'inherit' });
+      if (options.mode === 'full') {
+        console.log('[Full Mode] Tearing down active containers (preserving volumes)...');
+        execSync(`node "${join(worktreePath, 'packages/demo-runner/dist/demo-runner.js')}" down --repo-root "${repoRoot}"`, { cwd: worktreePath, stdio: 'inherit' });
+      } else {
+        console.log('[Platform Upgrade] Retaining active runtime containers and daemons without down/rebuild.');
+      }
 
-      console.log('Updating LaunchAgent plist with new worktree and container image...');
+      console.log('Updating LaunchAgent plist with new worktree and default container image...');
       const currentPlist = readFileSync(plistPath, 'utf8');
       const updatedPlist = updatePlistContent(currentPlist, worktreePath, imageTag);
       writeFileSync(plistPath, updatedPlist, 'utf8');
@@ -1074,6 +1273,90 @@ export async function executeDeploy(config) {
   console.log('\n================================================================');
   console.log(`✓ Release ${releaseId} deployed and verified successfully!`);
   console.log('================================================================');
+  return { success: true, releaseId, imageTag };
+}
+
+export async function executeDeploy(config) {
+  validateConfig(config);
+
+  if (config.only === 'rollback') {
+    return executeRollback(config);
+  }
+
+  if (config.only === 'verify') {
+    return executeVerify(config);
+  }
+
+  if (config.only === 'frontend') {
+    return executeFrontendDeploy(config);
+  }
+
+  if (config.only === 'runtime') {
+    return executeRuntimeDeploy(config);
+  }
+
+  if (config.mode === 'full') {
+    return executePlatformDeploy(config, { mode: 'full' });
+  }
+
+  // Automatic classification workflow: frontend -> runtime -> platform
+  const { plistPath, repoRoot, targetRef = 'origin/main', baseRef } = config;
+  let plistContent = '';
+  if (plistPath && existsSync(plistPath)) {
+    plistContent = readFileSync(plistPath, 'utf8');
+  }
+  const onlineWt = extractWorktreePathFromPlist(plistContent);
+  const effBaseRef = baseRef || resolveOnlineHead(plistPath, repoRoot);
+  const { paths, classification } = computeDiffPathsAndClassification(repoRoot || onlineWt, effBaseRef, targetRef);
+
+  console.log('================================================================');
+  console.log('  Enkeep Smart Split Release Deployment                         ');
+  console.log('================================================================');
+  console.log(`Base Commit:             ${effBaseRef}`);
+  console.log(`Target Commit / Ref:     ${targetRef}`);
+  console.log(`Detected Changes (${paths.length}):`);
+  for (const p of paths) {
+    console.log(`  - ${p}`);
+  }
+  console.log(`Classification:          ${JSON.stringify(classification)}`);
+  console.log('================================================================\n');
+
+  if (paths.length === 0) {
+    console.log('No file changes detected between base and target ref.');
+    return { success: true, message: 'No changes detected' };
+  }
+
+  // Multi-category sequential execution: frontend -> runtime -> platform
+  if (classification.frontend && !classification.runtime && !classification.platform) {
+    console.log('>>> Routing to Way 1: Frontend only upgrade...');
+    return executeFrontendDeploy(config);
+  }
+
+  if (classification.runtime && !classification.platform && !classification.frontend) {
+    console.log('>>> Routing to Way 2: Runtime only background upgrade...');
+    return executeRuntimeDeploy(config);
+  }
+
+  if (classification.frontend && classification.runtime && !classification.platform) {
+    console.log('>>> Executing Step 1/2: Frontend upgrade...');
+    await executeFrontendDeploy(config);
+    console.log('\n>>> Executing Step 2/2: Runtime upgrade...');
+    return executeRuntimeDeploy(config);
+  }
+
+  // If platform is involved (or mixed with frontend / runtime)
+  if (classification.frontend) {
+    console.log('>>> Executing Step 1/3 (or 1/2): Frontend upgrade...');
+    await executeFrontendDeploy(config);
+  }
+
+  if (classification.runtime) {
+    console.log('\n>>> Executing Step 2/3: Runtime target version setup...');
+    await executeRuntimeDeploy(config);
+  }
+
+  console.log('\n>>> Executing Platform Upgrade (retaining active runtime containers)...');
+  return executePlatformDeploy(config, { mode: 'platform' });
 }
 
 function main() {
@@ -1107,7 +1390,8 @@ Optional Options:
   --test-cmd <cmd>                 Targeted test command to run (repeatable, or TEST_CMDS in env)
   --skip-tests                     Skip unit test run
   --reuse                          Reuse existing release/batchNN branch without failing
-  --only <frontend|verify|rollback> Run only frontend upgrade, verify, or rollback mode
+  --mode <full|split>              Deployment mode ('full' forces container teardown; default is split)
+  --only <frontend|runtime|verify|rollback> Run only frontend, runtime, verify, or rollback mode
   --prune-old                      Prune historical release worktrees after deploy
   --dry-run                        Simulate actions without modifying system
   -h, --help                       Show this help message
