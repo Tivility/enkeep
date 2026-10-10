@@ -101,6 +101,20 @@ describe('Production Bug Verification: Lark Background Tasks Panel & /bg Visibil
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(session_id, child_id)
       );
+
+      CREATE TABLE channel_bindings (
+        id TEXT PRIMARY KEY,
+        space_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        channel TEXT NOT NULL DEFAULT 'lark',
+        account_id TEXT,
+        native_context_id TEXT NOT NULL,
+        activation_mode TEXT NOT NULL DEFAULT 'always',
+        chat_type TEXT,
+        session_route_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
     `);
 
     // Seed space and session route
@@ -381,5 +395,145 @@ describe('Production Bug Verification: Lark Background Tasks Panel & /bg Visibil
     expect(res.items.some((t: any) => t.shortId === 'sa01')).toBe(true);
     expect(res.items.some((t: any) => t.shortId === 'wf01')).toBe(true);
     expect(res.items.some((t: any) => t.shortId === 'oc01')).toBe(false);
+  });
+
+  it('8. Subagent task with no originTurnId/originChatContextId is visible when session route bound chat matches, and hidden when it does not', async () => {
+    const routeSessionId = 'ses_synth_no_origin_001';
+    const dshSessionId = 'dsh_synth_no_origin_001';
+    const boundChatId = 'oc_synth_bound_chat_001';
+    const differentChatId = 'oc_synth_diff_chat_002';
+
+    db.prepare(`
+      INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id, dsh_session_id, execution_mode)
+      VALUES (?, ?, ?, 'lark', ?, ?, ?, 'container')
+    `).run(routeSessionId, spaceId, aliceUserId, accountId, boundChatId, dshSessionId);
+
+    db.prepare(`
+      INSERT INTO channel_bindings (id, space_id, user_id, channel, account_id, native_context_id, session_route_id)
+      VALUES ('bnd_synth_no_origin_001', ?, ?, 'lark', ?, ?, ?)
+    `).run(spaceId, aliceUserId, accountId, boundChatId, routeSessionId);
+
+    const origList = (deliveryGateway as any).executor.listBackgroundTasks;
+    (deliveryGateway as any).executor.listBackgroundTasks = async (req: any) => {
+      if (req.dshSessionId === dshSessionId) {
+        return [
+          {
+            id: 'subagent_no_origin_01',
+            shortId: 'sno1',
+            kind: 'subagent' as const,
+            name: 'Workflow Derived Subagent Without Origin',
+            status: 'running' as const,
+            startedAt: new Date().toISOString(),
+            lastActivityAt: new Date().toISOString(),
+            // originTurnId and originChatContextId are undefined
+          },
+        ];
+      }
+      return origList(req);
+    };
+
+    // When queried with matching bound chat -> task is visible
+    const matchRes = await deliveryGateway.getBackgroundTasks(aliceUserId, routeSessionId, {
+      chatContextId: boundChatId,
+    });
+    expect(matchRes.items).toHaveLength(1);
+    expect(matchRes.items[0].shortId).toBe('sno1');
+
+    // When queried with a different chatContextId -> task is filtered out
+    const diffRes = await deliveryGateway.getBackgroundTasks(aliceUserId, routeSessionId, {
+      chatContextId: differentChatId,
+    });
+    expect(diffRes.items).toHaveLength(0);
+
+    // /bg stop command also uses the same filter: allowed on matching chat, rejected on different chat
+    chatCommandService.setCheckChatAdmin(async () => true);
+    const stopMatching = await chatCommandService.execute({
+      userId: aliceUserId,
+      sessionId: routeSessionId,
+      spaceId,
+      content: '/bg stop sno1',
+      channelContext: {
+        channel: 'lark',
+        chatType: 'group',
+        chatId: boundChatId,
+        nativeContextId: boundChatId,
+      } as any,
+    });
+    expect(stopMatching.replyText).toContain('已停止');
+
+    const stopDiff = await chatCommandService.execute({
+      userId: aliceUserId,
+      sessionId: routeSessionId,
+      spaceId,
+      content: '/bg stop sno1',
+      channelContext: {
+        channel: 'lark',
+        chatType: 'group',
+        chatId: differentChatId,
+        nativeContextId: differentChatId,
+      } as any,
+    });
+    expect(stopDiff.replyText).toContain('未找到后台任务');
+
+    (deliveryGateway as any).executor.listBackgroundTasks = origList;
+  });
+
+  it('9. Topic session where session_routes.native_context_id is session id and channel_bindings points to topic chat: task with no origin is visible in topic chat, hidden in other chat', async () => {
+    const topicRouteId = 'ses_synth_topic_route_002';
+    const topicDshId = 'dsh_synth_topic_session_002';
+    const topicChatId = 'oc_synth_topic_chat_009';
+    const otherChatId = 'oc_synth_topic_chat_other_010';
+
+    // In topic session: session_routes.native_context_id is the session id itself, NOT a chat context
+    db.prepare(`
+      INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id, dsh_session_id, execution_mode)
+      VALUES (?, ?, ?, 'lark', ?, ?, ?, 'container')
+    `).run(topicRouteId, spaceId, aliceUserId, accountId, topicRouteId, topicDshId);
+
+    // channel_bindings links the session route to the actual topic chat
+    db.prepare(`
+      INSERT INTO channel_bindings (id, space_id, user_id, channel, account_id, native_context_id, session_route_id)
+      VALUES ('bnd_synth_001', ?, ?, 'lark', ?, ?, ?)
+    `).run(spaceId, aliceUserId, accountId, topicChatId, topicRouteId);
+
+    const origList = (deliveryGateway as any).executor.listBackgroundTasks;
+    (deliveryGateway as any).executor.listBackgroundTasks = async (req: any) => {
+      if (req.dshSessionId === topicDshId) {
+        return [
+          {
+            id: 'subagent_topic_no_origin_01',
+            shortId: 'stno1',
+            kind: 'subagent' as const,
+            name: 'Topic Session Subagent Without Origin',
+            status: 'running' as const,
+            startedAt: new Date().toISOString(),
+            lastActivityAt: new Date().toISOString(),
+          },
+        ];
+      }
+      return origList(req);
+    };
+
+    // Visible under topic chat
+    const topicRes = await deliveryGateway.getBackgroundTasks(aliceUserId, topicRouteId, {
+      chatContextId: topicChatId,
+    });
+    expect(topicRes.items).toHaveLength(1);
+    expect(topicRes.items[0].shortId).toBe('stno1');
+
+    // Also works when passed dshSessionId as sessionId parameter
+    const dshTopicRes = await deliveryGateway.getBackgroundTasks(aliceUserId, topicDshId, {
+      chatContextId: topicChatId,
+    });
+    expect(dshTopicRes.items).toHaveLength(1);
+    expect(dshTopicRes.items[0].shortId).toBe('stno1');
+
+    // Hidden in other chat
+    const otherRes = await deliveryGateway.getBackgroundTasks(aliceUserId, topicRouteId, {
+      chatContextId: otherChatId,
+    });
+    expect(otherRes.items).toHaveLength(0);
+
+    (deliveryGateway as any).executor.listBackgroundTasks = origList;
   });
 });
