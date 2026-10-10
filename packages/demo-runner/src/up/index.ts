@@ -116,6 +116,10 @@ import {
   type RuntimeContainerPort,
 } from '../ports/index.js';
 import {
+  queryDaemonActivityOverSocket,
+  queryContainerActivity,
+} from '../preflight/index.js';
+import {
   loadLarkTestCredentials,
   createLarkTestCredentialResolver,
   ensureLarkTestResources,
@@ -1779,12 +1783,10 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               const userRecord = await storage!.users.findById(userId);
               if (userRecord && userRecord.status !== 'disabled') {
                 const runtimeIdentity = deriveRuntimeIdentity(userRecord.id, userRecord.username);
+                const targetVer = getEffectiveTargetRuntimeVersion();
                 const newHandle = await containerAdapter.startUserRuntime({
                   userId: runtimeIdentity,
-                  image:
-                    options.runtimeImage ??
-                    process.env.ENKEEP_RUNTIME_IMAGE?.trim() ??
-                    'enkeep-demo-runtime:acceptance',
+                  image: targetVer.image,
                   repoRoot,
                   dataRoot: options.dataRoot,
                   mode: options.mode,
@@ -1792,6 +1794,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                   timeoutMs: options.timeoutMs ?? 15000,
                   mounts: allMounts,
                 });
+                newHandle.launchedImage = targetVer.image;
                 await bindRuntimeServices(newHandle, userRecord.id);
                 runtimeHandles.set(userRecord.id, newHandle);
               }
@@ -2036,9 +2039,21 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         const isOutdated = Boolean(targetVer.image && currentImage !== targetVer.image);
         let isIdle = true;
         try {
-          if (deliveryGateway && typeof (deliveryGateway as any).getUserIdleStatus === 'function') {
-            const idleStatus = await (deliveryGateway as any).getUserIdleStatus(uid);
-            isIdle = idleStatus.isIdle;
+          if (handle.containerId) {
+            const containerAct = await queryContainerActivity(handle.containerId, 2000);
+            if (containerAct) {
+              const hasActivity =
+                containerAct.activeTurnsCount > 0 ||
+                containerAct.autonomousTurnsCount > 0 ||
+                containerAct.runningJobsCount > 0 ||
+                containerAct.runningWorkflowJobsCount > 0 ||
+                containerAct.liveSubagentsCount > 0 ||
+                containerAct.pendingInboxItemsCount > 0 ||
+                containerAct.queuedTurnsCount > 0;
+              if (hasActivity || !containerAct.isIdle) {
+                isIdle = false;
+              }
+            }
           }
         } catch {}
 
@@ -2067,9 +2082,23 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         const isOutdated = Boolean(targetCli && currentCli !== targetCli);
         let isIdle = true;
         try {
-          if (deliveryGateway && typeof (deliveryGateway as any).getUserIdleStatus === 'function') {
-            const idleStatus = await (deliveryGateway as any).getUserIdleStatus(uid);
-            isIdle = idleStatus.isIdle;
+          const rawHandle = (hostHandle as any).rawHandle;
+          const userRec = await storage?.users.findById(uid);
+          const userName = userRec?.username || uid;
+          const socketPath = rawHandle?.socketPath || join(paths.dataRoot, 'host-runtimes', userName, 'run', 'runtime.sock');
+          const hostAct = await queryDaemonActivityOverSocket(socketPath, 2000);
+          if (hostAct) {
+            const hasActivity =
+              hostAct.activeTurnsCount > 0 ||
+              hostAct.autonomousTurnsCount > 0 ||
+              hostAct.runningJobsCount > 0 ||
+              hostAct.runningWorkflowJobsCount > 0 ||
+              hostAct.liveSubagentsCount > 0 ||
+              hostAct.pendingInboxItemsCount > 0 ||
+              hostAct.queuedTurnsCount > 0;
+            if (hasActivity || !hostAct.isIdle) {
+              isIdle = false;
+            }
           }
         } catch {}
 
@@ -2079,7 +2108,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         }
 
         results.push({
-          userId: `${uid}-host`,
+          userId: uid,
           mode: 'host',
           currentImage: null,
           currentDaemonCliPath: currentCli,
@@ -2166,17 +2195,21 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       return results;
     },
     async stopRuntime(targetUserId: string): Promise<{ stopped: boolean; userId: string }> {
+      const normalizedUserId = targetUserId.endsWith('-host')
+        ? targetUserId.slice(0, -5)
+        : targetUserId;
       let stopped = false;
-      const hostHandle = hostRuntimeHandles.get(targetUserId);
+      const hostHandle = hostRuntimeHandles.get(normalizedUserId) || hostRuntimeHandles.get(targetUserId);
       if (hostHandle) {
         try {
           await hostHandle.stop();
           await hostHandle.teardown(false);
           stopped = true;
         } catch {}
+        hostRuntimeHandles.delete(normalizedUserId);
         hostRuntimeHandles.delete(targetUserId);
       }
-      const handle = runtimeHandles.get(targetUserId);
+      const handle = runtimeHandles.get(normalizedUserId) || runtimeHandles.get(targetUserId);
       if (handle) {
         try {
           await handle.stop();
@@ -2184,13 +2217,14 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await handle.teardown(false);
           stopped = true;
         } catch {}
+        runtimeHandles.delete(normalizedUserId);
         runtimeHandles.delete(targetUserId);
       }
       if (stopped) {
         try {
           if (runtimeDiagnosticsService) {
             await runtimeDiagnosticsService.recordDiagnostic({
-              userId: targetUserId,
+              userId: normalizedUserId,
               eventType: 'lifecycle_stop',
               level: 'info',
               code: 'RUNTIME_STOP_OK',
@@ -2944,9 +2978,10 @@ fs.appendFileSync(p, corruptData);
           throw new Error(`FAIL-CLOSED: Cannot connect runtime for non-canonical user "${userId}"`);
         }
         const runtimeIdentity = deriveRuntimeIdentity(userRecord.id, userRecord.username);
+        const targetVer = getEffectiveTargetRuntimeVersion();
         const startOpts = {
           userId: runtimeIdentity,
-          image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
+          image: targetVer.image,
           repoRoot,
           dataRoot: options.dataRoot,
           mode: options.mode,
@@ -2954,6 +2989,7 @@ fs.appendFileSync(p, corruptData);
           timeoutMs: options.timeoutMs ?? 15000,
         };
         const handle = await containerAdapter.startUserRuntime(startOpts);
+        handle.launchedImage = targetVer.image;
         await bindRuntimeServices(handle, userRecord.id);
         const health = await handle.checkHealth();
         if (health.toolsOperational !== true) {

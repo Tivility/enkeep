@@ -22,6 +22,7 @@ export class RuntimeAutoUpgrader {
   private timer?: NodeJS.Timeout;
   private isChecking = false;
   private lastIdleTimestamps = new Map<string, number>();
+  private currentlyPausedUserId?: string;
 
   constructor(options: RuntimeAutoUpgraderOptions = {}) {
     this.db = options.db;
@@ -62,6 +63,13 @@ export class RuntimeAutoUpgrader {
       this.timer = undefined;
     }
     this.lastIdleTimestamps.clear();
+    if (this.currentlyPausedUserId && this.deliveryGateway) {
+      try {
+        this.deliveryGateway.resumeUserDispatch(this.currentlyPausedUserId);
+        this.deliveryGateway.redriveHeld().catch(() => {});
+      } catch {}
+      this.currentlyPausedUserId = undefined;
+    }
   }
 
   public async checkAndUpgrade(): Promise<{ upgradedUserId?: string; status: string }> {
@@ -122,6 +130,7 @@ export class RuntimeAutoUpgrader {
 
       // Step 1: Pause dispatch for this user (new messages enter held)
       if (this.deliveryGateway) {
+        this.currentlyPausedUserId = targetUserId;
         this.deliveryGateway.pauseUserDispatch(targetUserId);
       }
 
@@ -138,6 +147,8 @@ export class RuntimeAutoUpgrader {
           // Busy! Abort and resume dispatch
           if (this.deliveryGateway) {
             this.deliveryGateway.resumeUserDispatch(targetUserId);
+            await this.deliveryGateway.redriveHeld();
+            this.currentlyPausedUserId = undefined;
           }
           this.lastIdleTimestamps.delete(targetUserId);
           return { status: 'aborted_became_busy' };
@@ -152,14 +163,19 @@ export class RuntimeAutoUpgrader {
         if (this.deliveryGateway) {
           this.deliveryGateway.resumeUserDispatch(targetUserId);
           await this.deliveryGateway.redriveHeld();
+          this.currentlyPausedUserId = undefined;
         }
 
         this.lastIdleTimestamps.delete(targetUserId);
         return { upgradedUserId: targetUserId, status: 'upgraded' };
       } catch (upgradeErr) {
-        // Always ensure dispatch is resumed on error
+        // Always ensure dispatch is resumed on error and held messages redriven
         if (this.deliveryGateway) {
-          this.deliveryGateway.resumeUserDispatch(targetUserId);
+          try {
+            this.deliveryGateway.resumeUserDispatch(targetUserId);
+            await this.deliveryGateway.redriveHeld();
+          } catch {}
+          this.currentlyPausedUserId = undefined;
         }
         throw upgradeErr;
       }

@@ -1051,28 +1051,52 @@ export async function executeFrontendDeploy(config) {
     // Read index.html from targetStaticDir
     const indexHtmlPath = join(targetStaticDir, 'index.html');
     if (!existsSync(indexHtmlPath)) {
+      if (existsSync(prevStaticDir)) {
+        try {
+          if (existsSync(targetStaticDir)) {
+            rmSync(targetStaticDir, { recursive: true, force: true });
+          }
+          renameSync(prevStaticDir, targetStaticDir);
+          console.warn(`! Rolled back to previous static directory due to missing index.html.`);
+        } catch {}
+      }
       throw new Error(`index.html not found in newly deployed static dir: ${indexHtmlPath}`);
     }
     const htmlContent = readFileSync(indexHtmlPath, 'utf8');
     const assets = extractAssetsFromIndexHtml(htmlContent);
 
-    console.log(`Verifying root page http://127.0.0.1:${port}/ ...`);
     try {
-      execSync(`curl -s -f -o /dev/null "http://127.0.0.1:${port}/"`);
-      console.log(`✓ Root page returned 200.`);
-    } catch {
-      throw new Error(`Failed to load http://127.0.0.1:${port}/ (HTTP non-200)`);
-    }
-
-    for (const assetUrl of assets) {
-      const fullUrl = assetUrl.startsWith('/') ? `http://127.0.0.1:${port}${assetUrl}` : `http://127.0.0.1:${port}/${assetUrl}`;
-      console.log(`Verifying asset: ${fullUrl} ...`);
+      console.log(`Verifying root page http://127.0.0.1:${port}/ ...`);
       try {
-        execSync(`curl -s -f -o /dev/null "${fullUrl}"`);
-        console.log(`  ✓ ${assetUrl} returned 200.`);
+        execSync(`curl -s -f -o /dev/null "http://127.0.0.1:${port}/"`);
+        console.log(`✓ Root page returned 200.`);
       } catch {
-        throw new Error(`Failed to load asset ${fullUrl} (HTTP non-200)`);
+        throw new Error(`Failed to load http://127.0.0.1:${port}/ (HTTP non-200)`);
       }
+
+      for (const assetUrl of assets) {
+        const fullUrl = assetUrl.startsWith('/') ? `http://127.0.0.1:${port}${assetUrl}` : `http://127.0.0.1:${port}/${assetUrl}`;
+        console.log(`Verifying asset: ${fullUrl} ...`);
+        try {
+          execSync(`curl -s -f -o /dev/null "${fullUrl}"`);
+          console.log(`  ✓ ${assetUrl} returned 200.`);
+        } catch {
+          throw new Error(`Failed to load asset ${fullUrl} (HTTP non-200)`);
+        }
+      }
+    } catch (verifyErr) {
+      if (existsSync(prevStaticDir)) {
+        try {
+          if (existsSync(targetStaticDir)) {
+            rmSync(targetStaticDir, { recursive: true, force: true });
+          }
+          renameSync(prevStaticDir, targetStaticDir);
+          console.warn(`! Rolled back ${targetStaticDir} to previous version from ${prevStaticDir} due to verification failure.`);
+        } catch (rollbackErr) {
+          console.error(`Failed to rollback static directory: ${rollbackErr.message}`);
+        }
+      }
+      throw verifyErr;
     }
   });
 
