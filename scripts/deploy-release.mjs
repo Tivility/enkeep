@@ -14,7 +14,7 @@
  * - Does not leak or print EnvironmentVariables values from plist files.
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { execSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
@@ -464,6 +464,44 @@ export function extractImageTagFromPlist(plistContent) {
   return match ? match[1].trim() : '';
 }
 
+export function formatUtcTimestamp(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = d.getUTCFullYear();
+  const m = pad(d.getUTCMonth() + 1);
+  const day = pad(d.getUTCDate());
+  const h = pad(d.getUTCHours());
+  const min = pad(d.getUTCMinutes());
+  const s = pad(d.getUTCSeconds());
+  return `${y}${m}${day}T${h}${min}${s}Z`;
+}
+
+export function parsePlistBackupTimestamp(filename, launchdLabel) {
+  // Matches: <launchdLabel>.plist.pre-<releaseId>-<YYYYMMDDTHHMMSSZ>-backup
+  // or legacy: <launchdLabel>.plist.pre-<releaseId>-backup
+  const prefix = `${launchdLabel}.plist.pre-`;
+  const suffix = `-backup`;
+  if (!filename.startsWith(prefix) || !filename.endsWith(suffix)) return null;
+  const middle = filename.slice(prefix.length, -suffix.length);
+  // middle could be "batch1-20261009T210000Z" or "batch1"
+  const tsMatch = /(\d{4}\d{2}\d{2}T\d{2}\d{2}\d{2}Z)$/.exec(middle);
+  if (tsMatch) {
+    const raw = tsMatch[1];
+    // Convert YYYYMMDDTHHMMSSZ to parseable ISO string: YYYY-MM-DDTHH:MM:SSZ
+    const iso = `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T${raw.slice(9, 11)}:${raw.slice(11, 13)}:${raw.slice(13, 15)}Z`;
+    const parsed = Date.parse(iso);
+    if (!isNaN(parsed)) return parsed;
+  }
+  return null;
+}
+
+export function getPlistBackupEffectiveTime(filename, launchdLabel, snapshotsDir) {
+  const ts = parsePlistBackupTimestamp(filename, launchdLabel);
+  if (ts !== null) return ts;
+  const stat = statSafe(join(snapshotsDir, filename));
+  return stat?.mtimeMs || 0;
+}
+
 export function findLatestPlistBackup(configDir, launchdLabel) {
   const snapshotsDir = join(configDir, 'snapshots');
   if (!existsSync(snapshotsDir)) {
@@ -480,11 +518,11 @@ export function findLatestPlistBackup(configDir, launchdLabel) {
     throw new Error(`No plist backups found in ${snapshotsDir} matching prefix ${prefix}`);
   }
 
-  // Sort by mtime descending
+  // Sort by effective time descending (timestamp in filename preferred, fallback to file mtime)
   matches.sort((a, b) => {
-    const statA = statSafe(join(snapshotsDir, a));
-    const statB = statSafe(join(snapshotsDir, b));
-    return (statB?.mtimeMs || 0) - (statA?.mtimeMs || 0);
+    const timeA = getPlistBackupEffectiveTime(a, launchdLabel, snapshotsDir);
+    const timeB = getPlistBackupEffectiveTime(b, launchdLabel, snapshotsDir);
+    return timeB - timeA;
   });
 
   return join(snapshotsDir, matches[0]);
@@ -492,7 +530,6 @@ export function findLatestPlistBackup(configDir, launchdLabel) {
 
 function statSafe(p) {
   try {
-    const { statSync } = require('node:fs');
     return statSync(p);
   } catch {
     return null;
@@ -1050,6 +1087,7 @@ export async function executeFrontendDeploy(config) {
   runDeployStep('Verify Index and Asset Endpoints', () => {
     // Read index.html from targetStaticDir
     const indexHtmlPath = join(targetStaticDir, 'index.html');
+    const commitMarkerPath = join(targetStaticDir, '.frontend-commit');
     if (!existsSync(indexHtmlPath)) {
       if (existsSync(prevStaticDir)) {
         try {
@@ -1061,6 +1099,19 @@ export async function executeFrontendDeploy(config) {
         } catch {}
       }
       throw new Error(`index.html not found in newly deployed static dir: ${indexHtmlPath}`);
+    }
+
+    if (!existsSync(commitMarkerPath)) {
+      if (existsSync(prevStaticDir)) {
+        try {
+          if (existsSync(targetStaticDir)) {
+            rmSync(targetStaticDir, { recursive: true, force: true });
+          }
+          renameSync(prevStaticDir, targetStaticDir);
+          console.warn(`! Rolled back to previous static directory due to missing .frontend-commit marker.`);
+        } catch {}
+      }
+      throw new Error(`.frontend-commit marker not found in newly deployed static dir: ${commitMarkerPath}`);
     }
     const htmlContent = readFileSync(indexHtmlPath, 'utf8');
     const assets = extractAssetsFromIndexHtml(htmlContent);
@@ -1134,8 +1185,9 @@ export async function executePlatformDeploy(config, options = {}) {
   const branchName = `release/${releaseId}`;
   const worktreePath = join(releaseRoot, `release-worktree-${releaseId}`);
   const dbPath = join(dataDir, 'platform.db');
-  const snapshotPath = join(configDir, 'snapshots', `platform.db.pre-${releaseId}-vacuum`);
-  const plistBackup = join(configDir, 'snapshots', `${launchdLabel}.plist.pre-${releaseId}-backup`);
+  const timestamp = formatUtcTimestamp();
+  const snapshotPath = join(configDir, 'snapshots', `platform.db.pre-${releaseId}-${timestamp}-vacuum`);
+  const plistBackup = join(configDir, 'snapshots', `${launchdLabel}.plist.pre-${releaseId}-${timestamp}-backup`);
 
   console.log('================================================================');
   console.log(`  Enkeep Controlled Release Deployment [${releaseId}]          `);

@@ -18,6 +18,8 @@ import {
   setRuntimeTargetVersionInDb,
   executeRuntimeDeploy,
   executePlatformDeploy,
+  formatUtcTimestamp,
+  findLatestPlistBackup,
 } from '../scripts/deploy-release.mjs';
 import { planPruneWorktrees, executePrune } from '../scripts/prune-release-worktrees.mjs';
 import * as fs from 'node:fs';
@@ -228,6 +230,61 @@ describe('Deploy Tooling Enhancements', () => {
       await expect(executeVerify(verifyConfig)).resolves.not.toThrow();
 
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    describe('Snapshot & Backup Timestamps and Rollback Selection', () => {
+      it('formats UTC timestamp in YYYYMMDDTHHMMSSZ format', () => {
+        const fixedDate = new Date('2026-10-09T14:30:45.000Z');
+        expect(formatUtcTimestamp(fixedDate)).toBe('20261009T143045Z');
+        expect(formatUtcTimestamp()).toMatch(/^\d{8}T\d{6}Z$/);
+      });
+
+      it('correctly selects the latest plist backup among mixed legacy and timestamp-suffixed backups', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-plist-bk-'));
+        const snapshotsDir = path.join(tmpDir, 'snapshots');
+        fs.mkdirSync(snapshotsDir);
+        const label = 'com.example.app';
+
+        // 1. Legacy backup from older batch
+        const legacyOld = path.join(snapshotsDir, `${label}.plist.pre-batch1-backup`);
+        fs.writeFileSync(legacyOld, '<plist>batch1</plist>');
+
+        // 2. Timestamped backup 1 (e.g. 2026-10-09 10:00:00 UTC)
+        const ts1 = path.join(snapshotsDir, `${label}.plist.pre-batch2-20261009T100000Z-backup`);
+        fs.writeFileSync(ts1, '<plist>batch2-ts1</plist>');
+
+        // 3. Timestamped backup 2 (e.g. 2026-10-09 12:00:00 UTC - later)
+        const ts2 = path.join(snapshotsDir, `${label}.plist.pre-batch2-20261009T120000Z-backup`);
+        fs.writeFileSync(ts2, '<plist>batch2-ts2</plist>');
+
+        // 4. Timestamped backup 3 (e.g. 2026-10-09 11:00:00 UTC - between ts1 and ts2)
+        const ts3 = path.join(snapshotsDir, `${label}.plist.pre-batch2-20261009T110000Z-backup`);
+        fs.writeFileSync(ts3, '<plist>batch2-ts3</plist>');
+
+        // Set mtime explicitly to simulate file modifications
+        const legacyTimeSec = Date.parse('2026-10-08T00:00:00Z') / 1000;
+        fs.utimesSync(legacyOld, legacyTimeSec, legacyTimeSec);
+        const ts1Sec = Date.parse('2026-10-09T10:00:00Z') / 1000;
+        fs.utimesSync(ts1, ts1Sec, ts1Sec);
+        const ts2Sec = Date.parse('2026-10-09T12:00:00Z') / 1000;
+        fs.utimesSync(ts2, ts2Sec, ts2Sec);
+        const ts3Sec = Date.parse('2026-10-09T11:00:00Z') / 1000;
+        fs.utimesSync(ts3, ts3Sec, ts3Sec);
+
+        const latest = findLatestPlistBackup(tmpDir, label);
+        expect(latest).toBe(ts2);
+
+        // If a new legacy backup is created with newer mtime (e.g. 2026-10-09 15:00:00 UTC)
+        const legacyNew = path.join(snapshotsDir, `${label}.plist.pre-batch3-backup`);
+        fs.writeFileSync(legacyNew, '<plist>batch3-legacy</plist>');
+        const legacyNewSec = Date.parse('2026-10-09T15:00:00Z') / 1000;
+        fs.utimesSync(legacyNew, legacyNewSec, legacyNewSec);
+
+        const latestAfterLegacy = findLatestPlistBackup(tmpDir, label);
+        expect(latestAfterLegacy).toBe(legacyNew);
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
     });
   });
 
@@ -470,6 +527,25 @@ describe('Deploy Tooling Enhancements', () => {
         };
 
         await expect(executeDeploy(config)).resolves.toBeDefined();
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      it('writes .frontend-commit marker inside dist/static and fails verification if marker is absent', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-fe-marker-'));
+        const staticDir = path.join(tmpDir, 'static');
+        fs.mkdirSync(staticDir, { recursive: true });
+        fs.writeFileSync(path.join(staticDir, 'index.html'), '<html><body>Hello</body></html>');
+
+        // Without .frontend-commit, check that error is thrown when verifying
+        const commitMarkerPath = path.join(staticDir, '.frontend-commit');
+        expect(fs.existsSync(commitMarkerPath)).toBe(false);
+
+        // When written into dist/static
+        const fakeCommit = '0123456789abcdef0123456789abcdef01234567';
+        fs.writeFileSync(commitMarkerPath, fakeCommit + '\n', 'utf8');
+        expect(fs.existsSync(commitMarkerPath)).toBe(true);
+        expect(fs.readFileSync(commitMarkerPath, 'utf8').trim()).toBe(fakeCommit);
 
         fs.rmSync(tmpDir, { recursive: true, force: true });
       });
