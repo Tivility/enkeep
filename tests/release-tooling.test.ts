@@ -733,6 +733,67 @@ describe('Deploy Tooling Enhancements', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       });
 
+      it('reuses release branch and worktree across steps in combined runtime + platform deploy without failing or duplicating setup/build/test/docker steps', async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-combined-reuse-'));
+        const fakeWorktree = path.join(tmpDir, 'release-worktree-batch59');
+        fs.mkdirSync(path.join(fakeWorktree, 'packages/demo-runner/dist'), { recursive: true });
+        fs.writeFileSync(path.join(fakeWorktree, 'packages/demo-runner/dist/demo-runner.js'), '// runner');
+
+        const fakePlist = path.join(tmpDir, 'com.example.app.plist');
+        fs.writeFileSync(fakePlist, `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${path.join(fakeWorktree, 'packages/demo-runner/dist/demo-runner.js')}</string>
+  </array>
+</dict>
+</plist>`);
+
+        const config = {
+          releaseId: 'batch59',
+          targetRef: 'HEAD',
+          baseRef: 'HEAD',
+          repoRoot: fakeWorktree,
+          releaseRoot: tmpDir,
+          dataDir: tmpDir,
+          configDir: tmpDir,
+          plistPath: fakePlist,
+          launchdLabel: 'com.example.app',
+          port: 3900,
+          proxyPort: 3901,
+          runtimeImagePrefix: 'enkeep-runtime:test-',
+          containerNamePrefix: 'enkeep-test-',
+          testCmds: ['true'],
+          dryRun: true,
+        };
+
+        const logs = [];
+        const originalLog = console.log;
+        console.log = (...args) => {
+          logs.push(args.join(' '));
+          originalLog(...args);
+        };
+
+        try {
+          await expect(
+            executeDeploy(config, {
+              classificationOverride: { frontend: false, runtime: true, platform: true },
+            })
+          ).resolves.toBeDefined();
+        } finally {
+          console.log = originalLog;
+        }
+
+        // Setup Release Branch and Worktree step and Install & Build step should only appear once (in Runtime step)
+        const setupStepCount = logs.filter(l => l.includes('Setup Release Branch and Worktree') || l.includes('Setup release branch')).length;
+        const buildStepCount = logs.filter(l => l.includes('Install & Build Worktree') || l.includes('Install dependencies and build worktree')).length;
+        expect(setupStepCount).toBe(1);
+        expect(buildStepCount).toBe(1);
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
       describe('verifyContainers in split and full modes', () => {
         it('full mode requires all matching containers to run target image', () => {
           const psOut = [

@@ -1247,33 +1247,35 @@ export async function executePlatformDeploy(config, options = {}) {
   console.log('----------------------------------------------------------------');
 
   // Step 1: Branch and Worktree setup
-  // Create release/batchNN pointing to TARGET_REF, check out in worktree. Fail if branch exists unless reuse.
-  runDeployStep('Setup Release Branch and Worktree', () => {
-    let branchExists = false;
-    try {
-      execSync(`git show-ref --verify --quiet "refs/heads/${branchName}"`, { cwd: repoRoot });
-      branchExists = true;
-    } catch {
-      branchExists = false;
-    }
-
-    if (branchExists && !reuse) {
-      throw new Error(`Release branch '${branchName}' already exists. Use --reuse to deploy from existing branch.`);
-    }
-
-    if (!branchExists) {
-      execSync(`git branch "${branchName}" "${targetRef}"`, { cwd: repoRoot, stdio: 'inherit' });
-    }
-
-    if (!existsSync(worktreePath)) {
-      execSync(`git worktree add "${worktreePath}" "${branchName}"`, { cwd: repoRoot, stdio: 'inherit' });
-    } else {
-      execSync(`git checkout "${branchName}"`, { cwd: worktreePath, stdio: 'inherit' });
-      if (!reuse) {
-        execSync(`git reset --hard "${targetRef}"`, { cwd: worktreePath, stdio: 'inherit' });
+  // Create release/batchNN pointing to TARGET_REF, check out in worktree. Fail if branch exists unless reuse or already created in this run.
+  if (!options.skipWorktreeSetup) {
+    runDeployStep('Setup Release Branch and Worktree', () => {
+      let branchExists = false;
+      try {
+        execSync(`git show-ref --verify --quiet "refs/heads/${branchName}"`, { cwd: repoRoot });
+        branchExists = true;
+      } catch {
+        branchExists = false;
       }
-    }
-  }, dryRun);
+
+      if (branchExists && !reuse) {
+        throw new Error(`Release branch '${branchName}' already exists. Use --reuse to deploy from existing branch.`);
+      }
+
+      if (!branchExists) {
+        execSync(`git branch "${branchName}" "${targetRef}"`, { cwd: repoRoot, stdio: 'inherit' });
+      }
+
+      if (!existsSync(worktreePath)) {
+        execSync(`git worktree add "${worktreePath}" "${branchName}"`, { cwd: repoRoot, stdio: 'inherit' });
+      } else {
+        execSync(`git checkout "${branchName}"`, { cwd: worktreePath, stdio: 'inherit' });
+        if (!reuse) {
+          execSync(`git reset --hard "${targetRef}"`, { cwd: worktreePath, stdio: 'inherit' });
+        }
+      }
+    }, dryRun);
+  }
 
   // Resolve target commit sha
   let targetSha = '0000000';
@@ -1282,17 +1284,19 @@ export async function executePlatformDeploy(config, options = {}) {
       targetSha = execSync(`git rev-parse --short "${branchName}"`, { cwd: repoRoot, encoding: 'utf8' }).trim();
     } catch {}
   }
-  const imageTag = `${runtimeImagePrefix}${releaseId}-${targetSha}`;
+  const imageTag = options.imageTag || `${runtimeImagePrefix}${releaseId}-${targetSha}`;
 
   // Step 2: Build & Compile
-  runDeployStep('Install & Build Worktree', () => {
-    execSync('pnpm install --frozen-lockfile', { cwd: worktreePath, stdio: 'inherit' });
-    execSync('pnpm run build:root && pnpm -r run build', { cwd: worktreePath, stdio: 'inherit' });
-  }, dryRun);
+  if (!options.skipWorktreeBuild) {
+    runDeployStep('Install & Build Worktree', () => {
+      execSync('pnpm install --frozen-lockfile', { cwd: worktreePath, stdio: 'inherit' });
+      execSync('pnpm run build:root && pnpm -r run build', { cwd: worktreePath, stdio: 'inherit' });
+    }, dryRun);
+  }
 
   // Step 3: Tests (P-04 Tree compare optimization & targeted test commands)
   const treeMatches = checkTreeMatch(repoRoot, targetRef, testedCommit);
-  let shouldRunTests = !skipTests;
+  let shouldRunTests = !skipTests && !options.skipTestsRun;
   if (treeMatches) {
     console.log(`\n[P-04 Optimization] Target tree matches tested commit ${testedCommit}. Skipping re-running test suite.`);
     shouldRunTests = false;
@@ -1312,9 +1316,11 @@ export async function executePlatformDeploy(config, options = {}) {
   }
 
   // Step 4: Build Docker Image
-  runDeployStep('Build Runtime Docker Image', () => {
-    execSync(`docker build -f "${dockerfilePath}" -t "${imageTag}" .`, { cwd: worktreePath, stdio: 'inherit' });
-  }, dryRun);
+  if (!options.skipDockerBuild) {
+    runDeployStep('Build Runtime Docker Image', () => {
+      execSync(`docker build -f "${dockerfilePath}" -t "${imageTag}" .`, { cwd: worktreePath, stdio: 'inherit' });
+    }, dryRun);
+  }
 
   // Step 5: Quiescent Drain Gate & Atomic DB Vacuum Snapshot & Switch with Automatic Rollback
   const preflightCmd = [
@@ -1394,7 +1400,7 @@ export async function executePlatformDeploy(config, options = {}) {
   return { success: true, releaseId, imageTag };
 }
 
-export async function executeDeploy(config) {
+export async function executeDeploy(config, options = {}) {
   validateConfig(config);
 
   if (config.only === 'rollback') {
@@ -1425,7 +1431,8 @@ export async function executeDeploy(config) {
   }
   const onlineWt = extractWorktreePathFromPlist(plistContent);
   const effBaseRef = baseRef || resolveOnlineHead(plistPath, repoRoot);
-  const { paths, classification } = computeDiffPathsAndClassification(repoRoot || onlineWt, effBaseRef, targetRef);
+  const { paths, classification: detectedClassification } = computeDiffPathsAndClassification(repoRoot || onlineWt, effBaseRef, targetRef);
+  const classification = options.classificationOverride || detectedClassification;
 
   console.log('================================================================');
   console.log('  Enkeep Smart Split Release Deployment                         ');
@@ -1439,7 +1446,7 @@ export async function executeDeploy(config) {
   console.log(`Classification:          ${JSON.stringify(classification)}`);
   console.log('================================================================\n');
 
-  if (paths.length === 0) {
+  if (paths.length === 0 && !options.classificationOverride) {
     console.log('No file changes detected between base and target ref.');
     return { success: true, message: 'No changes detected' };
   }
@@ -1468,13 +1475,24 @@ export async function executeDeploy(config) {
     await executeFrontendDeploy(config);
   }
 
+  let runtimeResult = null;
   if (classification.runtime) {
     console.log('\n>>> Executing Step 2/3: Runtime target version setup...');
-    await executeRuntimeDeploy(config);
+    runtimeResult = await executeRuntimeDeploy(config);
   }
 
   console.log('\n>>> Executing Platform Upgrade (retaining active runtime containers)...');
-  return executePlatformDeploy(config, { mode: 'platform' });
+  const platformOptions = { mode: 'platform' };
+  if (classification.runtime) {
+    platformOptions.skipWorktreeSetup = true;
+    platformOptions.skipWorktreeBuild = true;
+    platformOptions.skipTestsRun = true;
+    platformOptions.skipDockerBuild = true;
+    if (runtimeResult && runtimeResult.imageTag) {
+      platformOptions.imageTag = runtimeResult.imageTag;
+    }
+  }
+  return executePlatformDeploy(config, platformOptions);
 }
 
 function main() {
