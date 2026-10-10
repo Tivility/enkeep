@@ -81,6 +81,9 @@ import {
   type JournalTurnRecord,
 } from './daemon-journal.js';
 import {
+  DaemonSettlementJournal,
+} from './daemon-settlement-journal.js';
+import {
   DAEMON_OPS,
   DAEMON_ERROR_CODES,
   DAEMON_STREAM_EVENTS,
@@ -293,6 +296,9 @@ export class RuntimeDaemon extends EventEmitter {
   private readonly bootedRuntimePromise!: Promise<DshBootedRuntime>;
   private bootedRuntime!: DshBootedRuntime;
   private readonly journal: DaemonTurnJournal;
+  private readonly settlementJournal: DaemonSettlementJournal;
+  private readonly observedNativeNoticeTaskIds = new Set<string>();
+  private readonly pendingAnomalyTimers = new Map<string, NodeJS.Timeout>();
   private readonly agents = new Map<string, ManagedAgentEntry>();
   private readonly loadingAgents = new Map<string, Promise<ManagedAgentEntry>>();
   private readonly sessionQueues = new Map<string, QueuedTurnItem[]>();
@@ -347,6 +353,7 @@ export class RuntimeDaemon extends EventEmitter {
       (!isNaN(envMaxConcurrent) && envMaxConcurrent > 0 ? envMaxConcurrent : 4);
 
     this.journal = new DaemonTurnJournal(this.dshHome);
+    this.settlementJournal = new DaemonSettlementJournal(this.dshHome);
   }
 
   private getOrCreateSessionQueue(sessionId: string): QueuedTurnItem[] {
@@ -478,6 +485,19 @@ export class RuntimeDaemon extends EventEmitter {
           },
         };
         this.emit('stream', decidedPush);
+      }
+
+      // Extract structured settlement notice task IDs to dedup against daemon anomaly fallback
+      if (sessionIdStr && (event.type === 'agent/inbox/spliced' || event.type === 'user/message')) {
+        const rawEv = event as any;
+        const inserted = rawEv.data?.inserted;
+        if (Array.isArray(inserted)) {
+          for (const item of inserted) {
+            this.recordObservedNativeNotice(item?.source ?? item?.message?.source ?? item);
+          }
+        } else {
+          this.recordObservedNativeNotice(rawEv.data?.source ?? rawEv.data?.message?.source ?? rawEv.data);
+        }
       }
 
       // Track autonomous continuation turns
@@ -633,6 +653,18 @@ export class RuntimeDaemon extends EventEmitter {
             task.status = 'cancelled';
           } else {
             task.status = 'completed';
+          }
+
+          if (task.status === 'failed' || task.status === 'cancelled') {
+            this.scheduleAnomalyCallback({
+              taskId: runId,
+              parentSessionId: task.parentSessionId,
+              kind: 'workflow',
+              name: task.name,
+              status: task.status,
+              reason: stopReason || task.status,
+              originTurnId: task.originTurnId,
+            });
           }
         }
       }
@@ -830,6 +862,18 @@ export class RuntimeDaemon extends EventEmitter {
             existing.status = targetStatus;
           }
         }
+
+        if (existing && (existing.status === 'failed' || existing.status === 'cancelled')) {
+          daemon.scheduleAnomalyCallback({
+            taskId: idStr,
+            parentSessionId: existing.parentSessionId,
+            kind: 'subagent',
+            name: existing.name,
+            status: existing.status,
+            reason: stopReason || existing.status,
+            originTurnId: existing.originTurnId,
+          });
+        }
       }
     });
 
@@ -894,6 +938,18 @@ export class RuntimeDaemon extends EventEmitter {
         } else {
           task.status = 'completed';
         }
+
+        if (task.status === 'failed' || task.status === 'cancelled') {
+          this.scheduleAnomalyCallback({
+            taskId: runId,
+            parentSessionId: task.parentSessionId,
+            kind: 'workflow',
+            name: task.name,
+            status: task.status,
+            reason: stopReason || task.status,
+            originTurnId: task.originTurnId,
+          });
+        }
       }
     });
 
@@ -905,6 +961,138 @@ export class RuntimeDaemon extends EventEmitter {
       disposeWorkflowStart();
       disposeWorkflowEnd();
     };
+  }
+
+  /**
+   * Records that a native settlement notice for a child task was observed in session inbox/events.
+   */
+  private recordObservedNativeNotice(sourceOrItem: unknown): void {
+    if (!sourceOrItem || typeof sourceOrItem !== 'object') return;
+    const s = sourceOrItem as Record<string, unknown>;
+    const directTaskId =
+      (typeof s.senderSessionId === 'string' && s.senderSessionId.trim().length > 0
+        ? s.senderSessionId.trim()
+        : undefined) ||
+      (typeof s.jobId === 'string' && s.jobId.trim().length > 0 ? s.jobId.trim() : undefined) ||
+      (typeof s.taskId === 'string' && s.taskId.trim().length > 0 ? s.taskId.trim() : undefined);
+
+    if (directTaskId) {
+      this.observedNativeNoticeTaskIds.add(directTaskId);
+      const timer = this.pendingAnomalyTimers.get(directTaskId);
+      if (timer) {
+        clearTimeout(timer);
+        this.pendingAnomalyTimers.delete(directTaskId);
+      }
+    }
+  }
+
+  /**
+   * Schedules an anomaly callback to the parent session if native notice is not observed within 2000ms.
+   */
+  private scheduleAnomalyCallback(params: {
+    taskId: string;
+    parentSessionId?: string;
+    kind: 'subagent' | 'workflow' | 'job';
+    name?: string;
+    status: 'failed' | 'cancelled';
+    reason: string;
+    originTurnId?: string;
+  }): void {
+    const { taskId, parentSessionId, kind, name, status, reason, originTurnId } = params;
+    if (!parentSessionId || !parentSessionId.trim()) return;
+
+    if (this.settlementJournal.isNotified(taskId)) {
+      return;
+    }
+    if (this.observedNativeNoticeTaskIds.has(taskId)) {
+      return;
+    }
+
+    if (this.pendingAnomalyTimers.has(taskId)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingAnomalyTimers.delete(taskId);
+      this.dispatchAnomalyCallback({
+        taskId,
+        parentSessionId,
+        kind,
+        name: name || kind,
+        status,
+        reason,
+        originTurnId,
+      }).catch(() => {});
+    }, 2000);
+
+    if (timer && typeof timer.unref === 'function') {
+      timer.unref();
+    }
+    this.pendingAnomalyTimers.set(taskId, timer);
+  }
+
+  /**
+   * Dispatches the abnormal settlement notice to the parent agent, resuming it if evicted.
+   */
+  private async dispatchAnomalyCallback(params: {
+    taskId: string;
+    parentSessionId: string;
+    kind: 'subagent' | 'workflow' | 'job';
+    name: string;
+    status: 'failed' | 'cancelled';
+    reason: string;
+    originTurnId?: string;
+  }): Promise<void> {
+    const { taskId, parentSessionId, kind, name, status, reason, originTurnId } = params;
+
+    if (this.settlementJournal.isNotified(taskId)) {
+      return;
+    }
+    if (this.observedNativeNoticeTaskIds.has(taskId)) {
+      return;
+    }
+
+    const statusText = status === 'failed' ? '失败' : '被取消';
+    const cleanReason = String(reason || status).replace(/\s+/g, ' ').trim();
+    const promptText = `系统通知：后台${kind === 'workflow' ? '工作流' : '子代理'} "${name}" (ID: ${taskId}) 执行${statusText}。原因：${cleanReason}。请根据该执行结果决定后续处理。`;
+
+    const noticeMessage = createUserMessage({
+      content: [{ type: 'text', text: promptText }],
+      source: {
+        kind: 'task-anomaly',
+        form: 'notice',
+        senderSessionId: taskId,
+        summary: `后台任务 ${taskId} 异常结束 (${statusText})`,
+      } as any,
+    });
+
+    try {
+      const entry = await this.getOrCreateManagedAgent(parentSessionId);
+      const agent = entry.agent;
+
+      this.settlementJournal.recordNotified({
+        taskId,
+        parentSessionId,
+        kind,
+        status,
+        reason: cleanReason,
+        originTurnId,
+        notifiedAt: new Date().toISOString(),
+      });
+
+      if (entry.status === 'idle' && typeof agent.followup === 'function') {
+        agent.followup(noticeMessage);
+      } else if (typeof agent.steer === 'function') {
+        agent.steer(noticeMessage);
+      } else if (typeof agent.inject === 'function') {
+        agent.inject(noticeMessage);
+      }
+    } catch (err: unknown) {
+      this.emit('log', {
+        level: 'warn',
+        message: `Failed to dispatch anomaly callback for task "${taskId}" to parent "${parentSessionId}": ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   }
 
   /**
@@ -3147,6 +3335,38 @@ export class RuntimeDaemon extends EventEmitter {
   }
 
   /**
+   * Checks whether a session has any running jobs or workflows owned by it.
+   */
+  private hasRunningJobsForSession(sessionId: string): boolean {
+    const ctx = this.bootedRuntime?.context;
+    const jobRegistry = ctx?.get('jobs');
+    if (jobRegistry && typeof jobRegistry.list === 'function') {
+      try {
+        const jobs = jobRegistry.list(sessionId as any);
+        for (const job of jobs) {
+          const rawOwner = job.owner ?? (job as any).ownerSession;
+          const ownerStr = rawOwner
+            ? (typeof rawOwner === 'object' && rawOwner.id ? String(rawOwner.id) : String(rawOwner))
+            : '';
+          if (ownerStr === sessionId || (!ownerStr && !job.owner)) {
+            const status = String(job.status || '').toLowerCase();
+            if (status === 'running' || status === 'stopping') {
+              return true;
+            }
+          }
+        }
+      } catch {}
+    }
+    // Also check backgroundTasksTracker for active workflows or jobs belonging to sessionId
+    for (const task of this.backgroundTasksTracker.values()) {
+      if (task.parentSessionId === sessionId && task.status === 'running') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Periodic sweep: evicts agents that have been idle longer than idleAgentTimeoutMs.
    */
   private async sweepIdleAgents(): Promise<void> {
@@ -3156,13 +3376,33 @@ export class RuntimeDaemon extends EventEmitter {
     for (const [sid, entry] of this.agents.entries()) {
       const queue = this.sessionQueues.get(sid);
       const queueLen = queue ? queue.length : 0;
-      if (
-        entry.status === 'idle' &&
-        !entry.currentTurn &&
-        !this.currentTurns.has(sid) &&
-        queueLen === 0 &&
-        now - entry.lastUsed >= this.idleAgentTimeoutMs
-      ) {
+
+      // Check if session has active autonomous turns
+      const hasAutonomousTurn = this.autonomousTurnsTracker.has(sid);
+
+      // Check if session has live subagents running
+      const hasLiveSubagents = Array.from(this.liveSubagentsTracker.values()).some(
+        (sub) => sub.parentSession === sid
+      );
+
+      // Check if session has running jobs or workflows
+      const hasRunningJobs = this.hasRunningJobsForSession(sid);
+
+      const isBusy =
+        entry.status !== 'idle' ||
+        Boolean(entry.currentTurn) ||
+        this.currentTurns.has(sid) ||
+        queueLen > 0 ||
+        hasAutonomousTurn ||
+        hasLiveSubagents ||
+        hasRunningJobs;
+
+      if (isBusy) {
+        // Refresh lastUsed while session is actively running or executing background tasks
+        if (hasAutonomousTurn || hasLiveSubagents || hasRunningJobs) {
+          entry.lastUsed = now;
+        }
+      } else if (now - entry.lastUsed >= this.idleAgentTimeoutMs) {
         toEvict.push(sid);
       }
     }
@@ -3320,6 +3560,11 @@ export class RuntimeDaemon extends EventEmitter {
       clearInterval(this.idleSweepTimer);
       this.idleSweepTimer = null;
     }
+
+    for (const timer of this.pendingAnomalyTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingAnomalyTimers.clear();
 
     if (this.eventRelayCleanup) {
       this.eventRelayCleanup();
