@@ -395,6 +395,49 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
 
       manager.dispose();
     });
+
+    it('does not falsely report "✅ 后台任务已全部完成" when task list drops to empty', async () => {
+      const sessionRouteId = 'session_route_test_no_false_complete';
+      const chatContextId = 'oc_test_chat_no_false_complete';
+      let currentTasks: BackgroundTask[] = [
+        {
+          id: 'task_running_001',
+          shortId: 'r001',
+          kind: 'workflow',
+          name: 'active-workflow',
+          status: 'running',
+          startedAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+          originTurnId: 'turn_rfc_1',
+        },
+      ];
+
+      const card = createMockCardSession('crd_rfc_001', 'om_msg_rfc_001');
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => {
+          return { items: currentTasks, updatedAt: new Date().toISOString(), available: true };
+        },
+        pollIntervalMs: 30_000,
+      });
+
+      // Register card in an active turn
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_rfc_1');
+      expect(card.updates[card.updates.length - 1]).toContain('[workflow] active-workflow · running');
+
+      // Now simulate task query returning empty list (e.g. context filter mismatch or temporary disappearance)
+      currentTasks = [];
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      // It must NOT report "✅ 后台任务已全部完成"
+      expect(card.updates[card.updates.length - 1]).not.toBe('✅ 后台任务已全部完成');
+
+      // Finalize turn while task list is still empty -> panel cleared (null) rather than false complete
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_rfc_1');
+      expect(card.updates[card.updates.length - 1]).toBeNull();
+
+      manager.dispose();
+    });
   });
 
   describe('3. FakeLarkTransport Card Background Panel Rendering', () => {
