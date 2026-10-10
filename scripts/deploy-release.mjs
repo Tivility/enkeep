@@ -14,11 +14,88 @@
  * - Does not leak or print EnvironmentVariables values from plist files.
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { execSync } from 'node:child_process';
 
 const FORBIDDEN_ROOTS = ['/etc', '/usr', '/System', '/root', '/bin', '/sbin'];
+
+/**
+ * Classifies changed file paths into upgrade categories: { frontend: boolean, runtime: boolean, platform: boolean }
+ *
+ * Rules:
+ * - Frontend: paths starting with `packages/web-ui/`
+ * - Runtime: paths starting with `packages/runtime-runner/`, `packages/dsh-`, `docker/`,
+ *   or lockfile diffs touching @deepseek-ai or @tivility entries.
+ * - Platform: other server packages (platform-*, channel-*, web-channel, demo-runner),
+ *   root build / configs / scripts / safety, or any unmatched / unclassified path (conservative).
+ *
+ * Options:
+ * - lockfileDiff: optional string of git diff for pnpm-lock.yaml / package-lock.json / yarn.lock
+ */
+export function classifyChanges(paths, options = {}) {
+  const result = {
+    frontend: false,
+    runtime: false,
+    platform: false,
+  };
+
+  if (!paths || !Array.isArray(paths) || paths.length === 0) {
+    return result;
+  }
+
+  for (const rawPath of paths) {
+    const p = rawPath.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!p) continue;
+
+    // Check frontend
+    if (p.startsWith('packages/web-ui/')) {
+      result.frontend = true;
+      continue;
+    }
+
+    // Check runtime paths
+    if (
+      p.startsWith('packages/runtime-runner/') ||
+      p.startsWith('packages/dsh-') ||
+      p.startsWith('docker/')
+    ) {
+      result.runtime = true;
+      continue;
+    }
+
+    // Lockfile check
+    if (
+      p === 'pnpm-lock.yaml' ||
+      p === 'package-lock.json' ||
+      p === 'yarn.lock' ||
+      p.endsWith('/pnpm-lock.yaml') ||
+      p.endsWith('/package-lock.json') ||
+      p.endsWith('/yarn.lock')
+    ) {
+      const lockDiff = options.lockfileDiff;
+      if (typeof lockDiff === 'string' && lockDiff.length > 0) {
+        // If lockfile diff touches @deepseek-ai or @tivility
+        const touchesRuntimeScope = /@deepseek-ai|@tivility/.test(lockDiff);
+        if (touchesRuntimeScope) {
+          result.runtime = true;
+        } else {
+          // Changed other lockfile entries -> conservative platform
+          result.platform = true;
+        }
+      } else {
+        // Without diff content, lockfile is conservatively treated as platform
+        result.platform = true;
+      }
+      continue;
+    }
+
+    // Unmatched or platform paths
+    result.platform = true;
+  }
+
+  return result;
+}
 
 export function isSafePath(p) {
   if (!p) return { safe: false, reason: 'Path is empty' };
@@ -88,6 +165,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     pruneOld: false,
     reuse: false,
     only: undefined,
+    baseRef: undefined,
     help: false,
     testCmds: [],
   };
@@ -100,6 +178,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     else if (a === '--prune-old') cliOpts.pruneOld = true;
     else if (a === '--reuse') cliOpts.reuse = true;
     else if (a === '--only' && cliArgs[i + 1]) cliOpts.only = cliArgs[++i];
+    else if (a === '--base-ref' && cliArgs[i + 1]) cliOpts.baseRef = cliArgs[++i];
     else if (a === '--env-file' && cliArgs[i + 1]) envFile = cliArgs[++i];
     else if (a === '--release-id' && cliArgs[i + 1]) cliOpts.releaseId = cliArgs[++i];
     else if (a === '--target-ref' && cliArgs[i + 1]) cliOpts.targetRef = cliArgs[++i];
@@ -177,6 +256,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     pruneOld: cliOpts.pruneOld,
     reuse: cliOpts.reuse,
     only: cliOpts.only,
+    baseRef: getVal('BASE_REF', cliOpts.baseRef),
     help: cliOpts.help,
   };
 
@@ -196,6 +276,27 @@ export function validateConfig(config) {
       }
     }
     const pathProps = ['configDir', 'plistPath'];
+    for (const p of pathProps) {
+      const check = isSafePath(config[p]);
+      if (!check.safe) {
+        throw new Error(`Safety violation for ${p}: ${check.reason}`);
+      }
+    }
+    return;
+  }
+
+  if (config.only === 'frontend') {
+    const requiredForFrontend = [
+      ['plistPath', 'PLIST_PATH'],
+      ['port', 'PORT'],
+    ];
+    for (const [prop, envName] of requiredForFrontend) {
+      if (config[prop] === undefined || config[prop] === null || config[prop] === '') {
+        throw new Error(`Missing required configuration: ${prop} (Set via --${prop.replace(/[A-Z]/g, m => '-' + m.toLowerCase())} or ${envName} in env file)`);
+      }
+    }
+    const pathProps = ['plistPath'];
+    if (config.repoRoot) pathProps.push('repoRoot');
     for (const p of pathProps) {
       const check = isSafePath(config[p]);
       if (!check.safe) {
@@ -267,6 +368,68 @@ export function updatePlistContent(plistContent, newWorktreePath, newImageTag) {
   );
 
   return updated;
+}
+
+export function extractWorktreePathFromPlist(plistContent) {
+  const match = /<string>(.*?\/packages\/demo-runner\/dist\/demo-runner\.js)<\/string>/.exec(plistContent);
+  if (match && match[1]) {
+    return resolve(match[1], '..', '..', '..', '..');
+  }
+  return null;
+}
+
+export function resolveOnlineHead(plistPath, repoRoot) {
+  if (plistPath && existsSync(plistPath)) {
+    try {
+      const plistContent = readFileSync(plistPath, 'utf8');
+      const wtPath = extractWorktreePathFromPlist(plistContent);
+      if (wtPath && existsSync(wtPath)) {
+        return execSync('git rev-parse HEAD', { cwd: wtPath, encoding: 'utf8' }).trim();
+      }
+    } catch {
+      // Fallback
+    }
+  }
+  if (repoRoot && existsSync(repoRoot)) {
+    try {
+      return execSync('git rev-parse HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
+    } catch {
+      // Fallback
+    }
+  }
+  return 'HEAD';
+}
+
+export function computeDiffPathsAndClassification(repoRoot, baseRef, targetRef) {
+  if (!repoRoot || !existsSync(repoRoot)) {
+    return {
+      paths: [],
+      classification: { frontend: false, runtime: false, platform: false },
+    };
+  }
+
+  let paths = [];
+  try {
+    const diffOut = execSync(`git diff --name-only "${baseRef}" "${targetRef}"`, { cwd: repoRoot, encoding: 'utf8' }).trim();
+    if (diffOut) {
+      paths = diffOut.split('\n').map(p => p.trim()).filter(Boolean);
+    }
+  } catch {
+    paths = [];
+  }
+
+  let lockfileDiff = '';
+  const touchesLock = paths.some(p => p.endsWith('lock.yaml') || p.endsWith('lock.json') || p.endsWith('yarn.lock'));
+  if (touchesLock) {
+    try {
+      lockfileDiff = execSync(`git diff "${baseRef}" "${targetRef}" -- "*lock.yaml" "*lock.json" "*yarn.lock"`, { cwd: repoRoot, encoding: 'utf8' });
+    } catch {
+      lockfileDiff = '';
+    }
+  }
+
+  const classification = classifyChanges(paths, { lockfileDiff });
+  return { paths, classification };
 }
 
 export function extractImageTagFromPlist(plistContent) {
@@ -564,6 +727,152 @@ export async function executeVerify(config, expectedImageTag = null, preSwitchCo
   }
 }
 
+export function extractAssetsFromIndexHtml(htmlContent) {
+  const assets = [];
+  if (!htmlContent) return assets;
+
+  // Extract <script src="...">
+  const scriptRegex = /<script\b[^>]*?\bsrc=["']([^"']+)["']/gi;
+  let match;
+  while ((match = scriptRegex.exec(htmlContent)) !== null) {
+    if (match[1] && !match[1].startsWith('http://') && !match[1].startsWith('https://') && !match[1].startsWith('//')) {
+      assets.push(match[1]);
+    }
+  }
+
+  // Extract <link rel="stylesheet" href="...">
+  const linkRegex = /<link\b[^>]*?\bhref=["']([^"']+)["']/gi;
+  while ((match = linkRegex.exec(htmlContent)) !== null) {
+    if (match[1] && !match[1].startsWith('http://') && !match[1].startsWith('https://') && !match[1].startsWith('//')) {
+      assets.push(match[1]);
+    }
+  }
+
+  return assets;
+}
+
+export async function executeFrontendDeploy(config) {
+  const { plistPath, repoRoot, targetRef = 'origin/main', baseRef, port, dryRun } = config;
+
+  console.log('================================================================');
+  console.log('  Enkeep Frontend Only Upgrade (Way 1 - Zero Process Restart)   ');
+  console.log('================================================================');
+
+  let plistContent = '';
+  if (plistPath && existsSync(plistPath)) {
+    plistContent = readFileSync(plistPath, 'utf8');
+  }
+
+  const onlineWt = extractWorktreePathFromPlist(plistContent);
+  if (!onlineWt || !existsSync(onlineWt)) {
+    throw new Error(`Online worktree could not be resolved from plist (${plistPath}) or directory does not exist: ${onlineWt}`);
+  }
+
+  const effBaseRef = baseRef || resolveOnlineHead(plistPath, repoRoot);
+  console.log(`Online Worktree:         ${onlineWt}`);
+  console.log(`Base Commit / Ref:       ${effBaseRef}`);
+  console.log(`Target Commit / Ref:     ${targetRef}`);
+  console.log(`Port:                    ${port}`);
+  console.log(`Mode:                    ${dryRun ? 'DRY-RUN' : 'LIVE EXECUTION'}`);
+  console.log('----------------------------------------------------------------');
+
+  const { paths, classification } = computeDiffPathsAndClassification(repoRoot || onlineWt, effBaseRef, targetRef);
+  console.log(`Diff Paths (${paths.length}):`);
+  for (const p of paths) {
+    console.log(`  - ${p}`);
+  }
+  console.log(`Classification:`, JSON.stringify(classification));
+
+  if (dryRun) {
+    console.log('\n[DRY-RUN] Plan:');
+    console.log(`  1. In online worktree (${onlineWt}), checkout or pull targetRef ${targetRef} for packages/web-ui`);
+    console.log(`  2. Build web-ui into temporary directory`);
+    console.log(`  3. Atomically replace ${join(onlineWt, 'packages/web-ui/dist/static')} (rename existing to .prev)`);
+    console.log(`  4. Write target commit hash to ${join(onlineWt, 'packages/web-ui/dist/static/.frontend-commit')}`);
+    console.log(`  5. Verify HTTP 200 on http://127.0.0.1:${port}/ and all static assets referenced in index.html`);
+    return { classification, paths, dryRun: true };
+  }
+
+  // Live execution
+  // Step 1: Update/sync packages/web-ui in online worktree or build from targetRef
+  const webUiDir = join(onlineWt, 'packages', 'web-ui');
+  const distDir = join(webUiDir, 'dist');
+  const targetStaticDir = join(distDir, 'static');
+  const prevStaticDir = join(distDir, 'static.prev');
+  const tempStaticDir = join(distDir, `static.tmp-${Date.now()}`);
+
+  runDeployStep('Build Web UI to Temporary Directory', () => {
+    // Checkout web-ui files from targetRef if needed
+    try {
+      execSync(`git checkout "${targetRef}" -- packages/web-ui`, { cwd: onlineWt, stdio: 'inherit' });
+    } catch (e) {
+      console.warn(`Warning: git checkout from targetRef had issues: ${e.message}`);
+    }
+
+    // Build web-ui
+    execSync('pnpm --filter @enkeep/web-ui run build', { cwd: onlineWt, stdio: 'inherit' });
+
+    // Copy dist/static to tempStaticDir
+    mkdirSync(tempStaticDir, { recursive: true });
+    execSync(`cp -R "${targetStaticDir}/"* "${tempStaticDir}/"`, { stdio: 'inherit' });
+
+    // Resolve target sha
+    let targetSha = targetRef;
+    try {
+      targetSha = execSync(`git rev-parse "${targetRef}"`, { cwd: onlineWt, encoding: 'utf8' }).trim();
+    } catch {}
+    writeFileSync(join(tempStaticDir, '.frontend-commit'), targetSha + '\n', 'utf8');
+  });
+
+  runDeployStep('Atomic Replacement of dist/static', () => {
+    // If targetStaticDir exists, move to prevStaticDir
+    if (existsSync(targetStaticDir)) {
+      if (existsSync(prevStaticDir)) {
+        rmSync(prevStaticDir, { recursive: true, force: true });
+      }
+      renameSync(targetStaticDir, prevStaticDir);
+    }
+
+    // Move tempStaticDir to targetStaticDir
+    renameSync(tempStaticDir, targetStaticDir);
+    console.log(`✓ Replaced ${targetStaticDir} atomically (old preserved at ${prevStaticDir}).`);
+  });
+
+  runDeployStep('Verify Index and Asset Endpoints', () => {
+    // Read index.html from targetStaticDir
+    const indexHtmlPath = join(targetStaticDir, 'index.html');
+    if (!existsSync(indexHtmlPath)) {
+      throw new Error(`index.html not found in newly deployed static dir: ${indexHtmlPath}`);
+    }
+    const htmlContent = readFileSync(indexHtmlPath, 'utf8');
+    const assets = extractAssetsFromIndexHtml(htmlContent);
+
+    console.log(`Verifying root page http://127.0.0.1:${port}/ ...`);
+    try {
+      execSync(`curl -s -f -o /dev/null "http://127.0.0.1:${port}/"`);
+      console.log(`✓ Root page returned 200.`);
+    } catch {
+      throw new Error(`Failed to load http://127.0.0.1:${port}/ (HTTP non-200)`);
+    }
+
+    for (const assetUrl of assets) {
+      const fullUrl = assetUrl.startsWith('/') ? `http://127.0.0.1:${port}${assetUrl}` : `http://127.0.0.1:${port}/${assetUrl}`;
+      console.log(`Verifying asset: ${fullUrl} ...`);
+      try {
+        execSync(`curl -s -f -o /dev/null "${fullUrl}"`);
+        console.log(`  ✓ ${assetUrl} returned 200.`);
+      } catch {
+        throw new Error(`Failed to load asset ${fullUrl} (HTTP non-200)`);
+      }
+    }
+  });
+
+  console.log('\n================================================================');
+  console.log('✓ Frontend upgrade completed and verified successfully!');
+  console.log('================================================================');
+  return { classification, paths, success: true };
+}
+
 export async function executeDeploy(config) {
   validateConfig(config);
 
@@ -573,6 +882,10 @@ export async function executeDeploy(config) {
 
   if (config.only === 'verify') {
     return executeVerify(config);
+  }
+
+  if (config.only === 'frontend') {
+    return executeFrontendDeploy(config);
   }
 
   const {
@@ -652,7 +965,9 @@ export async function executeDeploy(config) {
   // Resolve target commit sha
   let targetSha = '0000000';
   if (!dryRun) {
-    targetSha = execSync(`git rev-parse --short "${branchName}"`, { cwd: repoRoot, encoding: 'utf8' }).trim();
+    try {
+      targetSha = execSync(`git rev-parse --short "${branchName}"`, { cwd: repoRoot, encoding: 'utf8' }).trim();
+    } catch {}
   }
   const imageTag = `${runtimeImagePrefix}${releaseId}-${targetSha}`;
 
@@ -787,11 +1102,12 @@ Optional Options:
   --release-id <id>                Release batch ID (e.g. batch56; defaults to max git release/batch* + 1)
   --env-file <path>                Path to external deployment env file
   --target-ref <ref>               Target git ref to deploy [default: origin/main]
+  --base-ref <ref>                 Base git ref for diff calculation [default: online HEAD from plist]
   --tested-commit <sha>            Commit SHA whose test suite passed (P-04 tree match)
   --test-cmd <cmd>                 Targeted test command to run (repeatable, or TEST_CMDS in env)
   --skip-tests                     Skip unit test run
   --reuse                          Reuse existing release/batchNN branch without failing
-  --only <verify|rollback>         Run only verify or rollback mode
+  --only <frontend|verify|rollback> Run only frontend upgrade, verify, or rollback mode
   --prune-old                      Prune historical release worktrees after deploy
   --dry-run                        Simulate actions without modifying system
   -h, --help                       Show this help message
