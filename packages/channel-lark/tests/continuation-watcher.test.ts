@@ -487,4 +487,52 @@ describe('ContinuationWatcher', () => {
 
     watcher.stop();
   });
+
+  it('triggers ensurePolling on backgroundPanelManager when observing background activity events and latest card exists', async () => {
+    const transport = new FakeLarkTransport();
+    await transport.start();
+
+    const routeId = 'session_route_bg_resume';
+    const chatId = 'oc_test_chat_bg_resume';
+
+    const events: Array<any> = [
+      { rowId: 60, type: 'tool_status', toolName: 'workflow', status: 'started' },
+    ];
+
+    const fakeSource = {
+      listAssistantEvents: vi.fn(async () => events),
+    };
+
+    const mockChannelRepo: any = {
+      createOutboxItem: vi.fn(),
+    };
+
+    const mockBgManager: any = {
+      hasLatestCard: vi.fn((rId: string) => rId === routeId),
+      ensurePolling: vi.fn(),
+    };
+
+    const watcher = new ContinuationWatcher({
+      sessionRouteId: routeId,
+      accountId: 'acc_lark_1',
+      userId: 'usr_1',
+      nativeContextId: chatId,
+      streamEventSource: fakeSource as any,
+      transport,
+      channelRepo: mockChannelRepo,
+      replyTarget: { chatId },
+      initialCursor: 59,
+      hasActiveInboundTracker: () => false,
+      pollIntervalMs: 100,
+      backgroundPanelManager: mockBgManager,
+    });
+
+    watcher.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockBgManager.hasLatestCard).toHaveBeenCalledWith(routeId);
+    expect(mockBgManager.ensurePolling).toHaveBeenCalledWith(routeId, chatId);
+
+    watcher.stop();
+  });
 });

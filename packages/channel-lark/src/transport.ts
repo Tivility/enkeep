@@ -1310,7 +1310,7 @@ export class FakeLarkTransport implements LarkTransport {
     initialElements.push({
       tag: 'markdown',
       element_id: 'bg_panel',
-      content: '',
+      content: ' ',
     });
     if (withStop) {
       initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
@@ -3009,7 +3009,7 @@ export class CredentialedLarkTransport implements LarkTransport {
       initialElements.push({
         tag: 'markdown',
         element_id: 'bg_panel',
-        content: '',
+        content: ' ',
       });
       if (withStop) {
         initialElements.push(buildStopReplyButton(params.turnId, params.sessionId));
@@ -3239,6 +3239,7 @@ export class CredentialedLarkTransport implements LarkTransport {
                   message: retryErr instanceof Error ? retryErr.message : String(retryErr),
                 });
               }
+              throw retryErr;
             }
             return;
           }
@@ -3250,7 +3251,7 @@ export class CredentialedLarkTransport implements LarkTransport {
               message: firstErr instanceof Error ? firstErr.message : String(firstErr),
             });
           }
-          return;
+          throw firstErr;
         }
 
         const resCode = res?.code !== undefined && res?.code !== 0 ? res.code : undefined;
@@ -3277,6 +3278,11 @@ export class CredentialedLarkTransport implements LarkTransport {
                   message: retryRes?.msg,
                 });
               }
+              if (secondResCode !== undefined) {
+                const err = new Error(retryRes?.msg || `cardElement.content retry code ${secondResCode}`);
+                (err as any).code = secondResCode;
+                throw err;
+              }
             } catch (retryErr) {
               const retryCode = getLarkApiErrorCode(retryErr);
               if (retryCode !== undefined && !loggedErrorCodes.has(retryCode)) {
@@ -3286,6 +3292,7 @@ export class CredentialedLarkTransport implements LarkTransport {
                   message: retryErr instanceof Error ? retryErr.message : String(retryErr),
                 });
               }
+              throw retryErr;
             }
             return;
           }
@@ -3297,6 +3304,9 @@ export class CredentialedLarkTransport implements LarkTransport {
               message: res?.msg,
             });
           }
+          const err = new Error(res?.msg || `cardElement.content code ${resCode}`);
+          (err as any).code = resCode;
+          throw err;
         }
       };
 
@@ -3483,7 +3493,11 @@ export class CredentialedLarkTransport implements LarkTransport {
             code: updateError?.code ?? (updateError as any)?.status,
             message: updateError instanceof Error ? updateError.message : String(updateError),
           });
-          return;
+          const err = new Error(
+            updateError instanceof Error ? updateError.message : String(updateError)
+          );
+          (err as any).code = updateError?.code ?? (updateError as any)?.status;
+          throw err;
         }
 
         logger.warn('[lark-stream] session card.update failed, falling back to message.patch', {
@@ -3599,11 +3613,29 @@ export class CredentialedLarkTransport implements LarkTransport {
           if (!isFinalized) {
             // Feishu rejects an empty element content update; a single space clears the panel.
             const content = panelText && panelText.length > 0 ? panelText : ' ';
-            await updateElementSafely('bg_panel', content);
+            try {
+              await sendElementContent('bg_panel', content);
+            } catch (err) {
+              const errCode = getLarkApiErrorCode(err);
+              logger.warn('[lark-stream] updateBackgroundPanel element update failed', {
+                code: errCode ?? (err as any)?.code ?? (err as any)?.status,
+                path: 'element',
+                message: err instanceof Error ? err.message : String(err),
+              });
+            }
             return;
           }
           const finalCard = buildFinalCard();
-          await pushFullCardUpdate(finalCard, true);
+          try {
+            await pushFullCardUpdate(finalCard, true);
+          } catch (err) {
+            const errCode = getLarkApiErrorCode(err);
+            logger.warn('[lark-stream] updateBackgroundPanel full card update failed', {
+              code: errCode ?? (err as any)?.code ?? (err as any)?.status,
+              path: 'full_card',
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
         },
       };
 

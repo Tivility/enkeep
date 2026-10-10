@@ -15,8 +15,13 @@
  * @module @enkeep/channel-lark/background-panel
  */
 
+import { createHash } from 'node:crypto';
 import type { BackgroundTask, LarkStreamingCardSession } from './types.js';
 import { formatDuration } from './transport.js';
+
+function hashRouteId(sessionRouteId: string): string {
+  return createHash('sha256').update(sessionRouteId).digest('hex').slice(0, 8);
+}
 
 export interface FormatBackgroundTaskLineOptions {
   completedDuringActiveTurn?: boolean;
@@ -155,6 +160,11 @@ interface ChatSessionState {
   isPolling: boolean;
   hadRunningTasks: boolean;
   lastPanelText?: string;
+  turnFinalizedAt?: number;
+  lastLoggedRegisterState?: string;
+  lastLoggedFinalizedState?: string;
+  lastLoggedPollState?: string;
+  lastLoggedStopState?: string;
 }
 
 export class LarkBackgroundPanelManager {
@@ -242,7 +252,14 @@ export class LarkBackgroundPanelManager {
       launchedTaskIds: new Set<string>(),
     };
     state.activeTurnId = turnId;
+    state.turnFinalizedAt = undefined;
     state.activeTurnCompletedTaskIds = new Set<string>();
+
+    const regLog = `registerCard session=${hashRouteId(sessionRouteId)} turn=${turnId ?? 'none'}`;
+    if (state.lastLoggedRegisterState !== regLog) {
+      state.lastLoggedRegisterState = regLog;
+      console.info(`[lark-bg] ${regLog}`);
+    }
 
     // 3. Immediately poll and render background tasks for new card
     await this.pollTick(sessionRouteId, chatContextId);
@@ -261,6 +278,14 @@ export class LarkBackgroundPanelManager {
     if (state.activeTurnId === turnId) {
       state.activeTurnId = undefined;
     }
+    state.turnFinalizedAt = Date.now();
+
+    const finLog = `onTurnFinalized session=${hashRouteId(sessionRouteId)} turn=${turnId ?? 'none'}`;
+    if (state.lastLoggedFinalizedState !== finLog) {
+      state.lastLoggedFinalizedState = finLog;
+      console.info(`[lark-bg] ${finLog}`);
+    }
+
     await this.pollTick(sessionRouteId, chatContextId);
   }
 
@@ -347,11 +372,12 @@ export class LarkBackgroundPanelManager {
         }
       }
 
-      // A-02: Keep polling if tasks are running OR turn active OR seen running tasks disappeared unconfirmed
       const turnActive = Boolean(state.activeTurnId);
+      let action: 'update' | 'unconfirmed' | 'clear' | 'none' = 'none';
 
       // Format and update panel on latest card
       if (hasMissingSeenTask) {
+        action = 'unconfirmed';
         // A seen running task disappeared without terminal state: retain previous text and append note, continue polling
         const baseText = state.lastPanelText || (tasks.length > 0 ? formatBackgroundPanel(tasks, {
           activeTurnCompletedTaskIds: state.activeTurnCompletedTaskIds,
@@ -365,6 +391,7 @@ export class LarkBackgroundPanelManager {
           await state.latestCard.cardSession.updateBackgroundPanel(panelText);
         }
       } else if (tasks.length > 0) {
+        action = 'update';
         const panelText = formatBackgroundPanel(tasks, {
           activeTurnCompletedTaskIds: state.activeTurnCompletedTaskIds,
           seenRunningTaskIds: state.seenRunningTaskIds,
@@ -375,6 +402,7 @@ export class LarkBackgroundPanelManager {
           await state.latestCard.cardSession.updateBackgroundPanel(panelText);
         }
       } else if (state.hadRunningTasks && !turnActive) {
+        action = 'clear';
         // If turn has finalized and task list is empty with no seen running tasks unconfirmed, clear panel
         state.lastPanelText = undefined;
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
@@ -383,7 +411,24 @@ export class LarkBackgroundPanelManager {
         state.hadRunningTasks = false;
       }
 
-      const shouldPoll = hasRunning || turnActive || hasMissingSeenTask;
+      // 10-minute grace period after turn finalized when list is empty and never saw running tasks
+      const GRACE_PERIOD_MS = 10 * 60 * 1000;
+      const inGracePeriod =
+        !turnActive &&
+        tasks.length === 0 &&
+        !state.hadRunningTasks &&
+        state.turnFinalizedAt !== undefined &&
+        Date.now() - state.turnFinalizedAt < GRACE_PERIOD_MS;
+
+      const runningCount = tasks.filter((t) => t.status === 'running').length;
+      const shouldPoll = hasRunning || turnActive || hasMissingSeenTask || inGracePeriod;
+
+      const tickLog = `pollTick session=${hashRouteId(sessionRouteId)} available=${res?.available ?? true} items=${tasks.length} running=${runningCount} action=${action} continuePolling=${shouldPoll}`;
+      if (state.lastLoggedPollState !== tickLog) {
+        state.lastLoggedPollState = tickLog;
+        console.info(`[lark-bg] ${tickLog}`);
+      }
+
       if (shouldPoll) {
         this.ensurePolling(sessionRouteId, chatContextId);
       } else {
@@ -394,7 +439,7 @@ export class LarkBackgroundPanelManager {
     }
   }
 
-  private ensurePolling(sessionRouteId: string, chatContextId?: string): void {
+  ensurePolling(sessionRouteId: string, chatContextId?: string): void {
     const state = this.getOrCreateState(sessionRouteId, chatContextId);
     if (state.pollTimer || state.isPolling || this.isDisposed) {
       return;
@@ -418,6 +463,21 @@ export class LarkBackgroundPanelManager {
       state.pollTimer = null;
     }
     state.isPolling = false;
+
+    const stopLog = `stopPolling session=${hashRouteId(sessionRouteId)}`;
+    if (state.lastLoggedStopState !== stopLog) {
+      state.lastLoggedStopState = stopLog;
+      console.info(`[lark-bg] ${stopLog}`);
+    }
+  }
+
+  hasLatestCard(sessionRouteId: string): boolean {
+    for (const [key, state] of this.chatStates.entries()) {
+      if (key === sessionRouteId || key.startsWith(`${sessionRouteId}:`)) {
+        if (state.latestCard) return true;
+      }
+    }
+    return false;
   }
 
   dispose(): void {
