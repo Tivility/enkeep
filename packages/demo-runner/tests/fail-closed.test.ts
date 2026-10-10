@@ -44,6 +44,9 @@ describe('Demo Runner Fail-Closed Security & Runtime Integrity', () => {
     const badClient = new SafeDockerClient('/non/existent/docker_bin');
     const adapter = new DockerRuntimeContainerAdapter(badClient);
 
+    const fakeAdapter = (adapter as any).adapter;
+    vi.spyOn(fakeAdapter, 'startRuntime').mockRejectedValue(new Error('FAIL-CLOSED: Docker daemon is required'));
+
     await expect(
       adapter.startUserRuntime({
         userId: 'alice',
@@ -55,6 +58,9 @@ describe('Demo Runner Fail-Closed Security & Runtime Integrity', () => {
   it('fails closed when container specification violates safety policy', async () => {
     const client = new SafeDockerClient();
     const adapter = new DockerRuntimeContainerAdapter(client);
+
+    const fakeAdapter = (adapter as any).adapter;
+    vi.spyOn(fakeAdapter, 'startRuntime').mockRejectedValue(new Error('Safety violation: userId must be non-empty'));
 
     await expect(
       adapter.startUserRuntime({
