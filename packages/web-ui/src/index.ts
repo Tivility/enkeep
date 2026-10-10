@@ -1,4 +1,4 @@
-import { readFileSync, lstatSync, realpathSync } from 'node:fs';
+import { readFileSync, lstatSync, realpathSync, existsSync } from 'node:fs';
 import { join, resolve, relative, extname, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,8 +34,16 @@ export function getMimeType(filePath: string): string {
 /**
  * Resolves the directory path containing static Web UI assets.
  * Evaluates strictly relative to the current module bundle directory.
+ * If running in TypeScript src mode (e.g. tests), falls back to dist/static if available.
  */
 export function getWebUiStaticDir(): string {
+  const distStatic = resolve(__dirname, '..', 'dist', 'static');
+  if (__dirname.endsWith('/src') || __dirname.endsWith('\\src')) {
+    if (existsSync(distStatic)) {
+      return distStatic;
+    }
+    return resolve(__dirname, 'static');
+  }
   return resolve(__dirname, 'static');
 }
 

@@ -566,6 +566,10 @@ export {
   type LarkScopedConfigProviderFactoryOptions,
   type PlatformProviderRegistrationOptions,
 } from './runtime/provider-registry.js';
+export {
+  RuntimeAutoUpgrader,
+  type RuntimeAutoUpgraderOptions,
+} from './runtime/auto-upgrader.js';
 
 // Space Mounts and Reconciler
 export {

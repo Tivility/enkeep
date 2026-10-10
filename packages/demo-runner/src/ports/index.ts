@@ -130,6 +130,8 @@ export interface UserRuntimeHandle {
   volumeCreated: boolean;
   meta?: SignedContainerMetadata;
   rawHandle?: ActiveRuntimeHandle;
+  launchedImage?: string | null;
+  launchedDaemonCliPath?: string | null;
   checkHealth(): Promise<UserRuntimeHealthInfo>;
   compactSession?(sessionId: string): Promise<{
     status: string;
@@ -186,6 +188,7 @@ export interface RuntimeContainerPort {
   startUserRuntime(options: {
     userId: 'alice' | 'bob' | string;
     image?: string;
+    daemonCliPath?: string;
     repoRoot?: string;
     dataRoot?: string;
     mode?: DemoRunnerMode;
@@ -1205,6 +1208,7 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
   async startUserRuntime(options: {
     userId: 'alice' | 'bob' | string;
     image?: string;
+    daemonCliPath?: string;
     repoRoot?: string;
     dataRoot?: string;
     mode?: DemoRunnerMode;
@@ -1266,7 +1270,14 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
 
     const runId = generateRunId();
     const storageId = `vol_host_${randomBytes(16).toString('hex').toLowerCase()}`;
-    const spec = this.adapter.createDefaultUserSpec({
+    let effectiveAdapter = this.adapter;
+    if (options.daemonCliPath && options.daemonCliPath.trim().length > 0) {
+      effectiveAdapter = new HostRuntimeAdapter({
+        daemonCliPath: options.daemonCliPath.trim(),
+      });
+    }
+
+    const spec = effectiveAdapter.createDefaultUserSpec({
       userId: options.userId,
       dataRoot: paths.dataRoot,
       runId,
@@ -1283,7 +1294,7 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
 
     let activeHandle: ActiveRuntimeHandle;
     try {
-      activeHandle = await this.adapter.startRuntime(spec, timeoutMs);
+      activeHandle = await effectiveAdapter.startRuntime(spec, timeoutMs);
     } catch (err: unknown) {
       if (
         err instanceof Error &&
@@ -1292,13 +1303,13 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
           err.message.includes('already running'))
       ) {
         try {
-          activeHandle = await this.adapter.connectRuntime(spec, timeoutMs);
+          activeHandle = await effectiveAdapter.connectRuntime(spec, timeoutMs);
         } catch (connErr: unknown) {
           if (
             (connErr as any)?.code === 'HOST_NOT_FOUND' ||
             (connErr instanceof Error && connErr.message.includes('no longer alive'))
           ) {
-            activeHandle = await this.adapter.startRuntime(spec, timeoutMs);
+            activeHandle = await effectiveAdapter.startRuntime(spec, timeoutMs);
           } else {
             throw connErr;
           }

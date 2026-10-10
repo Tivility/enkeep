@@ -49,6 +49,7 @@ import { PermissionPresetRepo } from './repos/permission-preset-repo.js';
 import { SqliteTenantScopedSpaceMountRepository } from './repos/space-mount-repo.js';
 import { SqliteTenantScopedChannelRepository } from './repos/channel-repo.js';
 import { SqliteTenantScopedTurnOriginRepository } from './repos/turn-origin-repo.js';
+import { RuntimeTargetVersionRepo } from './repos/runtime-version-repo.js';
 import {
   type DbParam,
   parseDeliveryInboxRow,
@@ -69,6 +70,7 @@ export class SqlitePlatformStorage implements PlatformStorage {
   readonly sessions: UserSessionRepository;
   readonly auditLogs: AuthAuditLogRepository;
   readonly migrations: MigrationRunner;
+  readonly runtimeTargetVersion: RuntimeTargetVersionRepo;
 
   constructor(options: SqliteStorageOptions | DatabaseSync = {}) {
     if (options && typeof (options as DatabaseSync).prepare === 'function') {
@@ -116,6 +118,7 @@ export class SqlitePlatformStorage implements PlatformStorage {
     this.sessions = new SqliteUserSessionRepository(this.db);
     this.auditLogs = new SqliteAuthAuditLogRepository(this.db);
     this.migrations = new SqliteMigrationRunner(this.db);
+    this.runtimeTargetVersion = new RuntimeTargetVersionRepo(this.db);
   }
 
   forTenant(userId: string): {

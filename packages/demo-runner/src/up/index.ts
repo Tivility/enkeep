@@ -75,7 +75,7 @@ import {
   type McpGatewayPort,
 } from '@enkeep/platform-service-mcp';
 import { chromium } from 'playwright';
-import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
+import { SqlitePlatformStorage, RuntimeTargetVersionRepo } from '@enkeep/platform-storage-sqlite';
 import { SafeDockerClient } from '@enkeep/runtime-runner/docker';
 import {
   computeSessionEventsChecksum,
@@ -115,6 +115,10 @@ import {
   type UserRuntimeHealthInfo,
   type RuntimeContainerPort,
 } from '../ports/index.js';
+import {
+  queryDaemonActivityOverSocket,
+  queryContainerActivity,
+} from '../preflight/index.js';
 import {
   loadLarkTestCredentials,
   createLarkTestCredentialResolver,
@@ -583,7 +587,15 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
   let storage: SqlitePlatformStorage | null = null;
   let messageStore: SqliteWebMessageStore | null = null;
   let runtimeDiagnosticsService: RuntimeDiagnosticsService | null = null;
+  let targetVersionRepo: RuntimeTargetVersionRepo | null = null;
   let allActiveUsers: Array<{ id: string; username: string; status: string; role: string }> = [];
+
+  function getEffectiveTargetRuntimeVersion(): { image: string; daemonCliPath?: string } {
+    const persisted = targetVersionRepo?.getTargetVersion();
+    const image = persisted?.image || options.runtimeImage || process.env.ENKEEP_RUNTIME_IMAGE?.trim() || 'enkeep-demo-runtime:acceptance';
+    const daemonCliPath = persisted?.daemonCliPath || undefined;
+    return { image, daemonCliPath };
+  }
 
   try {
     db = new DatabaseSync(paths.dbPath);
@@ -607,6 +619,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     storage = new SqlitePlatformStorage(db);
     messageStore = new SqliteWebMessageStore(db);
     runtimeDiagnosticsService = new RuntimeDiagnosticsService({ db });
+    targetVersionRepo = new RuntimeTargetVersionRepo(db);
 
     // Enumerate active users from DB; fail closed if ZERO active users
     allActiveUsers = db.prepare("SELECT id, username, status, role FROM users WHERE status = 'active'").all() as Array<{ id: string; username: string; status: string; role: string }>;
@@ -675,9 +688,10 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     // Boot runtimes for all active users from DB
     for (const u of allActiveUsers) {
       const runtimeIdentity = deriveRuntimeIdentity(u.id, u.username);
+      const targetVer = getEffectiveTargetRuntimeVersion();
       const userHandle = await containerAdapter.startUserRuntime({
         userId: runtimeIdentity,
-        image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
+        image: targetVer.image,
         repoRoot,
         dataRoot: options.dataRoot,
         mode: options.mode,
@@ -688,6 +702,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         llmModel: options.llmModel,
         networkMode: containerNetworkMode,
       });
+      userHandle.launchedImage = targetVer.image;
       newlyCreatedHandles.push(userHandle);
       if (userHandle.meta) {
         containersList.push(userHandle.meta);
@@ -803,8 +818,10 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           throw new Error(`FAIL-CLOSED: Cannot start host runtime for disabled user "${userRecord.username}" (${rawUserId})`);
         }
 
+        const targetVer = getEffectiveTargetRuntimeVersion();
         const handle = await hostAdapter.startUserRuntime({
           userId: userRecord.username,
+          daemonCliPath: targetVer.daemonCliPath,
           repoRoot,
           dataRoot: options.dataRoot,
           mode: options.mode,
@@ -815,6 +832,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           llmModel: options.llmModel,
           browserService,
         });
+        handle.launchedDaemonCliPath = targetVer.daemonCliPath || null;
 
         // Phase 2 Binding: Bind full platform proxy & events stream handlers with authoritative user UUID
         await bindRuntimeServices(handle, userRecord.id);
@@ -856,10 +874,11 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         }
 
         const runtimeIdentity = deriveRuntimeIdentity(userRecord.id, userRecord.username);
+        const targetVer = getEffectiveTargetRuntimeVersion();
 
         const handle = await containerAdapter.startUserRuntime({
           userId: runtimeIdentity,
-          image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
+          image: targetVer.image,
           repoRoot,
           dataRoot: options.dataRoot,
           mode: options.mode,
@@ -867,6 +886,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           timeoutMs: options.timeoutMs ?? 15000,
           networkMode: containerNetworkMode,
         });
+        handle.launchedImage = targetVer.image;
 
         // Phase 2 Binding: Bind full platform proxy & events stream handlers with authoritative user UUID
         await bindRuntimeServices(handle, userRecord.id);
@@ -1763,12 +1783,10 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               const userRecord = await storage!.users.findById(userId);
               if (userRecord && userRecord.status !== 'disabled') {
                 const runtimeIdentity = deriveRuntimeIdentity(userRecord.id, userRecord.username);
+                const targetVer = getEffectiveTargetRuntimeVersion();
                 const newHandle = await containerAdapter.startUserRuntime({
                   userId: runtimeIdentity,
-                  image:
-                    options.runtimeImage ??
-                    process.env.ENKEEP_RUNTIME_IMAGE?.trim() ??
-                    'enkeep-demo-runtime:acceptance',
+                  image: targetVer.image,
                   repoRoot,
                   dataRoot: options.dataRoot,
                   mode: options.mode,
@@ -1776,6 +1794,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                   timeoutMs: options.timeoutMs ?? 15000,
                   mounts: allMounts,
                 });
+                newHandle.launchedImage = targetVer.image;
                 await bindRuntimeServices(newHandle, userRecord.id);
                 runtimeHandles.set(userRecord.id, newHandle);
               }
@@ -1990,6 +2009,120 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
 
   // 7. Management Runtime Provider for Console Backend
   const managementProvider: import('@enkeep/platform-server').ManagementRuntimeProvider = {
+    async getTargetVersion(): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord | null> {
+      const persisted = targetVersionRepo?.getTargetVersion();
+      if (persisted) return persisted;
+      return {
+        id: 'default',
+        image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
+        daemonCliPath: null,
+        updatedBy: null,
+        updatedAt: new Date().toISOString(),
+      };
+    },
+    async setTargetVersion(input: {
+      image?: string | null;
+      daemonCliPath?: string | null;
+      updatedBy?: string | null;
+    }): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord> {
+      if (!targetVersionRepo) {
+        throw new Error('FAIL-CLOSED: Target version repository not initialized');
+      }
+      return targetVersionRepo.setTargetVersion(input);
+    },
+    async getUpgradeStatus(): Promise<import('@enkeep/platform-core').UserRuntimeUpgradeStatus[]> {
+      const results: import('@enkeep/platform-core').UserRuntimeUpgradeStatus[] = [];
+      const targetVer = getEffectiveTargetRuntimeVersion();
+
+      for (const [uid, handle] of runtimeHandles.entries()) {
+        const currentImage = handle.launchedImage || options.runtimeImage || process.env.ENKEEP_RUNTIME_IMAGE?.trim() || 'enkeep-demo-runtime:acceptance';
+        const isOutdated = Boolean(targetVer.image && currentImage !== targetVer.image);
+        let isIdle = true;
+        try {
+          if (handle.containerId) {
+            const containerAct = await queryContainerActivity(handle.containerId, 2000);
+            if (containerAct) {
+              const hasActivity =
+                containerAct.activeTurnsCount > 0 ||
+                containerAct.autonomousTurnsCount > 0 ||
+                containerAct.runningJobsCount > 0 ||
+                containerAct.runningWorkflowJobsCount > 0 ||
+                containerAct.liveSubagentsCount > 0 ||
+                containerAct.pendingInboxItemsCount > 0 ||
+                containerAct.queuedTurnsCount > 0;
+              if (hasActivity || !containerAct.isIdle) {
+                isIdle = false;
+              }
+            }
+          }
+        } catch {}
+
+        let pendingReason: string = 'up_to_date';
+        if (isOutdated) {
+          pendingReason = isIdle ? 'idle' : 'busy';
+        }
+
+        results.push({
+          userId: uid,
+          mode: 'container',
+          currentImage,
+          currentDaemonCliPath: null,
+          targetImage: targetVer.image,
+          targetDaemonCliPath: targetVer.daemonCliPath || null,
+          isOutdated,
+          isIdle,
+          idleDurationSeconds: 0,
+          pendingReason,
+        });
+      }
+
+      for (const [uid, hostHandle] of hostRuntimeHandles.entries()) {
+        const currentCli = hostHandle.launchedDaemonCliPath || null;
+        const targetCli = targetVer.daemonCliPath || null;
+        const isOutdated = Boolean(targetCli && currentCli !== targetCli);
+        let isIdle = true;
+        try {
+          const rawHandle = (hostHandle as any).rawHandle;
+          const userRec = await storage?.users.findById(uid);
+          const userName = userRec?.username || uid;
+          const socketPath = rawHandle?.socketPath || join(paths.dataRoot, 'host-runtimes', userName, 'run', 'runtime.sock');
+          const hostAct = await queryDaemonActivityOverSocket(socketPath, 2000);
+          if (hostAct) {
+            const hasActivity =
+              hostAct.activeTurnsCount > 0 ||
+              hostAct.autonomousTurnsCount > 0 ||
+              hostAct.runningJobsCount > 0 ||
+              hostAct.runningWorkflowJobsCount > 0 ||
+              hostAct.liveSubagentsCount > 0 ||
+              hostAct.pendingInboxItemsCount > 0 ||
+              hostAct.queuedTurnsCount > 0;
+            if (hasActivity || !hostAct.isIdle) {
+              isIdle = false;
+            }
+          }
+        } catch {}
+
+        let pendingReason: string = 'up_to_date';
+        if (isOutdated) {
+          pendingReason = isIdle ? 'idle' : 'busy';
+        }
+
+        results.push({
+          userId: uid,
+          mode: 'host',
+          currentImage: null,
+          currentDaemonCliPath: currentCli,
+          targetImage: null,
+          targetDaemonCliPath: targetCli,
+          isOutdated,
+          isIdle,
+          idleDurationSeconds: 0,
+          pendingReason,
+        });
+      }
+
+      return results;
+    },
     async getUserRuntime(userId: string): Promise<import('@enkeep/platform-server').UserRuntimeStatus | null> {
       try {
         let handle = runtimeHandles.get(userId);
@@ -2062,17 +2195,21 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       return results;
     },
     async stopRuntime(targetUserId: string): Promise<{ stopped: boolean; userId: string }> {
+      const normalizedUserId = targetUserId.endsWith('-host')
+        ? targetUserId.slice(0, -5)
+        : targetUserId;
       let stopped = false;
-      const hostHandle = hostRuntimeHandles.get(targetUserId);
+      const hostHandle = hostRuntimeHandles.get(normalizedUserId) || hostRuntimeHandles.get(targetUserId);
       if (hostHandle) {
         try {
           await hostHandle.stop();
           await hostHandle.teardown(false);
           stopped = true;
         } catch {}
+        hostRuntimeHandles.delete(normalizedUserId);
         hostRuntimeHandles.delete(targetUserId);
       }
-      const handle = runtimeHandles.get(targetUserId);
+      const handle = runtimeHandles.get(normalizedUserId) || runtimeHandles.get(targetUserId);
       if (handle) {
         try {
           await handle.stop();
@@ -2080,13 +2217,14 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await handle.teardown(false);
           stopped = true;
         } catch {}
+        runtimeHandles.delete(normalizedUserId);
         runtimeHandles.delete(targetUserId);
       }
       if (stopped) {
         try {
           if (runtimeDiagnosticsService) {
             await runtimeDiagnosticsService.recordDiagnostic({
-              userId: targetUserId,
+              userId: normalizedUserId,
               eventType: 'lifecycle_stop',
               level: 'info',
               code: 'RUNTIME_STOP_OK',
@@ -2147,6 +2285,8 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           hostRuntimeHandles.delete(uid);
           try {
             const newHostHandle = await ensureUserHostRuntime(uid);
+            const targetVer = getEffectiveTargetRuntimeVersion();
+            newHostHandle.launchedDaemonCliPath = targetVer.daemonCliPath || null;
             const health = await newHostHandle.checkHealth();
             if (health.status !== 'ok' && health.status !== 'degraded') {
               throw new Error(`FAIL-CLOSED: Restarted host runtime for user "${uid}" health check failed (status: ${health.status})`);
@@ -2180,15 +2320,17 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               continue;
             }
             const runtimeIdentity = deriveRuntimeIdentity(userRecord.id, userRecord.username);
+            const targetVer = getEffectiveTargetRuntimeVersion();
             const newHandle = await containerAdapter.startUserRuntime({
               userId: runtimeIdentity,
-              image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
+              image: targetVer.image,
               repoRoot,
               dataRoot: options.dataRoot,
               mode: options.mode,
               resourceSuffix: options.resourceSuffix,
               timeoutMs: options.timeoutMs ?? 15000,
             });
+            newHandle.launchedImage = targetVer.image;
             await bindRuntimeServices(newHandle, uid);
             const health = await newHandle.checkHealth();
             if (health.toolsOperational !== true) {
@@ -2836,9 +2978,10 @@ fs.appendFileSync(p, corruptData);
           throw new Error(`FAIL-CLOSED: Cannot connect runtime for non-canonical user "${userId}"`);
         }
         const runtimeIdentity = deriveRuntimeIdentity(userRecord.id, userRecord.username);
+        const targetVer = getEffectiveTargetRuntimeVersion();
         const startOpts = {
           userId: runtimeIdentity,
-          image: options.runtimeImage ?? process.env.ENKEEP_RUNTIME_IMAGE?.trim() ?? 'enkeep-demo-runtime:acceptance',
+          image: targetVer.image,
           repoRoot,
           dataRoot: options.dataRoot,
           mode: options.mode,
@@ -2846,6 +2989,7 @@ fs.appendFileSync(p, corruptData);
           timeoutMs: options.timeoutMs ?? 15000,
         };
         const handle = await containerAdapter.startUserRuntime(startOpts);
+        handle.launchedImage = targetVer.image;
         await bindRuntimeServices(handle, userRecord.id);
         const health = await handle.checkHealth();
         if (health.toolsOperational !== true) {

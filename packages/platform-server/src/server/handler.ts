@@ -6176,6 +6176,79 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
 
           const runtimeSub = adminSub === "/runtime" || adminSub === "/runtimes" ? "" : (adminSub.startsWith("/runtimes/") ? adminSub.slice("/runtimes/".length) : adminSub.slice("/runtime/".length));
 
+          // Target runtime version endpoints: GET /api/admin/runtime/target-version, PUT /api/admin/runtime/target-version
+          if (runtimeSub === "target-version" || runtimeSub === "target-versions") {
+            if (method === "GET") {
+              if (managementProvider && typeof managementProvider.getTargetVersion === "function") {
+                const targetVer = await managementProvider.getTargetVersion();
+                sendJsonResponse(res, 200, createSuccessEnvelope(targetVer ?? {
+                  id: 'default',
+                  image: process.env.ENKEEP_RUNTIME_IMAGE?.trim() || null,
+                  daemonCliPath: null,
+                  updatedBy: null,
+                  updatedAt: new Date().toISOString(),
+                }));
+                return;
+              }
+              sendJsonResponse(res, 200, createSuccessEnvelope({
+                id: 'default',
+                image: process.env.ENKEEP_RUNTIME_IMAGE?.trim() || null,
+                daemonCliPath: null,
+                updatedBy: null,
+                updatedAt: new Date().toISOString(),
+              }));
+              return;
+            }
+
+            if (method === "PUT") {
+              validateCsrf(req, { csrfToken });
+              const rawBody = await parseJsonBody(req, maxBodyBytes);
+              if (!isRecord(rawBody)) {
+                throw new ValidationError("Request body must be an object");
+              }
+              const unknownKeys = getUnknownKeys(rawBody, new Set(["image", "daemonCliPath"]));
+              if (unknownKeys.length > 0) {
+                throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+              }
+              if (rawBody.image !== undefined && typeof rawBody.image !== "string" && rawBody.image !== null) {
+                throw new ValidationError('Field "image" must be a string or null');
+              }
+              if (rawBody.daemonCliPath !== undefined && typeof rawBody.daemonCliPath !== "string" && rawBody.daemonCliPath !== null) {
+                throw new ValidationError('Field "daemonCliPath" must be a string or null');
+              }
+
+              const image = typeof rawBody.image === "string" ? rawBody.image.trim() : (rawBody.image === null ? null : undefined);
+              const daemonCliPath = typeof rawBody.daemonCliPath === "string" ? rawBody.daemonCliPath.trim() : (rawBody.daemonCliPath === null ? null : undefined);
+
+              if (managementProvider && typeof managementProvider.setTargetVersion === "function") {
+                const updated = await managementProvider.setTargetVersion({
+                  image,
+                  daemonCliPath,
+                  updatedBy: user.id,
+                });
+                sendJsonResponse(res, 200, createSuccessEnvelope(updated));
+                return;
+              }
+              throw new PlatformError("Runtime provider does not support configuring target version", "UNAVAILABLE", 503);
+            }
+
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+
+          // Upgrade status endpoint: GET /api/admin/runtime/upgrade-status
+          if (runtimeSub === "upgrade-status") {
+            if (method !== "GET") {
+              throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+            }
+            if (managementProvider && typeof managementProvider.getUpgradeStatus === "function") {
+              const upgradeStatus = await managementProvider.getUpgradeStatus();
+              sendJsonResponse(res, 200, createSuccessEnvelope(upgradeStatus));
+              return;
+            }
+            sendJsonResponse(res, 200, createSuccessEnvelope([]));
+            return;
+          }
+
           if (runtimeSub === "restart" || runtimeSub.endsWith("/restart")) {
             if (method !== "POST") {
               throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);

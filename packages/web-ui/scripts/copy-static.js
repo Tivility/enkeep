@@ -10,10 +10,12 @@ import {
   closeSync,
   writeSync,
   unlinkSync,
+  writeFileSync,
   constants,
 } from 'node:fs';
 import { resolve, dirname, join, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -174,3 +176,51 @@ function copyDirectorySecurely(currentSrc, currentDest) {
 }
 
 copyDirectorySecurely(realSrcStatic, realDistStatic);
+
+/**
+ * 5. Hash injection for index.html static JS and CSS references
+ * Append ?v=<first 12 chars of sha256(file content)> to local /static/ or relative JS/CSS references.
+ */
+const distIndexHtmlPath = join(realDistStatic, 'index.html');
+if (existsSync(distIndexHtmlPath)) {
+  let htmlContent = readFileSync(distIndexHtmlPath, 'utf8');
+
+  function getFileContentHash(targetRelativePath) {
+    const cleanPath = targetRelativePath.replace(/^\/static\//, '').replace(/^\.\//, '');
+    const fullPath = join(realDistStatic, cleanPath);
+    if (existsSync(fullPath)) {
+      const buf = readFileSync(fullPath);
+      return createHash('sha256').update(buf).digest('hex').slice(0, 12);
+    }
+    return null;
+  }
+
+  // Replace src="..." and href="..." for js/css pointing to /static/ or local relative js/css
+  htmlContent = htmlContent.replace(/(<script\b[^>]*?\bsrc=["'])([^"']+)(["'][^>]*>)/gi, (match, prefix, src, suffix) => {
+    if (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('//') || src.startsWith('data:')) {
+      return match;
+    }
+    const [pathname, query] = src.split('?');
+    const hash = getFileContentHash(pathname);
+    if (!hash) return match;
+    const newSrc = `${pathname}?v=${hash}${query ? '&' + query : ''}`;
+    return `${prefix}${newSrc}${suffix}`;
+  });
+
+  htmlContent = htmlContent.replace(/(<link\b[^>]*?\bhref=["'])([^"']+)(["'][^>]*>)/gi, (match, prefix, href, suffix) => {
+    if (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('//') || href.startsWith('data:')) {
+      return match;
+    }
+    const [pathname, query] = href.split('?');
+    if (!pathname.endsWith('.css') && !pathname.endsWith('.js')) {
+      return match;
+    }
+    const hash = getFileContentHash(pathname);
+    if (!hash) return match;
+    const newHref = `${pathname}?v=${hash}${query ? '&' + query : ''}`;
+    return `${prefix}${newHref}${suffix}`;
+  });
+
+  writeFileSync(distIndexHtmlPath, htmlContent, 'utf8');
+}
+

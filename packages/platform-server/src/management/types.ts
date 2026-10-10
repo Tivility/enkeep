@@ -103,6 +103,9 @@ export interface ManagementRuntimeProvider {
   restartRuntime?(userId?: string, options?: { mode?: 'container' | 'host' } | 'container' | 'host'): Promise<RuntimeRestartResult>;
   stopRuntime?(userId: string, mode?: 'container' | 'host'): Promise<{ stopped: boolean; userId: string; mode?: 'container' | 'host' }>;
   ensureRuntime?(userId: string, mode?: 'container' | 'host'): Promise<UserRuntimeStatus | null>;
+  getTargetVersion?(): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord | null>;
+  setTargetVersion?(input: { image?: string | null; daemonCliPath?: string | null; updatedBy?: string | null }): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord>;
+  getUpgradeStatus?(): Promise<import('@enkeep/platform-core').UserRuntimeUpgradeStatus[]>;
 }
 
 export interface AdminDashboardCounts {

@@ -798,5 +798,12 @@ describe('@enkeep/web-ui', () => {
         expect(stat.isFile()).toBe(true);
       }
     });
+
+    it('injects content hash (?v=<12-char-sha256>) into local script and css tags in dist/static/index.html', () => {
+      const distHtml = getWebUiIndexHtml();
+      expect(distHtml).toMatch(/<script\s+src="\/static\/theme-bootstrap\.js\?v=[0-9a-f]{12}"><\/script>/);
+      expect(distHtml).toMatch(/<link\s+rel="stylesheet"\s+href="\/static\/style\.css\?v=[0-9a-f]{12}">/);
+      expect(distHtml).toMatch(/<script\s+type="module"\s+src="\/static\/app\.js\?v=[0-9a-f]{12}"><\/script>/);
+    });
   });
 });

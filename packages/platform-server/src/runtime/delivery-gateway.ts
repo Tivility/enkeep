@@ -658,6 +658,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   private isScheduling = false;
   private schedulerTriggerPending = false;
   private schedulerLoopTimer?: NodeJS.Timeout;
+  private readonly pausedUserIds = new Set<string>();
 
   constructor(options: DeliveryRuntimeGatewayOptions) {
     if (
@@ -982,6 +983,40 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     }) => Promise<void> | void
   ): void {
     this.turnCompletedListeners.delete(listener);
+  }
+
+  pauseUserDispatch(userId: string): void {
+    if (userId && typeof userId === 'string') {
+      this.pausedUserIds.add(userId);
+    }
+  }
+
+  resumeUserDispatch(userId: string): void {
+    if (userId && typeof userId === 'string') {
+      this.pausedUserIds.delete(userId);
+      this.notifyScheduler();
+    }
+  }
+
+  isUserDispatchPaused(userId: string): boolean {
+    return this.pausedUserIds.has(userId);
+  }
+
+  getUserActiveRoundsCount(userId: string): { queued: number; running: number } {
+    let running = 0;
+    for (const task of this.activeTasks.values()) {
+      if (task.userId === userId) {
+        running++;
+      }
+    }
+    let queued = 0;
+    try {
+      const row = this.db.prepare(
+        "SELECT COUNT(*) as cnt FROM turn_runs WHERE user_id = ? AND status = 'queued'"
+      ).get(userId) as { cnt?: number } | undefined;
+      queued = row?.cnt ?? 0;
+    } catch {}
+    return { queued, running };
   }
 
   onTurnFailed(
@@ -1812,9 +1847,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         return null;
       }
 
-      // Filter candidate by in-memory active tasks count per user (< 2)
+      // Filter candidate by in-memory active tasks count per user (< 2) and paused dispatch
       let selectedCandidate: (typeof candidates)[0] | undefined;
       for (const cand of candidates) {
+        if (this.pausedUserIds.has(cand.user_id)) {
+          continue;
+        }
         let userActiveCount = 0;
         for (const task of this.activeTasks.values()) {
           if (task.userId === cand.user_id) {
@@ -3992,6 +4030,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         const errCode = steerResult?.error?.code;
         if (errCode === 'TURN_NOT_RUNNING' || errCode === 'NOT_RUNNING') {
           throw new PlatformError('Turn is not running in runtime', 'NOT_RUNNING', 409);
+        }
+        if (errCode === 'UNKNOWN_OP' || errCode === 'UNSUPPORTED_OPERATION' || steerResult?.error?.message?.includes('Unknown op') || steerResult?.error?.message?.includes('not supported')) {
+          throw new PlatformError('Operation requires runtime upgrade: 该会话运行时升级后可用', 'RUNTIME_UPGRADE_REQUIRED', 409);
         }
         throw new PlatformError(steerResult?.error?.message || 'Steer failed', errCode || 'STEER_FAILED', 409);
       }

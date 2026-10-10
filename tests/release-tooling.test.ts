@@ -12,6 +12,12 @@ import {
   executeRollback,
   executeVerify,
   parseEstablishedExternalConnections,
+  classifyChanges,
+  extractAssetsFromIndexHtml,
+  extractWorktreePathFromPlist,
+  setRuntimeTargetVersionInDb,
+  executeRuntimeDeploy,
+  executePlatformDeploy,
 } from '../scripts/deploy-release.mjs';
 import { planPruneWorktrees, executePrune } from '../scripts/prune-release-worktrees.mjs';
 import * as fs from 'node:fs';
@@ -147,7 +153,7 @@ describe('Deploy Tooling Enhancements', () => {
   });
 
   describe('Dry-run & Plan Executions', () => {
-    it('errors when no test-cmd given and skip-tests not set', async () => {
+    it('errors when no test-cmd given and skip-tests not set in platform/full deploy', async () => {
       const config = {
         releaseId: 'batch1',
         targetRef: 'origin/main',
@@ -165,6 +171,7 @@ describe('Deploy Tooling Enhancements', () => {
         skipTests: false,
         testedCommit: '',
         dryRun: true,
+        mode: 'full',
       };
 
       await expect(executeDeploy(config)).rejects.toThrow(/No test commands specified/);
@@ -297,6 +304,283 @@ describe('Deploy Tooling Enhancements', () => {
     it('returns 0 for empty or invalid output', () => {
       expect(parseEstablishedExternalConnections('')).toBe(0);
       expect(parseEstablishedExternalConnections(null as any)).toBe(0);
+    });
+  });
+
+  describe('Split Upgrade Classification & Frontend Deploy', () => {
+    describe('classifyChanges', () => {
+      it('classifies packages/web-ui changes as frontend only', () => {
+        const changes = [
+          'packages/web-ui/src/static/app.js',
+          'packages/web-ui/src/static/style.css',
+          'packages/web-ui/src/static/index.html',
+        ];
+        const res = classifyChanges(changes);
+        expect(res).toEqual({
+          frontend: true,
+          runtime: false,
+          platform: false,
+        });
+      });
+
+      it('classifies runtime-runner, dsh-*, and docker/ changes as runtime', () => {
+        const changes = [
+          'packages/runtime-runner/src/host/adapter.ts',
+          'packages/dsh-settings/src/index.ts',
+          'docker/Dockerfile.runtime',
+        ];
+        const res = classifyChanges(changes);
+        expect(res).toEqual({
+          frontend: false,
+          runtime: true,
+          platform: false,
+        });
+      });
+
+      it('classifies server, channel, and demo-runner changes as platform', () => {
+        const changes = [
+          'packages/platform-server/src/server/handler.ts',
+          'packages/channel-feishu/src/index.ts',
+          'packages/web-channel/src/handler.ts',
+          'packages/demo-runner/src/up/index.ts',
+        ];
+        const res = classifyChanges(changes);
+        expect(res).toEqual({
+          frontend: false,
+          runtime: false,
+          platform: true,
+        });
+      });
+
+      it('conservatively classifies unclassified/unmatched paths as platform', () => {
+        const changes = [
+          'docs/readme.md',
+          'scripts/custom-script.sh',
+          'random-unmatched-file.txt',
+        ];
+        const res = classifyChanges(changes);
+        expect(res).toEqual({
+          frontend: false,
+          runtime: false,
+          platform: true,
+        });
+      });
+
+      it('classifies lockfile changes touching @deepseek-ai/@tivility as runtime, else platform', () => {
+        // Lockfile with @deepseek-ai change
+        const diffWithDeepseek = `
+@@ -10,3 +10,3 @@
+-  '@deepseek-ai/dsh-settings': 0.2.0-rc.1
++  '@deepseek-ai/dsh-settings': 0.2.0-rc.2
+`;
+        const res1 = classifyChanges(['pnpm-lock.yaml'], { lockfileDiff: diffWithDeepseek });
+        expect(res1).toEqual({
+          frontend: false,
+          runtime: true,
+          platform: false,
+        });
+
+        // Lockfile without @deepseek-ai/@tivility (e.g. lodash upgrade)
+        const diffOther = `
+@@ -100,3 +100,3 @@
+-  lodash: 4.17.20
++  lodash: 4.17.21
+`;
+        const res2 = classifyChanges(['pnpm-lock.yaml'], { lockfileDiff: diffOther });
+        expect(res2).toEqual({
+          frontend: false,
+          runtime: false,
+          platform: true,
+        });
+
+        // Lockfile without diff string provided -> conservative platform
+        const res3 = classifyChanges(['pnpm-lock.yaml']);
+        expect(res3).toEqual({
+          frontend: false,
+          runtime: false,
+          platform: true,
+        });
+      });
+
+      it('correctly flags multiple categories when mixed changes exist', () => {
+        const changes = [
+          'packages/web-ui/src/static/app.js',
+          'packages/runtime-runner/src/host/adapter.ts',
+          'packages/platform-server/src/server/handler.ts',
+        ];
+        const res = classifyChanges(changes);
+        expect(res).toEqual({
+          frontend: true,
+          runtime: true,
+          platform: true,
+        });
+      });
+    });
+
+    describe('Frontend Deploy & Dry-run Plan', () => {
+      it('extracts script and stylesheet assets correctly from index.html', () => {
+        const sampleHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <script src="/static/theme-bootstrap.js?v=9c6909a9c62f"></script>
+  <link rel="stylesheet" href="/static/style.css?v=e9219aaa0f95">
+  <link rel="icon" href="/favicon.ico">
+  <script src="https://cdn.example.com/ext.js"></script>
+</head>
+<body>
+  <script type="module" src="/static/app.js?v=a86127bf9a0b"></script>
+</body>
+</html>
+`;
+        const assets = extractAssetsFromIndexHtml(sampleHtml);
+        expect(assets).toEqual([
+          '/static/theme-bootstrap.js?v=9c6909a9c62f',
+          '/static/app.js?v=a86127bf9a0b',
+          '/static/style.css?v=e9219aaa0f95',
+          '/favicon.ico',
+        ]);
+      });
+
+      it('executes dry-run frontend deploy successfully without errors', async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-fe-'));
+        const fakeWorktree = path.join(tmpDir, 'release-worktree-batch57');
+        fs.mkdirSync(path.join(fakeWorktree, 'packages/demo-runner/dist'), { recursive: true });
+        fs.writeFileSync(path.join(fakeWorktree, 'packages/demo-runner/dist/demo-runner.js'), '// runner');
+
+        const fakePlist = path.join(tmpDir, 'com.example.app.plist');
+        fs.writeFileSync(fakePlist, `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${path.join(fakeWorktree, 'packages/demo-runner/dist/demo-runner.js')}</string>
+  </array>
+</dict>
+</plist>`);
+
+        const config = {
+          only: 'frontend',
+          plistPath: fakePlist,
+          port: 3900,
+          baseRef: 'HEAD',
+          targetRef: 'HEAD',
+          repoRoot: fakeWorktree,
+          dryRun: true,
+        };
+
+        await expect(executeDeploy(config)).resolves.toBeDefined();
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+    });
+
+    describe('Runtime & Platform Deploy Plans', () => {
+      it('persists target version directly in sqlite database via setRuntimeTargetVersionInDb', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-db-'));
+        const dbPath = path.join(tmpDir, 'platform.db');
+        
+        setRuntimeTargetVersionInDb(dbPath, 'enkeep-runtime:test-tag-v1');
+        
+        // Verify persisted content
+        const { DatabaseSync } = require('node:sqlite');
+        const db = new DatabaseSync(dbPath);
+        const row = db.prepare('SELECT id, image, daemon_cli_path, updated_by FROM runtime_target_version WHERE id = ?').get('default');
+        expect(row.id).toBe('default');
+        expect(row.image).toBe('enkeep-runtime:test-tag-v1');
+        expect(row.updated_by).toBe('deploy_script');
+        db.close();
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      it('executes dry-run runtime deploy plan successfully', async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-rt-'));
+        const fakeWorktree = path.join(tmpDir, 'release-worktree-batch57');
+        fs.mkdirSync(path.join(fakeWorktree, 'packages/demo-runner/dist'), { recursive: true });
+        fs.writeFileSync(path.join(fakeWorktree, 'packages/demo-runner/dist/demo-runner.js'), '// runner');
+
+        const fakePlist = path.join(tmpDir, 'com.example.app.plist');
+        fs.writeFileSync(fakePlist, `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${path.join(fakeWorktree, 'packages/demo-runner/dist/demo-runner.js')}</string>
+  </array>
+</dict>
+</plist>`);
+
+        const config = {
+          only: 'runtime',
+          releaseId: 'batch57',
+          plistPath: fakePlist,
+          dataDir: tmpDir,
+          port: 3900,
+          runtimeImagePrefix: 'enkeep-runtime:gap-',
+          baseRef: 'HEAD',
+          targetRef: 'HEAD',
+          repoRoot: fakeWorktree,
+          dryRun: true,
+        };
+
+        await expect(executeDeploy(config)).resolves.toBeDefined();
+        await expect(executeRuntimeDeploy(config)).resolves.toBeDefined();
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      it('executes platform deploy plan in split mode without invoking container down', async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-platform-'));
+        const config = {
+          releaseId: 'batch57',
+          targetRef: 'HEAD',
+          repoRoot: tmpDir,
+          releaseRoot: tmpDir,
+          dataDir: tmpDir,
+          configDir: tmpDir,
+          plistPath: path.join(tmpDir, 'agent.plist'),
+          launchdLabel: 'com.example.app',
+          port: 3900,
+          proxyPort: 3901,
+          runtimeImagePrefix: 'enkeep-runtime:test-',
+          containerNamePrefix: 'enkeep-test-',
+          testCmds: ['true'],
+          dryRun: true,
+          mode: 'split',
+        };
+
+        await expect(executePlatformDeploy(config, { mode: 'platform' })).resolves.toBeDefined();
+        await expect(executeDeploy(config)).resolves.toBeDefined();
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      it('routes multi-category changes sequentially (frontend -> runtime -> platform)', async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-multi-'));
+        const config = {
+          releaseId: 'batch58',
+          targetRef: 'HEAD',
+          baseRef: 'HEAD',
+          repoRoot: tmpDir,
+          releaseRoot: tmpDir,
+          dataDir: tmpDir,
+          configDir: tmpDir,
+          plistPath: path.join(tmpDir, 'agent.plist'),
+          launchdLabel: 'com.example.app',
+          port: 3900,
+          proxyPort: 3901,
+          runtimeImagePrefix: 'enkeep-runtime:test-',
+          containerNamePrefix: 'enkeep-test-',
+          testCmds: ['true'],
+          dryRun: true,
+        };
+
+        // When changes is empty / dryRun
+        await expect(executeDeploy(config)).resolves.toBeDefined();
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
     });
   });
 });

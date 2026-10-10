@@ -122,6 +122,12 @@ node <release-worktree>/packages/demo-runner/dist/demo-runner.js preflight --dat
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<launchd-label>.plist
 ```
 
+> **分层升级模式说明 (Split Upgrade Modes)**:
+> 1. **方式一（仅前端，Zero Restart）**: `node scripts/deploy-release.mjs --only frontend`。原子替换 `dist/static` 并刷新内容哈希，平台与运行时 0 重启。
+> 2. **方式二（仅运行时，Background Auto-Upgrade）**: `node scripts/deploy-release.mjs --only runtime`。构建镜像并写入 `runtime_target_version` 表，平台不重启，由 `RuntimeAutoUpgrader` 闲时逐个滚动升级。
+> 3. **方式三（平台升级，Retain Runtimes）**: 默认执行。等待排空后 `bootout`/`bootstrap` 平台，保留活跃 Docker 容器与宿主 daemon（不执行 `demo-runner down`，不重建容器）。
+> 4. **兜底全量模式 (`--mode full`)**: 包含 `demo-runner down` 和容器彻底重建的传统停机升级流程。
+
 ### 步骤 6: LaunchAgent 配置更新与重载启动 (LaunchAgent Switch & Bootstrap)
 Enkeep 生产运行由 `~/Library/LaunchAgents/com.owner-user.enkeep.plist` 定义。发布切换即更新 Plist 中的工作树路径与镜像 Tag，然后通过 launchctl bootstrap 重新挂载：
 
