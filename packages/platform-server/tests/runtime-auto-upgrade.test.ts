@@ -387,6 +387,51 @@ describe('Runtime Idle Auto-Upgrade & Target Version Governance', () => {
       expect(paused).toContain('user-charlie');
       expect(resumed).toContain('user-charlie');
     });
+
+    it('isIdle=false or pendingReason=activity_unavailable never triggers upgrade or pause', async () => {
+      const paused: string[] = [];
+      const resumed: string[] = [];
+
+      const mockGateway: any = {
+        getUserActiveRoundsCount: vi.fn().mockReturnValue({ queued: 0, running: 0 }),
+        pauseUserDispatch: vi.fn((uid) => paused.push(uid)),
+        resumeUserDispatch: vi.fn((uid) => resumed.push(uid)),
+        redriveHeld: vi.fn(),
+      };
+
+      const mockManagement: any = {
+        getUpgradeStatus: vi.fn(async () => [
+          {
+            userId: 'user-busy',
+            mode: 'container',
+            isOutdated: true,
+            isIdle: false,
+            pendingReason: 'busy',
+          },
+          {
+            userId: 'user-unavail',
+            mode: 'container',
+            isOutdated: true,
+            isIdle: false,
+            pendingReason: 'activity_unavailable',
+          },
+        ]),
+        stopRuntime: vi.fn(),
+      };
+
+      const upgrader = new RuntimeAutoUpgrader({
+        db,
+        managementProvider: mockManagement,
+        deliveryGateway: mockGateway,
+        idleThresholdSeconds: 0,
+      });
+
+      const res = await upgrader.checkAndUpgrade();
+      expect(res.status).toBe('no_idle_candidate_meeting_threshold');
+      expect(mockManagement.stopRuntime).not.toHaveBeenCalled();
+      expect(paused).toHaveLength(0);
+      expect(resumed).toHaveLength(0);
+    });
   });
 
   describe('4. Steer Compatibility on Unsupported / Old Runtimes', () => {

@@ -2035,11 +2035,26 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       const targetVer = getEffectiveTargetRuntimeVersion();
 
       for (const [uid, handle] of runtimeHandles.entries()) {
-        const currentImage = handle.launchedImage || options.runtimeImage || process.env.ENKEEP_RUNTIME_IMAGE?.trim() || 'enkeep-demo-runtime:acceptance';
-        const isOutdated = Boolean(targetVer.image && currentImage !== targetVer.image);
-        let isIdle = true;
-        try {
-          if (handle.containerId) {
+        let currentImage: string | null = handle.launchedImage || null;
+        if (!currentImage && handle.containerId) {
+          try {
+            const dockerClient = new SafeDockerClient();
+            const info = await dockerClient.inspectContainer(handle.containerId);
+            if (info?.image) {
+              currentImage = info.image;
+            }
+          } catch (err) {
+            const errorType = err instanceof Error ? err.name || 'Error' : typeof err;
+            console.warn(`[getUpgradeStatus] Failed to inspect container image for user "${uid}": ${errorType}`);
+          }
+        }
+
+        const isOutdated = Boolean(targetVer.image && (!currentImage || currentImage !== targetVer.image));
+        let isIdle = false;
+        let pendingReason: string = isOutdated ? 'activity_unavailable' : 'up_to_date';
+
+        if (handle.containerId) {
+          try {
             const containerAct = await queryContainerActivity(handle.containerId, 2000);
             if (containerAct) {
               const hasActivity =
@@ -2050,16 +2065,33 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                 containerAct.liveSubagentsCount > 0 ||
                 containerAct.pendingInboxItemsCount > 0 ||
                 containerAct.queuedTurnsCount > 0;
-              if (hasActivity || !containerAct.isIdle) {
+              if (!hasActivity && containerAct.isIdle === true) {
+                isIdle = true;
+                if (isOutdated) {
+                  pendingReason = 'idle';
+                }
+              } else {
                 isIdle = false;
+                if (isOutdated) {
+                  pendingReason = 'busy';
+                }
+              }
+            } else {
+              if (isOutdated) {
+                pendingReason = 'activity_unavailable';
               }
             }
+          } catch (err) {
+            const errorType = err instanceof Error ? err.name || 'Error' : typeof err;
+            console.warn(`[getUpgradeStatus] Failed to query container activity for user "${uid}": ${errorType}`);
+            if (isOutdated) {
+              pendingReason = 'activity_unavailable';
+            }
           }
-        } catch {}
-
-        let pendingReason: string = 'up_to_date';
-        if (isOutdated) {
-          pendingReason = isIdle ? 'idle' : 'busy';
+        } else {
+          if (isOutdated) {
+            pendingReason = 'activity_unavailable';
+          }
         }
 
         results.push({
@@ -2079,32 +2111,53 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       for (const [uid, hostHandle] of hostRuntimeHandles.entries()) {
         const currentCli = hostHandle.launchedDaemonCliPath || null;
         const targetCli = targetVer.daemonCliPath || null;
-        const isOutdated = Boolean(targetCli && currentCli !== targetCli);
-        let isIdle = true;
+        const isOutdated = Boolean(targetCli && (!currentCli || currentCli !== targetCli));
+        let isIdle = false;
+        let pendingReason: string = isOutdated ? 'activity_unavailable' : 'up_to_date';
+
         try {
           const rawHandle = (hostHandle as any).rawHandle;
           const userRec = await storage?.users.findById(uid);
           const userName = userRec?.username || uid;
           const socketPath = rawHandle?.socketPath || join(paths.dataRoot, 'host-runtimes', userName, 'run', 'runtime.sock');
-          const hostAct = await queryDaemonActivityOverSocket(socketPath, 2000);
-          if (hostAct) {
-            const hasActivity =
-              hostAct.activeTurnsCount > 0 ||
-              hostAct.autonomousTurnsCount > 0 ||
-              hostAct.runningJobsCount > 0 ||
-              hostAct.runningWorkflowJobsCount > 0 ||
-              hostAct.liveSubagentsCount > 0 ||
-              hostAct.pendingInboxItemsCount > 0 ||
-              hostAct.queuedTurnsCount > 0;
-            if (hasActivity || !hostAct.isIdle) {
-              isIdle = false;
+          if (socketPath && existsSync(socketPath)) {
+            const hostAct = await queryDaemonActivityOverSocket(socketPath, 2000);
+            if (hostAct) {
+              const hasActivity =
+                hostAct.activeTurnsCount > 0 ||
+                hostAct.autonomousTurnsCount > 0 ||
+                hostAct.runningJobsCount > 0 ||
+                hostAct.runningWorkflowJobsCount > 0 ||
+                hostAct.liveSubagentsCount > 0 ||
+                hostAct.pendingInboxItemsCount > 0 ||
+                hostAct.queuedTurnsCount > 0;
+              if (!hasActivity && hostAct.isIdle === true) {
+                isIdle = true;
+                if (isOutdated) {
+                  pendingReason = 'idle';
+                }
+              } else {
+                isIdle = false;
+                if (isOutdated) {
+                  pendingReason = 'busy';
+                }
+              }
+            } else {
+              if (isOutdated) {
+                pendingReason = 'activity_unavailable';
+              }
+            }
+          } else {
+            if (isOutdated) {
+              pendingReason = 'activity_unavailable';
             }
           }
-        } catch {}
-
-        let pendingReason: string = 'up_to_date';
-        if (isOutdated) {
-          pendingReason = isIdle ? 'idle' : 'busy';
+        } catch (err) {
+          const errorType = err instanceof Error ? err.name || 'Error' : typeof err;
+          console.warn(`[getUpgradeStatus] Failed to query host activity for user "${uid}": ${errorType}`);
+          if (isOutdated) {
+            pendingReason = 'activity_unavailable';
+          }
         }
 
         results.push({
