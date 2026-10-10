@@ -865,31 +865,22 @@ export function extractAssetsFromIndexHtml(htmlContent) {
   return assets;
 }
 
-export function setRuntimeTargetVersionInDb(dbPath, imageTag, daemonCliPath = null) {
+export function setRuntimeTargetVersionInDb(dbPath, imageTag = null, daemonCliPath = null, updatedBy = null) {
   if (!dbPath) {
     throw new Error(`Platform DB path is required`);
   }
   const db = new DatabaseSync(dbPath);
   try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS runtime_target_version (
-        id TEXT PRIMARY KEY NOT NULL,
-        image TEXT,
-        daemon_cli_path TEXT,
-        updated_by TEXT,
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-    `);
     const stmt = db.prepare(`
       INSERT INTO runtime_target_version (id, image, daemon_cli_path, updated_by, updated_at)
-      VALUES ('default', ?, ?, 'deploy_script', CURRENT_TIMESTAMP)
+      VALUES ('default', ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(id) DO UPDATE SET
         image = excluded.image,
         daemon_cli_path = excluded.daemon_cli_path,
         updated_by = excluded.updated_by,
         updated_at = CURRENT_TIMESTAMP
     `);
-    stmt.run(imageTag, daemonCliPath);
+    stmt.run(imageTag, daemonCliPath, updatedBy);
   } finally {
     db.close();
   }
@@ -1026,8 +1017,9 @@ export async function executeRuntimeDeploy(config, options = {}) {
   });
 
   runDeployStep('Configure Target Runtime Version', () => {
-    console.log(`Setting target runtime version in platform database: ${imageTag}`);
-    setRuntimeTargetVersionInDb(dbPath, imageTag);
+    const daemonCliPath = join(worktreePath, 'packages', 'runtime-runner', 'dist', 'runtime', 'daemon-cli.js');
+    console.log(`Setting target runtime version in platform database: image=${imageTag}, daemonCliPath=${daemonCliPath}`);
+    setRuntimeTargetVersionInDb(dbPath, imageTag, daemonCliPath);
     console.log('✓ Target runtime version persisted.');
   });
 

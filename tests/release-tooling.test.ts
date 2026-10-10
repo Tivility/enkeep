@@ -556,17 +556,91 @@ describe('Deploy Tooling Enhancements', () => {
       it('persists target version directly in sqlite database via setRuntimeTargetVersionInDb', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-db-'));
         const dbPath = path.join(tmpDir, 'platform.db');
+        const { DatabaseSync } = require('node:sqlite');
+        const setupDb = new DatabaseSync(dbPath);
+        setupDb.exec(`
+          CREATE TABLE runtime_target_version (
+            id TEXT PRIMARY KEY DEFAULT 'default',
+            image TEXT,
+            daemon_cli_path TEXT,
+            updated_by TEXT,
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+          );
+        `);
+        setupDb.close();
         
-        setRuntimeTargetVersionInDb(dbPath, 'enkeep-runtime:test-tag-v1');
+        setRuntimeTargetVersionInDb(dbPath, 'enkeep-runtime:test-tag-v1', '/fake/worktree/packages/runtime-runner/dist/runtime/daemon-cli.js');
         
         // Verify persisted content
-        const { DatabaseSync } = require('node:sqlite');
         const db = new DatabaseSync(dbPath);
         const row = db.prepare('SELECT id, image, daemon_cli_path, updated_by FROM runtime_target_version WHERE id = ?').get('default');
         expect(row.id).toBe('default');
         expect(row.image).toBe('enkeep-runtime:test-tag-v1');
-        expect(row.updated_by).toBe('deploy_script');
+        expect(row.daemon_cli_path).toBe('/fake/worktree/packages/runtime-runner/dist/runtime/daemon-cli.js');
+        expect(row.updated_by).toBeNull();
         db.close();
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      it('enforces foreign key constraints and persists target version with NULL or valid user updated_by', async () => {
+        const { DatabaseSync } = require('node:sqlite');
+        const { ALL_PLATFORM_MIGRATIONS, PlatformServerMigrationRunner } = await import('../packages/platform-server/src/storage/migrations.js');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-fk-'));
+        const dbPath = path.join(tmpDir, 'platform.db');
+
+        // Migrate temporary database using platform server migrations with foreign keys enabled
+        const initDb = new DatabaseSync(dbPath);
+        initDb.exec('PRAGMA foreign_keys = ON;');
+        const runner = new PlatformServerMigrationRunner(initDb);
+        await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+        initDb.close();
+
+        // 1. Calling setRuntimeTargetVersionInDb on migrated DB with FK enabled should succeed with null updated_by
+        setRuntimeTargetVersionInDb(
+          dbPath,
+          'enkeep-runtime:test-tag-fk',
+          '/fake/worktree/packages/runtime-runner/dist/runtime/daemon-cli.js'
+        );
+
+        const verifyDb = new DatabaseSync(dbPath);
+        verifyDb.exec('PRAGMA foreign_keys = ON;');
+        const rowNullUser = verifyDb.prepare('SELECT id, image, daemon_cli_path, updated_by FROM runtime_target_version WHERE id = ?').get('default');
+        expect(rowNullUser.id).toBe('default');
+        expect(rowNullUser.image).toBe('enkeep-runtime:test-tag-fk');
+        expect(rowNullUser.daemon_cli_path).toBe('/fake/worktree/packages/runtime-runner/dist/runtime/daemon-cli.js');
+        expect(rowNullUser.updated_by).toBeNull();
+
+        // 2. Writing an invalid non-existent foreign key user id with FK enabled should fail
+        expect(() => {
+          setRuntimeTargetVersionInDb(
+            dbPath,
+            'enkeep-runtime:test-tag-fk-fail',
+            null,
+            'non-existent-user-id'
+          );
+        }).toThrow(/FOREIGN KEY/i);
+
+        // 3. Insert a synthetic user and verify setRuntimeTargetVersionInDb succeeds with valid user id
+        verifyDb.prepare(`
+          INSERT INTO users (id, username, password_hash, role, status, created_at, updated_at)
+          VALUES ('user-test-admin', 'test-admin', 'hash', 'admin', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run();
+        verifyDb.close();
+
+        setRuntimeTargetVersionInDb(
+          dbPath,
+          'enkeep-runtime:test-tag-fk-user',
+          '/fake/worktree/packages/runtime-runner/dist/runtime/daemon-cli.js',
+          'user-test-admin'
+        );
+
+        const verifyDb2 = new DatabaseSync(dbPath);
+        verifyDb2.exec('PRAGMA foreign_keys = ON;');
+        const rowWithUser = verifyDb2.prepare('SELECT id, image, daemon_cli_path, updated_by FROM runtime_target_version WHERE id = ?').get('default');
+        expect(rowWithUser.image).toBe('enkeep-runtime:test-tag-fk-user');
+        expect(rowWithUser.updated_by).toBe('user-test-admin');
+        verifyDb2.close();
 
         fs.rmSync(tmpDir, { recursive: true, force: true });
       });
