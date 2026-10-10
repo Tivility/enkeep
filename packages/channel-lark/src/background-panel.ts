@@ -318,6 +318,9 @@ export class LarkBackgroundPanelManager {
         state.hadRunningTasks = true;
       }
 
+      // A-02: Keep polling if tasks are running OR if the current turn has not finalized yet
+      const turnActive = Boolean(state.activeTurnId);
+
       // Format and update panel on latest card
       if (tasks.length > 0) {
         const panelText = formatBackgroundPanel(tasks, {
@@ -328,15 +331,18 @@ export class LarkBackgroundPanelManager {
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
           await state.latestCard.cardSession.updateBackgroundPanel(panelText);
         }
-      } else if (state.hadRunningTasks) {
+      } else if (state.hadRunningTasks && !turnActive) {
+        // Do not report "all completed" merely because task list is empty.
+        // If tasks have completed or ended, formatBackgroundPanel(tasks) handles it when tasks.length > 0.
+        // If the task list returned empty after previously having running tasks, and the turn is no longer active,
+        // clear the panel rather than falsely declaring "all completed".
         state.lastPanelText = undefined;
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
-          await state.latestCard.cardSession.updateBackgroundPanel('✅ 后台任务已全部完成');
+          await state.latestCard.cardSession.updateBackgroundPanel(null);
         }
+        state.hadRunningTasks = false;
       }
 
-      // A-02: Keep polling if tasks are running OR if the current turn has not finalized yet
-      const turnActive = Boolean(state.activeTurnId);
       if (hasRunning || turnActive) {
         this.ensurePolling(sessionRouteId, chatContextId);
       } else {
