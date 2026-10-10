@@ -84,6 +84,10 @@ import {
   DaemonSettlementJournal,
 } from './daemon-settlement-journal.js';
 import {
+  DaemonActiveTaskJournal,
+  type ActiveBackgroundTaskRecord,
+} from './daemon-active-task-journal.js';
+import {
   DAEMON_OPS,
   DAEMON_ERROR_CODES,
   DAEMON_STREAM_EVENTS,
@@ -184,6 +188,8 @@ function haveSkillsChanged(
   return false;
 }
 
+export const DEFAULT_ANOMALY_CALLBACK_WAIT_MS = 2000;
+
 export interface DaemonOptions extends DshRuntimeBootConfig {
   /** Maximum number of active agents held in memory (default: 16, or env DSH_MAX_AGENTS) */
   readonly maxAgents?: number;
@@ -193,6 +199,8 @@ export interface DaemonOptions extends DshRuntimeBootConfig {
   readonly maxConcurrentSessions?: number;
   /** Interval in ms for background idle sweep (default: 15,000 ms) */
   readonly idleSweepIntervalMs?: number;
+  /** Wait time in ms before dispatching anomaly callback for unnotified background tasks (default: 2,000 ms) */
+  readonly anomalyCallbackWaitMs?: number;
 }
 
 export type AgentSessionStatus =
@@ -292,11 +300,13 @@ export class RuntimeDaemon extends EventEmitter {
   public readonly maxAgents: number;
   public readonly idleAgentTimeoutMs: number;
   public readonly maxConcurrentSessions: number;
+  public readonly anomalyCallbackWaitMs: number;
 
   private readonly bootedRuntimePromise!: Promise<DshBootedRuntime>;
   private bootedRuntime!: DshBootedRuntime;
   private readonly journal: DaemonTurnJournal;
   private readonly settlementJournal: DaemonSettlementJournal;
+  private readonly activeTaskJournal: DaemonActiveTaskJournal;
   private readonly observedNativeNoticeTaskIds = new Set<string>();
   private readonly pendingAnomalyTimers = new Map<string, NodeJS.Timeout>();
   private readonly agents = new Map<string, ManagedAgentEntry>();
@@ -324,6 +334,7 @@ export class RuntimeDaemon extends EventEmitter {
   private readonly liveSubagentsTracker = new Map<string, LiveSubagentActivity>();
   private readonly backgroundTasksTracker = new Map<string, BackgroundTaskRecord>();
   private readonly stoppedTaskIds = new Set<string>();
+  private readonly workflowAgentChildIds = new Set<string>();
   private readonly autonomousTurnsTracker = new Map<string, { sessionId: string; turnNumber?: number; startedAt: number }>();
   private readonly sessionMaintenanceLocks = new Map<string, Promise<void>>();
 
@@ -352,8 +363,11 @@ export class RuntimeDaemon extends EventEmitter {
       options.maxConcurrentSessions ??
       (!isNaN(envMaxConcurrent) && envMaxConcurrent > 0 ? envMaxConcurrent : 4);
 
+    this.anomalyCallbackWaitMs = options.anomalyCallbackWaitMs ?? DEFAULT_ANOMALY_CALLBACK_WAIT_MS;
+
     this.journal = new DaemonTurnJournal(this.dshHome);
     this.settlementJournal = new DaemonSettlementJournal(this.dshHome);
+    this.activeTaskJournal = new DaemonActiveTaskJournal(this.dshHome);
   }
 
   private getOrCreateSessionQueue(sessionId: string): QueuedTurnItem[] {
@@ -417,6 +431,77 @@ export class RuntimeDaemon extends EventEmitter {
     }
 
     this.isStarted = true;
+
+    // 5. Notify parent sessions of background tasks interrupted by previous daemon crash/restart
+    this.notifyInterruptedTasksOnStartup().catch((err) => {
+      this.emit('log', {
+        level: 'warn',
+        message: `Error notifying interrupted tasks on daemon startup: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    });
+  }
+
+  /**
+   * Recovers leftover active background task records from previous daemon crash/restart,
+   * notifies parent sessions once, and removes the records.
+   */
+  private async notifyInterruptedTasksOnStartup(): Promise<void> {
+    const remainingTasks = this.activeTaskJournal.listRemainingRecords();
+    for (const task of remainingTasks) {
+      const { taskId, kind, name, parentSessionId, originTurnId } = task;
+      if (!parentSessionId || !parentSessionId.trim()) {
+        this.activeTaskJournal.removeActive(taskId);
+        continue;
+      }
+
+      // Check if already notified
+      if (this.settlementJournal.isNotified(taskId)) {
+        this.activeTaskJournal.removeActive(taskId);
+        continue;
+      }
+
+      const kindText = kind === 'workflow' ? '工作流' : '子代理';
+      const promptText = `后台${kindText} "${name}" 因运行时重启中断，未完成。请决定是否重新发起。`;
+      const noticeMessage = createUserMessage({
+        content: [{ type: 'text', text: promptText }],
+        source: {
+          kind: 'task-anomaly',
+          form: 'notice',
+          senderSessionId: taskId,
+          summary: `后台${kindText} "${name}" 因运行时重启中断`,
+        } as any,
+      });
+
+      try {
+        const entry = await this.getOrCreateManagedAgent(parentSessionId);
+        const agent = entry.agent;
+
+        this.settlementJournal.recordNotified({
+          taskId,
+          parentSessionId,
+          kind,
+          status: 'cancelled',
+          reason: 'Interrupted by daemon restart',
+          originTurnId,
+          notifiedAt: new Date().toISOString(),
+        });
+
+        if (entry.status === 'idle' && typeof agent.followup === 'function') {
+          agent.followup(noticeMessage);
+        } else if (typeof agent.steer === 'function') {
+          agent.steer(noticeMessage);
+        } else if (typeof agent.inject === 'function') {
+          agent.inject(noticeMessage);
+        }
+      } catch (err: unknown) {
+        this.emit('log', {
+          level: 'warn',
+          message: `Failed to dispatch restart interruption notice for task "${taskId}" to parent "${parentSessionId}": ${err instanceof Error ? err.message : String(err)}`,
+        });
+      } finally {
+        this.activeTaskJournal.removeActive(taskId);
+      }
+    }
   }
 
   /**
@@ -539,6 +624,16 @@ export class RuntimeDaemon extends EventEmitter {
             if (data.mode) task.mode = data.mode;
             if (data.mode === 'continuable') task.isBackground = true;
           }
+          if (task.isBackground && task.parentSessionId && !this.workflowAgentChildIds.has(sessionIdStr)) {
+            this.activeTaskJournal.recordActive({
+              taskId: sessionIdStr,
+              kind: 'subagent',
+              name: task.name,
+              parentSessionId: task.parentSessionId,
+              originTurnId: task.originTurnId,
+              startedAt: task.startedAt,
+            });
+          }
         } else if (parentSid && ((subject as any)?.header?.origin === 'subagent' || (subject as any)?.meta?.origin === 'subagent')) {
           const nowIso = new Date(event.time || Date.now()).toISOString();
           let originTurnId: string | undefined = undefined;
@@ -580,6 +675,16 @@ export class RuntimeDaemon extends EventEmitter {
             if (data.mode === 'continuable') task.isBackground = true;
           }
           this.backgroundTasksTracker.set(sessionIdStr, task);
+          if (task.isBackground && task.parentSessionId && !this.workflowAgentChildIds.has(sessionIdStr)) {
+            this.activeTaskJournal.recordActive({
+              taskId: sessionIdStr,
+              kind: 'subagent',
+              name: task.name,
+              parentSessionId: task.parentSessionId,
+              originTurnId: task.originTurnId,
+              startedAt: task.startedAt,
+            });
+          }
         }
       }
 
@@ -608,6 +713,7 @@ export class RuntimeDaemon extends EventEmitter {
           }
         }
         const nowIso = new Date().toISOString();
+        const isBg = rawEvent.data.runInBackground === true || rawEvent.data.run_in_background === true || rawEvent.data.background === true;
         this.backgroundTasksTracker.set(runId, {
           id: runId,
           parentSessionId: parentSid,
@@ -618,8 +724,23 @@ export class RuntimeDaemon extends EventEmitter {
           lastActivityAt: nowIso,
           progress: { agentsDone: 0, agentsTotal: 0 },
           originTurnId,
+          isBackground: isBg,
         });
+        if (isBg && parentSid) {
+          this.activeTaskJournal.recordActive({
+            taskId: runId,
+            kind: 'workflow',
+            name: String(rawEvent.data.name || 'workflow').slice(0, 60),
+            parentSessionId: parentSid,
+            originTurnId,
+            startedAt: nowIso,
+          });
+        }
       } else if (rawEvent?.type === 'tool-workflow/agent-start' && rawEvent.data) {
+        const childId = rawEvent.data.childId || rawEvent.data.child_id;
+        if (childId) {
+          this.workflowAgentChildIds.add(String(childId));
+        }
         const runId = String(rawEvent.data.runId);
         const task = this.backgroundTasksTracker.get(runId);
         if (task) {
@@ -628,6 +749,10 @@ export class RuntimeDaemon extends EventEmitter {
           task.progress.agentsTotal = (task.progress.agentsTotal || 0) + 1;
         }
       } else if (rawEvent?.type === 'tool-workflow/agent-end' && rawEvent.data) {
+        const childId = rawEvent.data.childId || rawEvent.data.child_id;
+        if (childId) {
+          this.workflowAgentChildIds.add(String(childId));
+        }
         const runId = String(rawEvent.data.runId);
         const task = this.backgroundTasksTracker.get(runId);
         if (task) {
@@ -639,6 +764,7 @@ export class RuntimeDaemon extends EventEmitter {
         const runId = String(rawEvent.data.runId);
         const task = this.backgroundTasksTracker.get(runId);
         if (task) {
+          this.activeTaskJournal.removeActive(runId);
           const nowIso = new Date().toISOString();
           task.finishedAt = nowIso;
           task.lastActivityAt = nowIso;
@@ -655,7 +781,7 @@ export class RuntimeDaemon extends EventEmitter {
             task.status = 'completed';
           }
 
-          if (task.status === 'failed' || task.status === 'cancelled') {
+          if (task.isBackground && !isExplicitlyStopped && (task.status === 'failed' || task.status === 'cancelled')) {
             this.scheduleAnomalyCallback({
               taskId: runId,
               parentSessionId: task.parentSessionId,
@@ -803,6 +929,18 @@ export class RuntimeDaemon extends EventEmitter {
             existing.name = String(info.label || info.description).slice(0, 60);
           }
         }
+
+        const effectiveTask = daemon.backgroundTasksTracker.get(idStr);
+        if (effectiveTask?.isBackground && effectiveTask.parentSessionId && !daemon.workflowAgentChildIds.has(idStr)) {
+          daemon.activeTaskJournal.recordActive({
+            taskId: idStr,
+            kind: 'subagent',
+            name: effectiveTask.name,
+            parentSessionId: effectiveTask.parentSessionId,
+            originTurnId: effectiveTask.originTurnId,
+            startedAt: effectiveTask.startedAt,
+          });
+        }
       }
     });
 
@@ -863,7 +1001,9 @@ export class RuntimeDaemon extends EventEmitter {
           }
         }
 
-        if (existing && (existing.status === 'failed' || existing.status === 'cancelled')) {
+        daemon.activeTaskJournal.removeActive(idStr);
+        const isFromWorkflow = daemon.workflowAgentChildIds.has(idStr);
+        if (existing && !isFromWorkflow && existing.isBackground && !isExplicitlyStopped && (existing.status === 'failed' || existing.status === 'cancelled')) {
           daemon.scheduleAnomalyCallback({
             taskId: idStr,
             parentSessionId: existing.parentSessionId,
@@ -902,6 +1042,7 @@ export class RuntimeDaemon extends EventEmitter {
           }
         }
         const nowIso = new Date().toISOString();
+        const isBg = info?.runInBackground === true || info?.run_in_background === true || info?.background === true;
         if (!this.backgroundTasksTracker.has(runId)) {
           this.backgroundTasksTracker.set(runId, {
             id: runId,
@@ -913,6 +1054,17 @@ export class RuntimeDaemon extends EventEmitter {
             lastActivityAt: nowIso,
             progress: { agentsDone: 0, agentsTotal: 0 },
             originTurnId,
+            isBackground: isBg,
+          });
+        }
+        if (isBg && parentSid) {
+          this.activeTaskJournal.recordActive({
+            taskId: runId,
+            kind: 'workflow',
+            name: String(info?.meta?.name || info?.name || 'workflow').slice(0, 60),
+            parentSessionId: parentSid,
+            originTurnId,
+            startedAt: nowIso,
           });
         }
       }
@@ -922,6 +1074,7 @@ export class RuntimeDaemon extends EventEmitter {
       const runId = String(info?.runId || info?.id || '');
       const task = this.backgroundTasksTracker.get(runId);
       if (task) {
+        this.activeTaskJournal.removeActive(runId);
         const nowIso = new Date().toISOString();
         task.finishedAt = nowIso;
         task.lastActivityAt = nowIso;
@@ -939,7 +1092,7 @@ export class RuntimeDaemon extends EventEmitter {
           task.status = 'completed';
         }
 
-        if (task.status === 'failed' || task.status === 'cancelled') {
+        if (task.isBackground && !isExplicitlyStopped && (task.status === 'failed' || task.status === 'cancelled')) {
           this.scheduleAnomalyCallback({
             taskId: runId,
             parentSessionId: task.parentSessionId,
@@ -1023,7 +1176,7 @@ export class RuntimeDaemon extends EventEmitter {
         reason,
         originTurnId,
       }).catch(() => {});
-    }, 2000);
+    }, this.anomalyCallbackWaitMs);
 
     if (timer && typeof timer.unref === 'function') {
       timer.unref();
@@ -1551,6 +1704,15 @@ export class RuntimeDaemon extends EventEmitter {
         for (const [sid, cur] of this.currentTurns.entries()) {
           if (cur.turnId === turnId) {
             cur.cancelRequested = true;
+            // Mark all currently running/active tasks in this session as stopped/cancelled
+            for (const [taskId, t] of this.backgroundTasksTracker.entries()) {
+              if (t.parentSessionId === sid && (t.status === 'running' || !t.finishedAt)) {
+                this.stoppedTaskIds.add(taskId);
+                this.stoppedTaskIds.add(t.id);
+                this.activeTaskJournal.removeActive(taskId);
+                this.activeTaskJournal.removeActive(t.id);
+              }
+            }
             const entry = this.agents.get(sid);
             if (entry?.agent) {
               entry.agent.cancel({ kind: 'user' });
@@ -1606,6 +1768,14 @@ export class RuntimeDaemon extends EventEmitter {
       const cur = this.currentTurns.get(sessionId);
       if (cur) {
         cur.cancelRequested = true;
+        for (const [taskId, t] of this.backgroundTasksTracker.entries()) {
+          if (t.parentSessionId === sessionId && (t.status === 'running' || !t.finishedAt)) {
+            this.stoppedTaskIds.add(taskId);
+            this.stoppedTaskIds.add(t.id);
+            this.activeTaskJournal.removeActive(taskId);
+            this.activeTaskJournal.removeActive(t.id);
+          }
+        }
         const entry = this.agents.get(sessionId);
         if (entry?.agent) {
           entry.agent.cancel({ kind: 'user' });
@@ -2184,7 +2354,7 @@ export class RuntimeDaemon extends EventEmitter {
     sessionId: string,
     taskId: string
   ): Promise<{ stopped: boolean }> {
-    const ctx = this.bootedRuntime?.context;
+    const ctx = this.bootedRuntime?.context ?? (this as any)._fakeContextForTest;
     let foundTask: BackgroundTaskRecord | undefined;
 
     // Match by exact id or shortId
@@ -2245,8 +2415,11 @@ export class RuntimeDaemon extends EventEmitter {
     if (stopped) {
       this.stoppedTaskIds.add(targetSessionId);
       this.stoppedTaskIds.add(taskId);
+      this.activeTaskJournal.removeActive(targetSessionId);
+      this.activeTaskJournal.removeActive(taskId);
       if (foundTask) {
         this.stoppedTaskIds.add(foundTask.id);
+        this.activeTaskJournal.removeActive(foundTask.id);
         // Do not force status to 'cancelled' immediately; status will update upon end events.
         // However update lastActivityAt to record attempt
         foundTask.lastActivityAt = new Date().toISOString();
