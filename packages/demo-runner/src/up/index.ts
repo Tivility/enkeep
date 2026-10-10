@@ -159,7 +159,7 @@ export interface RunningDemoSystem {
   ensureHostRuntime(userId: string): Promise<UserRuntimeHandle>;
   createHostSpace(userId: string, input: { name: string; folder: string; agentProfileId?: string }): Promise<import('@enkeep/platform-core').Space>;
   createHostSession(userId: string, input: { spaceId: string; title?: string }): Promise<import('@enkeep/platform-core').SessionRoute>;
-  close(options?: { removeVolumes?: boolean; crash?: boolean }): Promise<void>;
+  close(options?: { removeVolumes?: boolean; crash?: boolean; retainContainers?: boolean }): Promise<void>;
 }
 
 export {
@@ -702,7 +702,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         llmModel: options.llmModel,
         networkMode: containerNetworkMode,
       });
-      userHandle.launchedImage = targetVer.image;
+      userHandle.launchedImage = userHandle.meta?.image || targetVer.image;
       newlyCreatedHandles.push(userHandle);
       if (userHandle.meta) {
         containersList.push(userHandle.meta);
@@ -886,7 +886,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           timeoutMs: options.timeoutMs ?? 15000,
           networkMode: containerNetworkMode,
         });
-        handle.launchedImage = targetVer.image;
+        handle.launchedImage = handle.meta?.image || targetVer.image;
 
         // Phase 2 Binding: Bind full platform proxy & events stream handlers with authoritative user UUID
         await bindRuntimeServices(handle, userRecord.id);
@@ -3042,7 +3042,7 @@ fs.appendFileSync(p, corruptData);
           timeoutMs: options.timeoutMs ?? 15000,
         };
         const handle = await containerAdapter.startUserRuntime(startOpts);
-        handle.launchedImage = targetVer.image;
+        handle.launchedImage = handle.meta?.image || targetVer.image;
         await bindRuntimeServices(handle, userRecord.id);
         const health = await handle.checkHealth();
         if (health.toolsOperational !== true) {
@@ -3144,12 +3144,13 @@ fs.appendFileSync(p, corruptData);
         }
         return route;
       },
-      close: async (closeOptions?: { removeVolumes?: boolean; crash?: boolean }) => {
+      close: async (closeOptions?: { removeVolumes?: boolean; crash?: boolean; retainContainers?: boolean }) => {
         if (isClosed) return;
         isClosed = true;
 
         const removeVols = closeOptions?.removeVolumes ?? false;
         const isCrash = closeOptions?.crash ?? false;
+        const retainContainers = closeOptions?.retainContainers ?? false;
         const allErrors: Error[] = [];
 
         try {
@@ -3164,7 +3165,7 @@ fs.appendFileSync(p, corruptData);
           allErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
 
-        if (!isCrash) {
+        if (!isCrash && !retainContainers) {
           for (const h of new Set(runtimeHandles.values())) {
             try {
               await h.teardown(removeVols);
