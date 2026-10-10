@@ -1328,6 +1328,15 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
       browserService: options.browserService,
       platformProxyOptions: options.platformProxyOptions,
       platformProxyHandler: options.platformProxyHandler,
+      idleAgentTimeoutMs:
+        process.env.DSH_IDLE_AGENT_TIMEOUT_MS || process.env.ENKEEP_EXECUTION_BUDGET_MS
+          ? parseInt(
+              process.env.DSH_IDLE_AGENT_TIMEOUT_MS ||
+                process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+                '',
+              10
+            )
+          : undefined,
       mounts: options.mounts ? [...options.mounts] : undefined,
     });
 

@@ -89,6 +89,8 @@ export interface UserSpecOptions {
   llmModel?: string;
   /** Optional in-container providers JSON (injects ENKEEP_LLM_PROVIDERS) */
   llmProviders?: string | Record<string, unknown>;
+  /** Optional idle agent timeout in ms (injects DSH_IDLE_AGENT_TIMEOUT_MS) */
+  idleAgentTimeoutMs?: number;
 }
 
 
@@ -455,6 +457,21 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       DSH_HOME: '/home/dsh/.dsh',
       DSH_SPACES: '/home/dsh/spaces',
     };
+
+    const idleTimeoutVal =
+      options.idleAgentTimeoutMs !== undefined
+        ? options.idleAgentTimeoutMs
+        : process.env.DSH_IDLE_AGENT_TIMEOUT_MS || process.env.ENKEEP_EXECUTION_BUDGET_MS
+          ? parseInt(
+              process.env.DSH_IDLE_AGENT_TIMEOUT_MS ||
+                process.env.ENKEEP_EXECUTION_BUDGET_MS ||
+                '',
+              10
+            )
+          : undefined;
+    if (idleTimeoutVal !== undefined && !isNaN(idleTimeoutVal)) {
+      env.DSH_IDLE_AGENT_TIMEOUT_MS = String(idleTimeoutVal);
+    }
 
     if (isLlmEnabled) {
       env.ENKEEP_LLM_ENABLED = '1';
