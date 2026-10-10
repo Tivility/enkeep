@@ -210,6 +210,31 @@ export class ContinuationWatcher {
 
       this.lastActivityTime = Date.now();
 
+      // Check for background activity events (workflow/subagent start, autonomous continuation turn start)
+      if (this.backgroundPanelManager) {
+        const hasBgActivity = events.some((e) => {
+          if (e.type === 'turn_status' && e.status === 'running') return true;
+          if (e.type === 'tool_status') {
+            const toolLower = e.toolName?.toLowerCase() || '';
+            const isSubagentOrWorkflow =
+              Boolean(e.isSubagent) ||
+              toolLower === 'subagent' ||
+              toolLower === 'subagent_fork' ||
+              toolLower === 'workflow' ||
+              toolLower === 'create_task';
+            if (isSubagentOrWorkflow && (e.status === 'started' || e.status === 'running')) {
+              return true;
+            }
+          }
+          return false;
+        });
+        if (hasBgActivity) {
+          if (this.backgroundPanelManager.hasLatestCard(this.sessionRouteId)) {
+            this.backgroundPanelManager.ensurePolling(this.sessionRouteId, this.replyTarget.chatId);
+          }
+        }
+      }
+
       // Guard against double delivery: if an inbound tracker is currently handling this route,
       // do not open a continuation card. Advance cursor past events to avoid double-processing.
       if (this.hasActiveInboundTracker(this.sessionRouteId)) {

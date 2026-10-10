@@ -636,4 +636,136 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       await transport.stop();
     });
   });
+
+  describe('4. Observability & Self-healing Grace Period', () => {
+    function createMockCardSession(cardId: string, messageId: string) {
+      const updates: Array<string | null> = [];
+      const session: LarkStreamingCardSession = {
+        cardId,
+        messageId,
+        pushText: vi.fn(),
+        finalize: vi.fn(),
+        updateBackgroundPanel: vi.fn(async (panelText: string | null) => {
+          updates.push(panelText);
+        }),
+      };
+      return { session, updates };
+    }
+
+    it('observability: logs console.info only when state changes, and doesn\'t repeat on identical state', async () => {
+      const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+      const sessionRouteId = 'session_route_obs_test_1';
+      const chatContextId = 'oc_test_chat_obs_1';
+
+      const mockTasks: BackgroundTask[] = [
+        {
+          id: 'task_obs_1',
+          shortId: 'o001',
+          kind: 'subagent',
+          name: 'synthetic-worker',
+          status: 'running',
+          startedAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+          stalled: false,
+        },
+      ];
+
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => ({
+          items: mockTasks,
+          updatedAt: new Date().toISOString(),
+          available: true,
+        }),
+        pollIntervalMs: 10_000,
+      });
+
+      const card = createMockCardSession('crd_obs_001', 'om_obs_001');
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_obs_1');
+
+      // Check registerCard & first pollTick logged
+      const loggedTexts1 = infoSpy.mock.calls.map((c) => c[0] as string).filter((s) => s.startsWith('[lark-bg]'));
+      expect(loggedTexts1.some((s) => s.includes('registerCard'))).toBe(true);
+      expect(loggedTexts1.some((s) => s.includes('pollTick') && s.includes('action=update'))).toBe(true);
+
+      const countAfterFirstPoll = loggedTexts1.length;
+
+      // Advance by 10s -> next poll tick, same state -> should NOT log another pollTick
+      await vi.advanceTimersByTimeAsync(10_000);
+      const loggedTexts2 = infoSpy.mock.calls.map((c) => c[0] as string).filter((s) => s.startsWith('[lark-bg]'));
+      expect(loggedTexts2.length).toBe(countAfterFirstPoll);
+
+      // Now state changes: task completes
+      mockTasks[0].status = 'completed';
+      await vi.advanceTimersByTimeAsync(10_000);
+      const loggedTexts3 = infoSpy.mock.calls.map((c) => c[0] as string).filter((s) => s.startsWith('[lark-bg]'));
+      expect(loggedTexts3.length).toBeGreaterThan(countAfterFirstPoll);
+
+      // Finalize turn -> logs onTurnFinalized and stopPolling
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_obs_1');
+      const loggedTexts4 = infoSpy.mock.calls.map((c) => c[0] as string).filter((s) => s.startsWith('[lark-bg]'));
+      expect(loggedTexts4.some((s) => s.includes('onTurnFinalized'))).toBe(true);
+      expect(loggedTexts4.some((s) => s.includes('stopPolling'))).toBe(true);
+
+      manager.dispose();
+      infoSpy.mockRestore();
+    });
+
+    it('self-healing: continues polling during 10-minute grace period after turn finalized when empty and never saw running tasks, stops after 10m', async () => {
+      const sessionRouteId = 'session_route_grace_test_1';
+      const chatContextId = 'oc_test_chat_grace_1';
+      let pollCount = 0;
+
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => {
+          pollCount++;
+          return { items: [], updatedAt: new Date().toISOString(), available: true };
+        },
+        pollIntervalMs: 30_000,
+      });
+
+      const card = createMockCardSession('crd_grace_001', 'om_grace_001');
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_grace_1');
+      expect(pollCount).toBe(1);
+
+      // Finalize turn with empty list and never had running tasks
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_grace_1');
+      expect(pollCount).toBe(2);
+
+      // 5 minutes later: still in 10-minute grace period, polling continues!
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      const pollCountAt5m = pollCount;
+      expect(pollCountAt5m).toBeGreaterThan(2);
+
+      // Advance past 10 minutes total (another 6 minutes) -> grace period expires -> polling stops
+      await vi.advanceTimersByTimeAsync(6 * 60 * 1000);
+      const pollCountAt11m = pollCount;
+
+      // Another 5 minutes -> no further polling calls
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      expect(pollCount).toBe(pollCountAt11m);
+
+      manager.dispose();
+    });
+
+    it('initial card bg_panel element is non-empty string (single space) to prevent Feishu dropping element', async () => {
+      const transport = new FakeLarkTransport();
+      await transport.start();
+
+      const session = await transport.createStreamingCard({
+        chatId: 'oc_test_space_001',
+        title: 'Initial Space Test',
+      });
+      expect(session).not.toBeNull();
+
+      const cardCreate = transport.streamingCalls.find((c) => c.type === 'card_create');
+      expect(cardCreate).toBeDefined();
+
+      const bgElement = cardCreate?.card?.body?.elements?.find((e: any) => e.element_id === 'bg_panel');
+      expect(bgElement).toBeDefined();
+      expect(bgElement.content).toBe(' ');
+      expect(bgElement.content).not.toBe('');
+
+      await transport.stop();
+    });
+  });
 });
