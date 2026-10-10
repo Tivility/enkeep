@@ -584,7 +584,7 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
               console.log(`\nReceived ${sig}, gracefully stopping demo system...`);
             }
             try {
-              await system.close({ removeVolumes: false });
+              await system.close({ removeVolumes: false, retainContainers: true });
               resolve();
             } catch (err) {
               reject(err);

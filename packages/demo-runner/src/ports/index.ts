@@ -65,8 +65,13 @@ import {
   removeSignedVolumeMeta,
   generateRunId,
   VOLUME_ID_REGEX,
+  CONTAINER_ID_64_REGEX,
+  RUN_ID_REGEX,
 } from '../utils/crypto-meta.js';
 import {
+  DEMO_LABEL_KEY,
+  DEMO_LABEL_VALUE,
+  USER_LABEL_KEY,
   RUN_ID_LABEL_KEY,
   VOLUME_ID_LABEL_KEY,
   validateResourceSuffix,
@@ -724,11 +729,60 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
     const expectedVolumeName = tempSpec.volume.volumeName;
 
     // 2. Check for existing signed container & volume metadata
-    const existingContainerMeta = readSignedContainerMeta(tempSpec.containerName, pathOptions);
+    let existingContainerMeta = readSignedContainerMeta(tempSpec.containerName, pathOptions);
     const existingVolMeta = readSignedVolumeMeta(expectedVolumeName, pathOptions);
+    if (existingVolMeta) {
+      if (existingVolMeta.userId !== options.userId) {
+        throw new Error('FAIL-CLOSED: Signed volume metadata userId mismatch');
+      }
+      if (existingVolMeta.volumeName !== expectedVolumeName) {
+        throw new Error('FAIL-CLOSED: Signed volume metadata volumeName mismatch');
+      }
+      if (!existingVolMeta.volumeId || typeof existingVolMeta.volumeId !== 'string' || !VOLUME_ID_REGEX.test(existingVolMeta.volumeId)) {
+        throw new Error('FAIL-CLOSED: Signed volume metadata has invalid volumeId format');
+      }
+    }
     let isOwnedVolumeResume = Boolean(existingVolMeta);
 
     const existingContainer = await this.client.inspectContainer(tempSpec.containerName);
+
+    // If metadata was missing or corrupted but the container is running and satisfies full platform ownership, adopt/re-sign metadata
+    if (!existingContainerMeta && existingContainer && existingContainer.state === 'running') {
+      const containerLabels = existingContainer.labels || {};
+      const containerRunId = containerLabels[RUN_ID_LABEL_KEY];
+      const containerVolId = containerLabels[VOLUME_ID_LABEL_KEY];
+      const isPlatformContainer =
+        containerLabels[DEMO_LABEL_KEY] === DEMO_LABEL_VALUE &&
+        containerLabels[USER_LABEL_KEY] === options.userId &&
+        Boolean(containerRunId && RUN_ID_REGEX.test(containerRunId)) &&
+        Boolean(containerVolId && VOLUME_ID_REGEX.test(containerVolId)) &&
+        CONTAINER_ID_64_REGEX.test(existingContainer.id);
+
+      if (isPlatformContainer) {
+        try {
+          existingContainerMeta = writeSignedContainerMeta(
+            {
+              userId: options.userId,
+              containerName: tempSpec.containerName,
+              containerId: existingContainer.id,
+              image: existingContainer.image || options.image || 'enkeep-demo-runtime:latest',
+              volumeName: expectedVolumeName,
+              volumeId: containerVolId,
+              labels: {
+                ...containerLabels,
+                [DEMO_LABEL_KEY]: DEMO_LABEL_VALUE,
+                [USER_LABEL_KEY]: options.userId,
+                [RUN_ID_LABEL_KEY]: containerRunId,
+                [VOLUME_ID_LABEL_KEY]: containerVolId,
+              },
+              runId: containerRunId,
+            },
+            pathOptions
+          );
+        } catch {}
+      }
+    }
+
     let isExistingContainerReconnect = Boolean(
       existingContainerMeta &&
       existingContainer &&
@@ -758,21 +812,6 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       selectedVolumeId = existingContainerMeta!.volumeId;
       finalRunId = existingContainerMeta!.runId;
     } else if (existingVolMeta) {
-      if (existingVolMeta.userId !== options.userId) {
-        throw new Error(
-          'FAIL-CLOSED: Signed volume metadata userId mismatch'
-        );
-      }
-      if (existingVolMeta.volumeName !== expectedVolumeName) {
-        throw new Error(
-          'FAIL-CLOSED: Signed volume metadata volumeName mismatch'
-        );
-      }
-      if (!existingVolMeta.volumeId || typeof existingVolMeta.volumeId !== 'string' || !VOLUME_ID_REGEX.test(existingVolMeta.volumeId)) {
-        throw new Error(
-          'FAIL-CLOSED: Signed volume metadata has invalid volumeId format'
-        );
-      }
       selectedVolumeId = existingVolMeta.volumeId;
       finalRunId = generateRunId();
     } else {
@@ -976,7 +1015,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
           userId: options.userId,
           containerName: spec.containerName,
           containerId: activeHandle.containerId,
-          image: spec.image,
+          image: existingContainer?.image || existingContainerMeta?.image || spec.image,
           volumeName: spec.volume.volumeName,
           volumeId: spec.volume.volumeId,
           labels: {
