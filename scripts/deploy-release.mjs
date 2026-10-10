@@ -635,6 +635,59 @@ export async function executeRollback(config) {
   console.log('✓ Rollback completed successfully.');
 }
 
+export function verifyContainers(psOutput, containerNamePrefix, targetImageTag, isSplitMode = false, port = null) {
+  const lines = (psOutput || '').split('\n').filter(Boolean);
+  const matchingContainers = [];
+  for (const line of lines) {
+    const [name, img, status] = line.split('\t');
+    if (name && name.startsWith(containerNamePrefix)) {
+      matchingContainers.push({ name, img, status: status || '' });
+    }
+  }
+
+  if (isSplitMode) {
+    // split mode: check all matching containers are running
+    for (const c of matchingContainers) {
+      console.log(`Container ${c.name} is running image: ${c.img} (status: ${c.status || 'running'})`);
+      if (c.status && !c.status.toLowerCase().startsWith('up')) {
+        throw new Error(`Container ${c.name} is not in running state (status: ${c.status})`);
+      }
+    }
+    // Query GET /api/admin/runtime/upgrade-status if port is provided
+    if (port) {
+      try {
+        const out = execSync(`curl -s -f "http://127.0.0.1:${port}/api/admin/runtime/upgrade-status"`, { encoding: 'utf8' });
+        const json = JSON.parse(out);
+        if (json && json.success && Array.isArray(json.data)) {
+          console.log('\n--- Runtime Upgrade Status Summary ---');
+          if (json.data.length === 0) {
+            console.log('No active user runtimes reported.');
+          } else {
+            for (const st of json.data) {
+              const current = st.currentImage || st.currentDaemonCliPath || 'unknown';
+              const target = st.targetImage || st.targetDaemonCliPath || 'unknown';
+              const pendingReason = st.pendingReason !== undefined ? st.pendingReason : 'none';
+              console.log(`- Runtime [${st.userId || 'unknown'}] (${st.mode || 'container'}): current=${current}, target=${target}, pendingReason=${pendingReason}`);
+            }
+          }
+        } else {
+          console.log('Notice: /api/admin/runtime/upgrade-status returned unexpected format, skipping status summary.');
+        }
+      } catch {
+        console.log('Notice: /api/admin/runtime/upgrade-status endpoint unavailable, skipping runtime status summary.');
+      }
+    }
+  } else {
+    // full mode: strict check matching targetImageTag
+    for (const c of matchingContainers) {
+      console.log(`Container ${c.name} is using image: ${c.img}`);
+      if (targetImageTag && c.img !== targetImageTag && !c.img.includes(targetImageTag)) {
+        throw new Error(`Container ${c.name} is running image ${c.img}, expected ${targetImageTag}`);
+      }
+    }
+  }
+}
+
 export async function executeVerify(config, expectedImageTag = null, preSwitchConnCounts = null) {
   const {
     port,
@@ -644,7 +697,11 @@ export async function executeVerify(config, expectedImageTag = null, preSwitchCo
     dataDir,
     preflightDueMinutes = 10,
     dryRun,
+    mode,
+    only,
   } = config;
+
+  const isSplitMode = mode !== 'full';
 
   console.log('================================================================');
   console.log('  Enkeep Deployment Verification                                ');
@@ -655,7 +712,11 @@ export async function executeVerify(config, expectedImageTag = null, preSwitchCo
     console.log(`  - CSRF endpoint 200 on port ${port}`);
     console.log(`  - Port processes (port ${port}, proxy ${proxyPort}) have PPID=1 (launchd)`);
     console.log(`  - Port ${port} and proxy ${proxyPort} return HTTP 200`);
-    console.log(`  - Docker containers matching prefix "${containerNamePrefix}" match expected image`);
+    if (isSplitMode) {
+      console.log(`  - Docker containers matching prefix "${containerNamePrefix}" are running (split mode, runtime auto-upgrade via platform)`);
+    } else {
+      console.log(`  - Docker containers matching prefix "${containerNamePrefix}" match expected image`);
+    }
     console.log(`  - Established external connections match pre-switch counts within 120s`);
     console.log(`  - Single-shot preflight check is quiescent`);
     return;
@@ -725,22 +786,11 @@ export async function executeVerify(config, expectedImageTag = null, preSwitchCo
     }
     console.log('✓ HTTP endpoints responded successfully.');
 
-    // 4. Check docker containers matching prefix CONTAINER_NAME_PREFIX use new image
-    console.log(`\n[Verify 4/6] Checking containers starting with prefix "${containerNamePrefix}"...`);
-    if (targetImageTag) {
-      const psOut = execSync(`docker ps --format "{{.Names}}\t{{.Image}}" 2>/dev/null || true`, { encoding: 'utf8' }).trim();
-      const lines = psOut.split('\n').filter(Boolean);
-      for (const line of lines) {
-        const [name, img] = line.split('\t');
-        if (name && name.startsWith(containerNamePrefix)) {
-          console.log(`Container ${name} is using image: ${img}`);
-          if (img !== targetImageTag && !img.includes(targetImageTag)) {
-            throw new Error(`Container ${name} is running image ${img}, expected ${targetImageTag}`);
-          }
-        }
-      }
-    }
-    console.log('✓ Docker container images verified.');
+    // 4. Check docker containers matching prefix CONTAINER_NAME_PREFIX
+    console.log(`\n[Verify 4/6] Checking containers starting with prefix "${containerNamePrefix}" (mode: ${isSplitMode ? 'split' : 'full'})...`);
+    const psOut = execSync(`docker ps --format "{{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null || true`, { encoding: 'utf8' }).trim();
+    verifyContainers(psOut, containerNamePrefix, targetImageTag, isSplitMode, port);
+    console.log('✓ Docker container verification completed.');
 
     // 5. Connection counts check
     console.log(`\n[Verify 5/6] Checking established connection count (waiting up to 120s for match)...`);
@@ -1344,7 +1394,7 @@ export async function executePlatformDeploy(config, options = {}) {
   }, dryRun);
 
   // Step 6: Post-Deployment Verification
-  await executeVerify(config, imageTag, preSwitchConnCount);
+  await executeVerify({ ...config, mode: options.mode === 'full' ? 'full' : 'split' }, imageTag, preSwitchConnCount);
 
   console.log('\n================================================================');
   console.log(`✓ Release ${releaseId} deployed and verified successfully!`);
