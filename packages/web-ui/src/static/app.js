@@ -17524,7 +17524,9 @@ async function handleSteerMessage() {
       }
     }, 300);
   } catch (err) {
-    if (err && err.status === 409) {
+    if (err && (err.code === 'RUNTIME_UPGRADE_REQUIRED' || (typeof err.message === 'string' && err.message.includes('该会话运行时升级后可用')))) {
+      showToast(tr('chat.runtimeUpgradeRequired', null, '该会话运行时升级后可用'), 'warning');
+    } else if (err && err.status === 409) {
       showToast(tr('chat.queuedTurnEnded', null, 'Current turn has ended. Input retained.'), 'warning');
       if (state.currentSessionId === sessionId) {
         syncActiveTurnStatus(sessionId);

@@ -22,3 +22,4 @@ export * from './mcp.js';
 export * from './channel.js';
 export * from './cache-retention.js';
 export * from './context-window.js';
+export * from './runtime-version.js';

@@ -186,6 +186,7 @@ import {
 } from '../runtime/provider-registry.js';
 import type { RuntimeMountReconciler, BrowserService, PlatformProxyMcpService } from '@enkeep/platform-core';
 import { SpaceMountService } from '../mounts/space-mount-service.js';
+import { RuntimeAutoUpgrader } from '../runtime/auto-upgrader.js';
 
 export class PlatformConfigurationError extends PlatformError {
   constructor(message: string, code = 'CONFIGURATION_ERROR') {
@@ -273,6 +274,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'pipelineManifestPath',
   'pipelineTaskPreparer',
   'prepareTaskInput',
+  'runtimeAutoUpgrader',
 ]);
 
 const ALLOWED_LIMITS_OPTIONS = new Set([
@@ -418,6 +420,8 @@ export interface PlatformServerOptions {
   browserService?: BrowserService;
   /** Optional MCP execution and process pool service */
   mcpService?: PlatformProxyMcpService;
+  /** Optional runtime auto-upgrader background service */
+  runtimeAutoUpgrader?: RuntimeAutoUpgrader;
   /** Optional channel management service */
   channelService?: ChannelManagementService;
   /** Optional channel management routes */
@@ -518,6 +522,7 @@ export class PlatformServer {
   public readonly spaceMountService?: SpaceMountService;
   public readonly browserService?: BrowserService;
   public readonly mcpService?: PlatformProxyMcpService;
+  public readonly runtimeAutoUpgrader?: RuntimeAutoUpgrader;
   public readonly dshHome: string;
   public readonly dataRoot?: string;
 
@@ -1083,6 +1088,15 @@ export class PlatformServer {
       options.channelRoutes ??
       new ChannelRoutes(this.channelService, this.csrfToken, this.larkOnboardingService, this.wechatOnboardingService);
 
+    // Initialize RuntimeAutoUpgrader
+    this.runtimeAutoUpgrader =
+      options.runtimeAutoUpgrader ??
+      new RuntimeAutoUpgrader({
+        db,
+        managementProvider: this.managementProvider,
+        deliveryGateway: this.runtimeGateway as any,
+      });
+
     // 8. Construct HTTP Request Handler with all injected and adapted operational services
     this.handler = createPlatformServerHandler({
       database: db,
@@ -1372,6 +1386,11 @@ export class PlatformServer {
         await this.wechatRuntimeManager.start();
       }
 
+      // 5.7 Start Runtime Auto-Upgrader
+      if (this.runtimeAutoUpgrader) {
+        this.runtimeAutoUpgrader.start();
+      }
+
       // 6. Bind listener
       await new Promise<void>((resolve, reject) => {
         server.once('error', reject);
@@ -1560,6 +1579,9 @@ export class PlatformServer {
 
       this.runtimeDiagnosticsService.stopCleanupWorker();
       this.taskNotificationService.stopRetryWorker();
+      if (this.runtimeAutoUpgrader) {
+        this.runtimeAutoUpgrader.stop();
+      }
 
       // 2.5 Stop channel runtime manager
       if (this.channelRuntimeManager) {

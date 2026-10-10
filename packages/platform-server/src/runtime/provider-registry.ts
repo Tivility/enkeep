@@ -841,6 +841,50 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
     }
     return null;
   }
+
+  async getTargetVersion(): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord | null> {
+    for (const provider of this.registry.listProviders()) {
+      if (provider.managementProvider?.getTargetVersion) {
+        try {
+          const res = await provider.managementProvider.getTargetVersion();
+          if (res) return res;
+        } catch {}
+      }
+    }
+    return null;
+  }
+
+  async setTargetVersion(input: {
+    image?: string | null;
+    daemonCliPath?: string | null;
+    updatedBy?: string | null;
+  }): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord> {
+    let lastResult: import('@enkeep/platform-core').RuntimeTargetVersionRecord | null = null;
+    for (const provider of this.registry.listProviders()) {
+      if (provider.managementProvider?.setTargetVersion) {
+        try {
+          lastResult = await provider.managementProvider.setTargetVersion(input);
+        } catch {}
+      }
+    }
+    if (lastResult) return lastResult;
+    throw new PlatformError('No runtime provider configured to set target version', 'UNAVAILABLE', 503);
+  }
+
+  async getUpgradeStatus(): Promise<import('@enkeep/platform-core').UserRuntimeUpgradeStatus[]> {
+    const statuses: import('@enkeep/platform-core').UserRuntimeUpgradeStatus[] = [];
+    for (const provider of this.registry.listProviders()) {
+      if (provider.managementProvider?.getUpgradeStatus) {
+        try {
+          const res = await provider.managementProvider.getUpgradeStatus();
+          if (Array.isArray(res)) {
+            statuses.push(...res);
+          }
+        } catch {}
+      }
+    }
+    return statuses;
+  }
 }
 
 /**

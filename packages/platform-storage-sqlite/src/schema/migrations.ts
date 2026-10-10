@@ -1600,6 +1600,21 @@ ALTER TABLE session_routes ADD COLUMN context_window INTEGER;
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_041_RUNTIME_TARGET_VERSION_SQL = `
+-- Migration 41: Durable target runtime version configuration
+CREATE TABLE IF NOT EXISTS runtime_target_version (
+  id TEXT PRIMARY KEY DEFAULT 'default',
+  image TEXT,
+  daemon_cli_path TEXT,
+  updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_target_version_updated_by ON runtime_target_version(updated_by);
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,
