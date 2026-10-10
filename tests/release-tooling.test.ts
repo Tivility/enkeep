@@ -20,6 +20,7 @@ import {
   executePlatformDeploy,
   formatUtcTimestamp,
   findLatestPlistBackup,
+  verifyContainers,
 } from '../scripts/deploy-release.mjs';
 import { planPruneWorktrees, executePrune } from '../scripts/prune-release-worktrees.mjs';
 import * as fs from 'node:fs';
@@ -656,6 +657,47 @@ describe('Deploy Tooling Enhancements', () => {
         await expect(executeDeploy(config)).resolves.toBeDefined();
 
         fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      describe('verifyContainers in split and full modes', () => {
+        it('full mode requires all matching containers to run target image', () => {
+          const psOut = [
+            'enkeep-test-user1\tenkeep-runtime:target-img\tUp 2 hours',
+            'enkeep-test-user2\tenkeep-runtime:target-img\tUp 10 minutes',
+          ].join('\n');
+          expect(() => verifyContainers(psOut, 'enkeep-test-', 'enkeep-runtime:target-img', false)).not.toThrow();
+
+          const psOutOutdated = [
+            'enkeep-test-user1\tenkeep-runtime:target-img\tUp 2 hours',
+            'enkeep-test-user2\tenkeep-runtime:old-img\tUp 10 minutes',
+          ].join('\n');
+          expect(() => verifyContainers(psOutOutdated, 'enkeep-test-', 'enkeep-runtime:target-img', false))
+            .toThrow(/running image enkeep-runtime:old-img, expected enkeep-runtime:target-img/);
+        });
+
+        it('split mode only requires containers to be running and ignores outdated image', () => {
+          const psOutOutdated = [
+            'enkeep-test-user1\tenkeep-runtime:target-img\tUp 2 hours',
+            'enkeep-test-user2\tenkeep-runtime:old-img\tUp 10 minutes',
+          ].join('\n');
+          // In split mode, outdated image should NOT throw
+          expect(() => verifyContainers(psOutOutdated, 'enkeep-test-', 'enkeep-runtime:target-img', true)).not.toThrow();
+        });
+
+        it('split mode fails if any matching container is not running', () => {
+          const psOutStopped = [
+            'enkeep-test-user1\tenkeep-runtime:old-img\tUp 2 hours',
+            'enkeep-test-user2\tenkeep-runtime:old-img\tExited (0) 5 minutes ago',
+          ].join('\n');
+          expect(() => verifyContainers(psOutStopped, 'enkeep-test-', 'enkeep-runtime:target-img', true))
+            .toThrow(/is not in running state/);
+        });
+
+        it('split mode gracefully handles upgrade-status endpoint query', () => {
+          const psOut = 'enkeep-test-user1\tenkeep-runtime:old-img\tUp 3 hours';
+          // With non-existent port, should skip gracefully and not throw
+          expect(() => verifyContainers(psOut, 'enkeep-test-', 'enkeep-runtime:target-img', true, 59999)).not.toThrow();
+        });
       });
     });
   });
