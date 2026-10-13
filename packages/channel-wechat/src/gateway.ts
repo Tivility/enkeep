@@ -540,7 +540,9 @@ export class WeChatChannelGateway {
         });
       }
 
-      // 3. Create pending outbox item with clean plain text payload
+      // 3. Create the outbox item already claimed as 'sending': the runtime's periodic redrive
+      //    resends 'pending' rows, so a pending row here would be sent twice when a redrive
+      //    tick lands while this send is in flight.
       let outboxItem = await this.channelRepo.createOutboxItem({
         id: outboxId,
         accountId: this.accountId,
@@ -553,7 +555,7 @@ export class WeChatChannelGateway {
           text: plainText,
           turnId: params.turnId,
         }),
-        status: 'pending',
+        status: 'sending',
       });
 
       // 4. Send reply via transport with length splitting per HappyClaw
@@ -646,7 +648,8 @@ export class WeChatChannelGateway {
         isImage,
         turnId: params.turnId,
       }),
-      status: 'pending',
+      // Claimed while in flight so the runtime's periodic redrive does not resend it.
+      status: 'sending',
     });
 
     try {

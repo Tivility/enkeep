@@ -2330,6 +2330,11 @@ export class RuntimeDaemon extends EventEmitter {
           if (!task.finishedAt) task.finishedAt = new Date().toISOString();
         }
 
+        // Agents launched by a workflow are reported through the workflow's own progress line.
+        if (task.kind === 'subagent' && this.workflowAgentChildIds.has(id)) {
+          continue;
+        }
+
         // Exclude finished foreground one-shots (not continuable, not run_in_background)
         if (task.kind === 'subagent' && task.status !== 'running') {
           if (task.mode === 'one-shot' && !task.isBackground) {

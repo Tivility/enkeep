@@ -1045,6 +1045,19 @@ export class WeChatRuntimeManager {
             continue;
           }
 
+          // Claim the row before sending so overlapping ticks or an in-flight first send
+          // cannot deliver the same reply twice.
+          const claimed = this.db
+            .prepare(`
+              UPDATE channel_outbox
+              SET status = 'sending', updated_at = CURRENT_TIMESTAMP
+              WHERE id = ? AND status IN ('pending', 'failed')
+            `)
+            .run(row.id);
+          if (claimed.changes !== 1) {
+            continue;
+          }
+
           const res = await gateway.transport.sendReply(toUserId, contextToken, text);
           if (res.success) {
             this.db
@@ -1058,7 +1071,7 @@ export class WeChatRuntimeManager {
             this.db
               .prepare(`
                 UPDATE channel_outbox
-                SET attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
+                SET status = 'failed', attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
               `)
               .run(row.id);
@@ -1067,7 +1080,7 @@ export class WeChatRuntimeManager {
           this.db
             .prepare(`
               UPDATE channel_outbox
-              SET attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
+              SET status = 'failed', attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
               WHERE id = ?
             `)
             .run(row.id);
