@@ -434,6 +434,39 @@ describe('WeChatChannelGateway', () => {
     expect(reply.text).toBe('Hello Carol! This is assistant replying via WeChat.');
   });
 
+  it('keeps the outbox row claimed as sending while the reply is in flight', async () => {
+    const gateway = new WeChatChannelGateway({
+      account: testAccount,
+      transport: fakeTransport,
+      channelRepo: mockChannelRepo,
+      sessionRouteRepo: mockSessionRouteRepo,
+      spaceRepo: mockSpaceRepo,
+      runtimeGateway: mockRuntimeGateway,
+      contextTokenStore,
+    });
+    const inboundResult = await gateway.handleInboundMessage(sampleParsedMessage);
+
+    // Observe the row status at the moment the transport is called. A 'pending' row here
+    // is picked up by the runtime's periodic redrive and sent a second time.
+    let statusDuringSend: string | undefined;
+    const originalSendReply = fakeTransport.sendReply.bind(fakeTransport);
+    fakeTransport.sendReply = async (toUserId: string, contextToken: string, text: string) => {
+      statusDuringSend = (await mockChannelRepo.findOutboxById('out_wechat_turn_inflight_001'))?.status;
+      return originalSendReply(toUserId, contextToken, text);
+    };
+
+    const outboxItem = await gateway.handleTurnCompleted({
+      sessionId: inboundResult.sessionRouteId!,
+      turnId: 'turn_inflight_001',
+      replyText: 'Single delivery check.',
+      nativeEventId: sampleParsedMessage.messageId,
+    });
+
+    expect(statusDuringSend).toBe('sending');
+    expect(outboxItem?.status).toBe('delivered');
+    expect(fakeTransport.sentReplies.length).toBe(1);
+  });
+
   it('records outbox failure when context_token is missing', async () => {
     const emptyContextStore = new ContextTokenStore();
     const gateway = new WeChatChannelGateway({
