@@ -93,7 +93,6 @@ export function formatBackgroundTaskLine(
 
 export interface FormatBackgroundPanelOptions {
   activeTurnCompletedTaskIds?: Set<string>;
-  seenRunningTaskIds?: Set<string>;
   now?: number;
 }
 
@@ -154,7 +153,6 @@ interface ChatSessionState {
   latestCard: ChatCardRecord | null;
   previousCards: ChatCardRecord[];
   activeTurnCompletedTaskIds: Set<string>;
-  seenRunningTaskIds: Set<string>;
   activeTurnId?: string;
   pollTimer: NodeJS.Timeout | null;
   isPolling: boolean;
@@ -193,7 +191,6 @@ export class LarkBackgroundPanelManager {
         latestCard: null,
         previousCards: [],
         activeTurnCompletedTaskIds: new Set<string>(),
-        seenRunningTaskIds: new Set<string>(),
         activeTurnId: undefined,
         pollTimer: null,
         isPolling: false,
@@ -219,9 +216,21 @@ export class LarkBackgroundPanelManager {
     if (this.isDisposed) return;
     const state = this.getOrCreateState(sessionRouteId, chatContextId);
 
-    // 1. Handoff from previous card
-    if (state.latestCard && state.latestCard.cardSession !== cardSession) {
-      const prevCard = state.latestCard;
+    // 1. Make the new card the latest before touching the previous one, so a poll that
+    //    lands during the handoff writes to the new card and cannot overwrite the collapse.
+    const prevCard =
+      state.latestCard && state.latestCard.cardSession !== cardSession ? state.latestCard : null;
+    state.latestCard = {
+      cardSession,
+      turnId,
+      launchedTaskIds: new Set<string>(),
+    };
+    state.activeTurnId = turnId;
+    state.turnFinalizedAt = undefined;
+    state.activeTurnCompletedTaskIds = new Set<string>();
+
+    // 2. Handoff from previous card
+    if (prevCard) {
       state.previousCards.push(prevCard);
 
       const launchedCount = prevCard.launchedTaskIds.size;
@@ -244,16 +253,6 @@ export class LarkBackgroundPanelManager {
         }
       }
     }
-
-    // 2. Set new card as latest
-    state.latestCard = {
-      cardSession,
-      turnId,
-      launchedTaskIds: new Set<string>(),
-    };
-    state.activeTurnId = turnId;
-    state.turnFinalizedAt = undefined;
-    state.activeTurnCompletedTaskIds = new Set<string>();
 
     const regLog = `registerCard session=${hashRouteId(sessionRouteId)} turn=${turnId ?? 'none'}`;
     if (state.lastLoggedRegisterState !== regLog) {
@@ -342,71 +341,32 @@ export class LarkBackgroundPanelManager {
         }
       }
 
-      // Maintain seenRunningTaskIds: "only records tasks that were running when last seen"
-      // Each poll:
-      // 1. If present in list and status is terminal -> remove from seenRunningTaskIds
-      // 2. If present and running -> add to seenRunningTaskIds
-      const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
-      const currentTaskMap = new Map(tasks.map((t) => [t.id, t]));
-
-      for (const t of tasks) {
-        if (terminalStatuses.has(t.status)) {
-          state.seenRunningTaskIds.delete(t.id);
-        } else if (t.status === 'running') {
-          state.seenRunningTaskIds.add(t.id);
-        }
-      }
-
       const hasRunning = tasks.some((t) => t.status === 'running');
       if (hasRunning) {
         state.hadRunningTasks = true;
       }
 
-      // Check whether any task currently in seenRunningTaskIds is missing from current tasks
-      // (a task in seenRunningTaskIds was running when last seen; if it disappears from the list, it's missing unconfirmed)
-      let hasMissingSeenTask = false;
-      for (const seenId of state.seenRunningTaskIds) {
-        if (!currentTaskMap.has(seenId)) {
-          hasMissingSeenTask = true;
-          break;
-        }
-      }
-
       const turnActive = Boolean(state.activeTurnId);
-      let action: 'update' | 'unconfirmed' | 'clear' | 'none' = 'none';
+      let action: 'update' | 'ended' | 'none' = 'none';
 
-      // Format and update panel on latest card
-      if (hasMissingSeenTask) {
-        action = 'unconfirmed';
-        // A seen running task disappeared without terminal state: retain previous text and append note, continue polling
-        const baseText = state.lastPanelText || (tasks.length > 0 ? formatBackgroundPanel(tasks, {
-          activeTurnCompletedTaskIds: state.activeTurnCompletedTaskIds,
-          seenRunningTaskIds: state.seenRunningTaskIds,
-        }) : '**🔄 后台任务**');
-        const unconfirmedSuffix = '（部分任务状态未确认）';
-        const panelText = baseText.endsWith(unconfirmedSuffix) ? baseText : `${baseText}\n${unconfirmedSuffix}`;
-        state.lastPanelText = panelText;
-
-        if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
-          await state.latestCard.cardSession.updateBackgroundPanel(panelText);
-        }
-      } else if (tasks.length > 0) {
+      // The runtime list is authoritative: tasks that finished leave it (finished foreground
+      // and workflow-internal agents are not listed), so the panel always renders what is
+      // currently reported instead of keeping an older snapshot.
+      if (tasks.length > 0) {
         action = 'update';
         const panelText = formatBackgroundPanel(tasks, {
           activeTurnCompletedTaskIds: state.activeTurnCompletedTaskIds,
-          seenRunningTaskIds: state.seenRunningTaskIds,
         });
         state.lastPanelText = panelText;
-
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
           await state.latestCard.cardSession.updateBackgroundPanel(panelText);
         }
-      } else if (state.hadRunningTasks && !turnActive) {
-        action = 'clear';
-        // If turn has finalized and task list is empty with no seen running tasks unconfirmed, clear panel
-        state.lastPanelText = undefined;
+      } else if (state.hadRunningTasks) {
+        action = 'ended';
+        const panelText = '后台任务已结束';
+        state.lastPanelText = panelText;
         if (typeof state.latestCard.cardSession.updateBackgroundPanel === 'function') {
-          await state.latestCard.cardSession.updateBackgroundPanel(null);
+          await state.latestCard.cardSession.updateBackgroundPanel(panelText);
         }
         state.hadRunningTasks = false;
       }
@@ -421,7 +381,7 @@ export class LarkBackgroundPanelManager {
         Date.now() - state.turnFinalizedAt < GRACE_PERIOD_MS;
 
       const runningCount = tasks.filter((t) => t.status === 'running').length;
-      const shouldPoll = hasRunning || turnActive || hasMissingSeenTask || inGracePeriod;
+      const shouldPoll = hasRunning || turnActive || inGracePeriod;
 
       const tickLog = `pollTick session=${hashRouteId(sessionRouteId)} available=${res?.available ?? true} items=${tasks.length} running=${runningCount} action=${action} continuePolling=${shouldPoll}`;
       if (state.lastLoggedPollState !== tickLog) {

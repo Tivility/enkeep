@@ -396,64 +396,71 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       manager.dispose();
     });
 
-    it('retains panel and appends unconfirmed status when running task disappears without terminal status, continuing polling', async () => {
-      const sessionRouteId = 'session_route_test_unconfirmed';
-      const chatContextId = 'oc_test_chat_unconfirmed';
+    it('re-renders the current list when tasks leave it, never freezing an older snapshot', async () => {
+      const sessionRouteId = 'session_route_test_rerender';
+      const chatContextId = 'oc_test_chat_rerender';
+      const base = { startedAt: new Date().toISOString(), lastActivityAt: new Date().toISOString(), stalled: false, originTurnId: 'turn_rr_1' };
       let currentTasks: BackgroundTask[] = [
-        {
-          id: 'task_running_001',
-          shortId: 'r001',
-          kind: 'workflow',
-          name: 'active-workflow',
-          status: 'running',
-          startedAt: new Date().toISOString(),
-          lastActivityAt: new Date().toISOString(),
-          stalled: false,
-          originTurnId: 'turn_rfc_1',
-        },
+        { ...base, id: 'wf_001', shortId: 'w001', kind: 'workflow', name: 'citations', status: 'running', progress: { agentsDone: 0, agentsTotal: 2 } },
+        { ...base, id: 'sa_001', shortId: 's001', kind: 'subagent', name: 'helper', status: 'running' },
       ];
-
-      const card = createMockCardSession('crd_rfc_001', 'om_msg_rfc_001');
+      const card = createMockCardSession('crd_rr_001', 'om_msg_rr_001');
       const manager = new LarkBackgroundPanelManager({
-        getBackgroundTasks: async () => {
-          return { items: currentTasks, updatedAt: new Date().toISOString(), available: true };
-        },
+        getBackgroundTasks: async () => ({ items: currentTasks, updatedAt: new Date().toISOString(), available: true }),
         pollIntervalMs: 30_000,
       });
 
-      // Register card in an active turn
-      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_rfc_1');
-      expect(card.updates[card.updates.length - 1]).toContain('[workflow] active-workflow · running');
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_rr_1');
+      expect(card.updates[card.updates.length - 1]).toContain('[subagent] helper · running');
 
-      // Now simulate task disappearing without terminal status
+      // The helper finishes and leaves the list; workflow progress advances.
+      currentTasks = [{ ...currentTasks[0], progress: { agentsDone: 1, agentsTotal: 2 } }];
+      await vi.advanceTimersByTimeAsync(30_000);
+      const latest = card.updates[card.updates.length - 1];
+      expect(latest).toContain('1/2 agents');
+      expect(latest).not.toContain('helper');
+      expect(latest).not.toContain('未确认');
+
+      // Everything leaves the list after it ran: neutral end line, no false "all completed" claim.
       currentTasks = [];
       await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates[card.updates.length - 1]).toBe('后台任务已结束');
 
-      // It must NOT report "✅ 后台任务已全部完成", but append unconfirmed note and retain text
-      expect(card.updates[card.updates.length - 1]).not.toBe('✅ 后台任务已全部完成');
-      expect(card.updates[card.updates.length - 1]).toContain('（部分任务状态未确认）');
+      manager.dispose();
+    });
 
-      // Turn finalized while still unconfirmed -> remains unconfirmed, polling continues
-      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_rfc_1');
-      expect(card.updates[card.updates.length - 1]).toContain('（部分任务状态未确认）');
+    it('collapses the previous card even when a poll lands during the handoff', async () => {
+      const sessionRouteId = 'session_route_test_handoff_race';
+      const chatContextId = 'oc_test_chat_handoff_race';
+      const running: BackgroundTask = {
+        id: 'wf_002', shortId: 'w002', kind: 'workflow', name: 'long-run', status: 'running',
+        startedAt: new Date().toISOString(), lastActivityAt: new Date().toISOString(), stalled: false, originTurnId: 'turn_hr_1',
+      };
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => ({ items: [running], updatedAt: new Date().toISOString(), available: true }),
+        pollIntervalMs: 30_000,
+      });
+      const oldCard = createMockCardSession('crd_hr_old', 'om_msg_hr_old');
+      await manager.registerCard(sessionRouteId, chatContextId, oldCard.session, 'turn_hr_1');
+      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_hr_1');
 
-      // Later task reappears with terminal status completed
-      currentTasks = [
-        {
-          id: 'task_running_001',
-          shortId: 'r001',
-          kind: 'workflow',
-          name: 'active-workflow',
-          status: 'completed',
-          startedAt: new Date().toISOString(),
-          finishedAt: new Date().toISOString(),
-          lastActivityAt: new Date().toISOString(),
-          stalled: false,
-          originTurnId: 'turn_rfc_1',
-        },
-      ];
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(card.updates[card.updates.length - 1]).toBe('✅ 后台任务已全部完成');
+      // Slow down the collapse write on the old card and fire a poll while it is in flight.
+      const originalUpdate = oldCard.session.updateBackgroundPanel!;
+      let releaseCollapse: () => void = () => {};
+      oldCard.session.updateBackgroundPanel = async (text: string | null) => {
+        if (text && text.startsWith('本轮启动了')) {
+          await new Promise<void>((resolve) => { releaseCollapse = resolve; });
+        }
+        return originalUpdate(text);
+      };
+      const newCard = createMockCardSession('crd_hr_new', 'om_msg_hr_new');
+      const registering = manager.registerCard(sessionRouteId, chatContextId, newCard.session, 'turn_hr_2');
+      await manager.pollTick(sessionRouteId, chatContextId);
+      releaseCollapse();
+      await registering;
+
+      expect(oldCard.updates[oldCard.updates.length - 1]).toBe('本轮启动了 1 个后台任务，进度见最新消息');
+      expect(newCard.updates[newCard.updates.length - 1]).toContain('[workflow] long-run · running');
 
       manager.dispose();
     });
@@ -507,51 +514,6 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       for (const update of card.updates) {
         expect(update).not.toContain('部分任务状态未确认');
       }
-
-      manager.dispose();
-    });
-
-    it('running task disappears while still running -> marks unconfirmed and continues polling', async () => {
-      const sessionRouteId = 'session_route_test_running_disappear';
-      const chatContextId = 'oc_test_chat_running_disappear';
-      let pollCount = 0;
-      let currentTasks: BackgroundTask[] = [
-        {
-          id: 'task_disappear_001',
-          shortId: 'd001',
-          kind: 'subagent',
-          name: 'worker-abrupt-exit',
-          status: 'running',
-          startedAt: new Date(Date.now() - 10000).toISOString(),
-          lastActivityAt: new Date().toISOString(),
-          stalled: false,
-        },
-      ];
-
-      const card = createMockCardSession('crd_rd_001', 'om_msg_rd_001');
-      const manager = new LarkBackgroundPanelManager({
-        getBackgroundTasks: async () => {
-          pollCount++;
-          return { items: currentTasks, updatedAt: new Date().toISOString(), available: true };
-        },
-        pollIntervalMs: 30_000,
-      });
-
-      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_rd_1');
-      expect(card.updates[card.updates.length - 1]).toContain('worker-abrupt-exit · running');
-
-      // Finalize turn, but task was still running
-      await manager.onTurnFinalized(sessionRouteId, chatContextId, 'turn_rd_1');
-
-      // Task abruptly disappears from list while it was running
-      currentTasks = [];
-      const pollCountBefore = pollCount;
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(card.updates[card.updates.length - 1]).toContain('部分任务状态未确认');
-
-      // Should continue polling because of unconfirmed disappeared running task
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(pollCount).toBeGreaterThan(pollCountBefore + 1);
 
       manager.dispose();
     });
