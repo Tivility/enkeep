@@ -116,6 +116,31 @@ describe('Piece 2(b): Chat Command /compact', () => {
       expect(res.replyText).toContain('Compaction failed: manual compaction requires an idle agent');
     });
 
+    it('does not report success when compaction produced no summary', async () => {
+      const stubCompactSession = vi.fn(async () => ({
+        eventsBefore: 0,
+        eventsAfter: 0,
+        summaryChars: 0,
+      }));
+      const service = new ChatCommandService({
+        modelSelectionService: mockModelSelectionService,
+        platformApi: {
+          resetSession: vi.fn() as any,
+          compactSession: stubCompactSession as any,
+        },
+      });
+
+      const res = await service.execute({
+        userId: 'alice',
+        sessionId: 'ses_test',
+        spaceId: 'sp_test',
+        content: '/compact',
+      });
+
+      expect(res.replyText).toContain('压缩未生效');
+      expect(res.replyText).not.toContain('Session compacted');
+    });
+
     it('reports unavailable if platformApi compactSession is not provided', async () => {
       const service = new ChatCommandService({
         modelSelectionService: mockModelSelectionService,

@@ -3050,6 +3050,13 @@ export class ChatCommandService {
 
     try {
       const res = await this.platformApi.compactSession(userId, sessionId);
+      // A run that produced no summary did not compact anything; say so instead of
+      // reporting success with zero counts.
+      if (!res.summaryChars) {
+        return {
+          replyText: '压缩未生效：没有生成摘要，会话历史保持不变。若会话持续报错，可以用 /new 开启新会话。',
+        };
+      }
       const beforeTok = res.beforeTokens !== undefined ? `${res.beforeTokens}` : 'unknown';
       const afterTok = res.afterTokens !== undefined ? `${res.afterTokens}` : 'unknown';
       return {

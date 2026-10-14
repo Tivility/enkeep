@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
+import zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
 import { bootDshRuntime } from '../src/runtime/dsh-boot.js';
@@ -448,4 +449,126 @@ describe('read_image & Official Attachments Capability', () => {
     expect(actualDiskSha).toBe(expectedSha);
     expect(Buffer.from(stored.data)).toEqual(testJpeg);
   });
+
+  it('8. Caps the longest request image edge so wide images stay within many-image limits', async () => {
+    // A wide, low-pixel-count image (about 1.9 MP) passes the total-pixel budget unchanged,
+    // but its 3534px edge is rejected by Anthropic once a request carries more than 20 images.
+    const widePng = createSolidPng(3534, 549);
+    fs.writeFileSync(path.join(spacePath, 'wide.png'), widePng);
+
+    let capturedPayload: any = null;
+    const mockServer = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        try { capturedPayload = JSON.parse(body); } catch {}
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test_wide","type":"message","role":"assistant","content":[],"model":"claude-opus-5","usage":{"input_tokens":25,"output_tokens":0}}}\n\n');
+        res.write('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n');
+        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n');
+        res.write('event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n');
+        res.write('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n');
+        res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+        res.end();
+      });
+    });
+    const mockPort = await new Promise<number>((resolve) => {
+      mockServer.listen(0, '127.0.0.1', () => {
+        const addr = mockServer.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 8787);
+      });
+    });
+
+    const runtime = await bootDshRuntime({
+      userId: 'alice',
+      dshHome: aliceHome,
+      spacesDir: aliceSpaces,
+      llmEnabled: true,
+      llmBaseUrl: `http://127.0.0.1:${mockPort}/llm`,
+      provider: 'cpa-claude',
+      model: 'claude-opus-5',
+    });
+
+    try {
+      const agent = await runtime.getOrCreateAgent('ses_0123456789abcdef0123456789000008', null, spaceName);
+      const readImageTool = agent.ctx.tools.get('read_image', agent);
+      const result = await readImageTool.execute(
+        { file_path: 'wide.png' },
+        { agent, signal: new AbortController().signal, callId: 'call_read_img_wide', name: 'read_image' }
+      );
+      const renderedBlocks: ContentBlock[] = readImageTool.output.render({ file_path: 'wide.png' }, result);
+      agent.followup(createToolResultMessage({ callId: 'call_read_img_wide' as any, content: renderedBlocks, isError: false }));
+      await agent.whenIdle();
+
+      const imageBlocks = (capturedPayload?.messages ?? [])
+        .flatMap((m: any) => (Array.isArray(m.content) ? m.content : []))
+        .flatMap((c: any) => (Array.isArray(c.content) ? c.content : [c]))
+        .filter((b: any) => b.type === 'image');
+      expect(imageBlocks.length).toBe(1);
+      const sent = imageDimensions(Buffer.from(imageBlocks[0].source.data, 'base64'));
+      expect(Math.max(sent.width, sent.height)).toBeLessThanOrEqual(2000);
+      // Aspect ratio is preserved (3534:549 ≈ 6.44).
+      expect(sent.width / sent.height).toBeGreaterThan(6);
+    } finally {
+      await runtime.dispose();
+      mockServer.close();
+    }
+  });
 });
+
+/** Builds a valid single-colour RGB PNG of the given size. */
+function createSolidPng(width: number, height: number): Buffer {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc32 = (buf: Buffer) => {
+    let c = 0xffffffff;
+    for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer) => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(td));
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // RGB
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(width * 3, 0x80)]);
+  const raw = Buffer.concat(Array.from({ length: height }, () => row));
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/** Reads width and height from a PNG, JPEG, or WebP header. */
+function imageDimensions(buf: Buffer): { width: number; height: number } {
+  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  }
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    let i = 2;
+    while (i < buf.length - 9) {
+      if (buf[i] !== 0xff) { i++; continue; }
+      const marker = buf[i + 1];
+      if (marker >= 0xc0 && marker <= 0xc2) {
+        return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+      }
+      i += 2 + buf.readUInt16BE(i + 2);
+    }
+  }
+  if (buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(12, 16).toString('ascii') === 'VP8X') {
+    return { width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) };
+  }
+  throw new Error('unrecognized image header');
+}

@@ -18,8 +18,9 @@ RUN pnpm config set ignore-scripts true
 
 WORKDIR /build
 
-# Copy root workspace configuration
+# Copy root workspace configuration (patches/ is referenced by pnpm-workspace.yaml patchedDependencies)
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.json ./
+COPY patches/ ./patches/
 
 # Copy minimal monorepo subset packages needed for DSH runtime + bundle
 COPY packages/protocol/ ./packages/protocol/
