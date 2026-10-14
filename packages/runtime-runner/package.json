@@ -60,6 +60,7 @@
     "@deepseek-ai/dsh-agent-instructions": "0.2.0-rc.2",
     "@deepseek-ai/dsh-agent-loop": "0.2.0-rc.2",
     "@deepseek-ai/dsh-attachment": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-attachment-local": "0.2.0-rc.2",
     "@deepseek-ai/dsh-bash-local": "0.2.0-rc.2",
     "@deepseek-ai/dsh-commands": "0.2.0-rc.2",
     "@deepseek-ai/dsh-compaction": "0.2.0-rc.2",

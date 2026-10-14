@@ -6,7 +6,6 @@ import {
   AttachmentStore,
   AttachmentError,
   AttachmentId,
-  ImageVariantId,
   type ImageAttachmentLimits,
   type ImageAttachmentRef,
   type ImageMediaType,
@@ -15,6 +14,7 @@ import {
   type SaveImageAttachment,
   type StoredImageAttachment,
 } from '@deepseek-ai/dsh-attachment';
+import { readRequestImageFile } from '@deepseek-ai/dsh-attachment-local';
 
 export const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB
 export const DEFAULT_MAX_IMAGES_PER_MESSAGE = 20;
@@ -418,19 +418,10 @@ export class WorkspaceAttachmentStore extends AttachmentStore {
   ): Promise<RequestImageAttachment> {
     signal?.throwIfAborted();
     const stored = await this.readImage(ref, signal);
-    const variantId = ImageVariantId(`req:${String(ref.attachmentId)}:${target.width}x${target.height}:${target.maxBytes}`);
-    return {
-      variantId,
-      attachment: ref,
-      data: stored.data,
-      mediaType: ref.mediaType,
-      bytes: stored.data.byteLength,
-      width: ref.width,
-      height: ref.height,
-      depth: 'uchar',
-      space: 'srgb',
-      hasAlpha: ref.mediaType === 'image/png' || ref.mediaType === 'image/webp',
-    };
+    // Produce the route-chosen request variant (resize/re-encode, cached under request-images/).
+    // Returning the stored bytes unchanged ignored the provider's size target, so oversized
+    // images reached the model and were rejected.
+    return readRequestImageFile(this.root, stored, target, signal);
   }
 }
 
