@@ -145,6 +145,8 @@ export interface LarkBackgroundPanelManagerOptions {
 
 interface ChatCardRecord {
   cardSession: LarkStreamingCardSession;
+  /** When this card became the latest; tasks that finished earlier belong to older cards. */
+  registeredAt: number;
   turnId?: string;
   launchedTaskIds: Set<string>;
 }
@@ -224,8 +226,11 @@ export class LarkBackgroundPanelManager {
       cardSession,
       turnId,
       launchedTaskIds: new Set<string>(),
+      registeredAt: Date.now(),
     };
     state.activeTurnId = turnId;
+    // Completion of earlier work was already reported on earlier cards.
+    state.hadRunningTasks = false;
     state.turnFinalizedAt = undefined;
     state.activeTurnCompletedTaskIds = new Set<string>();
 
@@ -330,16 +335,26 @@ export class LarkBackgroundPanelManager {
         return;
       }
 
-      const tasks = res?.items ?? [];
+      const allTasks = res?.items ?? [];
 
       // Track tasks launched during this latest turn
       if (state.latestCard.turnId) {
-        for (const task of tasks) {
+        for (const task of allTasks) {
           if (task.originTurnId === state.latestCard.turnId) {
             state.latestCard.launchedTaskIds.add(task.id);
           }
         }
       }
+
+      // A card shows work that is running, or that finished while this card was the latest.
+      // Tasks that had already finished when the card appeared were reported on earlier cards;
+      // rendering them here made every new card open with a stale "all completed" line.
+      const registeredAt = state.latestCard.registeredAt;
+      const tasks = allTasks.filter((t) => {
+        if (t.status === 'running') return true;
+        const finishedAt = t.finishedAt ? Date.parse(t.finishedAt) : NaN;
+        return Number.isFinite(finishedAt) && finishedAt >= registeredAt;
+      });
 
       const hasRunning = tasks.some((t) => t.status === 'running');
       if (hasRunning) {

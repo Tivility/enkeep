@@ -429,6 +429,45 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       manager.dispose();
     });
 
+    it('does not open a new card with the stale completion of earlier work', async () => {
+      const sessionRouteId = 'session_route_test_stale_done';
+      const chatContextId = 'oc_test_chat_stale_done';
+      const earlier = new Date(Date.now() - 5 * 60_000).toISOString();
+      const finishedEarlier: BackgroundTask = {
+        id: 'wf_old', shortId: 'w0ld', kind: 'workflow', name: 'previous-run', status: 'completed',
+        startedAt: earlier, finishedAt: earlier, lastActivityAt: earlier, stalled: false, originTurnId: 'turn_prev',
+      };
+      let currentTasks: BackgroundTask[] = [finishedEarlier];
+      const card = createMockCardSession('crd_sd_001', 'om_msg_sd_001');
+      const manager = new LarkBackgroundPanelManager({
+        getBackgroundTasks: async () => ({ items: currentTasks, updatedAt: new Date().toISOString(), available: true }),
+        pollIntervalMs: 30_000,
+      });
+
+      // New turn starts; only an already-finished task from an earlier turn is listed.
+      await manager.registerCard(sessionRouteId, chatContextId, card.session, 'turn_sd_1');
+      expect(card.updates.some((u) => u.includes('全部完成'))).toBe(false);
+
+      // This turn starts a workflow: it shows as running, the old one stays hidden.
+      const now = new Date().toISOString();
+      currentTasks = [finishedEarlier, {
+        id: 'wf_new', shortId: 'w0nw', kind: 'workflow', name: 'current-run', status: 'running',
+        startedAt: now, lastActivityAt: now, stalled: false, originTurnId: 'turn_sd_1',
+      }];
+      await vi.advanceTimersByTimeAsync(30_000);
+      const running = card.updates[card.updates.length - 1];
+      expect(running).toContain('current-run · running');
+      expect(running).not.toContain('previous-run');
+
+      // When it finishes, this card reports the completion.
+      const done = new Date().toISOString();
+      currentTasks = [finishedEarlier, { ...currentTasks[1], status: 'completed', finishedAt: done }];
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(card.updates[card.updates.length - 1]).toBe('✅ 后台任务已全部完成');
+
+      manager.dispose();
+    });
+
     it('collapses the previous card even when a poll lands during the handoff', async () => {
       const sessionRouteId = 'session_route_test_handoff_race';
       const chatContextId = 'oc_test_chat_handoff_race';
@@ -656,8 +695,9 @@ describe('Feishu/Lark Background Tasks Panel & Handoff', () => {
       const loggedTexts2 = infoSpy.mock.calls.map((c) => c[0] as string).filter((s) => s.startsWith('[lark-bg]'));
       expect(loggedTexts2.length).toBe(countAfterFirstPoll);
 
-      // Now state changes: task completes
+      // Now state changes: task completes (the runtime reports finishedAt with terminal status)
       mockTasks[0].status = 'completed';
+      mockTasks[0].finishedAt = new Date().toISOString();
       await vi.advanceTimersByTimeAsync(10_000);
       const loggedTexts3 = infoSpy.mock.calls.map((c) => c[0] as string).filter((s) => s.startsWith('[lark-bg]'));
       expect(loggedTexts3.length).toBeGreaterThan(countAfterFirstPoll);
