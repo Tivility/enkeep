@@ -58,9 +58,11 @@ describe('DeliveryTurnExecutor Static Invariants & Space Folder Contracts', () =
       expect(executorBlock).not.toContain('nativeContext');
       expect(executorBlock).not.toContain('routeKey');
 
-      // Invariant 3: userHandle.sendTurn called with exactly ONE named object argument ({ ... })
-      // Must match .sendTurn({ ... }) and NOT positional arguments like .sendTurn(prompt, ...)
-      expect(executorBlock).toMatch(/\.sendTurn\s*\(\s*\{/);
+      // Invariant 3: the turn is sent as ONE named RuntimeTurnRequest object. The executor
+      // builds it as an object literal and hands it to sendTurnWithHostReconnect, which calls
+      // handle.sendTurn(request) with that single object.
+      expect(executorBlock).toMatch(/const turnRequest = \{/);
+      expect(executorBlock).toMatch(/sendTurnWithHostReconnect\(\s*userHandle,\s*turnRequest,/);
 
       // Ensure no positional argument .sendTurn(a, ...) exists in executorBlock
       const positionalSendTurnPattern = /\.sendTurn\s*\(\s*[^{\s]/;

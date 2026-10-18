@@ -9,6 +9,8 @@ export interface RuntimeAutoUpgraderOptions {
   checkIntervalSeconds?: number;
   idleThresholdSeconds?: number;
   enabled?: boolean;
+  /** Wait after pausing dispatch before re-confirming idleness, so in-flight claims settle. */
+  pauseSettleMs?: number;
 }
 
 export class RuntimeAutoUpgrader {
@@ -18,6 +20,7 @@ export class RuntimeAutoUpgrader {
   private readonly checkIntervalSeconds: number;
   private readonly idleThresholdSeconds: number;
   private readonly enabled: boolean;
+  private readonly pauseSettleMs: number;
 
   private timer?: NodeJS.Timeout;
   private isChecking = false;
@@ -28,6 +31,7 @@ export class RuntimeAutoUpgrader {
     this.db = options.db;
     this.managementProvider = options.managementProvider;
     this.deliveryGateway = options.deliveryGateway;
+    this.pauseSettleMs = options.pauseSettleMs ?? 1000;
 
     const envEnabled = process.env.ENKEEP_RUNTIME_AUTO_UPGRADE;
     this.enabled = options.enabled !== undefined
@@ -135,7 +139,8 @@ export class RuntimeAutoUpgrader {
       }
 
       try {
-        // Step 2: Re-confirm idle status
+        // Step 2: Re-confirm idle status after in-flight claims settle
+        await new Promise((resolve) => setTimeout(resolve, this.pauseSettleMs));
         const recheckStatuses = await this.managementProvider.getUpgradeStatus();
         const currentTarget = recheckStatuses.find((s) => s.userId === targetUserId);
         const recheckRounds = this.deliveryGateway
@@ -155,6 +160,13 @@ export class RuntimeAutoUpgrader {
         }
 
         // Step 3: Stop runtime (host stops daemon, container reconstructs on demand keeping volumes)
+        console.info('[auto-upgrader] stopping outdated idle runtime', {
+          userId: targetUserId,
+          mode: candidateToUpgrade.mode,
+          reason: candidateToUpgrade.pendingReason,
+          current: candidateToUpgrade.currentImage ?? candidateToUpgrade.currentDaemonCliPath ?? null,
+          target: candidateToUpgrade.targetImage ?? candidateToUpgrade.targetDaemonCliPath ?? null,
+        });
         if (typeof this.managementProvider.stopRuntime === 'function') {
           await this.managementProvider.stopRuntime(targetUserId, candidateToUpgrade.mode);
         }

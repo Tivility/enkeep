@@ -183,6 +183,49 @@ export function isChromiumAvailable(customExecutablePath?: string): boolean {
   }
 }
 
+/**
+ * Whether an error means the platform lost its connection to a host runtime daemon
+ * (daemon replaced or exited) rather than the turn itself failing.
+ * @param err - error thrown by a host runtime handle.
+ * @returns true for host daemon exit or transport-disconnect errors.
+ */
+export function isHostTransportDrop(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    err.name === 'HostRuntimeExitedError' ||
+    (err as { code?: unknown }).code === 'HOST_RUNTIME_EXITED' ||
+    err.message.includes('transport disconnected while turn was executing')
+  );
+}
+
+/**
+ * Sends a turn; when a host runtime connection drops during dispatch, resubmits once on a
+ * fresh connection if the runtime's turn journal shows the turn never started there. A
+ * started turn may already have run tools and is not resubmitted.
+ * @param handle - runtime handle the turn was routed to.
+ * @param request - turn request passed to sendTurn.
+ * @param options - whether the runtime is a host daemon, the turn id, and how to reconnect.
+ * @returns the runtime's turn result.
+ */
+export async function sendTurnWithHostReconnect<T extends Pick<UserRuntimeHandle, 'sendTurn' | 'inspectTurnResult'>>(
+  handle: T,
+  request: Parameters<T['sendTurn']>[0],
+  options: { isHost: boolean; turnId: string; reconnect: () => Promise<T> }
+): Promise<Awaited<ReturnType<T['sendTurn']>>> {
+  try {
+    return (await handle.sendTurn(request)) as Awaited<ReturnType<T['sendTurn']>>;
+  } catch (sendErr) {
+    if (!options.isHost || !isHostTransportDrop(sendErr)) throw sendErr;
+    const fresh = await options.reconnect();
+    const inspected = typeof fresh.inspectTurnResult === 'function'
+      ? await fresh.inspectTurnResult(options.turnId)
+      : { status: 'unknown' };
+    console.warn('[host-runtime] turn transport dropped', { turnId: options.turnId, journal: inspected.status });
+    if (inspected.status !== 'absent') throw sendErr;
+    return (await fresh.sendTurn(request)) as Awaited<ReturnType<T['sendTurn']>>;
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -800,6 +843,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         return existing;
       }
       // Process is not alive, evict stale handle
+      console.info('[host-runtime] evicting handle of exited daemon', { userId: rawUserId, pid: pid ?? null });
       hostRuntimeHandles.delete(rawUserId);
     }
 
@@ -833,6 +877,10 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           browserService,
         });
         handle.launchedDaemonCliPath = targetVer.daemonCliPath || null;
+        console.info('[host-runtime] runtime ready', {
+          userId: rawUserId,
+          pid: (handle as any).rawHandle?.pid ?? null,
+        });
 
         // Phase 2 Binding: Bind full platform proxy & events stream handlers with authoritative user UUID
         await bindRuntimeServices(handle, userRecord.id);
@@ -1043,7 +1091,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         dataRoot: paths.dataRoot,
       });
 
-      const res = await userHandle.sendTurn({
+      const turnRequest = {
         prompt,
         sessionId: dshSessionId,
         turnId,
@@ -1055,6 +1103,11 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         extensionPlan: request.extensionPlan ?? null,
         timeoutMs,
         extraReadableRoots,
+      };
+      const res = await sendTurnWithHostReconnect(userHandle, turnRequest, {
+        isHost,
+        turnId,
+        reconnect: () => ensureUserHostRuntime(userId),
       });
       if (typeof res.replyText !== 'string' || res.replyText.trim().length === 0) {
         throw new Error('FAIL-CLOSED: DSH runtime returned empty or invalid replyText');
@@ -2254,6 +2307,10 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       let stopped = false;
       const hostHandle = hostRuntimeHandles.get(normalizedUserId) || hostRuntimeHandles.get(targetUserId);
       if (hostHandle) {
+        console.info('[host-runtime] stopping runtime', {
+          userId: normalizedUserId,
+          pid: (hostHandle as any).rawHandle?.pid ?? null,
+        });
         try {
           await hostHandle.stop();
           await hostHandle.teardown(false);
