@@ -1003,19 +1003,20 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   }
 
   getUserActiveRoundsCount(userId: string): { queued: number; running: number } {
-    let running = 0;
+    let inMemoryRunning = 0;
     for (const task of this.activeTasks.values()) {
       if (task.userId === userId) {
-        running++;
+        inMemoryRunning++;
       }
     }
-    let queued = 0;
-    try {
-      const row = this.db.prepare(
-        "SELECT COUNT(*) as cnt FROM turn_runs WHERE user_id = ? AND status = 'queued'"
-      ).get(userId) as { cnt?: number } | undefined;
-      queued = row?.cnt ?? 0;
-    } catch {}
+    // The database is authoritative: a turn claimed in the same moment is 'running' there
+    // before it is registered in activeTasks. Counting only memory let the idle upgrader
+    // stop a runtime while a just-claimed turn was being dispatched to it.
+    const row = this.db.prepare(
+      "SELECT SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued, SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running FROM turn_runs WHERE user_id = ?"
+    ).get(userId) as { queued?: number | null; running?: number | null } | undefined;
+    const queued = row?.queued ?? 0;
+    const running = Math.max(inMemoryRunning, row?.running ?? 0);
     return { queued, running };
   }
 

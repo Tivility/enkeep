@@ -474,4 +474,50 @@ describe('Runtime Idle Auto-Upgrade & Target Version Governance', () => {
       });
     });
   });
+
+  describe('4. Active rounds counting for the upgrader', () => {
+    it('counts a turn that is running in the database before it is registered in memory', () => {
+      const mem = new DatabaseSync(':memory:');
+      mem.exec("CREATE TABLE turn_runs (id TEXT, user_id TEXT, status TEXT)");
+      mem.prepare('INSERT INTO turn_runs VALUES (?, ?, ?)').run('tr_1', 'user-alice', 'running');
+      mem.prepare('INSERT INTO turn_runs VALUES (?, ?, ?)').run('tr_2', 'user-alice', 'queued');
+      mem.prepare('INSERT INTO turn_runs VALUES (?, ?, ?)').run('tr_3', 'user-bob', 'completed');
+
+      // Just-claimed turn: committed as running, not yet in activeTasks.
+      const fakeGateway = { activeTasks: new Map(), db: mem };
+      const counts = DeliveryRuntimeGateway.prototype.getUserActiveRoundsCount.call(fakeGateway as any, 'user-alice');
+      expect(counts).toEqual({ queued: 1, running: 1 });
+
+      const idle = DeliveryRuntimeGateway.prototype.getUserActiveRoundsCount.call(fakeGateway as any, 'user-bob');
+      expect(idle).toEqual({ queued: 0, running: 0 });
+    });
+
+    it('aborts the upgrade when a turn starts between pausing and stopping', async () => {
+      let running = 0;
+      const mockGateway: any = {
+        getUserActiveRoundsCount: vi.fn(() => ({ queued: 0, running })),
+        pauseUserDispatch: vi.fn(() => { running = 1; }), // a turn was claimed just before the pause
+        resumeUserDispatch: vi.fn(),
+        redriveHeld: vi.fn(async () => 0),
+      };
+      const mockManagement: any = {
+        getUpgradeStatus: vi.fn(async () => [
+          { userId: 'user-bob', mode: 'host', isOutdated: true, isIdle: true, pendingReason: 'idle' },
+        ]),
+        stopRuntime: vi.fn(),
+      };
+      const upgrader = new RuntimeAutoUpgrader({
+        db,
+        managementProvider: mockManagement,
+        deliveryGateway: mockGateway,
+        idleThresholdSeconds: 0,
+        pauseSettleMs: 0,
+      });
+
+      const res = await upgrader.checkAndUpgrade();
+      expect(res.status).toBe('aborted_became_busy');
+      expect(mockManagement.stopRuntime).not.toHaveBeenCalled();
+      expect(mockGateway.resumeUserDispatch).toHaveBeenCalledWith('user-bob');
+    });
+  });
 });
