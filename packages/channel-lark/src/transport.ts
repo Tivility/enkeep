@@ -1613,6 +1613,12 @@ export interface CredentialedLarkTransportOptions {
  * WSClient long-connection with 15000ms handshake timeout, SanitizedLarkLogger to prevent credential leakage,
  * real onReady lifecycle, openapi Client for replies with stable uuid idempotency, bounded HTTP timeout, and bot identity resolution.
  */
+/** Interval between websocket health checks. */
+const WS_WATCHDOG_INTERVAL_MS = 60_000;
+/** First delay between websocket restarts; doubles per restart up to the maximum. */
+const WS_RESTART_MIN_BACKOFF_MS = 30_000;
+const WS_RESTART_MAX_BACKOFF_MS = 10 * 60_000;
+
 export class CredentialedLarkTransport implements LarkTransport {
   private readonly account: LarkAccountConfig;
   private readonly credentialResolver?: LarkCredentialResolver;
@@ -1624,6 +1630,14 @@ export class CredentialedLarkTransport implements LarkTransport {
   private apiClient: any = null;
   private _resolvedBotOpenId?: string;
   private readonly logger: lark.Logger;
+  /** Builds and starts a fresh WSClient; set once credentials and dispatcher are known. */
+  private wsStarter: (() => Promise<void>) | null = null;
+  private wsWatchdog: NodeJS.Timeout | null = null;
+  private wsRestartInFlight = false;
+  private wsUnhealthyChecks = 0;
+  private wsRestartBackoffMs = WS_RESTART_MIN_BACKOFF_MS;
+  private wsNextRestartAt = 0;
+  private stopped = false;
 
   constructor(options: LarkAccountConfig | CredentialedLarkTransportOptions) {
     if ('account' in options) {
@@ -1803,8 +1817,8 @@ export class CredentialedLarkTransport implements LarkTransport {
       this._connecting = false;
     };
 
-    this._connecting = true;
-    try {
+    this.stopped = false;
+    this.wsStarter = async () => {
       if (this.clientFactory && this.clientFactory.createWSClient) {
         this.wsClient = this.clientFactory.createWSClient({
           appId,
@@ -1838,6 +1852,12 @@ export class CredentialedLarkTransport implements LarkTransport {
       if (this.wsClient && typeof this.wsClient.start === 'function') {
         await this.wsClient.start({ eventDispatcher });
       }
+    };
+
+    this._connecting = true;
+    try {
+      await this.wsStarter();
+      this.startWsWatchdog();
 
       // If WSClient provides getConnectionStatus, check if state is connected
       if (this.wsClient && typeof this.wsClient.getConnectionStatus === 'function') {
@@ -1854,7 +1874,68 @@ export class CredentialedLarkTransport implements LarkTransport {
     }
   }
 
+  /**
+   * The SDK stops reconnecting after the server-provided attempt budget or a non-retryable
+   * error, and then stays disconnected: a network outage longer than that budget silently
+   * ended event delivery for the account until the platform restarted. The watchdog
+   * recreates the WSClient when it reports `failed`, or stays `idle` for two checks, with
+   * exponential backoff between restarts.
+   */
+  private startWsWatchdog(): void {
+    if (this.wsWatchdog || !this.wsClient || typeof this.wsClient.getConnectionStatus !== 'function') return;
+    this.wsWatchdog = setInterval(() => {
+      void this.checkWsHealth();
+    }, WS_WATCHDOG_INTERVAL_MS);
+    if (typeof this.wsWatchdog.unref === 'function') this.wsWatchdog.unref();
+  }
+
+  /** One watchdog tick; exposed for tests. */
+  async checkWsHealth(now: number = Date.now()): Promise<void> {
+    if (this.stopped || this.wsRestartInFlight || !this.wsStarter || !this.wsClient) return;
+    if (typeof this.wsClient.getConnectionStatus !== 'function') return;
+    const status = this.wsClient.getConnectionStatus();
+    const state = typeof status === 'object' && status !== null && 'state' in status ? status.state : status;
+    if (state === 'connected') {
+      this.wsUnhealthyChecks = 0;
+      this.wsRestartBackoffMs = WS_RESTART_MIN_BACKOFF_MS;
+      return;
+    }
+    if (state === 'connecting' || state === 'reconnecting') {
+      // The SDK is still retrying on its own.
+      return;
+    }
+    this.wsUnhealthyChecks += 1;
+    const unhealthy = state === 'failed' || this.wsUnhealthyChecks >= 2;
+    if (!unhealthy || now < this.wsNextRestartAt) return;
+
+    this.wsRestartInFlight = true;
+    this.logger.warn('[lark-ws] restarting websocket client', { state, backoffMs: this.wsRestartBackoffMs });
+    try {
+      const previous = this.wsClient;
+      try {
+        if (typeof previous.close === 'function') await previous.close();
+      } catch (err) {
+        // The old client is abandoned either way; its close failure does not block the restart.
+        this.logger.warn('[lark-ws] closing previous websocket client failed', { message: err instanceof Error ? err.message : String(err) });
+      }
+      if (this.stopped) return;
+      await this.wsStarter();
+      this.wsUnhealthyChecks = 0;
+    } catch (err) {
+      this.logger.warn('[lark-ws] websocket restart failed', { message: err instanceof Error ? err.message : String(err) });
+    } finally {
+      this.wsNextRestartAt = now + this.wsRestartBackoffMs;
+      this.wsRestartBackoffMs = Math.min(this.wsRestartBackoffMs * 2, WS_RESTART_MAX_BACKOFF_MS);
+      this.wsRestartInFlight = false;
+    }
+  }
+
   async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.wsWatchdog) {
+      clearInterval(this.wsWatchdog);
+      this.wsWatchdog = null;
+    }
     this._connected = false;
     this._connecting = false;
     if (this.wsClient) {
