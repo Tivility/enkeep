@@ -25,7 +25,7 @@ export interface MessageItem {
   image_item?: { media?: CDNMedia; aeskey?: string; url?: string };
   voice_item?: { media?: CDNMedia; text?: string };
   file_item?: { media?: CDNMedia; file_name?: string; len?: string };
-  video_item?: { media?: CDNMedia };
+  video_item?: { media?: CDNMedia; video_size?: number };
   ref_msg?: { message_item?: MessageItem; title?: string };
 }
 
@@ -107,6 +107,7 @@ export interface WeChatTransport {
     toUserId: string,
     contextToken: string,
     fileBuffer: Buffer,
-    fileName?: string
+    fileName?: string,
+    mimeType?: string
   ): Promise<{ success: boolean; error?: string; messageId?: string }>;
 }

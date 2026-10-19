@@ -9,6 +9,7 @@
 import { randomBytes } from 'node:crypto';
 import { resolveInboundRoute } from '@enkeep/platform-core';
 import type { WeChatParsedMessage, WeChatTransport } from './types.js';
+import { isWeChatVideoFile } from './crypto-types.js';
 import { ContextTokenStore } from './context-token-store.js';
 import { downloadAndDecryptMedia } from './crypto.js';
 import {
@@ -631,6 +632,7 @@ export class WeChatChannelGateway {
 
     const isImage = (params.mimeType && params.mimeType.startsWith('image/')) ||
       /\.(png|jpe?g|gif|webp)$/i.test(params.fileName);
+    const isVideo = isWeChatVideoFile(params.fileName, params.mimeType);
 
     const outboxId = `out_wc_${params.turnId ? `${params.turnId}_` : ''}${Date.now()}`;
 
@@ -646,6 +648,7 @@ export class WeChatChannelGateway {
         fileName: params.fileName,
         fileSize: params.fileBuffer.length,
         isImage,
+        isVideo,
         turnId: params.turnId,
       }),
       // Claimed while in flight so the runtime's periodic redrive does not resend it.
@@ -657,7 +660,7 @@ export class WeChatChannelGateway {
       if (isImage && typeof this.transport.sendImage === 'function') {
         sendRes = await this.transport.sendImage(toUserId, contextToken, params.fileBuffer, params.fileName);
       } else if (typeof this.transport.sendFile === 'function') {
-        sendRes = await this.transport.sendFile(toUserId, contextToken, params.fileBuffer, params.fileName);
+        sendRes = await this.transport.sendFile(toUserId, contextToken, params.fileBuffer, params.fileName, params.mimeType);
       } else {
         sendRes = { success: false, error: 'Transport does not support file/image delivery' };
       }

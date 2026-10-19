@@ -39,14 +39,21 @@ import {
   WECHAT_ITEM_TYPE_FILE,
   WECHAT_ITEM_TYPE_IMAGE,
   WECHAT_ITEM_TYPE_TEXT,
+  WECHAT_ITEM_TYPE_VIDEO,
   WECHAT_MESSAGE_TYPE_BOT,
+  type MessageItem,
   type WeChatGetUpdatesResponse,
   type WeChatOutboundReply,
   type WeChatParsedMessage,
   type WeChatTransport,
 } from './types.js';
 import { uploadMediaBuffer } from './crypto.js';
-import { WECHAT_MEDIA_TYPE_FILE, WECHAT_MEDIA_TYPE_IMAGE } from './crypto-types.js';
+import {
+  WECHAT_MEDIA_TYPE_FILE,
+  WECHAT_MEDIA_TYPE_IMAGE,
+  WECHAT_MEDIA_TYPE_VIDEO,
+  isWeChatVideoFile,
+} from './crypto-types.js';
 
 export * from './transport-types.js';
 export * from './http.js';
@@ -191,7 +198,8 @@ export class FakeWeChatTransport implements WeChatTransport {
     toUserId: string,
     contextToken: string,
     fileBuffer: Buffer,
-    fileName?: string
+    fileName?: string,
+    mimeType?: string
   ): Promise<{ success: boolean; error?: string; messageId?: string }> {
     if (!this._connected) {
       return { success: false, error: 'FakeWeChatTransport is not connected' };
@@ -203,11 +211,14 @@ export class FakeWeChatTransport implements WeChatTransport {
       this.failNextSend = false;
       return { success: false, error: this.failNextSendReason };
     }
-    const messageId = `msg_wc_file_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const isVideo = isWeChatVideoFile(fileName, mimeType);
+    const prefix = isVideo ? 'msg_wc_vid' : 'msg_wc_file';
+    const messageId = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const label = isVideo ? 'Video' : 'File';
     this._sentReplies.push({
       toUserId,
       contextToken,
-      text: `[File: ${fileName || 'file.bin'}] (${fileBuffer.length} bytes)`,
+      text: `[${label}: ${fileName || (isVideo ? 'video.mp4' : 'file.bin')}] (${fileBuffer.length} bytes)`,
       messageId,
       timestamp: new Date().toISOString(),
     });
@@ -745,7 +756,8 @@ export class CredentialedWeChatTransport implements ICredentialedWeChatTransport
     toUserId: string,
     contextToken: string,
     fileBuffer: Buffer,
-    fileName = 'file.bin'
+    fileName = 'file.bin',
+    mimeType?: string
   ): Promise<{ success: boolean; error?: string; messageId?: string }> {
     if (!this._running) {
       return {
@@ -761,7 +773,9 @@ export class CredentialedWeChatTransport implements ICredentialedWeChatTransport
       };
     }
 
-    try {
+    const isVideo = isWeChatVideoFile(fileName, mimeType);
+
+    const executeSend = async (asVideo: boolean) => {
       const uploadRes = await uploadMediaBuffer({
         buf: fileBuffer,
         fileName,
@@ -769,31 +783,41 @@ export class CredentialedWeChatTransport implements ICredentialedWeChatTransport
         baseUrl: this.baseUrl,
         token: this.config.botToken,
         cdnBaseUrl: this.cdnBaseUrl,
-        mediaType: WECHAT_MEDIA_TYPE_FILE,
+        mediaType: asVideo ? WECHAT_MEDIA_TYPE_VIDEO : WECHAT_MEDIA_TYPE_FILE,
         fetchFn: this.fetchImpl,
       });
 
       const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
+      const media = {
+        encrypt_query_param: uploadRes.downloadEncryptedQueryParam,
+        aes_key: uploadRes.aeskey,
+        encrypt_type: 1,
+      };
+
+      const item: MessageItem = asVideo
+        ? {
+            type: WECHAT_ITEM_TYPE_VIDEO,
+            video_item: {
+              media,
+              video_size: uploadRes.fileSizeCiphertext,
+            },
+          }
+        : {
+            type: WECHAT_ITEM_TYPE_FILE,
+            file_item: {
+              media,
+              file_name: fileName,
+              len: String(fileBuffer.length),
+            },
+          };
+
       const resp = await this.apiPost<WeChatGetUpdatesResponse>(
         'ilink/bot/sendmessage',
         {
           msg: {
             to_user_id: toUserId,
             context_token: contextToken,
-            item_list: [
-              {
-                type: WECHAT_ITEM_TYPE_FILE,
-                file_item: {
-                  media: {
-                    encrypt_query_param: uploadRes.downloadEncryptedQueryParam,
-                    aes_key: uploadRes.aeskey,
-                    encrypt_type: 1,
-                  },
-                  file_name: fileName,
-                  len: String(fileBuffer.length),
-                },
-              },
-            ],
+            item_list: [item],
             message_type: WECHAT_MESSAGE_TYPE_BOT,
             message_state: 2, // MESSAGE_STATE_FINISH
             client_id: clientId,
@@ -802,11 +826,26 @@ export class CredentialedWeChatTransport implements ICredentialedWeChatTransport
         }
       );
 
-      assertWeChatApiSuccess(resp, 'sendFile');
+      assertWeChatApiSuccess(resp, asVideo ? 'sendVideo' : 'sendFile');
       return {
         success: true,
-        messageId: `msg_wc_file_${clientId}`,
+        messageId: asVideo ? `msg_wc_video_${clientId}` : `msg_wc_file_${clientId}`,
       };
+    };
+
+    try {
+      if (isVideo) {
+        try {
+          return await executeSend(true);
+        } catch (videoErr) {
+          this.deps.logger?.warn?.(
+            { err: videoErr, fileName },
+            'Failed to send native WeChat video, falling back to file delivery'
+          );
+          return await executeSend(false);
+        }
+      }
+      return await executeSend(false);
     } catch (err) {
       return {
         success: false,

@@ -61,7 +61,8 @@ export interface CredentialedWeChatTransport extends WeChatTransport {
     toUserId: string,
     contextToken: string,
     fileBuffer: Buffer,
-    fileName?: string
+    fileName?: string,
+    mimeType?: string
   ): Promise<{ success: boolean; error?: string; messageId?: string }>;
 }
 
