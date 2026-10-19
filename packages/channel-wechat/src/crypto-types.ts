@@ -100,3 +100,18 @@ export interface DownloadMediaParams extends DownloadMediaOptions {
   readonly encryptQueryParam: string;
   readonly aesKeyBase64: string;
 }
+
+/**
+ * Check whether a filename or MIME type indicates an MP4 native video.
+ * WeChat iLink native video specifically supports MP4 containers.
+ */
+export function isWeChatVideoFile(fileName?: string, mimeType?: string): boolean {
+  if (mimeType && (mimeType === 'video/mp4' || mimeType.startsWith('video/mp4;'))) {
+    return true;
+  }
+  if (fileName && /\.mp4$/i.test(fileName.trim())) {
+    return true;
+  }
+  return false;
+}
+
