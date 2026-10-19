@@ -77,6 +77,10 @@ export class SqliteTenantScopedTurnRunRepository implements TenantScopedTurnRunR
       updates.push('error = ?');
       params.push(input.error);
     }
+    if (input.stepsJson !== undefined) {
+      updates.push('steps_json = ?');
+      params.push(input.stepsJson);
+    }
 
     params.push(id, this.userId);
     const sql = `UPDATE turn_runs SET ${updates.join(', ')} WHERE id = ? AND user_id = ?`;

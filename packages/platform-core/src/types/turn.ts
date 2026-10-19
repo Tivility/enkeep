@@ -7,6 +7,21 @@ export type TurnRunStatus =
   | 'interrupted'
   | 'failed';
 
+export type ProcessStepKind = 'thinking' | 'tool' | 'task';
+export type ProcessStepStatus = 'running' | 'completed' | 'failed';
+
+export interface ProcessStepItem {
+  id: string;
+  kind: ProcessStepKind;
+  name: string;
+  status: ProcessStepStatus;
+  summary?: string;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  facts?: string;
+}
+
 export interface TurnRun {
   id: string;
   userId: string; // Tenant/Owner ID
@@ -18,6 +33,7 @@ export interface TurnRun {
   finishedAt?: string | null;
   error?: string | null;
   executionMode: ExecutionMode;
+  stepsJson?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -38,4 +54,5 @@ export interface UpdateTurnRunStatusInput {
   startedAt?: string | null;
   finishedAt?: string | null;
   error?: string | null;
+  stepsJson?: string | null;
 }

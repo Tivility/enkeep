@@ -22,6 +22,7 @@ export interface WebMessageRecord {
   content: string;
   status: 'pending' | 'delivered' | 'failed';
   createdAt: string;
+  turnId?: string;
   attachments?: readonly PublicMessageAttachment[];
   replyReference?: WebMessageReplyReference;
 }
@@ -90,11 +91,15 @@ export interface WebReasoningDeltaEventPayload {
 
 /**
  * Safe tool status event payload.
- * Public payload contains ONLY safe toolName allowlist + status (no args, no result).
+ * Public payload contains safe toolName allowlist + status + optional callId, summary, facts (no large args, no large result).
  */
 export interface WebToolStatusEventPayload {
   toolName: string;
   status: 'started' | 'completed' | 'failed';
+  callId?: string;
+  summary?: string;
+  facts?: string;
+  [key: string]: unknown;
 }
 
 /**
@@ -1610,12 +1615,14 @@ export class SqliteWebMessageStore {
 
         const atts = attachmentsMap.get(String(r.id));
         const ref = referencesMap.get(String(r.id));
+        const turnId = typeof r.turn_id === 'string' && r.turn_id.length > 0 ? r.turn_id : undefined;
         records.push({
           id: r.id,
           role: r.role,
           content: r.content,
           status: r.status,
           createdAt: r.created_at,
+          ...(turnId ? { turnId } : {}),
           ...(atts && atts.length > 0 ? { attachments: atts } : {}),
           ...(ref ? { replyReference: ref } : {}),
         });
@@ -1696,6 +1703,7 @@ export class SqliteWebMessageStore {
 
     const atts = queryMessageAttachments(this.db, row.id);
     const ref = queryMessageReference(this.db, row.id);
+    const turnId = typeof row.turn_id === 'string' && row.turn_id.length > 0 ? row.turn_id : undefined;
 
     return {
       id: row.id,
@@ -1703,6 +1711,7 @@ export class SqliteWebMessageStore {
       content: row.content,
       status: row.status,
       createdAt: row.created_at,
+      ...(turnId ? { turnId } : {}),
       ...(atts.length > 0 ? { attachments: atts } : {}),
       ...(ref ? { replyReference: ref } : {}),
     };
@@ -2049,11 +2058,21 @@ export class SqliteWebMessageStore {
           const toolName = sanitizeToolName(rawToolName);
           const rawStatus = event.payload['status'];
           const status = (rawStatus === 'started' || rawStatus === 'completed' || rawStatus === 'failed') ? rawStatus : 'started';
-          sanitizedPayload = { toolName, status };
+          const callId = typeof event.payload['callId'] === 'string' ? event.payload['callId'].slice(0, 64) : undefined;
+          const summary = typeof event.payload['summary'] === 'string' ? event.payload['summary'].slice(0, 120) : undefined;
+          const facts = typeof event.payload['facts'] === 'string' ? event.payload['facts'].slice(0, 60) : undefined;
+          const toolPayload: WebToolStatusEventPayload = {
+            toolName,
+            status,
+            ...(callId ? { callId } : {}),
+            ...(summary ? { summary } : {}),
+            ...(facts ? { facts } : {}),
+          };
+          sanitizedPayload = toolPayload;
           record = {
             id,
             type: 'tool_status',
-            payload: { toolName, status },
+            payload: toolPayload,
             createdAt,
           };
           break;
@@ -2307,10 +2326,19 @@ export class SqliteWebMessageStore {
           const toolName = sanitizeToolName(rawToolName);
           const rawStatus = parsedPayload['status'];
           const status = (rawStatus === 'started' || rawStatus === 'completed' || rawStatus === 'failed') ? rawStatus : 'started';
+          const callId = typeof parsedPayload['callId'] === 'string' ? parsedPayload['callId'].slice(0, 64) : undefined;
+          const summary = typeof parsedPayload['summary'] === 'string' ? parsedPayload['summary'].slice(0, 120) : undefined;
+          const facts = typeof parsedPayload['facts'] === 'string' ? parsedPayload['facts'].slice(0, 60) : undefined;
           record = {
             id: r.id,
             type: 'tool_status',
-            payload: { toolName, status },
+            payload: {
+              toolName,
+              status,
+              ...(callId ? { callId } : {}),
+              ...(summary ? { summary } : {}),
+              ...(facts ? { facts } : {}),
+            },
             createdAt: r.created_at,
           };
           break;

@@ -1647,6 +1647,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_streaming_cards_account_turn ON channel_st
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_043_TURN_RUNS_STEPS_SQL = `
+-- Migration 43: Process card steps JSON for turn runs
+ALTER TABLE turn_runs ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

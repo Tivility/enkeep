@@ -4,6 +4,9 @@ import type {
   UserLocale,
   UserTheme,
   ChannelType,
+  ProcessStepKind,
+  ProcessStepStatus,
+  ProcessStepItem,
 } from '@enkeep/platform-core';
 import type {
   PublicMessageAttachment,
@@ -107,6 +110,7 @@ export interface PublicMessage {
   readonly content: string;
   readonly status: 'pending' | 'delivered' | 'failed';
   readonly createdAt: string;
+  readonly turnId?: string;
   readonly attachments?: readonly PublicMessageAttachment[];
   readonly replyReference?: MessageReplyReference;
 }
@@ -188,6 +192,9 @@ export type PublicWebChannelEvent =
       readonly toolName: string;
       readonly status: PublicToolStatus;
       readonly timestamp: string;
+      readonly callId?: string;
+      readonly summary?: string;
+      readonly facts?: string;
     }
   | {
       readonly id: string;
@@ -469,4 +476,12 @@ export interface RuntimeGateway {
   ): Promise<Array<{ turnId: string; createdAt: string; contentSnippet: string }>>;
 }
 
-export type { LifecycleStatus, AuthContext, PublicMessageAttachment, CanonicalAttachment };
+export type {
+  LifecycleStatus,
+  AuthContext,
+  PublicMessageAttachment,
+  CanonicalAttachment,
+  ProcessStepKind,
+  ProcessStepStatus,
+  ProcessStepItem,
+};

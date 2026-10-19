@@ -55,6 +55,7 @@ import {
   MIGRATION_040_CONTEXT_WINDOW_OVERRIDES_SQL,
   MIGRATION_041_RUNTIME_TARGET_VERSION_SQL,
   MIGRATION_042_CHANNEL_STREAMING_CARDS_SQL,
+  MIGRATION_043_TURN_RUNS_STEPS_SQL,
 } from '@enkeep/platform-storage-sqlite';
 
 export {
@@ -107,6 +108,7 @@ export {
   MIGRATION_040_CONTEXT_WINDOW_OVERRIDES_SQL,
   MIGRATION_041_RUNTIME_TARGET_VERSION_SQL,
   MIGRATION_042_CHANNEL_STREAMING_CARDS_SQL,
+  MIGRATION_043_TURN_RUNS_STEPS_SQL,
 };
 
 function isSqliteBusyOrLocked(err: unknown): boolean {
@@ -350,6 +352,12 @@ export const ALL_PLATFORM_MIGRATIONS: MigrationDefinition[] = [
     name: '042_channel_streaming_cards',
     upSql: MIGRATION_042_CHANNEL_STREAMING_CARDS_SQL,
     checksum: computeChecksum(MIGRATION_042_CHANNEL_STREAMING_CARDS_SQL),
+  },
+  {
+    version: 43,
+    name: '043_turn_runs_steps',
+    upSql: MIGRATION_043_TURN_RUNS_STEPS_SQL,
+    checksum: computeChecksum(MIGRATION_043_TURN_RUNS_STEPS_SQL),
   },
 ];
 

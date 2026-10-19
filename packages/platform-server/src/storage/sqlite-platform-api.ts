@@ -1808,6 +1808,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
         content: m.content,
         status: m.status,
         createdAt: m.createdAt,
+        ...(m.turnId ? { turnId: m.turnId } : {}),
         ...(m.attachments && m.attachments.length > 0 ? { attachments: m.attachments } : {}),
         ...(m.replyReference ? { replyReference: m.replyReference } : {}),
       };
@@ -1835,6 +1836,7 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
       content: m.content,
       status: m.status,
       createdAt: m.createdAt,
+      ...(m.turnId ? { turnId: m.turnId } : {}),
       ...(m.attachments && m.attachments.length > 0 ? { attachments: m.attachments } : {}),
       ...(m.replyReference ? { replyReference: m.replyReference } : {}),
     };
@@ -1942,12 +1944,18 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
           const toolName = typeof rawToolName === 'string' && rawToolName.trim() ? rawToolName.trim() : 'custom_tool';
           const rawStatus = payload['status'];
           const status = (rawStatus === 'started' || rawStatus === 'completed' || rawStatus === 'failed') ? rawStatus : 'started';
+          const callId = typeof payload['callId'] === 'string' ? payload['callId'].slice(0, 64) : undefined;
+          const summary = typeof payload['summary'] === 'string' ? payload['summary'].slice(0, 120) : undefined;
+          const facts = typeof payload['facts'] === 'string' ? payload['facts'].slice(0, 60) : undefined;
           return {
             id: e.id,
             type: 'tool_status',
             toolName,
             status,
             timestamp: e.createdAt,
+            ...(callId ? { callId } : {}),
+            ...(summary ? { summary } : {}),
+            ...(facts ? { facts } : {}),
           };
         }
 
