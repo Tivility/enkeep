@@ -796,4 +796,103 @@ describe('D-03 & D-04: Platform Steer and Queue Cancel/List Gateway and Routes',
       expect(parsedPayload.channelContext).toEqual(channelCtx);
     });
   });
+
+  describe('06-C: Batch Queued Turns Merging', () => {
+    it('merges 3 queued turns into single execution turn after running turn completes', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      // 1. Running turn
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_init_running', 'turn_init_running', 'sp1', 'ses1', 'u1', 'container', 'running', '2026-10-19T00:00:00.000Z', '2026-10-19T00:00:00.000Z')
+      `).run();
+
+      // 2. Queue 3 turns
+      const queuedTurns = [
+        { turnId: 'turn_q_merge_1', runId: 'run_q_1', msgId: 'msg_q_1', inboxId: 'inbox_q_1', content: 'First queued prompt', time: '2026-10-19T10:01:00.000Z' },
+        { turnId: 'turn_q_merge_2', runId: 'run_q_2', msgId: 'msg_q_2', inboxId: 'inbox_q_2', content: 'Second queued prompt', time: '2026-10-19T10:02:00.000Z' },
+        { turnId: 'turn_q_merge_3', runId: 'run_q_3', msgId: 'msg_q_3', inboxId: 'inbox_q_3', content: 'Third queued prompt', time: '2026-10-19T10:03:00.000Z' },
+      ];
+
+      for (const q of queuedTurns) {
+        db.prepare(`
+          INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+          VALUES (?, ?, 'sp1', 'ses1', 'u1', 'container', 'queued', ?, ?)
+        `).run(q.runId, q.turnId, q.time, q.time);
+
+        db.prepare(`
+          INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at)
+          VALUES (?, 'ses1', 'u1', 'user', ?, 'delivered', 'u1:web:ses1', ?, NULL, ?)
+        `).run(q.msgId, q.content, q.turnId, q.time);
+
+        db.prepare(`
+          INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+          VALUES (?, 'u1', 'ses1', ?, ?, ?, 'held', ?, ?, ?)
+        `).run(q.inboxId, q.msgId, `deliv_${q.turnId}`, JSON.stringify({ content: q.content, timestamp: q.time }), q.turnId, q.time, q.time);
+      }
+
+      const executedRequests: any[] = [];
+      const executor = {
+        execute: vi.fn().mockImplementation(async (req: any) => {
+          executedRequests.push(req);
+          return {
+            replyText: `Batched reply for: ${req.content}`,
+            usage: { totalTokens: 30 },
+          };
+        }),
+        cancel: vi.fn().mockResolvedValue(true),
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+      });
+
+      // 3. Complete the initial running turn
+      db.prepare(`
+        UPDATE turn_runs
+        SET status = 'completed', finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE turn_id = 'turn_init_running'
+      `).run();
+
+      // 4. Trigger scheduler drain to claim and run queued turns
+      await gateway.drain(2000);
+
+      // Assertions:
+      // executor.execute should have been called exactly once
+      expect(executor.execute).toHaveBeenCalledTimes(1);
+
+      // Main turn should be the last turn (turn_q_merge_3)
+      expect(executedRequests[0].turnId).toBe('turn_q_merge_3');
+
+      // Content should contain all 3 texts formatted with [HH:mm] prefixes
+      const content = executedRequests[0].content;
+      expect(content).toContain('First queued prompt');
+      expect(content).toContain('Second queued prompt');
+      expect(content).toContain('Third queued prompt');
+      const lines = content.split('\n');
+      expect(lines.length).toBe(3);
+      expect(lines[0]).toMatch(/^\[\d{2}:\d{2}\] First queued prompt$/);
+      expect(lines[1]).toMatch(/^\[\d{2}:\d{2}\] Second queued prompt$/);
+      expect(lines[2]).toMatch(/^\[\d{2}:\d{2}\] Third queued prompt$/);
+
+      // First two turns must be completed with error starting with 'merged into'
+      const t1 = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_q_merge_1') as any;
+      const t2 = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_q_merge_2') as any;
+      const t3 = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_q_merge_3') as any;
+
+      expect(t1.status).toBe('completed');
+      expect(t1.error).toBe('merged into turn_q_merge_3');
+
+      expect(t2.status).toBe('completed');
+      expect(t2.error).toBe('merged into turn_q_merge_3');
+
+      expect(t3.status).toBe('completed');
+      expect(t3.error).toBeNull();
+    });
+  });
 });
