@@ -1,7 +1,13 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
+import { createServer, type Server } from 'node:http';
 import { ALL_PLATFORM_MIGRATIONS, PlatformServerMigrationRunner } from '../src/storage/migrations.js';
 import { DeliveryRuntimeGateway } from '../src/runtime/delivery-gateway.js';
+import { createPlatformServerHandler } from '../src/server/handler.js';
+import { SqlitePlatformWebApiAdapter } from '../src/storage/sqlite-platform-api.js';
+import { SqliteWebMessageStore } from '../src/storage/web-messages.js';
+import { ConsoleDataSource } from '../src/management/console-data-source.js';
+import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
 
 describe('Turn Steps Persistence and Retrieval Endpoint (Process Card)', () => {
   let db: DatabaseSync;
@@ -110,5 +116,102 @@ describe('Turn Steps Persistence and Retrieval Endpoint (Process Card)', () => {
     // Verify turnId exposed on assistant message in web_messages
     const msgRow = db.prepare("SELECT turn_id, role FROM web_messages WHERE session_id = 'ses_test' AND role = 'assistant'").get() as { turn_id: string; role: string };
     expect(msgRow.turn_id).toBe(turnId);
+  });
+
+  it('serves lazy GET /api/sessions/:sessionId/turns/:turnId/steps endpoint', async () => {
+    const turnId = 'turn_synth_steps_02';
+    const stepsData = [
+      { id: 'c1', kind: 'tool', name: 'read', status: 'completed', summary: '/synth/code.ts', durationMs: 120 },
+    ];
+
+    db.prepare(`
+      INSERT INTO turn_runs (id, user_id, space_id, route_id, turn_id, status, steps_json)
+      VALUES ('tr_2', 'u_alice_test', 'spc_test', 'ses_test', ?, 'completed', ?)
+    `).run(turnId, JSON.stringify(stepsData));
+
+    const storage = new SqlitePlatformStorage(db);
+    const messageStore = new SqliteWebMessageStore(db);
+    const authService = {
+      authenticateUser: async () => ({ id: 'u_alice_test', username: 'alice', role: 'user', status: 'active' }),
+      authenticateRequest: async () => ({ id: 'u_alice_test', username: 'alice', role: 'user', status: 'active' }),
+      authenticateCookie: async () => ({
+        authenticated: true,
+        user: { id: 'u_alice_test', username: 'alice', role: 'user', status: 'active' },
+        session: { id: 'ses_auth_1' },
+      }),
+      generateCsrfToken: () => 'csrf_synth_token',
+      validateCsrfToken: () => true,
+    } as any;
+
+    const platformApi = new SqlitePlatformWebApiAdapter({
+      storage,
+      messageStore,
+      authService,
+      db,
+    });
+
+    const handler = createPlatformServerHandler({
+      database: db,
+      storage,
+      authService,
+      runtimeGateway: {
+        dispatchInbound: async () => ({ accepted: true, turnId: 't1', message: {} as any, isDuplicate: false }),
+        getCurrentTurnStatus: async () => null,
+        cancelCurrentTurn: async () => false,
+      } as any,
+      platformApi,
+      csrfToken: 'csrf_synth_token',
+      consoleDataSource: new ConsoleDataSource({
+        database: db,
+        storage,
+        quotaDefaults: {
+          turns: 100,
+          messages: 100,
+          tokens: 65536,
+          storage_bytes: 10485760,
+          api_calls: 500,
+          resetInterval: 'none',
+        },
+      }),
+    });
+
+    const server: Server = createServer((req, res) => {
+      handler(req, res).catch((err) => {
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ success: false, error: { message: err.message } }));
+        }
+      });
+    });
+
+    let serverUrl = '';
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        if (typeof addr === 'object' && addr !== null) {
+          serverUrl = `http://127.0.0.1:${addr.port}`;
+        }
+        resolve();
+      });
+    });
+
+    try {
+      const res = await fetch(`${serverUrl}/api/sessions/ses_test/turns/${turnId}/steps`, {
+        headers: {
+          'Cookie': 'auth_token=synth_token',
+        },
+      });
+
+      const json = await res.json();
+      expect(res.status).toBe(200);
+      expect(json.success).toBe(true);
+      expect(json.data.turnId).toBe(turnId);
+      expect(Array.isArray(json.data.steps)).toBe(true);
+      expect(json.data.steps.length).toBe(1);
+      expect(json.data.steps[0].name).toBe('read');
+      expect(json.data.steps[0].summary).toBe('/synth/code.ts');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

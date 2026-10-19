@@ -3121,7 +3121,11 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           if (!session) {
             throw new NotFoundError(`Session "${sessionId}" not found`);
           }
-          const row = (storage as any).db.prepare(`
+          const targetDb = db ?? (storage as any)?.db;
+          if (!targetDb) {
+            throw new PlatformError("Database unavailable", "INTERNAL_ERROR", 500);
+          }
+          const row = targetDb.prepare(`
             SELECT steps_json FROM turn_runs
             WHERE route_id = ? AND turn_id = ? AND user_id = ? LIMIT 1
           `).get(sessionId, turnId, user.id) as { steps_json?: string } | undefined;

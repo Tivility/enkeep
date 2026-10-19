@@ -5993,9 +5993,11 @@ aside.workspace-sidebar.is-collapsed {
   color: var(--text-secondary);
 }
 
-.process-card-header:hover {
+.process-card-header:hover,
+.process-card-header:focus-visible {
   background: var(--hover-overlay);
   color: var(--text-primary);
+  outline: none;
 }
 
 .process-card-header-left {
@@ -6081,6 +6083,11 @@ aside.workspace-sidebar.is-collapsed {
   align-items: center;
   gap: 0.4rem;
   flex-shrink: 0;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.process-step-duration {
   font-size: 0.7rem;
   color: var(--text-muted);
 }

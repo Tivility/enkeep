@@ -1549,6 +1549,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       content: replyText,
       status: 'delivered',
       createdAt: assistantCreatedAt,
+      turnId,
     };
 
     let inTx = false;
@@ -2832,7 +2833,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
       // 4. Insert assistant message into web_messages (idempotent: check if already exists for this turn)
       const existingMsg = this.db.prepare(`
-        SELECT id, content, status, created_at FROM web_messages
+        SELECT id, content, status, created_at, turn_id as turnId FROM web_messages
         WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
       `).get(sessionId, userId, turnId) as WebMessageRecord | undefined;
 
@@ -2859,6 +2860,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           content: executionResult.replyText,
           status: 'delivered',
           createdAt: nowIso,
+          turnId,
         };
 
         // 5. Insert assistant message event into web_events
@@ -3039,11 +3041,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         return;
       }
 
+      const stepsJson = this.collectTurnStepsJson(sessionId, turnId);
       this.db.prepare(`
         UPDATE turn_runs
-        SET status = 'interrupted', error = ?, finished_at = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = 'interrupted', error = ?, finished_at = ?, steps_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status IN ('queued', 'running')
-      `).run(reason, nowIso, turnId, userId);
+      `).run(reason, nowIso, stepsJson, turnId, userId);
 
       this.db.prepare(`
         UPDATE delivery_inbox
@@ -3281,7 +3284,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       // 3c. If timeout or upstream transient, insert assistant system notice message into web_messages
       if ((isTimeout || isUpstreamTransient) && noticeContent) {
         const existingAssistantMsg = this.db.prepare(`
-          SELECT id, content, status, created_at FROM web_messages
+          SELECT id, content, status, created_at, turn_id as turnId FROM web_messages
           WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
         `).get(sessionId, userId, turnId) as WebMessageRecord | undefined;
 
@@ -3307,6 +3310,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             content: noticeContent,
             status: 'delivered',
             createdAt: nowIso,
+            turnId,
           };
 
           const eventPayload = JSON.stringify({ message: assistantMsgRecord });
@@ -3761,15 +3765,16 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         return false;
       }
 
+      const stepsJson = this.collectTurnStepsJson(sessionId, turnId);
       let inTx = false;
       this.db.exec('BEGIN IMMEDIATE');
       inTx = true;
       try {
         const turnRes = this.db.prepare(`
           UPDATE turn_runs
-          SET status = 'interrupted', error = 'Turn cancelled by user', finished_at = ?, updated_at = CURRENT_TIMESTAMP
+          SET status = 'interrupted', error = 'Turn cancelled by user', finished_at = ?, steps_json = ?, updated_at = CURRENT_TIMESTAMP
           WHERE turn_id = ? AND user_id = ? AND status = 'running'
-        `).run(nowIso, turnId, userId);
+        `).run(nowIso, stepsJson, turnId, userId);
 
         if (safeChangesCount(turnRes.changes) === 0) {
           this.db.exec('ROLLBACK');
