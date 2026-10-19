@@ -467,11 +467,29 @@ export function expandMergeForwardContent(
     return { text: '[合并转发消息]', resources };
   }
 
-  const bounded = items.slice(0, maxItems);
+  // Filter items:
+  // 1. Skip items whose msg_type === 'merge_forward' (e.g. parent message itself in im.v1.message.get)
+  // 2. If any item has upper_message_id, only keep items whose upper_message_id === parentMessageId
+  let candidates = items.filter((item) => (item.msg_type || item.message_type) !== 'merge_forward');
+  if (candidates.some((item) => Boolean(item.upper_message_id))) {
+    candidates = candidates.filter((item) => item.upper_message_id === parentMessageId);
+  }
+
+  if (candidates.length === 0) {
+    return { text: '[合并转发消息]', resources };
+  }
+
+  const bounded = candidates.slice(0, maxItems);
   const lines: string[] = ['[合并转发]'];
 
   for (const item of bounded) {
-    const sender = item.sender?.name || item.sender_name || item.sender?.id || item.sender || '';
+    const rawSender =
+      typeof item.sender?.name === 'string'
+        ? item.sender.name.trim()
+        : typeof item.sender_name === 'string'
+          ? item.sender_name.trim()
+          : '';
+    const sender = rawSender;
     const senderPart = sender ? `${sender} ` : '';
 
     const timeRaw = item.create_time ?? item.createTime ?? item.timestamp;
@@ -505,8 +523,8 @@ export function expandMergeForwardContent(
     lines.push(header ? `${header} ${contentText}` : contentText);
   }
 
-  if (items.length > maxItems) {
-    lines.push(`> ...（共 ${items.length} 条，仅展示前 ${maxItems} 条）`);
+  if (candidates.length > maxItems) {
+    lines.push(`> ...（共 ${candidates.length} 条，仅展示前 ${maxItems} 条）`);
   }
 
   return { text: lines.join('\n'), resources };

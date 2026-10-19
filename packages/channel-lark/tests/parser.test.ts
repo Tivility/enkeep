@@ -385,4 +385,76 @@ describe('parser: new message types (P1: interactive, audio, media, sticker, etc
     expect(forwardRes.resources[0].key).toBe('img_child_002');
     expect(forwardRes.resources[0].messageId).toBe(rootMessageId);
   });
+
+  it('filters out merge_forward parent item and mismatched upper_message_id items', () => {
+    const rootMessageId = 'om_test_root_001';
+    const otherRootId = 'om_test_root_other';
+    const rawItems = [
+      {
+        message_id: rootMessageId,
+        msg_type: 'merge_forward',
+        create_time: '1700000000000',
+        sender: { id: 'ou_fake_sender_01' }, // sender only has id, no name
+        body: { content: '' },
+      },
+      {
+        message_id: 'om_test_child_001',
+        upper_message_id: rootMessageId,
+        msg_type: 'text',
+        create_time: '1700000010000',
+        sender: { name: 'Alice' },
+        body: { content: JSON.stringify({ text: '子消息 1' }) },
+      },
+      {
+        message_id: 'om_test_child_002',
+        upper_message_id: otherRootId,
+        msg_type: 'text',
+        create_time: '1700000020000',
+        sender: { name: 'Bob' },
+        body: { content: JSON.stringify({ text: '无关消息' }) },
+      },
+      {
+        message_id: 'om_test_child_003',
+        upper_message_id: rootMessageId,
+        msg_type: 'text',
+        create_time: '1700000030000',
+        sender_name: 'Charlie',
+        body: { content: JSON.stringify({ text: '子消息 2' }) },
+      },
+    ];
+
+    const forwardRes = expandMergeForwardContent(rawItems, rootMessageId);
+    expect(forwardRes.text).toContain('Alice');
+    expect(forwardRes.text).toContain('子消息 1');
+    expect(forwardRes.text).toContain('Charlie');
+    expect(forwardRes.text).toContain('子消息 2');
+    expect(forwardRes.text).not.toContain('Bob');
+    expect(forwardRes.text).not.toContain('无关消息');
+    expect(forwardRes.text).not.toContain('ou_fake_sender_01');
+    expect(forwardRes.text).not.toContain('[object Object]');
+  });
+
+  it('omits sender display when sender has only id/id_type/sender_type or is an object without name', () => {
+    const rootMessageId = 'om_test_root_002';
+    const rawItems = [
+      {
+        message_id: 'om_test_child_010',
+        upper_message_id: rootMessageId,
+        msg_type: 'text',
+        sender: {
+          id: 'ou_synthetic_user_001',
+          id_type: 'open_id',
+          sender_type: 'user',
+        },
+        body: { content: JSON.stringify({ text: '无姓名发送者消息' }) },
+      },
+    ];
+
+    const forwardRes = expandMergeForwardContent(rawItems, rootMessageId);
+    expect(forwardRes.text).toContain('无姓名发送者消息');
+    expect(forwardRes.text).not.toContain('ou_synthetic_user_001');
+    expect(forwardRes.text).not.toContain('open_id');
+    expect(forwardRes.text).not.toContain('[object Object]');
+    expect(forwardRes.text).not.toMatch(/:\s*无姓名发送者消息/);
+  });
 });
