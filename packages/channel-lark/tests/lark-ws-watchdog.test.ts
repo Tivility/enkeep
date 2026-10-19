@@ -5,19 +5,38 @@ type WsState = 'connected' | 'reconnecting' | 'failed' | 'idle';
 
 /** Fake SDK boundary whose websocket clients report a controllable connection state. */
 function makeFactory() {
-  const clients: Array<{ state: WsState; closed: boolean }> = [];
+  const clients: Array<{
+    state: WsState;
+    closed: boolean;
+    forceClosed?: boolean;
+    options: any;
+    triggerReady: () => void;
+  }> = [];
   const factory: LarkSdkClientFactory = {
     createClient: () => ({}),
-    createWSClient: () => {
-      const record = { state: 'idle' as WsState, closed: false };
+    createWSClient: (options) => {
+      const record = {
+        state: 'idle' as WsState,
+        closed: false,
+        forceClosed: false,
+        options,
+        triggerReady: () => {
+          if (options?.onReady) {
+            options.onReady();
+          }
+        },
+      };
       clients.push(record);
       return {
         getConnectionStatus: () => ({ state: record.state, reconnectAttempts: 0 }),
         start: async () => {
           record.state = 'connected';
         },
-        close: async () => {
+        close: async (closeOpts?: { force?: boolean }) => {
           record.closed = true;
+          if (closeOpts?.force) {
+            record.forceClosed = true;
+          }
         },
       };
     },
@@ -96,5 +115,46 @@ describe('Lark websocket watchdog', () => {
     clients[2].state = 'failed';
     await transport.checkWsHealth(9_000_000);
     expect(clients).toHaveLength(3);
+  });
+
+  it('passes pingTimeout: 10 to wsConfig and force-closes late ready client after stop()', async () => {
+    const { factory, clients } = makeFactory();
+    const transport = makeTransport(factory);
+    await transport.start();
+    expect(clients).toHaveLength(1);
+    expect(clients[0].options?.wsConfig).toEqual({ pingTimeout: 10 });
+
+    await transport.stop();
+    expect(transport.connected).toBe(false);
+
+    // Simulate delayed onReady arriving after transport has been stopped
+    clients[0].triggerReady();
+    expect(clients[0].forceClosed).toBe(true);
+    expect(transport.connected).toBe(false);
+  });
+
+  it('force-closes retired client when late onReady fires after watchdog restart', async () => {
+    const { factory, clients } = makeFactory();
+    const transport = makeTransport(factory);
+    await transport.start();
+    expect(clients).toHaveLength(1);
+    const clientA = clients[0];
+
+    // Trigger watchdog restart: clientA fails and is replaced by clientB
+    clientA.state = 'failed';
+    await transport.checkWsHealth(1_000_000);
+    expect(clients).toHaveLength(2);
+    const clientB = clients[1];
+
+    // Late onReady arrives on retired clientA
+    clientA.triggerReady();
+    expect(clientA.forceClosed).toBe(true);
+
+    // clientB finishes ready normally and becomes connected
+    clientB.triggerReady();
+    expect(clientB.forceClosed).toBe(false);
+    expect(transport.connected).toBe(true);
+
+    await transport.stop();
   });
 });

@@ -479,7 +479,7 @@ export interface ILarkApiClient {
 
 export interface ILarkWSClient {
   start: (params: { eventDispatcher: any }) => Promise<void>;
-  close?: () => Promise<void> | void;
+  close?: (options?: { force?: boolean }) => Promise<void> | void;
   getConnectionStatus?: () => { state: string } | any;
 }
 
@@ -492,6 +492,7 @@ export interface LarkSdkClientFactory {
     logger?: any;
     loggerLevel?: any;
     handshakeTimeoutMs?: number;
+    wsConfig?: { pingTimeout?: number };
     onReady?: () => void;
     onError?: (err: Error) => void;
     onReconnecting?: () => void;

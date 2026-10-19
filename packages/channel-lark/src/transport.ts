@@ -1629,6 +1629,8 @@ const WS_WATCHDOG_INTERVAL_MS = 60_000;
 /** First delay between websocket restarts; doubles per restart up to the maximum. */
 const WS_RESTART_MIN_BACKOFF_MS = 30_000;
 const WS_RESTART_MAX_BACKOFF_MS = 10 * 60_000;
+/** SDK ping/pong liveness timeout in seconds (default is 0 = disabled). */
+const WS_PING_TIMEOUT_SEC = 10;
 
 export class CredentialedLarkTransport implements LarkTransport {
   private readonly account: LarkAccountConfig;
@@ -1812,52 +1814,65 @@ export class CredentialedLarkTransport implements LarkTransport {
       },
     });
 
-    const onReadyCallback = () => {
-      this._connected = true;
-      this._connecting = false;
-    };
-    const onErrorCallback = (_err: Error) => {
-      this._connected = false;
-    };
-    const onReconnectingCallback = () => {
-      this._connected = false;
-      this._connecting = true;
-    };
-    const onReconnectedCallback = () => {
-      this._connected = true;
-      this._connecting = false;
-    };
-
     this.stopped = false;
     this.wsStarter = async () => {
+      let client: ILarkWSClient;
+
+      const onReadyCallback = () => {
+        // If the client was replaced by watchdog/restart or the transport was stopped,
+        // force close this late-ready client to prevent orphan connections.
+        if (this.stopped || this.wsClient !== client) {
+          this.logger.warn('[lark-ws] closing retired or stopped WS client that finished handshake late');
+          try {
+            if (typeof client.close === 'function') {
+              void client.close({ force: true });
+            }
+          } catch (err) {
+            this.logger.warn('[lark-ws] failed to close retired client', { message: err instanceof Error ? err.message : String(err) });
+          }
+          return;
+        }
+        this._connected = true;
+        this._connecting = false;
+      };
+      const onErrorCallback = (_err: Error) => {
+        if (this.wsClient !== client) return;
+        this._connected = false;
+      };
+      const onReconnectingCallback = () => {
+        if (this.wsClient !== client) return;
+        this._connected = false;
+        this._connecting = true;
+      };
+      const onReconnectedCallback = () => {
+        if (this.wsClient !== client) return;
+        this._connected = true;
+        this._connecting = false;
+      };
+
+      const wsOptions = {
+        appId,
+        appSecret,
+        domain,
+        logger: sanitizedLogger,
+        loggerLevel: lark.LoggerLevel.error,
+        handshakeTimeoutMs: 15000,
+        wsConfig: { pingTimeout: WS_PING_TIMEOUT_SEC },
+        onReady: onReadyCallback,
+        onError: onErrorCallback,
+        onReconnecting: onReconnectingCallback,
+        onReconnected: onReconnectedCallback,
+      };
+
       if (this.clientFactory && this.clientFactory.createWSClient) {
-        this.wsClient = this.clientFactory.createWSClient({
-          appId,
-          appSecret,
-          domain,
-          logger: sanitizedLogger,
-          loggerLevel: lark.LoggerLevel.error,
-          handshakeTimeoutMs: 15000,
-          onReady: onReadyCallback,
-          onError: onErrorCallback,
-          onReconnecting: onReconnectingCallback,
-          onReconnected: onReconnectedCallback,
-        });
+        client = this.clientFactory.createWSClient(wsOptions);
       } else {
-        this.wsClient = new lark.WSClient({
-          appId,
-          appSecret,
-          domain,
+        client = new lark.WSClient({
+          ...wsOptions,
           httpInstance: boundedHttpInstance,
-          logger: sanitizedLogger,
-          loggerLevel: lark.LoggerLevel.error,
-          handshakeTimeoutMs: 15000,
-          onReady: onReadyCallback,
-          onError: onErrorCallback,
-          onReconnecting: onReconnectingCallback,
-          onReconnected: onReconnectedCallback,
         });
       }
+      this.wsClient = client;
 
       // Start WSClient with eventDispatcher
       if (this.wsClient && typeof this.wsClient.start === 'function') {
@@ -1952,7 +1967,7 @@ export class CredentialedLarkTransport implements LarkTransport {
     if (this.wsClient) {
       try {
         if (typeof this.wsClient.close === 'function') {
-          await this.wsClient.close();
+          await this.wsClient.close({ force: true });
         }
       } catch {
         // Ignore close error on shutdown
