@@ -979,6 +979,8 @@ export class SqliteWebMessageStore {
       const minimalDeliveryPayload = JSON.stringify({
         content,
         timestamp,
+        senderName: params.channelContext?.senderName ?? null,
+        chatType: params.channelContext?.chatType ?? null,
       });
 
       // 2a. Insert placeholder into idempotency_records

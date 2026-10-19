@@ -72,6 +72,8 @@ export interface DeliveryExecutionRequest {
   readonly dshSessionId: string;
   readonly turnId: string;
   readonly content: string;
+  readonly senderName?: string | null;
+  readonly chatType?: string | null;
   readonly attachments?: readonly CanonicalAttachment[];
   readonly profile: RuntimeAgentProfileSnapshot | null;
   readonly modelSelection?: EffectiveModelSelection | null;
@@ -1770,6 +1772,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     userMessageId: string;
     idempotencyKey: string;
     content: string;
+    senderName?: string | null;
+    chatType?: string | null;
     timestamp: string;
     leaseId: string;
     workerId: string;
@@ -1889,6 +1893,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       const idempotencyKey = candidate.idempotency_key || deliveryId;
 
       let content = '';
+      let senderName: string | null = null;
+      let chatType: string | null = null;
       let timestamp = candidate.inbox_timestamp || nowIso;
       let payloadCorrupted = false;
 
@@ -1897,6 +1903,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           const parsed = JSON.parse(candidate.inbox_payload);
           if (parsed && typeof parsed === 'object') {
             content = typeof parsed.content === 'string' ? parsed.content : '';
+            if (typeof parsed.senderName === 'string') senderName = parsed.senderName;
+            if (typeof parsed.chatType === 'string') chatType = parsed.chatType;
             if (typeof parsed.timestamp === 'string') timestamp = parsed.timestamp;
           } else {
             payloadCorrupted = true;
@@ -2008,6 +2016,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         userMessageId,
         idempotencyKey,
         content,
+        senderName,
+        chatType,
         timestamp,
         leaseId,
         workerId,
@@ -2044,6 +2054,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     userMessageId: string;
     idempotencyKey: string;
     content: string;
+    senderName?: string | null;
+    chatType?: string | null;
     timestamp: string;
     leaseId: string;
     workerId: string;
@@ -2059,6 +2071,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       userMessageId,
       idempotencyKey,
       content,
+      senderName,
+      chatType,
       timestamp,
       leaseId,
       workerId,
@@ -2351,6 +2365,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
           }
 
+          const isGroupChat = chatType === 'group' || (typeof chatType === 'string' && chatType !== 'p2p');
+          const effectiveExecutionContent =
+            isGroupChat && senderName && senderName.trim().length > 0
+              ? `[发送者: ${senderName.trim()}] ${content}`
+              : content;
+
           const timeoutMs = this.turnTimeouts.get(turnId) ?? DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS;
           const executionRequest: DeliveryExecutionRequest = {
             userId,
@@ -2358,7 +2378,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             workspaceFolder,
             dshSessionId,
             turnId,
-            content,
+            content: effectiveExecutionContent,
+            senderName: senderName ?? null,
+            chatType: chatType ?? null,
             attachments: canonicalAttachments,
             profile: profileSnapshot,
             modelSelection: effectiveModel,

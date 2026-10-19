@@ -51,6 +51,10 @@ import { ContinuationWatcher, type ContinuationTarget } from './continuation-wat
 import { LarkCotManager, type LarkCotApiClient, type CotEntry } from './cot.js';
 import { LarkBackgroundPanelManager } from './background-panel.js';
 import { isReasoningModelOrEffort } from './transport.js';
+import {
+  createFeishuSenderNameResolver,
+  type FeishuSenderNameResolver,
+} from './sender-name.js';
 
 export interface LarkChannelGatewayOptions {
   account: ChannelAccount | LarkAccountConfig;
@@ -67,6 +71,7 @@ export interface LarkChannelGatewayOptions {
   cotApiClient?: LarkCotApiClient;
   noCotChats?: string[];
   withThinkingPanel?: boolean;
+  senderNameResolver?: FeishuSenderNameResolver;
   isOperatorAllowed?: (params: {
     operatorId: string;
     chatId?: string;
@@ -123,6 +128,7 @@ export class LarkChannelGateway {
   private readonly finalizedStopTurns = new Set<string>();
   readonly cotManager: LarkCotManager;
   readonly backgroundPanelManager: LarkBackgroundPanelManager;
+  readonly senderNameResolver: FeishuSenderNameResolver;
   private readonly configuredWithThinkingPanel?: boolean;
   private readonly isOperatorAllowedCallback?: (params: {
     operatorId: string;
@@ -160,6 +166,55 @@ export class LarkChannelGateway {
           return this.streamEventSource.getBackgroundTasks(sessionId, opts);
         }
         return { items: [], updatedAt: new Date().toISOString() };
+      },
+    });
+
+    const larkApiClient = options.cotApiClient ?? ((this.transport as any).apiClient || (this.transport as any).getApiClient?.());
+    this.senderNameResolver = options.senderNameResolver ?? createFeishuSenderNameResolver({
+      lookup: async (openId) => {
+        const client = (this.transport as any).apiClient ?? larkApiClient;
+        if (!client) throw new Error('Lark API client not connected');
+        const userApi = client.contact?.v3?.user || client.contact?.user;
+        if (!userApi || typeof userApi.get !== 'function') {
+          throw new Error('contact.v3.user.get API not available');
+        }
+        const res = await userApi.get({
+          path: { user_id: openId },
+          params: { user_id_type: 'open_id' },
+        });
+        if (res.code !== undefined && res.code !== 0) {
+          const err = new Error(`contact.v3.user.get failed: ${res.code} ${res.msg ?? ''}`);
+          (err as any).code = res.code;
+          throw err;
+        }
+        return res.data?.user?.name;
+      },
+      listChatMembers: async (chatId, pageToken) => {
+        const client = (this.transport as any).apiClient ?? larkApiClient;
+        if (!client) throw new Error('Lark API client not connected');
+        const getMembersFn = client.im?.v1?.chatMembers?.get || client.im?.chatMembers?.get;
+        if (typeof getMembersFn !== 'function') throw new Error('im.v1.chatMembers.get API not available');
+        const res = await getMembersFn({
+          path: { chat_id: chatId },
+          params: {
+            member_id_type: 'open_id',
+            page_size: 100,
+            ...(pageToken ? { page_token: pageToken } : {}),
+          },
+        });
+        if (res.code !== undefined && res.code !== 0) {
+          const err = new Error(`im.v1.chatMembers.get failed: ${res.code} ${res.msg ?? ''}`);
+          (err as any).code = res.code;
+          throw err;
+        }
+        return {
+          members: (res.data?.items ?? []).map((m: any) => ({
+            openId: m.member_id || m.open_id || '',
+            name: m.name,
+          })),
+          hasMore: res.data?.has_more === true,
+          pageToken: res.data?.page_token,
+        };
       },
     });
 
@@ -638,6 +693,13 @@ export class LarkChannelGateway {
     }
 
     const cleanedText = stripBotMentions(parsed.text, parsed.mentions, this.botOpenId);
+    if (parsed.mentions && parsed.mentions.length > 0) {
+      for (const m of parsed.mentions) {
+        if (m.openId && m.name) {
+          this.senderNameResolver.cacheMentionName(m.openId, m.name);
+        }
+      }
+    }
     // Derive stable platform idempotency key from account + nativeEventId
     const platformIdempotencyKey = this.deriveIdempotencyKey(nativeEventId);
 
@@ -1208,6 +1270,14 @@ export class LarkChannelGateway {
       nativeContextId,
     });
 
+    let senderName: string | undefined;
+    const isGroupChat = parsed.chatType === 'group' || (!parsed.chatType && !parsed.chatId.startsWith('ou_'));
+    if (isGroupChat && parsed.senderId && parsed.senderType === 'user') {
+      try {
+        senderName = await this.senderNameResolver.resolve(parsed.senderId, parsed.chatId);
+      } catch {}
+    }
+
     const envelope: InboundEnvelope = {
       id: platformIdempotencyKey,
       userId: this.userId,
@@ -1225,6 +1295,7 @@ export class LarkChannelGateway {
         rootId: parsed.rootId,
         threadId: parsed.threadId,
         senderId: parsed.senderId,
+        senderName: senderName ?? null,
         chatType: parsed.chatType,
         ...(fallbackNotice ? { fallbackNotice } : {}),
       },

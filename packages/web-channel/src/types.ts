@@ -349,6 +349,7 @@ export interface InboundEnvelopeChannelContext {
   readonly threadId?: string | null;
   readonly originTurnId?: string | null;
   readonly senderId?: string | null;
+  readonly senderName?: string | null;
   readonly chatType?: string | null;
   readonly fallbackNotice?: string | null;
 }
