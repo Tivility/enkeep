@@ -12,6 +12,7 @@ import type {
   LarkMessageResource,
   LarkParsedCardAction,
   LarkParsedMessage,
+  LarkRestMessageItem,
   LarkRawEvent,
   LarkRawMention,
   MentionIdentity,
@@ -924,3 +925,79 @@ export function parseLarkCardAction(rawEvent: LarkRawEvent | null | undefined): 
     operatorUnionId,
   };
 }
+
+/**
+ * Normalizes a REST message from OpenAPI im.v1.message.list into LarkParsedMessage.
+ * Align mentions, sender and resources with the EventDispatcher im.message.receive_v1 format.
+ */
+export function normalizeRestMessageToParsed(
+  item: LarkRestMessageItem,
+  context: { chatType: 'p2p' | 'group' }
+): LarkParsedMessage | null {
+  if (!item || !item.message_id || item.deleted) {
+    return null;
+  }
+  // Bot's own messages must not be ingested as inbound user messages
+  if (item.sender?.sender_type === 'app') {
+    return null;
+  }
+
+  const rawMentions: LarkRawMention[] = (item.mentions || []).map((m) => ({
+    key: m.key,
+    name: m.name,
+    id_type: m.id_type,
+    id: m.id_type === 'open_id' ? { open_id: m.id } : m.id_type === 'user_id' ? { user_id: m.id } : { open_id: m.id },
+  }));
+
+  const { text, resources } = extractTextAndResources(
+    item.msg_type,
+    item.body?.content || '{}',
+    rawMentions
+  );
+
+  const mentions: LarkMention[] = [];
+  if (rawMentions.length > 0) {
+    for (const m of rawMentions) {
+      mentions.push({
+        key: m.key,
+        name: m.name,
+        openId: mentionOpenId(m),
+        userId: mentionIdentity(m).userId,
+        unionId: mentionUnionId(m),
+        appId: mentionAppId(m),
+        idType: m.id_type,
+      });
+    }
+  }
+
+  const postAts = extractPostAtParticipants(item.body?.content);
+  for (const pa of postAts) {
+    if (!mentions.some((m) => (m.openId && m.openId === pa.openId) || (m.appId && m.appId === pa.appId))) {
+      mentions.push(pa);
+    }
+  }
+
+  let senderId = '';
+  if (item.sender?.id_type === 'open_id') {
+    senderId = item.sender.id;
+  } else if (item.sender?.id) {
+    senderId = item.sender.id;
+  }
+
+  return {
+    messageId: item.message_id,
+    chatId: item.chat_id,
+    chatType: context.chatType,
+    rootId: item.root_id || undefined,
+    threadId: item.thread_id || undefined,
+    parentId: item.parent_id || undefined,
+    senderId,
+    senderType: item.sender?.sender_type ?? 'user',
+    msgType: item.msg_type,
+    text,
+    createTime: item.create_time ? new Date(Number(item.create_time)).toISOString() : new Date().toISOString(),
+    mentions: mentions.length > 0 ? mentions : undefined,
+    resources: resources.length > 0 ? resources : undefined,
+  };
+}
+

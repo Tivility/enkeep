@@ -283,6 +283,46 @@ export interface ReconcileStreamingCardParams {
   reasonBanner?: string;
 }
 
+export interface LarkRestMessageItem {
+  message_id: string;
+  root_id?: string;
+  parent_id?: string;
+  thread_id?: string;
+  msg_type: string;
+  create_time: string;
+  update_time?: string;
+  deleted?: boolean;
+  updated?: boolean;
+  chat_id: string;
+  sender?: {
+    id: string;
+    id_type: string;
+    sender_type?: string;
+    tenant_key?: string;
+  };
+  body?: {
+    content?: string;
+  };
+  mentions?: Array<{
+    key: string;
+    id: string;
+    id_type: string;
+    name: string;
+    tenant_key?: string;
+  }>;
+}
+
+export interface LarkBackfillBudget {
+  remaining: number;
+  exhausted: boolean;
+}
+
+export interface LarkConnectionChangeStatus {
+  connected: boolean;
+  generation: number;
+  reason?: string;
+}
+
 export interface LarkTransport {
   readonly connected: boolean;
   start(): Promise<void>;
@@ -361,6 +401,15 @@ export interface LarkTransport {
     method: 'cardkit' | 'message_patch';
     version: number;
   }>;
+  onConnectionChange?(listener: (status: LarkConnectionChangeStatus) => void): void;
+  listChatMessages?(params: {
+    containerId: string;
+    containerType?: 'chat';
+    startTimeSec?: number;
+    endTimeSec?: number;
+    pageSize?: number;
+    pageToken?: string;
+  }): Promise<{ items: LarkRestMessageItem[]; hasMore: boolean; pageToken?: string }>;
 }
 
 export interface LarkImageAttachmentIngestor {

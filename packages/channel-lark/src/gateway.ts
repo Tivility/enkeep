@@ -30,6 +30,7 @@ import {
   expandMergeForwardContent,
   isCardActionEvent,
   messageMentionsBot,
+  normalizeRestMessageToParsed,
   parseLarkCardAction,
   parseLarkEvent,
   stripBotMentions,
@@ -37,10 +38,12 @@ import {
 } from './parser.js';
 import type {
   LarkAccountConfig,
+  LarkBackfillBudget,
   LarkImageAttachmentIngestor,
   LarkParsedCardAction,
   LarkParsedMessage,
   LarkRawEvent,
+  LarkRestMessageItem,
   LarkStreamingCardSession,
   LarkTransport,
   OutboundReplyPayload,
@@ -144,6 +147,11 @@ export class LarkChannelGateway {
   private readonly turnSenders = new Map<string, string>();
   private readonly stoppedTurns = new Set<string>();
   private readonly finalizedStopTurns = new Set<string>();
+  private readonly legacyEventToMessageId = new Map<string, string>();
+  private readonly messageToLegacyEventId = new Map<string, string>();
+  private backfillRunning = false;
+  private currentGeneration = 0;
+  private disconnectedAt: number | null = null;
   readonly cotManager: LarkCotManager;
   readonly backgroundPanelManager: LarkBackgroundPanelManager;
   readonly senderNameResolver: FeishuSenderNameResolver;
@@ -242,6 +250,21 @@ export class LarkChannelGateway {
         return await this.handleInboundEvent(rawEvent);
       }
     });
+
+    if (typeof this.transport.onConnectionChange === 'function') {
+      this.transport.onConnectionChange(async ({ connected, generation, reason }) => {
+        this.currentGeneration = generation;
+        if (!connected) {
+          if (!this.disconnectedAt) this.disconnectedAt = Date.now();
+        } else if (connected && !this.isDisposed) {
+          const disconnectMoment = this.disconnectedAt;
+          this.disconnectedAt = null;
+          this.startBackfill(reason ?? 'reconnected', generation, disconnectMoment).catch((err) => {
+            console.warn('[gateway] Lark backfill encountered error', err);
+          });
+        }
+      });
+    }
   }
 
   get userId(): string {
@@ -465,11 +488,17 @@ export class LarkChannelGateway {
     errorReplyText: string;
   }): Promise<void> {
     const outboxId = this.deriveOutboxId(`err_${params.nativeEventId}`);
+    const legacyEventId = this.messageToLegacyEventId.get(params.nativeEventId);
+    const legacyOutboxId = legacyEventId ? this.deriveOutboxId(`err_${legacyEventId}`) : undefined;
     try {
       let outboxItem = await this.channelRepo.findOutboxById(outboxId);
+      if (!outboxItem && legacyOutboxId) {
+        outboxItem = await this.channelRepo.findOutboxById(legacyOutboxId);
+      }
       if (!outboxItem) {
+        const targetId = legacyOutboxId || outboxId;
         outboxItem = await this.channelRepo.createOutboxItem({
-          id: outboxId,
+          id: targetId,
           accountId: this.accountId,
           sessionId: params.route.id,
           nativeContextId: params.nativeContextId,
@@ -538,7 +567,19 @@ export class LarkChannelGateway {
       return { handled: false, ignoredReason: 'parse_error' };
     }
 
-    const nativeEventId = rawEvent.header?.event_id ?? rawEvent.uuid ?? parsed.messageId;
+    const nativeEventId = parsed.messageId;
+    if (rawEvent.header?.event_id) {
+      this.legacyEventToMessageId.set(rawEvent.header.event_id, parsed.messageId);
+      this.messageToLegacyEventId.set(parsed.messageId, rawEvent.header.event_id);
+      if (this.legacyEventToMessageId.size > 2000) {
+        const oldest = this.legacyEventToMessageId.keys().next().value;
+        if (oldest) this.legacyEventToMessageId.delete(oldest);
+      }
+      if (this.messageToLegacyEventId.size > 2000) {
+        const oldest = this.messageToLegacyEventId.keys().next().value;
+        if (oldest) this.messageToLegacyEventId.delete(oldest);
+      }
+    }
     const nativeContextId = buildNativeContextId(parsed.chatId, parsed.threadId, parsed.rootId);
     const chatNativeContextId = parsed.chatId;
     const isTopic = nativeContextId !== chatNativeContextId;
@@ -1509,6 +1550,9 @@ export class LarkChannelGateway {
         });
         tracker.start();
         this.registerTracker(platformIdempotencyKey, tracker);
+        if (rawEvent.header?.event_id && rawEvent.header.event_id !== nativeEventId) {
+          this.registerTracker(this.deriveIdempotencyKey(rawEvent.header.event_id), tracker);
+        }
       }
     } catch (err) {
       const pending = this.pendingReactions.get(platformIdempotencyKey);
@@ -1923,7 +1967,13 @@ export class LarkChannelGateway {
     }
 
     if (nativeEventId) {
-      const inboxItem = await this.channelRepo.findInboxByEvent(this.accountId, nativeEventId);
+      let inboxItem = await this.channelRepo.findInboxByEvent(this.accountId, nativeEventId);
+      if (!inboxItem) {
+        const mappedMsgId = this.legacyEventToMessageId.get(nativeEventId);
+        if (mappedMsgId) {
+          inboxItem = await this.channelRepo.findInboxByEvent(this.accountId, mappedMsgId);
+        }
+      }
       if (inboxItem) {
         try {
           const payload = JSON.parse(inboxItem.payloadJson);
@@ -1965,9 +2015,18 @@ export class LarkChannelGateway {
     const nativeContextId = params.nativeContextId || route.nativeContextId;
 
     const idemKey = params.idempotencyKey || (nativeEventId ? this.deriveIdempotencyKey(nativeEventId) : undefined);
-    const tracker = idemKey ? this.activeTrackers.get(idemKey) : undefined;
+    let tracker = idemKey ? this.activeTrackers.get(idemKey) : undefined;
+    if (!tracker && nativeEventId) {
+      const mappedMsgId = this.legacyEventToMessageId.get(nativeEventId);
+      if (mappedMsgId) {
+        tracker = this.activeTrackers.get(this.deriveIdempotencyKey(mappedMsgId));
+      }
+    }
     if (idemKey) {
       this.activeTrackers.delete(idemKey);
+    }
+    if (nativeEventId && this.legacyEventToMessageId.has(nativeEventId)) {
+      this.activeTrackers.delete(this.deriveIdempotencyKey(this.legacyEventToMessageId.get(nativeEventId)!));
     }
 
     let streamingHandled = false;
@@ -2059,9 +2118,18 @@ export class LarkChannelGateway {
     }
 
     // Best-effort reaction update: remove 'OnIt' then add 'DONE'
-    const pending = idemKey ? this.pendingReactions.get(idemKey) : undefined;
+    let pending = idemKey ? this.pendingReactions.get(idemKey) : undefined;
+    if (!pending && nativeEventId) {
+      const mappedMsgId = this.legacyEventToMessageId.get(nativeEventId);
+      if (mappedMsgId) {
+        pending = this.pendingReactions.get(this.deriveIdempotencyKey(mappedMsgId));
+      }
+    }
     if (idemKey) {
       this.pendingReactions.delete(idemKey);
+    }
+    if (nativeEventId && this.legacyEventToMessageId.has(nativeEventId)) {
+      this.pendingReactions.delete(this.deriveIdempotencyKey(this.legacyEventToMessageId.get(nativeEventId)!));
     }
     const messageIdForReaction = pending?.messageId || replyToMessageId || params.replyToMessageId;
     if (messageIdForReaction) {
@@ -2324,7 +2392,13 @@ export class LarkChannelGateway {
     }
 
     if (nativeEventId) {
-      const inboxItem = await this.channelRepo.findInboxByEvent(this.accountId, nativeEventId);
+      let inboxItem = await this.channelRepo.findInboxByEvent(this.accountId, nativeEventId);
+      if (!inboxItem) {
+        const mappedMsgId = this.legacyEventToMessageId.get(nativeEventId);
+        if (mappedMsgId) {
+          inboxItem = await this.channelRepo.findInboxByEvent(this.accountId, mappedMsgId);
+        }
+      }
       if (inboxItem) {
         try {
           const payload = JSON.parse(inboxItem.payloadJson);
@@ -2344,9 +2418,18 @@ export class LarkChannelGateway {
 
     // Best-effort reaction cleanup: remove 'OnIt' only (do NOT add 'DONE')
     const idemKey = params.idempotencyKey || (nativeEventId ? this.deriveIdempotencyKey(nativeEventId) : undefined);
-    const pending = idemKey ? this.pendingReactions.get(idemKey) : undefined;
+    let pending = idemKey ? this.pendingReactions.get(idemKey) : undefined;
+    if (!pending && nativeEventId) {
+      const mappedMsgId = this.legacyEventToMessageId.get(nativeEventId);
+      if (mappedMsgId) {
+        pending = this.pendingReactions.get(this.deriveIdempotencyKey(mappedMsgId));
+      }
+    }
     if (idemKey) {
       this.pendingReactions.delete(idemKey);
+    }
+    if (nativeEventId && this.legacyEventToMessageId.has(nativeEventId)) {
+      this.pendingReactions.delete(this.deriveIdempotencyKey(this.legacyEventToMessageId.get(nativeEventId)!));
     }
     const messageIdForReaction = pending?.messageId || replyToMessageId || params.replyToMessageId;
     if (messageIdForReaction && pending) {
@@ -2372,9 +2455,18 @@ export class LarkChannelGateway {
 
     const nativeContextId = params.nativeContextId || route.nativeContextId;
 
-    const tracker = idemKey ? this.activeTrackers.get(idemKey) : undefined;
+    let tracker = idemKey ? this.activeTrackers.get(idemKey) : undefined;
+    if (!tracker && nativeEventId) {
+      const mappedMsgId = this.legacyEventToMessageId.get(nativeEventId);
+      if (mappedMsgId) {
+        tracker = this.activeTrackers.get(this.deriveIdempotencyKey(mappedMsgId));
+      }
+    }
     if (idemKey) {
       this.activeTrackers.delete(idemKey);
+    }
+    if (nativeEventId && this.legacyEventToMessageId.has(nativeEventId)) {
+      this.activeTrackers.delete(this.deriveIdempotencyKey(this.legacyEventToMessageId.get(nativeEventId)!));
     }
 
     let streamingHandled = false;
@@ -2731,6 +2823,7 @@ export class LarkChannelGateway {
    */
   async dispose(): Promise<void> {
     this.isDisposed = true;
+    this.currentGeneration++;
     this.cotManager.dispose();
     this.backgroundPanelManager.dispose();
     for (const tracker of this.activeTrackers.values()) {
@@ -2743,6 +2836,202 @@ export class LarkChannelGateway {
     this.continuationWatchers.clear();
     if (this.transport) {
       await this.transport.stop();
+    }
+  }
+
+  /**
+   * Starts background backfill of missed messages during disconnection or cold start.
+   */
+  async startBackfill(reason: string, generation: number, disconnectedAt?: number | null): Promise<void> {
+    if (this.backfillRunning || this.isDisposed || generation !== this.currentGeneration) return;
+    this.backfillRunning = true;
+
+    try {
+      if (typeof this.transport.listChatMessages !== 'function') return;
+
+      // 1. Get bound chat IDs
+      const bindings = await this.channelRepo.listBindings(this.accountId);
+      const chatIds = Array.from(new Set(
+        bindings
+          .map((b) => b.nativeContextId.split(':')[0])
+          .filter(Boolean)
+      ));
+      if (chatIds.length === 0) return;
+
+      const budget: LarkBackfillBudget = { remaining: 200, exhausted: false };
+      const concurrency = 3;
+      let idx = 0;
+
+      const worker = async () => {
+        while (idx < chatIds.length) {
+          if (this.isDisposed || generation !== this.currentGeneration || budget.exhausted || budget.remaining <= 0) {
+            return;
+          }
+          const chatId = chatIds[idx++];
+          await this.backfillSingleChat(chatId, generation, budget, disconnectedAt);
+        }
+      };
+
+      await Promise.all(Array.from({ length: Math.min(concurrency, chatIds.length) }, worker));
+    } finally {
+      this.backfillRunning = false;
+    }
+  }
+
+  private async backfillSingleChat(
+    chatId: string,
+    generation: number,
+    budget: LarkBackfillBudget,
+    disconnectedAt?: number | null
+  ): Promise<void> {
+    if (typeof this.transport.listChatMessages !== 'function') return;
+
+    const now = Date.now();
+    const maxLookbackMs = 24 * 60 * 60 * 1000;
+    const lookbackHorizon = now - maxLookbackMs;
+    const bufferMs = 5 * 60 * 1000;
+
+    let sinceMs: number;
+    if (disconnectedAt) {
+      sinceMs = disconnectedAt - bufferMs;
+    } else {
+      // Cold start: find last channel_inbox time for this chat context
+      let latestCreatedAt: string | undefined;
+      const repoAny = this.channelRepo as any;
+      if (typeof repoAny.db?.prepare === 'function') {
+        try {
+          const row = repoAny.db.prepare(
+            'SELECT created_at FROM channel_inbox WHERE user_id = ? AND account_id = ? AND (native_context_id = ? OR native_context_id LIKE ?) ORDER BY created_at DESC LIMIT 1'
+          ).get(repoAny.userId, this.accountId, chatId, `${chatId}:%`) as { created_at?: string } | undefined;
+          latestCreatedAt = row?.created_at;
+        } catch {}
+      }
+      if (latestCreatedAt) {
+        const lastTs = new Date(latestCreatedAt).getTime();
+        sinceMs = isNaN(lastTs) ? now - bufferMs : lastTs - bufferMs;
+      } else {
+        sinceMs = now - bufferMs;
+      }
+    }
+
+    sinceMs = Math.max(lookbackHorizon, sinceMs);
+    const startTimeSec = Math.floor(sinceMs / 1000);
+    const endTimeSec = Math.floor(now / 1000);
+
+    let pageToken: string | undefined;
+    const fetchedItems: LarkRestMessageItem[] = [];
+
+    for (let page = 0; page < 10; page++) {
+      if (this.isDisposed || generation !== this.currentGeneration) return;
+      if (budget.remaining <= 0) {
+        budget.exhausted = true;
+        console.warn(`[gateway] Lark backfill API budget exhausted (remaining: 0) while querying chat ${chatId}`);
+        break;
+      }
+      budget.remaining--;
+
+      try {
+        const res = await this.transport.listChatMessages({
+          containerId: chatId,
+          containerType: 'chat',
+          startTimeSec,
+          endTimeSec,
+          pageSize: 50,
+          pageToken,
+        });
+        fetchedItems.push(...res.items);
+        if (!res.hasMore || !res.pageToken) break;
+        pageToken = res.pageToken;
+      } catch (err) {
+        console.warn(`[gateway] Failed to fetch message list for chat ${chatId}`, err);
+        break;
+      }
+    }
+
+    if (pageToken && fetchedItems.length >= 500) {
+      console.warn(`[gateway] Lark backfill exceeded max 10 pages for chat ${chatId}, truncating`);
+    }
+
+    // Sort ascending by create_time
+    const ordered = fetchedItems.sort((a, b) => Number(a.create_time) - Number(b.create_time));
+
+    // Resolve chat-level binding to get activation mode
+    const binding = await this.channelRepo.findBindingByContext(this.accountId, chatId);
+    const isP2P = binding?.chatType === 'p2p' || chatId.startsWith('ou_');
+    const chatType: 'p2p' | 'group' = isP2P ? 'p2p' : 'group';
+    const activationMode = binding?.activationMode ?? (isP2P ? 'always' : 'mention');
+    const requiresMention = activationMode === 'mention' && !isP2P;
+
+    for (const item of ordered) {
+      if (this.isDisposed || generation !== this.currentGeneration) return;
+
+      // Discard messages outside the 24h horizon
+      const msgTimeMs = Number(item.create_time);
+      if (msgTimeMs && msgTimeMs < lookbackHorizon) {
+        continue;
+      }
+
+      const parsed = normalizeRestMessageToParsed(item, { chatType });
+      if (!parsed) continue;
+
+      // Group chat activation_mode check: discard unmentioned messages
+      if (requiresMention) {
+        const rawMentions = (item.mentions || []).map((m) => ({
+          key: m.key,
+          name: m.name,
+          id_type: m.id_type,
+          id: m.id_type === 'open_id' ? { open_id: m.id } : { user_id: m.id },
+        }));
+        const mentioned = messageMentionsBot(
+          { mentions: rawMentions, content: item.body?.content },
+          this.botAppId,
+          this.botOpenId
+        );
+        if (!mentioned) {
+          continue;
+        }
+      }
+
+      // Build synthetic rawEvent and feed into standard handleInboundEvent
+      const syntheticRawEvent: LarkRawEvent = {
+        header: {
+          event_id: parsed.messageId,
+          event_type: 'im.message.receive_v1',
+          create_time: String(Number(item.create_time)),
+        },
+        event: {
+          sender: {
+            sender_id: {
+              open_id: item.sender?.id_type === 'open_id' ? item.sender.id : undefined,
+              user_id: item.sender?.id_type === 'user_id' ? item.sender.id : undefined,
+            },
+            sender_type: item.sender?.sender_type ?? 'user',
+          },
+          message: {
+            message_id: parsed.messageId,
+            root_id: parsed.rootId,
+            thread_id: parsed.threadId,
+            parent_id: parsed.parentId,
+            message_type: parsed.msgType,
+            content: item.body?.content || '{}',
+            chat_id: parsed.chatId,
+            chat_type: parsed.chatType,
+            create_time: String(Number(item.create_time)),
+            mentions: (item.mentions || []).map((m) => ({
+              key: m.key,
+              name: m.name,
+              id_type: m.id_type,
+              id: m.id_type === 'open_id' ? { open_id: m.id } : { user_id: m.id },
+            })),
+          },
+        },
+      };
+
+      try {
+        await this.handleInboundEvent(syntheticRawEvent);
+      } catch (inboundErr) {
+        console.warn(`[gateway] Lark backfill error processing synthetic event for message ${parsed.messageId}`, inboundErr);
+      }
     }
   }
 }

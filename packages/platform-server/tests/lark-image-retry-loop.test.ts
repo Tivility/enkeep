@@ -146,7 +146,7 @@ describe('Lark Inbound Image Retry Loop & Durable Failure Classification', () =>
     expect(outboxRows[0].status).toBe('delivered');
 
     // Inbox status is 'failed' and payload classifies terminal failure
-    const inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id = ?`).get('evt_image_fail_loop_01') as any;
+    const inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id IN ('evt_image_fail_loop_01', 'om_image_fail_01')`).get() as any;
     expect(inboxRow.status).toBe('failed');
     const parsedPayload = JSON.parse(inboxRow.payload_json);
     expect(parsedPayload.retry).toBeDefined();
@@ -166,7 +166,7 @@ describe('Lark Inbound Image Retry Loop & Durable Failure Classification', () =>
     expect(transport.sentReplies).toHaveLength(1);
 
     // Verify: inbox terminal failed row is NOT claimed for processing
-    const inboxAfterTicks = db.prepare(`SELECT status FROM channel_inbox WHERE native_event_id = ?`).get('evt_image_fail_loop_01') as any;
+    const inboxAfterTicks = db.prepare(`SELECT status FROM channel_inbox WHERE native_event_id IN ('evt_image_fail_loop_01', 'om_image_fail_01')`).get() as any;
     expect(inboxAfterTicks.status).toBe('failed');
 
     // Verify claimInboxForProcessing refuses to claim it
@@ -229,7 +229,7 @@ describe('Lark Inbound Image Retry Loop & Durable Failure Classification', () =>
     const res = await gateway.handleInboundEvent(rawEvent);
     expect(res.handled).toBe(true);
 
-    const inboxRow = db.prepare(`SELECT status FROM channel_inbox WHERE native_event_id = ?`).get('evt_text_normal_01') as any;
+    const inboxRow = db.prepare(`SELECT status FROM channel_inbox WHERE native_event_id IN ('evt_text_normal_01', 'om_text_normal_01')`).get() as any;
     expect(inboxRow.status).toBe('delivered');
   });
 
@@ -281,7 +281,7 @@ describe('Lark Inbound Image Retry Loop & Durable Failure Classification', () =>
     expect(transport.sentReplies).toHaveLength(1);
 
     // Classified as HTTP_TRANSIENT_NETWORK with retryable = true and attempt 1
-    let inboxRow = db.prepare(`SELECT id, status, payload_json FROM channel_inbox WHERE native_event_id = ?`).get('evt_transient_retry_01') as any;
+    let inboxRow = db.prepare(`SELECT id, status, payload_json FROM channel_inbox WHERE native_event_id IN ('evt_transient_retry_01', 'om_transient_01')`).get() as any;
     let payload = JSON.parse(inboxRow.payload_json);
     expect(payload.retry.retryable).toBe(true);
     expect(payload.retry.terminal).toBe(false);
@@ -310,9 +310,8 @@ describe('Lark Inbound Image Retry Loop & Durable Failure Classification', () =>
 
     // Advance time past nextRetryAt in payload so backoff elapses
     payload.retry.nextRetryAt = new Date(Date.now() - 1000).toISOString();
-    db.prepare(`UPDATE channel_inbox SET payload_json = ? WHERE native_event_id = ?`).run(
-      JSON.stringify(payload),
-      'evt_transient_retry_01'
+    db.prepare(`UPDATE channel_inbox SET payload_json = ? WHERE native_event_id IN ('evt_transient_retry_01', 'om_transient_01')`).run(
+      JSON.stringify(payload)
     );
 
     // --- GATE CHECK: Concurrent claim when backoff elapsed yields exactly ONE claim ---
@@ -331,23 +330,22 @@ describe('Lark Inbound Image Retry Loop & Durable Failure Classification', () =>
     await runtimeManager.runBackgroundWorkerTick();
     expect(downloadAttempts).toBe(2);
 
-    inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id = ?`).get('evt_transient_retry_01') as any;
+    inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id IN ('evt_transient_retry_01', 'om_transient_01')`).get() as any;
     payload = JSON.parse(inboxRow.payload_json);
     expect(payload.retry.attempts).toBe(2);
     expect(payload.retry.retryable).toBe(true);
 
     // Advance time past nextRetryAt again
     payload.retry.nextRetryAt = new Date(Date.now() - 1000).toISOString();
-    db.prepare(`UPDATE channel_inbox SET payload_json = ? WHERE native_event_id = ?`).run(
-      JSON.stringify(payload),
-      'evt_transient_retry_01'
+    db.prepare(`UPDATE channel_inbox SET payload_json = ? WHERE native_event_id IN ('evt_transient_retry_01', 'om_transient_01')`).run(
+      JSON.stringify(payload)
     );
 
     // Attempt 3: Worker tick retries and reaches maxAttempts (3) -> becomes terminal
     await runtimeManager.runBackgroundWorkerTick();
     expect(downloadAttempts).toBe(3);
 
-    inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id = ?`).get('evt_transient_retry_01') as any;
+    inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id IN ('evt_transient_retry_01', 'om_transient_01')`).get() as any;
     payload = JSON.parse(inboxRow.payload_json);
     expect(payload.retry.attempts).toBe(3);
     expect(payload.retry.retryable).toBe(false);
@@ -466,7 +464,7 @@ describe('Lark Inbound Image Retry Loop & Durable Failure Classification', () =>
     expect(mockApiClient.im.v1.messageResource.get).toHaveBeenCalledTimes(1);
 
     // Verify inbox item classified as terminal failure
-    const inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id = ?`).get('evt_cred_smoke_01') as any;
+    const inboxRow = db.prepare(`SELECT status, payload_json FROM channel_inbox WHERE native_event_id IN ('evt_cred_smoke_01', 'om_cred_smoke_msg')`).get() as any;
     expect(inboxRow.status).toBe('failed');
     const payload = JSON.parse(inboxRow.payload_json);
     expect(payload.retry.terminal).toBe(true);

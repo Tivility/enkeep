@@ -457,8 +457,9 @@ describe('Lark Generic & PDF Attachment Intake', () => {
     expect(replies).toHaveLength(1);
     expect(replies[0].content).toContain('文件大小超出限制（单文件最大 500MB）');
 
-    const inboxRows = db.prepare('SELECT status, payload_json FROM channel_inbox WHERE native_event_id = ?').all(
-      'evt_oversize_001'
+    const inboxRows = db.prepare('SELECT status, payload_json FROM channel_inbox WHERE native_event_id IN (?, ?)').all(
+      'evt_oversize_001',
+      messageId
     ) as Array<{ status: string; payload_json: string }>;
     expect(inboxRows).toHaveLength(1);
     expect(inboxRows[0].status).toBe('failed');

@@ -506,7 +506,7 @@ describe('Lark Inbound Image Compatibility End-to-End', () => {
     expect(transport.sentReplies[0].content).toBe('图片接收失败，请稍后重试');
 
     // Inbox status marked 'failed'
-    const inboxRow = db.prepare(`SELECT status FROM channel_inbox WHERE native_event_id = ?`).get('evt_fail_01') as any;
+    const inboxRow = db.prepare(`SELECT status FROM channel_inbox WHERE native_event_id IN ('evt_fail_01', 'om_fail_01')`).get() as any;
     expect(inboxRow.status).toBe('failed');
   });
 
