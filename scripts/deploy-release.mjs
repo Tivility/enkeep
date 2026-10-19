@@ -34,6 +34,14 @@ const FORBIDDEN_ROOTS = ['/etc', '/usr', '/System', '/root', '/bin', '/sbin'];
  * Options:
  * - lockfileDiff: optional string of git diff for pnpm-lock.yaml / package-lock.json / yarn.lock
  */
+/**
+ * Default wait for quiescence before any service stop. A switch never forces a restart:
+ * long background work is waited for, and the deploy gives up (no restart) after this.
+ */
+export const DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 24 * 60 * 60;
+/** Default interval between quiescence checks while waiting. */
+export const DEFAULT_PREFLIGHT_INTERVAL_SECONDS = 120;
+
 export function classifyChanges(paths, options = {}) {
   const result = {
     frontend: false,
@@ -249,8 +257,8 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     runtimeImagePrefix: getVal('RUNTIME_IMAGE_PREFIX', cliOpts.runtimeImagePrefix),
     containerNamePrefix: getVal('CONTAINER_NAME_PREFIX', cliOpts.containerNamePrefix),
     dockerfilePath: getVal('DOCKERFILE_PATH', undefined, 'docker/Dockerfile.runtime'),
-    preflightTimeoutSeconds: getIntVal('PREFLIGHT_TIMEOUT_SECONDS', undefined, 7200),
-    preflightIntervalSeconds: getIntVal('PREFLIGHT_INTERVAL_SECONDS', undefined, 10),
+    preflightTimeoutSeconds: getIntVal('PREFLIGHT_TIMEOUT_SECONDS', undefined, DEFAULT_PREFLIGHT_TIMEOUT_SECONDS),
+    preflightIntervalSeconds: getIntVal('PREFLIGHT_INTERVAL_SECONDS', undefined, DEFAULT_PREFLIGHT_INTERVAL_SECONDS),
     preflightDueMinutes: getIntVal('PREFLIGHT_DUE_MINUTES', undefined, 10),
     testedCommit: getVal('TESTED_COMMIT', cliOpts.testedCommit, ''),
     testCmds,
@@ -1400,6 +1408,59 @@ export async function executePlatformDeploy(config, options = {}) {
   return { success: true, releaseId, imageTag };
 }
 
+/**
+ * Builds the commands for a platform-only restart of the currently deployed release:
+ * wait for quiescence, then restart the LaunchAgent in place. Runtime daemons and
+ * containers are retained.
+ * @param config - resolved deploy configuration.
+ * @param runnerJs - demo-runner entry of the online release (from the plist).
+ * @returns the quiescence-wait command and the restart command.
+ */
+export function buildRestartPlatformCommands(config, runnerJs) {
+  const preflightCmd = [
+    `node "${runnerJs}" preflight`,
+    `--data-dir "${config.dataDir}"`,
+    `--port ${config.port}`,
+    `--due-within-minutes ${config.preflightDueMinutes}`,
+    `--wait`,
+    `--timeout-seconds ${config.preflightTimeoutSeconds}`,
+    `--interval-seconds ${config.preflightIntervalSeconds}`,
+  ].join(' ');
+  const restartCmd = `launchctl kickstart -k gui/$(id -u)/${config.launchdLabel}`;
+  return { preflightCmd, restartCmd };
+}
+
+/**
+ * Restarts the platform process of the online release without deploying anything, for
+ * recovery (for example lost channel connections). Waits for quiescence first and never
+ * restarts while turns or background work are active; verifies afterwards.
+ * @param config - resolved deploy configuration.
+ */
+export async function executeRestartPlatform(config) {
+  const plistContent = readFileSync(config.plistPath, 'utf8');
+  const match = /<string>(.*?\/packages\/demo-runner\/dist\/demo-runner\.js)<\/string>/.exec(plistContent);
+  if (!match || !existsSync(match[1])) {
+    throw new Error('Cannot locate the online demo-runner entry from the LaunchAgent plist');
+  }
+  const { preflightCmd, restartCmd } = buildRestartPlatformCommands(config, match[1]);
+  console.log('================================================================');
+  console.log('  Enkeep Platform Restart (no deploy, runtimes retained)          ');
+  console.log('================================================================');
+  if (config.dryRun) {
+    console.log(`[DRY-RUN] Would wait for quiescence: ${preflightCmd}`);
+    console.log(`[DRY-RUN] Would restart: ${restartCmd}`);
+    console.log('[DRY-RUN] Would run post-restart verification');
+    return;
+  }
+  console.log('Waiting for quiescence before restarting the platform...');
+  execSync(preflightCmd, { stdio: 'inherit' });
+  const preSwitchConnCount = countEstablishedConnections(config.port);
+  console.log(`Pre-restart connection count: ${preSwitchConnCount}`);
+  execSync(restartCmd, { stdio: 'inherit' });
+  await executeVerify({ ...config, mode: 'split' }, null, preSwitchConnCount);
+  console.log('✓ Platform restarted and verified.');
+}
+
 export async function executeDeploy(config, options = {}) {
   validateConfig(config);
 
@@ -1409,6 +1470,10 @@ export async function executeDeploy(config, options = {}) {
 
   if (config.only === 'verify') {
     return executeVerify(config);
+  }
+
+  if (config.only === 'restart-platform') {
+    return executeRestartPlatform(config);
   }
 
   if (config.only === 'frontend') {
@@ -1527,7 +1592,7 @@ Optional Options:
   --skip-tests                     Skip unit test run
   --reuse                          Reuse existing release/batchNN branch without failing
   --mode <full|split>              Deployment mode ('full' forces container teardown; default is split)
-  --only <frontend|runtime|verify|rollback> Run only frontend, runtime, verify, or rollback mode
+  --only <frontend|runtime|verify|rollback|restart-platform> Run only one step; restart-platform waits for quiescence then restarts the online platform in place
   --prune-old                      Prune historical release worktrees after deploy
   --dry-run                        Simulate actions without modifying system
   -h, --help                       Show this help message
