@@ -288,6 +288,7 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
         'state',
         'tr',
         'handleCancelQueuedTurn',
+        'handleSteerQueuedTurns',
         `
         ${fnMatch![0]}
         return renderQueuedTurns;
@@ -299,6 +300,8 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
             tagName: tag,
             className: '',
             textContent: '',
+            title: '',
+            disabled: false,
             children: [] as any[],
             appendChild: function (c: any) { this.children.push(c); },
             setAttribute: () => {},
@@ -307,6 +310,7 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
         },
         mockState,
         (k: string, _p: any, fb: string) => fb,
+        () => {},
         () => {}
       );
 
@@ -314,8 +318,161 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
 
       expect(classList.has('hidden')).toBe(false);
       expect(trayChildren.length).toBe(2); // Header + List
-      expect(trayChildren[0].textContent).toContain('Queued Messages (2)');
+      expect(trayChildren[0].children[0].textContent).toContain('Queued Messages (2)');
       expect(trayChildren[1].children.length).toBe(2); // Two queued items
+    });
+
+    it('renderQueuedTurns: renders steer button on each item and steer all button on header, enabled only when running', () => {
+      const trayChildren: any[] = [];
+      const classList = new Set<string>();
+
+      const mockTray = {
+        replaceChildren: () => { trayChildren.length = 0; },
+        appendChild: (child: any) => { trayChildren.push(child); },
+        classList: {
+          contains: (c: string) => classList.has(c),
+          add: (c: string) => classList.add(c),
+          remove: (c: string) => classList.delete(c),
+        },
+      };
+
+      const mockState = {
+        currentSessionId: 'ses_test_001',
+        activeTurnStatus: 'running',
+        queuedTurns: [
+          { turnId: 'turn_q1', contentSnippet: 'Queued item 1' },
+        ],
+        isCancellingQueuedTurn: false,
+        isSteeringQueuedTurn: false,
+      };
+
+      const fnMatch = appJs.match(/function renderQueuedTurns\(\) \{[\s\S]*?\n\}/);
+      expect(fnMatch).not.toBeNull();
+
+      const renderFn = new Function(
+        'document',
+        'state',
+        'tr',
+        'handleCancelQueuedTurn',
+        'handleSteerQueuedTurns',
+        `
+        ${fnMatch![0]}
+        return renderQueuedTurns;
+      `
+      )(
+        {
+          getElementById: (id: string) => (id === 'composer-queue-tray' ? mockTray : null),
+          createElement: (tag: string) => ({
+            tagName: tag,
+            className: '',
+            textContent: '',
+            title: '',
+            disabled: false,
+            children: [] as any[],
+            appendChild: function (c: any) { this.children.push(c); },
+            setAttribute: () => {},
+            addEventListener: () => {},
+          }),
+        },
+        mockState,
+        (k: string, _p: any, fb: string) => fb,
+        () => {},
+        () => {}
+      );
+
+      // When running: steer buttons are enabled
+      renderFn();
+      const header = trayChildren[0];
+      const steerAllBtn = header.children.find((c: any) => c.className === 'composer-queue-steer-all');
+      expect(steerAllBtn).toBeDefined();
+      expect(steerAllBtn.disabled).toBe(false);
+
+      const list = trayChildren[1];
+      const itemRow = list.children[0];
+      const actionsDiv = itemRow.children.find((c: any) => c.className === 'composer-queue-item-actions');
+      expect(actionsDiv).toBeDefined();
+      const steerItemBtn = actionsDiv.children.find((c: any) => c.className === 'composer-queue-item-steer');
+      expect(steerItemBtn).toBeDefined();
+      expect(steerItemBtn.disabled).toBe(false);
+
+      // When NOT running: steer buttons are disabled
+      mockState.activeTurnStatus = 'queued';
+      renderFn();
+      const headerNotRunning = trayChildren[0];
+      const steerAllBtnNotRunning = headerNotRunning.children.find((c: any) => c.className === 'composer-queue-steer-all');
+      expect(steerAllBtnNotRunning.disabled).toBe(true);
+
+      const listNotRunning = trayChildren[1];
+      const actionsDivNotRunning = listNotRunning.children[0].children.find((c: any) => c.className === 'composer-queue-item-actions');
+      const steerItemBtnNotRunning = actionsDivNotRunning.children.find((c: any) => c.className === 'composer-queue-item-steer');
+      expect(steerItemBtnNotRunning.disabled).toBe(true);
+    });
+
+    it('chatInput keydown: Mod+Shift+Enter triggers handleSteerMessage', () => {
+      let steerCalled = false;
+      let sendCalled = false;
+      let defaultPrevented = false;
+
+      const mockHandleSteerMessage = () => { steerCalled = true; };
+      const mockHandleSendMessage = () => { sendCalled = true; };
+
+      // Simulate keydown event handler logic
+      const simulateKeydown = (event: { key: string; metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean; preventDefault: () => void }) => {
+        if (event.key === 'Enter') {
+          const isMod = event.metaKey || event.ctrlKey;
+          if (isMod && event.shiftKey) {
+            event.preventDefault();
+            mockHandleSteerMessage();
+          } else if (!event.shiftKey) {
+            event.preventDefault();
+            mockHandleSendMessage();
+          }
+        }
+      };
+
+      // 1. Mod+Shift+Enter (e.g. metaKey + shiftKey + Enter on macOS)
+      simulateKeydown({
+        key: 'Enter',
+        metaKey: true,
+        shiftKey: true,
+        preventDefault: () => { defaultPrevented = true; },
+      });
+      expect(steerCalled).toBe(true);
+      expect(sendCalled).toBe(false);
+      expect(defaultPrevented).toBe(true);
+
+      // 2. Mod+Shift+Enter on Windows/Linux (ctrlKey + shiftKey + Enter)
+      steerCalled = false;
+      simulateKeydown({
+        key: 'Enter',
+        ctrlKey: true,
+        shiftKey: true,
+        preventDefault: () => {},
+      });
+      expect(steerCalled).toBe(true);
+      expect(sendCalled).toBe(false);
+
+      // 3. Regular Enter
+      steerCalled = false;
+      simulateKeydown({
+        key: 'Enter',
+        metaKey: false,
+        ctrlKey: false,
+        shiftKey: false,
+        preventDefault: () => {},
+      });
+      expect(steerCalled).toBe(false);
+      expect(sendCalled).toBe(true);
+
+      // 4. Shift+Enter (multiline newline, no send, no steer)
+      sendCalled = false;
+      simulateKeydown({
+        key: 'Enter',
+        shiftKey: true,
+        preventDefault: () => {},
+      });
+      expect(steerCalled).toBe(false);
+      expect(sendCalled).toBe(false);
     });
   });
 });

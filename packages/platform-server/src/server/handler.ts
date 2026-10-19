@@ -178,6 +178,7 @@ const ALLOWED_CIRCUIT_BREAKER_RESET_KEYS = new Set([
 const ALLOWED_EDIT_MESSAGE_KEYS = new Set(["content", "attachments", "title", "targetSpaceId", "replyToMessageId"]);
 const ALLOWED_MESSAGE_KEYS = new Set(["content", "attachments", "metadata", "replyToMessageId"]);
 const ALLOWED_STEER_KEYS = new Set(["clientRequestId", "expectedTurnId", "content"]);
+const ALLOWED_QUEUE_STEER_KEYS = new Set(["turnIds"]);
 const ALLOWED_CREATE_TASK_KEYS = new Set([
   "title",
   "prompt",
@@ -3247,6 +3248,44 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             throw new PlatformError("Turn is not in queue or already running/completed", "NOT_IN_QUEUE", 409);
           }
           sendJsonResponse(res, 200, createSuccessEnvelope({ cancelled: true, turnId }));
+          return;
+        }
+
+        // 6.1.7-queue-steer /api/sessions/:sessionId/queue/steer
+        if (subPath === "/queue/steer") {
+          if (method !== "POST") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          validateCsrf(req, { csrfToken });
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          const body = await parseJsonBody(req, maxBodyBytes);
+          const unknownKeys = getUnknownKeys(body, ALLOWED_QUEUE_STEER_KEYS);
+          if (unknownKeys.length > 0) {
+            throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+          }
+
+          let sel: { turnIds: string[] } | { all: true; senderId?: string };
+          if (body && Array.isArray(body.turnIds)) {
+            const turnIds = body.turnIds.map((tid: unknown) => {
+              if (typeof tid !== "string" || !tid.trim()) {
+                throw new ValidationError("Each item in turnIds must be a non-empty string");
+              }
+              return tid.trim();
+            });
+            sel = { turnIds };
+          } else {
+            sel = { all: true };
+          }
+
+          if (!runtimeGateway.promoteQueuedToSteer) {
+            throw new PlatformError("Promoting queue to steer is not supported by runtime gateway", "NOT_IMPLEMENTED", 501);
+          }
+
+          const promoteRes = await runtimeGateway.promoteQueuedToSteer(user.id, sessionId, sel);
+          sendJsonResponse(res, 200, createSuccessEnvelope(promoteRes));
           return;
         }
 

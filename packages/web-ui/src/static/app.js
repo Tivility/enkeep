@@ -1398,6 +1398,7 @@ const state = {
   queuedTurns: [],
   isCancellingTurn: false,
   isCancellingQueuedTurn: false,
+  isSteeringQueuedTurn: false,
   isSteeringMessage: false,
   isSendingMessage: false,
   isPollingInFlight: false,
@@ -1933,6 +1934,7 @@ function showAuthView() {
   state.queuedTurns = [];
   state.isCancellingTurn = false;
   state.isCancellingQueuedTurn = false;
+  state.isSteeringQueuedTurn = false;
   state.isSteeringMessage = false;
   state.consecutivePollingFailures = 0;
   state.pendingConfirmAction = null;
@@ -14798,7 +14800,13 @@ const CHAT_I18N_EN = {
   'chat.steerBadge': 'Steer',
   'chat.queuedTurnEnded': 'Current turn has ended. Input retained.',
   'chat.cancelQueuedTurn': 'Cancel Queued Turn',
+  'chat.steerQueuedTurn': 'Steer Queued Turn',
+  'chat.steerAllQueuedTurns': 'Steer All Queued',
   'chat.queuedTurnCancelled': 'Queued turn cancelled successfully.',
+  'chat.queuedSteeredSuccess': 'Inserted into current turn ({count}).',
+  'chat.queuedNothingRunning': 'No running turn. Messages will run in order.',
+  'chat.queuedNothingQueued': 'No queued messages.',
+  'chat.queuedRequeued': 'Turn ended. Messages requeued for execution.',
   'chat.queuedTurnsHeader': 'Queued Messages',
   'chat.statusThinking': 'Thinking...',
   'chat.statusActive': 'active',
@@ -15044,7 +15052,13 @@ const CHAT_I18N_ZH = {
   'chat.steerBadge': '纠偏',
   'chat.queuedTurnEnded': '当前轮次已结束，内容已保留',
   'chat.cancelQueuedTurn': '取消排队轮次',
+  'chat.steerQueuedTurn': '插队',
+  'chat.steerAllQueuedTurns': '全部插队',
   'chat.queuedTurnCancelled': '排队轮次已成功取消。',
+  'chat.queuedSteeredSuccess': '已插入当前任务（{count} 条）',
+  'chat.queuedNothingRunning': '当前没有运行中的任务，消息会正常处理',
+  'chat.queuedNothingQueued': '没有排队中的消息',
+  'chat.queuedRequeued': '任务已结束，消息已重新排队等待处理',
   'chat.queuedTurnsHeader': '排队中的消息',
   'chat.statusThinking': '思考中...',
   'chat.statusActive': '活跃',
@@ -17365,6 +17379,7 @@ function deselectSession() {
   state.queuedTurns = [];
   state.isCancellingTurn = false;
   state.isCancellingQueuedTurn = false;
+  state.isSteeringQueuedTurn = false;
   state.isSteeringMessage = false;
   state.messages = [];
   state.streamingState = null;
@@ -17929,9 +17944,28 @@ function renderQueuedTurns() {
   tray.replaceChildren();
   tray.classList.remove('hidden');
 
+  const isTurnRunning = state.activeTurnStatus === 'running';
+
   const headerDiv = document.createElement('div');
   headerDiv.className = 'composer-queue-header';
-  headerDiv.textContent = `⏳ ${tr('chat.queuedTurnsHeader', null, 'Queued Messages')} (${state.queuedTurns.length})`;
+
+  const titleSpan = document.createElement('span');
+  titleSpan.className = 'composer-queue-header-title';
+  titleSpan.textContent = `⏳ ${tr('chat.queuedTurnsHeader', null, 'Queued Messages')} (${state.queuedTurns.length})`;
+  headerDiv.appendChild(titleSpan);
+
+  const steerAllBtn = document.createElement('button');
+  steerAllBtn.type = 'button';
+  steerAllBtn.className = 'composer-queue-steer-all';
+  steerAllBtn.textContent = tr('chat.steerAllQueuedTurns', null, 'Steer All Queued');
+  steerAllBtn.title = tr('chat.steerAllQueuedTurns', null, 'Steer All Queued');
+  steerAllBtn.disabled = !isTurnRunning || state.isSteeringQueuedTurn || state.isCancellingQueuedTurn;
+  steerAllBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    handleSteerQueuedTurns();
+  });
+  headerDiv.appendChild(steerAllBtn);
+
   tray.appendChild(headerDiv);
 
   const listDiv = document.createElement('div');
@@ -17954,20 +17988,38 @@ function renderQueuedTurns() {
 
     contentDiv.appendChild(textSpan);
 
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'composer-queue-item-actions';
+
+    const steerBtn = document.createElement('button');
+    steerBtn.type = 'button';
+    steerBtn.className = 'composer-queue-item-steer';
+    steerBtn.title = tr('chat.steerQueuedTurn', null, 'Steer Queued Turn');
+    steerBtn.setAttribute('aria-label', tr('chat.steerQueuedTurn', null, 'Steer Queued Turn'));
+    steerBtn.textContent = tr('chat.steerQueuedTurn', null, 'Steer');
+    steerBtn.disabled = !isTurnRunning || state.isSteeringQueuedTurn || state.isCancellingQueuedTurn;
+    steerBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      handleSteerQueuedTurns([item.turnId]);
+    });
+
     const cancelBtn = document.createElement('button');
     cancelBtn.type = 'button';
     cancelBtn.className = 'composer-queue-item-cancel';
     cancelBtn.title = tr('chat.cancelQueuedTurn', null, 'Cancel Queued Turn');
     cancelBtn.setAttribute('aria-label', tr('chat.cancelQueuedTurn', null, 'Cancel Queued Turn'));
     cancelBtn.textContent = '✕';
-    cancelBtn.disabled = state.isCancellingQueuedTurn;
+    cancelBtn.disabled = state.isCancellingQueuedTurn || state.isSteeringQueuedTurn;
     cancelBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       handleCancelQueuedTurn(item.turnId);
     });
 
+    actionsDiv.appendChild(steerBtn);
+    actionsDiv.appendChild(cancelBtn);
+
     itemRow.appendChild(contentDiv);
-    itemRow.appendChild(cancelBtn);
+    itemRow.appendChild(actionsDiv);
     listDiv.appendChild(itemRow);
   });
 
@@ -18031,6 +18083,62 @@ async function handleCancelQueuedTurn(turnId) {
     }
   } finally {
     state.isCancellingQueuedTurn = false;
+    renderQueuedTurns();
+  }
+}
+
+async function handleSteerQueuedTurns(turnIds) {
+  const sessionId = state.currentSessionId;
+  if (!sessionId || state.isSteeringQueuedTurn || state.isCancellingQueuedTurn) return;
+
+  if (state.activeTurnStatus !== 'running') {
+    showToast(tr('chat.queuedNothingRunning', null, 'No running turn. Messages will run in order.'), 'warning');
+    return;
+  }
+
+  state.isSteeringQueuedTurn = true;
+  renderQueuedTurns();
+
+  try {
+    const payload = {};
+    if (Array.isArray(turnIds) && turnIds.length > 0) {
+      payload.turnIds = turnIds;
+    }
+    const res = await apiRequest(`/api/sessions/${sessionId}/queue/steer`, {
+      method: 'POST',
+      body: payload,
+    });
+
+    const data = res && res.data;
+    const status = data ? data.status : null;
+    const count = (data && typeof data.count === 'number') ? data.count : 0;
+
+    if (status === 'steered') {
+      showToast(tr('chat.queuedSteeredSuccess', { count }, `Inserted into current turn (${count}).`), 'success');
+    } else if (status === 'nothing_running') {
+      showToast(tr('chat.queuedNothingRunning', null, 'No running turn. Messages will run in order.'), 'info');
+    } else if (status === 'nothing_queued') {
+      showToast(tr('chat.queuedNothingQueued', null, 'No queued messages.'), 'info');
+    } else if (status === 'requeued') {
+      showToast(tr('chat.queuedRequeued', null, 'Turn ended. Messages requeued for execution.'), 'warning');
+    } else {
+      showToast(tr('chat.queuedSteeredSuccess', { count }, `Inserted into current turn (${count}).`), 'success');
+    }
+
+    if (state.currentSessionId === sessionId) {
+      await fetchQueuedTurns(sessionId);
+      await syncActiveTurnStatus(sessionId);
+      await loadMessages(sessionId);
+      pollEvents(sessionId);
+    }
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, tr('common.error', null, 'Failed to steer queued turn.')), 'error');
+    if (state.currentSessionId === sessionId) {
+      await fetchQueuedTurns(sessionId);
+      await syncActiveTurnStatus(sessionId);
+    }
+  } finally {
+    state.isSteeringQueuedTurn = false;
     renderQueuedTurns();
   }
 }
@@ -20947,6 +21055,7 @@ async function syncActiveTurnStatus(sessionId) {
     updateStopTurnControl();
     updateTurnStatusBadge();
     updateComposerControlsState();
+    renderQueuedTurns();
   } catch {
     if (state.currentSessionId === sessionId) {
       state.hasCancellableTurn = false;
@@ -20955,6 +21064,7 @@ async function syncActiveTurnStatus(sessionId) {
       updateStopTurnControl();
       updateTurnStatusBadge();
       updateComposerControlsState();
+      renderQueuedTurns();
     }
   } finally {
     state.isTurnSyncInFlight = false;
@@ -22082,6 +22192,7 @@ if (typeof window !== 'undefined') {
   window.renderQueuedTurns = renderQueuedTurns;
   window.fetchQueuedTurns = fetchQueuedTurns;
   window.handleCancelQueuedTurn = handleCancelQueuedTurn;
+  window.handleSteerQueuedTurns = handleSteerQueuedTurns;
   window.handleSteerMessage = handleSteerMessage;
   window.openEditMessageModal = openEditMessageModal;
   window.handleEditMessage = handleEditMessage;
@@ -22469,9 +22580,15 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     chatInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        handleSendMessage();
+      if (e.key === 'Enter') {
+        const isMod = e.metaKey || e.ctrlKey;
+        if (isMod && e.shiftKey) {
+          e.preventDefault();
+          handleSteerMessage();
+        } else if (!e.shiftKey) {
+          e.preventDefault();
+          handleSendMessage();
+        }
       }
     });
   }
