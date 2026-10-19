@@ -75,6 +75,7 @@ describe('SqliteTenantScopedChannelRepository', () => {
       expect(binding.spaceId).toBe(spaceId);
       expect(binding.nativeContextId).toBe('oc_chat_123');
       expect(binding.activationMode).toBe('mention');
+      expect(binding.busyMode).toBe('queue');
 
       const found = await repo.findBindingByContext(account.id, 'oc_chat_123');
       expect(found).toEqual(binding);
@@ -90,8 +91,10 @@ describe('SqliteTenantScopedChannelRepository', () => {
 
       const updated = await repo.updateBinding(binding.id, {
         activationMode: 'always',
+        busyMode: 'steer',
       });
       expect(updated.activationMode).toBe('always');
+      expect(updated.busyMode).toBe('steer');
 
       const bindings = await repo.listBindings(account.id);
       expect(bindings.length).toBe(1);

@@ -28,7 +28,7 @@ describe('Lark Offline Backfill', () => {
         id TEXT PRIMARY KEY, user_id TEXT, type TEXT, default_space_id TEXT, status TEXT, credential_ref TEXT, brand TEXT, app_id TEXT, bot_open_id TEXT, config_json TEXT, created_at TEXT, updated_at TEXT
       );
       CREATE TABLE IF NOT EXISTS channel_bindings (
-        id TEXT PRIMARY KEY, user_id TEXT, account_id TEXT, space_id TEXT, native_context_id TEXT, activation_mode TEXT, chat_type TEXT, session_route_id TEXT, created_at TEXT, updated_at TEXT
+        id TEXT PRIMARY KEY, user_id TEXT, account_id TEXT, space_id TEXT, native_context_id TEXT, activation_mode TEXT, busy_mode TEXT DEFAULT 'queue', chat_type TEXT, session_route_id TEXT, created_at TEXT, updated_at TEXT
       );
       CREATE TABLE IF NOT EXISTS session_routes (
         id TEXT PRIMARY KEY, user_id TEXT, space_id TEXT, channel TEXT, account_id TEXT, native_context_id TEXT, peer_id TEXT, dsh_session_id TEXT, execution_mode TEXT, current_generation INTEGER DEFAULT 1, title TEXT, status TEXT DEFAULT 'active', created_at TEXT, updated_at TEXT
