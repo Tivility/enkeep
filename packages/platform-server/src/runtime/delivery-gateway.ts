@@ -4641,31 +4641,55 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         count: candidatesToPromote.length,
         runningTurnId,
       };
-    } catch (steerErr: any) {
-      // If steer was rejected (e.g. turn finished in the interim), requeue via dispatchInbound
-      const isTurnNotRunning =
-        steerErr?.code === 'NOT_RUNNING' ||
-        steerErr?.code === 'TURN_NOT_RUNNING' ||
-        steerErr?.message?.includes('not running');
-
-      if (isTurnNotRunning) {
-        const requeueEnvelope: InboundEnvelope = {
-          id: `requeue_${generate32HexId('deliv')}`,
-          userId,
-          sessionId,
-          content: mergedContent,
-          timestamp: new Date().toISOString(),
-          attachments: combinedAttachments.length > 0 ? combinedAttachments : undefined,
-        };
-        await this.dispatchInbound(requeueEnvelope);
-
-        return {
-          status: 'requeued',
-          count: candidatesToPromote.length,
-          runningTurnId,
-        };
+    } catch (_steerErr: any) {
+      // If steer was rejected (e.g. turn finished in the interim or any runtime steer error), requeue via dispatchInbound.
+      // Re-queued envelope carries channelContext from the last promoted candidate's delivery_inbox payload as well as attachments.
+      let channelContext: any = undefined;
+      const lastCand = candidatesToPromote[candidatesToPromote.length - 1];
+      if (lastCand?.payload) {
+        try {
+          const parsed = JSON.parse(lastCand.payload);
+          if (parsed && typeof parsed === 'object' && parsed.channelContext) {
+            channelContext = parsed.channelContext;
+          }
+        } catch {}
       }
-      throw steerErr;
+
+      const requeueEnvelope: InboundEnvelope = {
+        id: `requeue_${generate32HexId('deliv')}`,
+        userId,
+        sessionId,
+        content: mergedContent,
+        timestamp: new Date().toISOString(),
+        attachments: combinedAttachments.length > 0 ? combinedAttachments : undefined,
+        channelContext,
+      };
+      const dispatchRes = await this.dispatchInbound(requeueEnvelope);
+
+      if (channelContext && dispatchRes?.turnId) {
+        try {
+          const row = this.db.prepare(
+            'SELECT payload FROM delivery_inbox WHERE turn_id = ? AND user_id = ?'
+          ).get(dispatchRes.turnId, userId) as { payload?: string | null } | undefined;
+          if (row && row.payload) {
+            const parsed = JSON.parse(row.payload);
+            if (!parsed.channelContext) {
+              parsed.channelContext = channelContext;
+              this.db.prepare(
+                'UPDATE delivery_inbox SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE turn_id = ? AND user_id = ?'
+              ).run(JSON.stringify(parsed), dispatchRes.turnId, userId);
+            }
+          }
+        } catch (updateErr) {
+          this.recordSettledError(updateErr);
+        }
+      }
+
+      return {
+        status: 'requeued',
+        count: candidatesToPromote.length,
+        runningTurnId,
+      };
     }
   }
 
