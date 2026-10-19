@@ -13,6 +13,7 @@ import type {
   LarkParsedCardAction,
   LarkParsedMessage,
   LarkRestMessageItem,
+  LarkParsedReactionCreated,
   LarkRawEvent,
   LarkRawMention,
   MentionIdentity,
@@ -1007,3 +1008,68 @@ export function normalizeRestMessageToParsed(
   };
 }
 
+/**
+ * Checks whether the raw Lark event represents a message reaction created event.
+ */
+export function isReactionCreatedEvent(rawEvent: LarkRawEvent | null | undefined): boolean {
+  if (!rawEvent) return false;
+  const eventType = rawEvent.header?.event_type ?? (rawEvent as any).event_type;
+  return eventType === 'im.message.reaction.created_v1';
+}
+
+/**
+ * Parses a Lark `im.message.reaction.created_v1` event into a normalized LarkParsedReactionCreated object.
+ */
+export function parseLarkReactionCreated(rawEvent: LarkRawEvent | null | undefined): LarkParsedReactionCreated | null {
+  if (!rawEvent || !isReactionCreatedEvent(rawEvent)) {
+    return null;
+  }
+
+  const rawEventBody = rawEvent.event ?? (rawEvent as any);
+  const messageId =
+    rawEventBody.message_id ??
+    rawEventBody.messageId ??
+    rawEvent.open_message_id ??
+    '';
+
+  const emojiType =
+    rawEventBody.reaction_type?.emoji_type ??
+    rawEventBody.emoji_type ??
+    (rawEvent as any).reaction_type?.emoji_type ??
+    '';
+
+  const rawUser = rawEventBody.user_id ?? rawEventBody.operator ?? (rawEvent as any).user_id ?? {};
+  const operatorId =
+    rawUser.open_id ??
+    rawUser.operator_id?.open_id ??
+    rawEvent.open_id ??
+    (rawEvent.sender as any)?.sender_id?.open_id ??
+    '';
+
+  const operatorUserId =
+    rawUser.user_id ??
+    rawUser.operator_id?.user_id ??
+    (rawEvent.sender as any)?.sender_id?.user_id ??
+    undefined;
+
+  const operatorUnionId =
+    rawUser.union_id ??
+    rawUser.operator_id?.union_id ??
+    (rawEvent.sender as any)?.sender_id?.union_id ??
+    undefined;
+
+  const actionTime =
+    rawEventBody.action_time ??
+    rawEvent.header?.create_time ??
+    undefined;
+
+  return {
+    eventType: 'im.message.reaction.created_v1',
+    messageId,
+    emojiType,
+    operatorId,
+    operatorUserId,
+    operatorUnionId,
+    actionTime,
+  };
+}

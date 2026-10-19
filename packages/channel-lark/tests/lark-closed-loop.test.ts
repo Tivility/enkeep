@@ -684,6 +684,145 @@ describe('Lark Channel Closed-Loop Communication', () => {
       expect(qTransport.removedReactions.map((r: any) => r.reactionId)).toContain(oneSecondId);
     });
 
+    it('06-A3: reaction with Fire promotes queued turn to steer and switches reaction to OnIt', async () => {
+      const qTransport = new FakeLarkTransport();
+      await qTransport.start();
+      let queuedTurns: Array<{ turnId: string; createdAt: string; contentSnippet: string }> = [
+        { turnId: 'turn_queued_001', createdAt: new Date().toISOString(), contentSnippet: 'queued question' },
+      ];
+      const promoteQueuedToSteerMock = vi.fn().mockImplementation(async (uId: string, sId: string, sel: any) => {
+        queuedTurns = [];
+        return {
+          status: 'steered',
+          count: 1,
+          runningTurnId: 'turn_running_001',
+        };
+      });
+      const mockRuntime: any = {
+        dispatchInbound: vi.fn().mockImplementation(async () => {
+          return { turnId: 'turn_queued_001', executionMode: 'runtime', queuePosition: 1 };
+        }),
+        getCurrentTurnStatus: vi.fn().mockResolvedValue({ status: 'running', turnId: 'turn_running_001' }),
+        listQueuedTurns: vi.fn().mockImplementation(async () => queuedTurns),
+        promoteQueuedToSteer: promoteQueuedToSteerMock,
+      };
+      const qGateway = new LarkChannelGateway({
+        account: { id: gateway.accountId, userId, appId: 'cli_test_queue_02', botOpenId, groupActivationMode: 'always' },
+        transport: qTransport,
+        channelRepo,
+        sessionRouteRepo,
+        spaceRepo,
+        runtimeGateway: mockRuntime,
+      });
+      const chatId = 'oc_queue_chat_rx_1';
+      await channelRepo.createBinding({ accountId: gateway.accountId, spaceId, nativeContextId: chatId, activationMode: 'always' });
+      const makeEvent = (eventId: string, messageId: string, text: string) => ({
+        header: { event_id: eventId, event_type: 'im.message.receive_v1', create_time: '1700000000000' },
+        event: {
+          sender: { sender_id: { open_id: 'ou_developer_1' } },
+          message: { message_id: messageId, chat_id: chatId, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }), create_time: '1700000000000' },
+        },
+      });
+      const settle = () => new Promise((r) => setTimeout(r, 30));
+
+      await qGateway.handleInboundEvent(makeEvent('evt_queue_rx_001', 'om_queue_msg_rx_001', 'queued question'));
+      await settle();
+      const forMsg = () => qTransport.addedReactions.filter((r: any) => r.messageId === 'om_queue_msg_rx_001').map((r: any) => r.emojiType);
+      expect(forMsg()).toEqual(['OnIt', 'OneSecond']);
+
+      // 1. Simulate sender reacting with Fire -> promotes to steer (using transport.simulateInboundReaction)
+      const res = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_fire_01',
+        messageId: 'om_queue_msg_rx_001',
+        emojiType: 'Fire',
+        operatorOpenId: 'ou_developer_1',
+        createTime: '1700000001000',
+      });
+      expect(res.handled).toBe(true);
+      expect(promoteQueuedToSteerMock).toHaveBeenCalledTimes(1);
+      expect(promoteQueuedToSteerMock).toHaveBeenCalledWith(userId, expect.any(String), { turnIds: ['turn_queued_001'] });
+      await settle();
+
+      // Reaction switched back to OnIt
+      expect(forMsg()).toEqual(['OnIt', 'OneSecond', 'OnIt']);
+    });
+
+    it('06-A3: reaction ignores other emojis, non-sender operators, and bot reactions', async () => {
+      const qTransport = new FakeLarkTransport();
+      await qTransport.start();
+      const queuedTurns: Array<{ turnId: string; createdAt: string; contentSnippet: string }> = [
+        { turnId: 'turn_queued_002', createdAt: new Date().toISOString(), contentSnippet: 'queued question' },
+      ];
+      const promoteQueuedToSteerMock = vi.fn().mockResolvedValue({
+        status: 'steered',
+        count: 1,
+        runningTurnId: 'turn_running_001',
+      });
+      const mockRuntime: any = {
+        dispatchInbound: vi.fn().mockImplementation(async () => {
+          return { turnId: 'turn_queued_002', executionMode: 'runtime', queuePosition: 1 };
+        }),
+        getCurrentTurnStatus: vi.fn().mockResolvedValue({ status: 'running', turnId: 'turn_running_001' }),
+        listQueuedTurns: vi.fn().mockImplementation(async () => queuedTurns),
+        promoteQueuedToSteer: promoteQueuedToSteerMock,
+      };
+      const qGateway = new LarkChannelGateway({
+        account: { id: gateway.accountId, userId, appId: 'cli_test_queue_03', botOpenId, groupActivationMode: 'always' },
+        transport: qTransport,
+        channelRepo,
+        sessionRouteRepo,
+        spaceRepo,
+        runtimeGateway: mockRuntime,
+      });
+      const chatId = 'oc_queue_chat_rx_2';
+      await channelRepo.createBinding({ accountId: gateway.accountId, spaceId, nativeContextId: chatId, activationMode: 'always' });
+      const makeEvent = (eventId: string, messageId: string, text: string) => ({
+        header: { event_id: eventId, event_type: 'im.message.receive_v1', create_time: '1700000000000' },
+        event: {
+          sender: { sender_id: { open_id: 'ou_developer_1' } },
+          message: { message_id: messageId, chat_id: chatId, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }), create_time: '1700000000000' },
+        },
+      });
+      const settle = () => new Promise((r) => setTimeout(r, 30));
+
+      await qGateway.handleInboundEvent(makeEvent('evt_queue_rx_002', 'om_queue_msg_rx_002', 'queued question 2'));
+      await settle();
+
+      // 1. Other emoji (e.g. 'THUMBSUP') is ignored
+      const resOtherEmoji = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_other_01',
+        messageId: 'om_queue_msg_rx_002',
+        emojiType: 'THUMBSUP',
+        operatorOpenId: 'ou_developer_1',
+        createTime: '1700000001000',
+      });
+      expect(resOtherEmoji.handled).toBe(false);
+      expect(promoteQueuedToSteerMock).not.toHaveBeenCalled();
+
+      // 2. Different operator (not sender) is ignored
+      const resOtherUser = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_other_user',
+        messageId: 'om_queue_msg_rx_002',
+        emojiType: 'Fire',
+        operatorOpenId: 'ou_other_person',
+        createTime: '1700000002000',
+      });
+      expect(resOtherUser.handled).toBe(false);
+      expect(resOtherUser.ignoredReason).toBe('permission_denied');
+      expect(promoteQueuedToSteerMock).not.toHaveBeenCalled();
+
+      // 3. Bot itself reacting is ignored
+      const resBot = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_bot',
+        messageId: 'om_queue_msg_rx_002',
+        emojiType: 'Fire',
+        operatorOpenId: botOpenId,
+        createTime: '1700000003000',
+      });
+      expect(resBot.handled).toBe(false);
+      expect(promoteQueuedToSteerMock).not.toHaveBeenCalled();
+    });
+
     it('processes inbound merge_forward event, enriches sub-messages via getMessage, and reparents image attachment', async () => {
       const forwardTransport = new FakeLarkTransport();
       await forwardTransport.start();

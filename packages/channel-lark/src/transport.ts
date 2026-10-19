@@ -1046,6 +1046,33 @@ export class FakeLarkTransport implements LarkTransport {
     return results.find((r) => r && typeof r === 'object') ?? results[0];
   }
 
+  async simulateInboundReaction(params: {
+    messageId: string;
+    emojiType: string;
+    operatorOpenId: string;
+    eventId?: string;
+    createTime?: string;
+  }): Promise<any> {
+    const rawEvent: LarkRawEvent = {
+      header: {
+        event_id: params.eventId ?? `evt_rx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        event_type: 'im.message.reaction.created_v1',
+        create_time: params.createTime ?? String(Date.now()),
+      },
+      event: {
+        message_id: params.messageId,
+        reaction_type: {
+          emoji_type: params.emojiType,
+        },
+        user_id: {
+          open_id: params.operatorOpenId,
+        },
+        action_time: params.createTime ?? String(Date.now()),
+      } as any,
+    };
+    return this.simulateInboundEvent(rawEvent);
+  }
+
   async addReaction(messageId: string, emojiType: string): Promise<{ reactionId?: string }> {
     const reactionId = `rx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     this._addedReactions.push({
@@ -1927,6 +1954,30 @@ export class CredentialedLarkTransport implements LarkTransport {
         const results = await Promise.all(Array.from(this.handlers).map((h) => h(rawEvent)));
         const resWithToast = results.find((r) => r && typeof r === 'object' && ('toast' in r || 'card' in r));
         return resWithToast ?? {};
+      },
+      'im.message.reaction.created_v1': async (data: any) => {
+        const rawEvent: LarkRawEvent = {
+          header: data.header ?? {
+            event_id: data.event_id,
+            event_type: data.event_type ?? 'im.message.reaction.created_v1',
+            create_time: data.create_time,
+            token: data.token,
+            app_id: data.app_id,
+            tenant_key: data.tenant_key,
+          },
+          event: data.event ?? {
+            message_id: data.message_id,
+            reaction_type: data.reaction_type,
+            operator_type: data.operator_type,
+            user_id: data.user_id,
+            action_time: data.action_time,
+          },
+          open_message_id: data.message_id ?? data.event?.message_id,
+          open_id: data.user_id?.open_id ?? data.event?.user_id?.open_id,
+          uuid: data.uuid,
+        };
+        const promises = Array.from(this.handlers).map((h) => h(rawEvent));
+        await Promise.all(promises);
       },
     });
 

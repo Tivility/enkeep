@@ -4,6 +4,8 @@ import {
   extractTextAndResources,
   isCardActionEvent,
   parseLarkCardAction,
+  isReactionCreatedEvent,
+  parseLarkReactionCreated,
   expandMergeForwardContent,
 } from '../src/parser.js';
 
@@ -261,6 +263,41 @@ describe('parser: card.action.trigger (C3: card-stop-reply-button)', () => {
         message: { content: 'hello' },
       } as any)
     ).toBeNull();
+  });
+});
+
+describe('parser: isReactionCreatedEvent and parseLarkReactionCreated', () => {
+  it('identifies and extracts reaction created event correctly', () => {
+    const raw = {
+      header: {
+        event_id: 'evt_rx_001',
+        event_type: 'im.message.reaction.created_v1',
+        create_time: '1700000000000',
+      },
+      event: {
+        message_id: 'om_target_msg_001',
+        reaction_type: { emoji_type: 'Fire' },
+        user_id: { open_id: 'ou_rx_operator_001' },
+        action_time: '1700000000000',
+      },
+    };
+
+    expect(isReactionCreatedEvent(raw as any)).toBe(true);
+    const parsed = parseLarkReactionCreated(raw as any);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.eventType).toBe('im.message.reaction.created_v1');
+    expect(parsed?.messageId).toBe('om_target_msg_001');
+    expect(parsed?.emojiType).toBe('Fire');
+    expect(parsed?.operatorId).toBe('ou_rx_operator_001');
+  });
+
+  it('returns null for non-reaction events', () => {
+    expect(isReactionCreatedEvent(null)).toBe(false);
+    expect(isReactionCreatedEvent(undefined)).toBe(false);
+    expect(isReactionCreatedEvent({ header: { event_type: 'im.message.receive_v1' } } as any)).toBe(false);
+    expect(parseLarkReactionCreated(null)).toBeNull();
+    expect(parseLarkReactionCreated(undefined)).toBeNull();
+    expect(parseLarkReactionCreated({ header: { event_type: 'im.message.receive_v1' } } as any)).toBeNull();
   });
 });
 

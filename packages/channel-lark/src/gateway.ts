@@ -29,10 +29,12 @@ import {
   buildNativeContextId,
   expandMergeForwardContent,
   isCardActionEvent,
+  isReactionCreatedEvent,
   messageMentionsBot,
   normalizeRestMessageToParsed,
   parseLarkCardAction,
   parseLarkEvent,
+  parseLarkReactionCreated,
   stripBotMentions,
   stripLeadingMentions,
 } from './parser.js';
@@ -63,9 +65,11 @@ import {
  * Lark built-in reaction emoji types:
  * - OnIt: the message is being handled.
  * - OneSecond: the message is queued behind a running turn.
+ * - Fire: default reaction to trigger queue-to-steer promotion (configurable).
  */
 export const LARK_ONIT_REACTION = 'OnIt';
 export const LARK_QUEUE_REACTION = 'OneSecond';
+export const LARK_STEER_TRIGGER_REACTION = 'Fire'; // Can be configured / changed if another emoji is preferred
 
 export interface LarkChannelGatewayOptions {
   account: ChannelAccount | LarkAccountConfig;
@@ -555,7 +559,12 @@ export class LarkChannelGateway {
       return await this.handleCardAction(rawEvent);
     }
 
-    // 0b. Verify active account state dynamically
+    // 0b. Check if event is message reaction created (e.g. reaction-based queue promotion)
+    if (isReactionCreatedEvent(rawEvent)) {
+      return await this.handleReactionCreated(rawEvent);
+    }
+
+    // 0c. Verify active account state dynamically
     const isActive = await this.checkAccountActive();
     if (!isActive) {
       return { handled: false, ignoredReason: 'account_disabled' };
@@ -1904,6 +1913,165 @@ export class LarkChannelGateway {
         content: '已停止回复',
       },
     };
+  }
+
+  /**
+   * Handles Lark `im.message.reaction.created_v1` event.
+   * Promotes a queued turn to steer when:
+   * 1. Emoji matches LARK_STEER_TRIGGER_REACTION
+   * 2. Operator is not the bot itself and is the sender of the original message
+   * 3. The turn corresponding to the message is still queued
+   * On success, switches the message's reaction back to OnIt.
+   */
+  async handleReactionCreated(rawEvent: LarkRawEvent): Promise<InboundHandlingResult> {
+    if (this.isDisposed) {
+      return { handled: false, ignoredReason: 'account_disabled' };
+    }
+
+    const isActive = await this.checkAccountActive();
+    if (!isActive) {
+      return { handled: false, ignoredReason: 'account_disabled' };
+    }
+
+    const parsed = parseLarkReactionCreated(rawEvent);
+    if (!parsed) {
+      return { handled: false, ignoredReason: 'parse_error' };
+    }
+
+    const { messageId, emojiType, operatorId } = parsed;
+
+    // 1. Emoji match check
+    if (emojiType !== LARK_STEER_TRIGGER_REACTION) {
+      return { handled: false };
+    }
+
+    // 2. Ignore reactions from the bot itself
+    if (this.botOpenId && operatorId === this.botOpenId) {
+      return { handled: false };
+    }
+
+    // 3. Find the turn and route matching messageId
+    let foundRouteId: string | undefined;
+    let foundTurnId: string | undefined;
+    let foundIdempotencyKey: string | undefined;
+
+    // First check memory map: queuedReactionTurns (routeId -> turnId -> idempotencyKey)
+    for (const [rId, entries] of this.queuedReactionTurns) {
+      for (const [tId, idemKey] of entries) {
+        const pending = this.pendingReactions.get(idemKey);
+        if (pending && pending.messageId === messageId) {
+          foundRouteId = rId;
+          foundTurnId = tId;
+          foundIdempotencyKey = idemKey;
+          break;
+        }
+      }
+      if (foundTurnId) break;
+    }
+
+    // If not found in queuedReactionTurns by pending messageId, query channel_turn_origins from SQLite db if available
+    const db = (this.streamEventSource as any)?.db ?? (this.channelRepo as any)?.db;
+    if (!foundTurnId && db && typeof db.prepare === 'function') {
+      try {
+        const originRow = db
+          .prepare(
+            `SELECT turn_id, session_id FROM channel_turn_origins
+             WHERE reply_to_message_id = ? AND user_id = ?
+             LIMIT 1`
+          )
+          .get(messageId, this.userId) as { turn_id: string; session_id: string } | undefined;
+        if (originRow) {
+          foundTurnId = originRow.turn_id;
+          foundRouteId = originRow.session_id;
+        }
+      } catch {}
+    }
+
+    if (!foundTurnId || !foundRouteId) {
+      return { handled: false };
+    }
+
+    // 4. Sender verification: operator must be the sender of the original message
+    let expectedSenderId = this.turnSenders.get(foundTurnId);
+
+    // Fallback: check delivery_inbox or channel_inbox payload if turnSenders doesn't have it
+    if (!expectedSenderId && db && typeof db.prepare === 'function') {
+      try {
+        const inboxRow = db
+          .prepare(
+            `SELECT payload FROM delivery_inbox WHERE turn_id = ? AND user_id = ? LIMIT 1`
+          )
+          .get(foundTurnId, this.userId) as { payload?: string } | undefined;
+        if (inboxRow?.payload) {
+          const parsedPayload = JSON.parse(inboxRow.payload);
+          expectedSenderId =
+            parsedPayload?.channelContext?.senderId ??
+            parsedPayload?.senderId ??
+            parsedPayload?.parsed?.senderId;
+        }
+      } catch {}
+    }
+
+    if (expectedSenderId && operatorId !== expectedSenderId) {
+      return { handled: false, ignoredReason: 'permission_denied' };
+    }
+
+    // 5. Verify the turn is still queued
+    if (typeof this.runtimeGateway.listQueuedTurns === 'function') {
+      try {
+        const queuedList = await this.runtimeGateway.listQueuedTurns(this.userId, foundRouteId);
+        const isQueued = queuedList.some((q) => q.turnId === foundTurnId);
+        if (!isQueued) {
+          return { handled: false };
+        }
+      } catch {
+        return { handled: false };
+      }
+    }
+
+    // 6. Promote queued turn to steer
+    if (typeof this.runtimeGateway.promoteQueuedToSteer !== 'function') {
+      return { handled: false };
+    }
+
+    try {
+      const promoteRes = await this.runtimeGateway.promoteQueuedToSteer(this.userId, foundRouteId, {
+        turnIds: [foundTurnId],
+      });
+
+      if (promoteRes.status === 'steered') {
+        // Remove from queuedReactionTurns
+        const entries = this.queuedReactionTurns.get(foundRouteId);
+        if (entries) {
+          entries.delete(foundTurnId);
+          if (entries.size === 0) {
+            this.queuedReactionTurns.delete(foundRouteId);
+          }
+        }
+
+        // Switch reaction back to OnIt
+        const idemKey = foundIdempotencyKey ?? (
+          foundTurnId ? this.deriveIdempotencyKey(foundTurnId) : undefined
+        );
+        if (idemKey && this.pendingReactions.has(idemKey)) {
+          await this.switchReaction(idemKey, LARK_ONIT_REACTION);
+        } else {
+          // If no pending record in map, directly add OnIt reaction
+          await this.transport.addReaction(messageId, LARK_ONIT_REACTION).catch(() => {});
+        }
+
+        return {
+          handled: true,
+          turnId: foundTurnId,
+          sessionRouteId: foundRouteId,
+        };
+      }
+
+      return { handled: false };
+    } catch (err) {
+      console.warn('[lark-gateway] failed to promote queued turn on reaction:', err);
+      return { handled: false, ignoredReason: 'transport_error' };
+    }
   }
 
   /**

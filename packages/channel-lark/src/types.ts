@@ -106,6 +106,16 @@ export interface LarkParsedCardAction {
   readonly operatorUnionId?: string;
 }
 
+export interface LarkParsedReactionCreated {
+  readonly eventType: 'im.message.reaction.created_v1';
+  readonly messageId: string;
+  readonly emojiType: string;
+  readonly operatorId: string;
+  readonly operatorUserId?: string;
+  readonly operatorUnionId?: string;
+  readonly actionTime?: string;
+}
+
 export interface LarkMention {
   key: string;
   name: string;
