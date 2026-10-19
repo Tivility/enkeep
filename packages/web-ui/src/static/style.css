@@ -5952,3 +5952,13 @@ aside.workspace-sidebar.is-collapsed {
   font-weight: 600;
 }
 
+#btn-session-model-reset {
+  margin-right: auto;
+}
+
+#btn-session-model-reset:hover {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+
