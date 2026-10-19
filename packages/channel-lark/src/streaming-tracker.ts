@@ -118,6 +118,7 @@ export interface StreamingReplyTrackerOptions {
   backgroundPanelManager?: LarkBackgroundPanelManager;
   onCardCreated?: (info: { cardId: string; messageId: string }) => Promise<void> | void;
   onSnapshotFlush?: (snapshotText: string) => Promise<void> | void;
+  onRunning?: () => void;
 }
 
 /**
@@ -362,6 +363,7 @@ export class StreamingReplyTracker {
   private inFlightTick: Promise<void> | null = null;
   private finalizedResult: { handled: boolean; messageId?: string; degraded?: boolean } | null = null;
   private seenOwnRunning = false;
+  private readonly onRunning?: () => void;
 
   private readonly backgroundPanelManager?: LarkBackgroundPanelManager;
   private readonly onCardCreated?: (info: { cardId: string; messageId: string }) => Promise<void> | void;
@@ -385,6 +387,7 @@ export class StreamingReplyTracker {
     this.backgroundPanelManager = options.backgroundPanelManager;
     this.onCardCreated = options.onCardCreated;
     this.onSnapshotFlush = options.onSnapshotFlush;
+    this.onRunning = options.onRunning;
     this.startTime = Date.now();
     this.lastActivityAt = this.startTime;
     this.lastPushedStatusBucket = Math.floor(this.startTime / 5000);
@@ -574,6 +577,9 @@ export class StreamingReplyTracker {
           break;
         }
         this.seenOwnRunning = true;
+        try {
+          this.onRunning?.();
+        } catch {}
       }
 
       if (evt.rowId > this.cursor) {

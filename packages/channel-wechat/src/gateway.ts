@@ -100,6 +100,7 @@ export class WeChatChannelGateway {
 
   private isDisposed = false;
   private readonly inFlightTurns = new Set<string>();
+  private readonly hintedQueueSessions = new Map<string, string>(); // sessionId -> runningTurnId
   private readonly messageHandler: (msg: WeChatParsedMessage) => Promise<void>;
   private readonly cursorCommitHandler?: (cursor: string) => Promise<void> | void;
 
@@ -428,6 +429,30 @@ export class WeChatChannelGateway {
       const dispatchResult = await this.runtimeGateway.dispatchInbound(envelope);
       turnId = dispatchResult.turnId || platformIdempotencyKey;
       inboxItem = await this.channelRepo.updateInboxStatus(inboxItem.id, 'delivered');
+
+      // Check if message is queued behind a running turn
+      if (typeof dispatchResult.queuePosition === 'number' && dispatchResult.queuePosition > 0) {
+        if (typeof (this.runtimeGateway as any).getCurrentTurnStatus === 'function') {
+          try {
+            const currentStatus = await (this.runtimeGateway as any).getCurrentTurnStatus(this.userId, route.id);
+            if (currentStatus?.status === 'running' && currentStatus?.turnId) {
+              const runningTurnId = currentStatus.turnId;
+              const lastHintedTurn = this.hintedQueueSessions.get(route.id);
+              if (lastHintedTurn !== runningTurnId) {
+                this.hintedQueueSessions.set(route.id, runningTurnId);
+                if (msg.senderId && msg.contextToken) {
+                  await this.transport.sendReply(
+                    msg.senderId,
+                    msg.contextToken,
+                    '已排队，发 /steer 可插入当前任务'
+                  ).catch(() => {});
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+
       return {
         handled: true,
         inboxItem,
@@ -584,6 +609,9 @@ export class WeChatChannelGateway {
 
       return outboxItem;
     } finally {
+      if (params.sessionId) {
+        this.hintedQueueSessions.delete(params.sessionId);
+      }
       if (inFlightKey) {
         this.inFlightTurns.delete(inFlightKey);
       }

@@ -348,6 +348,7 @@ export interface InboundEnvelopeChannelContext {
   readonly rootId?: string | null;
   readonly threadId?: string | null;
   readonly originTurnId?: string | null;
+  readonly parentId?: string | null;
   readonly senderId?: string | null;
   readonly senderName?: string | null;
   readonly chatType?: string | null;
@@ -438,8 +439,25 @@ export interface RuntimeGateway {
   steerTurn?(
     userId: string,
     sessionId: string,
-    req: { clientRequestId: string; expectedTurnId: string; content: string }
+    req: {
+      clientRequestId: string;
+      expectedTurnId: string;
+      content: string;
+      attachments?: readonly (CanonicalAttachment | InboundEnvelopeAttachmentItem)[];
+      updateOriginalMessages?: {
+        messageIds: string[];
+      };
+    }
   ): Promise<{ messageId: string; ok: boolean }>;
+  promoteQueuedToSteer?(
+    userId: string,
+    sessionId: string,
+    sel: { turnIds: string[] } | { all: true; senderId?: string }
+  ): Promise<{
+    status: 'steered' | 'nothing_running' | 'nothing_queued' | 'requeued';
+    count: number;
+    runningTurnId?: string;
+  }>;
   cancelQueuedTurn?(
     userId: string,
     sessionId: string,

@@ -1,4 +1,4 @@
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import {
   PlatformError,
@@ -172,7 +172,28 @@ export interface DrainableRuntimeGateway extends RuntimeGateway {
   cancelCurrentTurn(userId: string, sessionId: string): Promise<boolean>;
   getBackgroundTasks?(userId: string, sessionId: string, options?: { chatContextId?: string }): Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
   stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
-  steerTurn?(userId: string, sessionId: string, req: { clientRequestId: string; expectedTurnId: string; content: string }): Promise<{ messageId: string; ok: boolean }>;
+  steerTurn?(
+    userId: string,
+    sessionId: string,
+    req: {
+      clientRequestId: string;
+      expectedTurnId: string;
+      content: string;
+      attachments?: readonly any[];
+      updateOriginalMessages?: {
+        messageIds: string[];
+      };
+    }
+  ): Promise<{ messageId: string; ok: boolean }>;
+  promoteQueuedToSteer?(
+    userId: string,
+    sessionId: string,
+    sel: { turnIds: string[] } | { all: true; senderId?: string }
+  ): Promise<{
+    status: 'steered' | 'nothing_running' | 'nothing_queued' | 'requeued';
+    count: number;
+    runningTurnId?: string;
+  }>;
   cancelQueuedTurn?(userId: string, sessionId: string, turnId: string): Promise<boolean>;
   listQueuedTurns?(userId: string, sessionId: string): Promise<Array<{ turnId: string; createdAt: string; contentSnippet: string }>>;
 }
@@ -1188,14 +1209,33 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     // Chat command interception hook (before profile resolution, attachments, idempotency, and runtime dispatch)
     const chatCmd = parseChatCommand(envelope.content, { allowUnknown: true });
     if (chatCmd && this.chatCommandService) {
-      return await this.dispatchChatCommand({
-        envelope,
-        userId,
-        sessionId,
-        spaceId: authoritativeSpaceId,
-        idempotencyKey,
-        timestamp,
-      });
+      if (chatCmd.command === 'steer' && chatCmd.arg && chatCmd.arg.trim()) {
+        const runningRow = this.db.prepare(`
+          SELECT turn_id FROM turn_runs
+          WHERE user_id = ? AND route_id = ? AND status = 'running'
+          LIMIT 1
+        `).get(userId, sessionId) as { turn_id: string } | undefined;
+
+        if (!runningRow) {
+          // Fall back to ordinary message dispatch by stripping /steer prefix
+          envelope = {
+            ...envelope,
+            content: chatCmd.arg.trim(),
+          };
+        }
+      }
+
+      const activeCmd = parseChatCommand(envelope.content, { allowUnknown: true });
+      if (activeCmd) {
+        return await this.dispatchChatCommand({
+          envelope,
+          userId,
+          sessionId,
+          spaceId: authoritativeSpaceId,
+          idempotencyKey,
+          timestamp,
+        });
+      }
     }
 
     // Fail fast if route is in recovery_required or holds a blocked RECOVERY_REQUIRED lease
@@ -4010,7 +4050,15 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   async steerTurn(
     userId: string,
     sessionId: string,
-    req: { clientRequestId: string; expectedTurnId: string; content: string }
+    req: {
+      clientRequestId: string;
+      expectedTurnId: string;
+      content: string;
+      attachments?: readonly any[];
+      updateOriginalMessages?: {
+        messageIds: string[];
+      };
+    }
   ): Promise<{ messageId: string; ok: boolean }> {
     if (typeof userId !== 'string' || !userId.trim()) {
       throw new ValidationError('Invalid userId for steerTurn');
@@ -4018,7 +4066,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     if (typeof sessionId !== 'string' || !sessionId.trim()) {
       throw new ValidationError('Invalid sessionId for steerTurn');
     }
-    const { clientRequestId, expectedTurnId, content } = req;
+    const { clientRequestId, expectedTurnId, content, attachments, updateOriginalMessages } = req;
     if (typeof clientRequestId !== 'string' || !clientRequestId.trim()) {
       throw new ValidationError('Field "clientRequestId" must be a non-empty string');
     }
@@ -4102,6 +4150,21 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       }
     } catch {}
 
+    // Process attachments if provided
+    let processedAttachments: readonly any[] | undefined;
+    if (attachments && attachments.length > 0) {
+      try {
+        processedAttachments = await this.processInboundAttachments(
+          userId,
+          platformSpaceId,
+          clientRequestId,
+          attachments
+        );
+      } catch {
+        processedAttachments = attachments;
+      }
+    }
+
     // 3. Call executor steerTurn
     if (this.executor && typeof this.executor.steerTurn === 'function') {
       const steerResult = await this.executor.steerTurn({
@@ -4110,6 +4173,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         dshSessionId,
         expectedTurnId,
         message: content,
+        attachments: processedAttachments,
         clientRequestId,
       });
 
@@ -4142,43 +4206,70 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     this.db.exec('BEGIN IMMEDIATE');
     inTx = true;
     try {
-      // 4a. Insert web_messages row
-      this.db.prepare(`
-        INSERT INTO web_messages (
-          id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at
-        ) VALUES (?, ?, ?, 'user', ?, 'delivered', ?, ?, ?, ?)
-      `).run(
-        steerMessageId,
-        sessionId,
-        userId,
-        content,
-        routeKey,
-        expectedTurnId,
-        metadata,
-        nowIso
-      );
+      let returnedMessageId = steerMessageId;
 
-      // 4b. Insert web_events row
-      const publicMsg: WebMessageRecord = {
-        id: steerMessageId,
-        role: 'user',
-        content,
-        status: 'delivered',
-        createdAt: nowIso,
-      };
-      this.db.prepare(`
-        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
-        VALUES (?, ?, ?, 'message', ?, ?)
-      `).run(
-        steerEventId,
-        sessionId,
-        userId,
-        JSON.stringify({ message: publicMsg }),
-        nowIso
-      );
+      if (updateOriginalMessages && updateOriginalMessages.messageIds && updateOriginalMessages.messageIds.length > 0) {
+        // Do not insert new web_messages; instead update metadata of original messages
+        returnedMessageId = updateOriginalMessages.messageIds[0];
+        const updateMsgStmt = this.db.prepare(`
+          UPDATE web_messages
+          SET metadata = ?
+          WHERE id = ? AND user_id = ? AND session_id = ?
+        `);
+        for (const origMsgId of updateOriginalMessages.messageIds) {
+          const row = this.db.prepare(`
+            SELECT metadata FROM web_messages WHERE id = ? AND user_id = ? AND session_id = ?
+          `).get(origMsgId, userId, sessionId) as { metadata?: string | null } | undefined;
+          let newMetaObj: Record<string, any> = { isSteer: true, attachedTurnId: expectedTurnId, clientRequestId };
+          if (row && row.metadata) {
+            try {
+              const existing = JSON.parse(row.metadata);
+              if (existing && typeof existing === 'object') {
+                newMetaObj = { ...existing, ...newMetaObj };
+              }
+            } catch {}
+          }
+          updateMsgStmt.run(JSON.stringify(newMetaObj), origMsgId, userId, sessionId);
+        }
+      } else {
+        // 4a. Insert web_messages row
+        this.db.prepare(`
+          INSERT INTO web_messages (
+            id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at
+          ) VALUES (?, ?, ?, 'user', ?, 'delivered', ?, ?, ?, ?)
+        `).run(
+          steerMessageId,
+          sessionId,
+          userId,
+          content,
+          routeKey,
+          expectedTurnId,
+          metadata,
+          nowIso
+        );
+
+        // 4b. Insert web_events row
+        const publicMsg: WebMessageRecord = {
+          id: steerMessageId,
+          role: 'user',
+          content,
+          status: 'delivered',
+          createdAt: nowIso,
+        };
+        this.db.prepare(`
+          INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+          VALUES (?, ?, ?, 'message', ?, ?)
+        `).run(
+          steerEventId,
+          sessionId,
+          userId,
+          JSON.stringify({ message: publicMsg }),
+          nowIso
+        );
+      }
 
       // 4c. Insert idempotency_records row
-      const responsePayload = JSON.stringify({ messageId: steerMessageId, ok: true });
+      const responsePayload = JSON.stringify({ messageId: returnedMessageId, ok: true });
       this.db.prepare(`
         INSERT INTO idempotency_records (
           id, user_id, idempotency_key, session_id, delivery_id, turn_id, request_hash, state, response_payload, created_at, updated_at
@@ -4188,7 +4279,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         userId,
         idempotencyKey,
         sessionId,
-        steerMessageId,
+        returnedMessageId,
         expectedTurnId,
         requestHash,
         responsePayload,
@@ -4199,7 +4290,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       this.db.exec('COMMIT');
       inTx = false;
 
-      return { messageId: steerMessageId, ok: true };
+      return { messageId: returnedMessageId, ok: true };
     } catch (err) {
       if (inTx) {
         try {
@@ -4315,6 +4406,267 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         contentSnippet: snippet,
       };
     });
+  }
+
+  async promoteQueuedToSteer(
+    userId: string,
+    sessionId: string,
+    sel: { turnIds: string[] } | { all: true; senderId?: string }
+  ): Promise<{
+    status: 'steered' | 'nothing_running' | 'nothing_queued' | 'requeued';
+    count: number;
+    runningTurnId?: string;
+  }> {
+    if (typeof userId !== 'string' || typeof sessionId !== 'string') {
+      throw new ValidationError('Invalid arguments for promoteQueuedToSteer');
+    }
+
+    const nowIso = new Date().toISOString();
+    let inTx = false;
+
+    type QueuedTurnCandidate = {
+      turn_id: string;
+      space_id: string;
+      rowid: number;
+      created_at: string;
+      message_id: string | null;
+      payload: string | null;
+      content: string | null;
+      sender_id?: string | null;
+      raw_created_at: string;
+    };
+
+    let runningTurnId: string | undefined;
+    let candidatesToPromote: QueuedTurnCandidate[] = [];
+
+    this.db.exec('BEGIN IMMEDIATE');
+    inTx = true;
+    try {
+      // 1. Find running turn for this session
+      const runningRow = this.db.prepare(`
+        SELECT turn_id, space_id FROM turn_runs
+        WHERE user_id = ? AND route_id = ? AND status = 'running'
+        LIMIT 1
+      `).get(userId, sessionId) as { turn_id: string; space_id: string } | undefined;
+
+      if (!runningRow) {
+        this.db.exec('ROLLBACK');
+        inTx = false;
+        return { status: 'nothing_running', count: 0 };
+      }
+      runningTurnId = runningRow.turn_id;
+
+      // 2. Query queued turns ordered by rowid ASC
+      const queuedRows = this.db.prepare(`
+        SELECT tr.turn_id, tr.space_id, tr.rowid, tr.created_at,
+               di.message_id, di.payload,
+               wm.content
+        FROM turn_runs tr
+        LEFT JOIN delivery_inbox di ON tr.turn_id = di.turn_id AND tr.user_id = di.user_id
+        LEFT JOIN web_messages wm ON tr.turn_id = wm.turn_id AND tr.user_id = wm.user_id AND wm.role = 'user'
+        WHERE tr.user_id = ? AND tr.route_id = ? AND tr.status = 'queued'
+        ORDER BY tr.rowid ASC
+      `).all(userId, sessionId) as Array<{
+        turn_id: string;
+        space_id: string;
+        rowid: number;
+        created_at: string;
+        message_id: string | null;
+        payload: string | null;
+        content: string | null;
+      }>;
+
+      // Filter by selection
+      if ('turnIds' in sel && Array.isArray(sel.turnIds)) {
+        const idSet = new Set(sel.turnIds);
+        candidatesToPromote = queuedRows.filter((r) => idSet.has(r.turn_id)).map((r) => ({
+          ...r,
+          raw_created_at: r.created_at,
+        }));
+      } else if ('all' in sel && sel.all === true) {
+        if (sel.senderId) {
+          candidatesToPromote = queuedRows.filter((r) => {
+            if (r.payload) {
+              try {
+                const parsed = JSON.parse(r.payload);
+                if (parsed?.channelContext?.senderId === sel.senderId) return true;
+              } catch {}
+            }
+            return false;
+          }).map((r) => ({
+            ...r,
+            raw_created_at: r.created_at,
+          }));
+        } else {
+          candidatesToPromote = queuedRows.map((r) => ({
+            ...r,
+            raw_created_at: r.created_at,
+          }));
+        }
+      }
+
+      if (candidatesToPromote.length === 0) {
+        this.db.exec('ROLLBACK');
+        inTx = false;
+        return { status: 'nothing_queued', count: 0, runningTurnId };
+      }
+
+      // 3. CAS cancel each selected queued turn
+      const updateTurnStmt = this.db.prepare(`
+        UPDATE turn_runs
+        SET status = 'interrupted', error = 'promoted to steer', finished_at = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE turn_id = ? AND route_id = ? AND user_id = ? AND status = 'queued'
+      `);
+      const updateInboxStmt = this.db.prepare(`
+        UPDATE delivery_inbox
+        SET status = 'cancelled', error = 'promoted to steer', updated_at = CURRENT_TIMESTAMP
+        WHERE (turn_id = ? OR delivery_id = ?) AND user_id = ? AND route_id = ? AND status IN ('held', 'processing')
+      `);
+      const deleteQueueStmt = this.db.prepare(`
+        DELETE FROM turn_execution_queue
+        WHERE turn_id = ? AND user_id = ? AND route_id = ?
+      `);
+      const updateIdemStmt = this.db.prepare(`
+        UPDATE idempotency_records
+        SET state = 'failed', updated_at = CURRENT_TIMESTAMP
+        WHERE turn_id = ? AND user_id = ?
+      `);
+      const insertEvtStmt = this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'turn_cancelled', ?, ?)
+      `);
+
+      const hasExecQueue = Boolean(
+        this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='turn_execution_queue'").get()
+      );
+
+      const successfullyCancelled: QueuedTurnCandidate[] = [];
+
+      for (const cand of candidatesToPromote) {
+        const turnRes = updateTurnStmt.run(nowIso, cand.turn_id, sessionId, userId);
+        if (safeChangesCount(turnRes.changes) > 0) {
+          updateInboxStmt.run(cand.turn_id, cand.turn_id, userId, sessionId);
+          if (hasExecQueue) {
+            deleteQueueStmt.run(cand.turn_id, userId, sessionId);
+          }
+          updateIdemStmt.run(cand.turn_id, userId);
+          insertEvtStmt.run(
+            generate32HexId('evt'),
+            sessionId,
+            userId,
+            JSON.stringify({ code: 'USER_CANCELLED', turnId: cand.turn_id }),
+            nowIso
+          );
+          successfullyCancelled.push(cand);
+        }
+      }
+
+      if (successfullyCancelled.length === 0) {
+        this.db.exec('ROLLBACK');
+        inTx = false;
+        return { status: 'nothing_queued', count: 0, runningTurnId };
+      }
+
+      this.db.exec('COMMIT');
+      inTx = false;
+
+      for (const cand of successfullyCancelled) {
+        this.turnTimeouts.delete(cand.turn_id);
+      }
+      this.notifyScheduler();
+
+      candidatesToPromote = successfullyCancelled;
+    } catch (err) {
+      if (inTx) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch (rbErr) {
+          this.recordSettledError(rbErr);
+        }
+      }
+      throw err;
+    }
+
+    // 4. Outside transaction: format merged content and combine attachments
+    const messageParts: string[] = [];
+    const combinedAttachments: any[] = [];
+    const originalMessageIds: string[] = [];
+    const authoritativeSpaceId = candidatesToPromote[0]?.space_id;
+
+    for (const cand of candidatesToPromote) {
+      let turnContent = cand.content;
+      if (!turnContent && cand.payload) {
+        try {
+          const parsed = JSON.parse(cand.payload);
+          if (typeof parsed?.content === 'string') {
+            turnContent = parsed.content;
+          }
+        } catch {}
+      }
+      turnContent = turnContent || '';
+
+      if (candidatesToPromote.length === 1) {
+        messageParts.push(turnContent);
+      } else {
+        const dateObj = new Date(cand.raw_created_at || Date.now());
+        const hh = String(dateObj.getHours()).padStart(2, '0');
+        const mm = String(dateObj.getMinutes()).padStart(2, '0');
+        messageParts.push(`[${hh}:${mm}] ${turnContent}`);
+      }
+
+      if (cand.message_id) {
+        originalMessageIds.push(cand.message_id);
+        const atts = this.queryAttachmentsByMessageId(cand.message_id, authoritativeSpaceId || '');
+        if (atts && atts.length > 0) {
+          combinedAttachments.push(...atts);
+        }
+      }
+    }
+
+    const mergedContent = messageParts.join('\n');
+    const steerRequestId = `req_${randomUUID().replace(/-/g, '')}`;
+
+    // 5. Call steerTurn once
+    try {
+      await this.steerTurn(userId, sessionId, {
+        clientRequestId: steerRequestId,
+        expectedTurnId: runningTurnId!,
+        content: mergedContent,
+        attachments: combinedAttachments.length > 0 ? combinedAttachments : undefined,
+        updateOriginalMessages: originalMessageIds.length > 0 ? { messageIds: originalMessageIds } : undefined,
+      });
+
+      return {
+        status: 'steered',
+        count: candidatesToPromote.length,
+        runningTurnId,
+      };
+    } catch (steerErr: any) {
+      // If steer was rejected (e.g. turn finished in the interim), requeue via dispatchInbound
+      const isTurnNotRunning =
+        steerErr?.code === 'NOT_RUNNING' ||
+        steerErr?.code === 'TURN_NOT_RUNNING' ||
+        steerErr?.message?.includes('not running');
+
+      if (isTurnNotRunning) {
+        const requeueEnvelope: InboundEnvelope = {
+          id: `requeue_${generate32HexId('deliv')}`,
+          userId,
+          sessionId,
+          content: mergedContent,
+          timestamp: new Date().toISOString(),
+          attachments: combinedAttachments.length > 0 ? combinedAttachments : undefined,
+        };
+        await this.dispatchInbound(requeueEnvelope);
+
+        return {
+          status: 'requeued',
+          count: candidatesToPromote.length,
+          runningTurnId,
+        };
+      }
+      throw steerErr;
+    }
   }
 
   /**

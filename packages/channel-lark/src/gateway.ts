@@ -56,6 +56,15 @@ import {
   type FeishuSenderNameResolver,
 } from './sender-name.js';
 
+/**
+ * Standard Feishu Reaction emoji types:
+ * - OnIt: "收到/在处理" (Feishu built-in emoji_type 'OnIt')
+ * - SANDGLASS: "排队中/沙漏" (Feishu built-in emoji_type 'SANDGLASS')
+ * Source: Lark Open Platform reaction emojis documentation and HappyClaw reference.
+ */
+export const LARK_ONIT_REACTION = 'OnIt';
+export const LARK_QUEUE_REACTION = 'SANDGLASS';
+
 export interface LarkChannelGatewayOptions {
   account: ChannelAccount | LarkAccountConfig;
   transport: LarkTransport;
@@ -117,7 +126,15 @@ export class LarkChannelGateway {
   private readonly groupActivationMode?: ChannelActivationMode;
   private readonly streamEventSource?: StreamEventSource;
   private isDisposed = false;
-  private readonly pendingReactions = new Map<string, { messageId: string; reactionIdPromise: Promise<string | undefined> }>();
+  // Bounded map of idempotency key -> pending reaction state
+  private readonly pendingReactions = new Map<
+    string,
+    {
+      messageId: string;
+      emojiType: string;
+      reactionIdPromise: Promise<string | undefined>;
+    }
+  >();
   private readonly ackedNativeEvents = new Set<string>();
   private readonly activeTrackers = new Map<string, StreamingReplyTracker>();
   private readonly lastInboundTargets = new Map<string, ContinuationTarget>();
@@ -355,9 +372,9 @@ export class LarkChannelGateway {
   }
 
   /**
-   * Records an in-flight receipt reaction ('OnIt') in a bounded in-memory map.
+   * Records an in-flight receipt reaction in a bounded in-memory map.
    */
-  private recordReaction(idempotencyKey: string, messageId: string): void {
+  private recordReaction(idempotencyKey: string, messageId: string, emojiType: string = LARK_ONIT_REACTION): void {
     const maxEntries = 500;
     if (this.pendingReactions.size >= maxEntries) {
       const oldestKey = this.pendingReactions.keys().next().value;
@@ -368,14 +385,42 @@ export class LarkChannelGateway {
 
     const reactionIdPromise = (async () => {
       try {
-        const res = await this.transport.addReaction(messageId, 'OnIt');
+        const res = await this.transport.addReaction(messageId, emojiType);
         return res?.reactionId;
       } catch {
         return undefined;
       }
     })();
 
-    this.pendingReactions.set(idempotencyKey, { messageId, reactionIdPromise });
+    this.pendingReactions.set(idempotencyKey, { messageId, emojiType, reactionIdPromise });
+  }
+
+  /**
+   * Switches an existing pending reaction to target emojiType (e.g. from SANDGLASS to OnIt).
+   */
+  private async switchReaction(idempotencyKey: string, targetEmoji: string): Promise<void> {
+    const pending = this.pendingReactions.get(idempotencyKey);
+    if (!pending || pending.emojiType === targetEmoji) return;
+
+    try {
+      const oldReactionId = await pending.reactionIdPromise;
+      if (oldReactionId) {
+        await this.transport.removeReaction(pending.messageId, oldReactionId).catch(() => {});
+      }
+      const newPromise = (async () => {
+        try {
+          const res = await this.transport.addReaction(pending.messageId, targetEmoji);
+          return res?.reactionId;
+        } catch {
+          return undefined;
+        }
+      })();
+      this.pendingReactions.set(idempotencyKey, {
+        messageId: pending.messageId,
+        emojiType: targetEmoji,
+        reactionIdPromise: newPromise,
+      });
+    } catch {}
   }
 
   private markEventAcked(nativeEventId: string): void {
@@ -1292,6 +1337,7 @@ export class LarkChannelGateway {
         nativeContextId,
         nativeEventId,
         replyToMessageId: parsed.messageId,
+        parentId: parsed.parentId,
         rootId: parsed.rootId,
         threadId: parsed.threadId,
         senderId: parsed.senderId,
@@ -1341,6 +1387,21 @@ export class LarkChannelGateway {
         this.recordTurnSender(route.id, parsed.senderId);
         if (dispatchResult.turnId) {
           this.recordTurnSender(dispatchResult.turnId, parsed.senderId);
+        }
+      }
+
+      // Check queuePosition and running status to set or switch reaction
+      const isQueued = typeof dispatchResult.queuePosition === 'number' && dispatchResult.queuePosition > 0;
+      if (isQueued) {
+        let hasRunning = false;
+        try {
+          const currentStatus = await this.runtimeGateway.getCurrentTurnStatus(this.userId, route.id);
+          hasRunning = currentStatus?.status === 'running';
+        } catch {}
+
+        if (hasRunning) {
+          // Switch initial OnIt reaction to SANDGLASS (queued)
+          this.switchReaction(platformIdempotencyKey, LARK_QUEUE_REACTION).catch(() => {});
         }
       }
 
@@ -1399,6 +1460,10 @@ export class LarkChannelGateway {
                 console.warn('[lark-stream] upsertStreamingCard onSnapshotFlush failed', err);
               }
             }
+          },
+          onRunning: () => {
+            // When turn actually starts running, switch reaction to OnIt
+            this.switchReaction(platformIdempotencyKey, LARK_ONIT_REACTION).catch(() => {});
           },
           cardParams: {
             chatId: parsed.chatId,

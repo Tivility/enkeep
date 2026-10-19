@@ -231,6 +231,22 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       expect(parseChatCommand('/swift')).toBeNull();
       expect(parseChatCommand('/spawning')).toBeNull();
     });
+
+    it('parses /steer commands: without args, with args, and respects word boundary', () => {
+      const p1 = parseChatCommand('/steer');
+      expect(p1).not.toBeNull();
+      expect(p1?.command).toBe('steer');
+      expect(p1?.subcommand).toBe('promote');
+      expect(p1?.arg).toBeUndefined();
+
+      const p2 = parseChatCommand('/steer Stop and write tests');
+      expect(p2).not.toBeNull();
+      expect(p2?.command).toBe('steer');
+      expect(p2?.subcommand).toBe('steer');
+      expect(p2?.arg).toBe('Stop and write tests');
+
+      expect(parseChatCommand('/steering')).toBeNull();
+    });
   });
 
   // =========================================================================
@@ -1196,6 +1212,79 @@ describe('Chat Slash Commands (/model and /effort)', () => {
       expect(assistantMsg).toBeDefined();
       const shortId = persistedTask.id.slice(5, 9);
       expect(assistantMsg?.content).toBe(`⚡ 并行任务已启动 [${shortId}]: gateway task`);
+    });
+
+    it('06-A1: executes /steer without args via promoteQueuedToSteer, and /steer <msg> fallback to ordinary when nothing running', async () => {
+      const db = new DatabaseSync(':memory:');
+      const runner = new PlatformServerMigrationRunner(db);
+      await runner.migrate(ALL_PLATFORM_MIGRATIONS);
+
+      const userId = 'u_steer_test';
+      const spaceId = 'spc_steer_test';
+      const sessionId = 'ses_steer_test';
+
+      db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, 'tester', 'hash', 'user')").run(userId);
+      db.prepare("INSERT INTO spaces (id, user_id, name, folder, execution_mode) VALUES (?, ?, 'Space Test', 'spc-t', 'container')").run(spaceId, userId);
+      db.prepare("INSERT INTO session_routes (id, user_id, space_id, channel, account_id, native_context_id, peer_id, dsh_session_id, execution_mode, current_generation, reset_count) VALUES (?, ?, ?, 'web', 'acc-1', 'ses1', 'p1', 'dsh1', 'container', 1, 0)").run(sessionId, userId, spaceId);
+
+      const modelSelectionService = new ModelSelectionService({ db });
+
+      const promoteMock = vi.fn().mockResolvedValue({
+        status: 'steered',
+        count: 1,
+        runningTurnId: 'turn_active_test',
+      });
+      const steerMock = vi.fn().mockResolvedValue({ ok: true });
+
+      const gatewayMock = {
+        cancelCurrentTurn: vi.fn(),
+        getCurrentTurnStatus: vi.fn(),
+        steerTurn: steerMock,
+        promoteQueuedToSteer: promoteMock,
+      };
+
+      const cmdService = new ChatCommandService({
+        modelSelectionService,
+        gateway: gatewayMock as any,
+        db,
+      });
+
+      // 1. /steer without args -> promotes queued
+      const res1 = await cmdService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/steer',
+        channelContext: { channel: 'wechat' },
+      });
+      expect(res1.replyText).toBe('已插入当前任务（1 条）');
+      expect(promoteMock).toHaveBeenCalledWith(userId, sessionId, { all: true });
+
+      // 2. /steer <msg> when no running turn -> fallbackToOrdinary
+      const res2 = await cmdService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/steer Do this next',
+      });
+      expect(res2.fallbackToOrdinary).toBe(true);
+
+      // 3. /steer <msg> when running turn exists in db -> calls steerTurn
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_r1', 'turn_r1', ?, ?, ?, 'container', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(spaceId, sessionId, userId);
+
+      const res3 = await cmdService.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: '/steer Do this next',
+      });
+      expect(res3.isSteerExecuted).toBe(true);
+      expect(steerMock).toHaveBeenCalledTimes(1);
+      expect(steerMock.mock.calls[0][2].expectedTurnId).toBe('turn_r1');
+      expect(steerMock.mock.calls[0][2].content).toBe('Do this next');
     });
   });
 });
