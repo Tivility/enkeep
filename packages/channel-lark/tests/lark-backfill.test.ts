@@ -109,6 +109,15 @@ describe('Lark Offline Backfill', () => {
       sender: { id: botOpenId, id_type: 'open_id', sender_type: 'user' },
     };
     expect(normalizeRestMessageToParsed(botUserMsg, { chatType: 'group', botOpenId })).toBeNull();
+
+    // System notices (member joins, group changes) never replay as user turns
+    const systemMsg: LarkRestMessageItem = {
+      ...rawRestItem,
+      message_id: 'om_synth_system_001',
+      msg_type: 'system',
+      sender: { id: '', id_type: '', sender_type: '' },
+    };
+    expect(normalizeRestMessageToParsed(systemMsg, { chatType: 'group' })).toBeNull();
   });
 
   // Test 2: Realtime WS event vs Backfill deduplication alignment

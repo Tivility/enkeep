@@ -611,6 +611,10 @@ export class LarkChannelGateway {
     if (!parsed) {
       return { handled: false, ignoredReason: 'parse_error' };
     }
+    // System notices (member joins, group changes, ...) are not user input.
+    if (parsed.msgType === 'system') {
+      return { handled: false, ignoredReason: 'parse_error' };
+    }
 
     const nativeEventId = parsed.messageId;
     if (rawEvent.header?.event_id) {
