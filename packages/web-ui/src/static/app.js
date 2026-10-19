@@ -18674,7 +18674,18 @@ const ALLOWED_IMAGE_MIMES = new Set([
   'image/gif',
 ]);
 
-const SAFE_DOWNLOAD_URL_PATTERN = /^\/api\/spaces\/[a-zA-Z0-9_-]+\/files\/download\?path=[a-zA-Z0-9_.\-%/]+$/;
+const SAFE_DOWNLOAD_URL_PATTERN = /^\/api\/spaces\/[a-zA-Z0-9_-]+\/files\/download\?path=[a-zA-Z0-9_.\-%/]+(&variant=thumb)?$/;
+
+function openImageLightbox(src, alt) {
+  const modal = document.getElementById('modal-image-lightbox');
+  if (!modal) return;
+  const imgEl = modal.querySelector('#lightbox-full-image');
+  if (imgEl) {
+    imgEl.src = src;
+    imgEl.alt = alt || '';
+  }
+  openModal('modal-image-lightbox');
+}
 
 function isAllowedImageAttachment(att) {
   if (!att || typeof att !== 'object') return false;
@@ -18693,6 +18704,18 @@ function isAllowedImageAttachment(att) {
   }
   if (!SAFE_DOWNLOAD_URL_PATTERN.test(url)) {
     return false;
+  }
+
+  // 3. If thumbnailUrl is present, validate it against the safe pattern as well
+  if (att.thumbnailUrl !== undefined) {
+    const thumbUrl = att.thumbnailUrl;
+    if (typeof thumbUrl !== 'string') return false;
+    if (thumbUrl.includes('://') || thumbUrl.startsWith('//') || thumbUrl.includes('\0') || thumbUrl.includes('..')) {
+      return false;
+    }
+    if (!SAFE_DOWNLOAD_URL_PATTERN.test(thumbUrl)) {
+      return false;
+    }
   }
 
   return true;
@@ -18728,19 +18751,31 @@ function renderMessageAttachments(parentCard, attachments) {
       previewLink.rel = 'noopener noreferrer';
       previewLink.setAttribute('title', t('chat.attachmentDownloadAria', { name: displayName }, `Download ${displayName}`));
 
+      // Intercept click to open in Lightbox modal
+      previewLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        openImageLightbox(att.downloadUrl, displayName);
+      });
+
       const img = document.createElement('img');
       img.className = 'message-attachment-thumbnail';
       img.loading = 'lazy';
       img.alt = t('chat.imagePreviewAlt', { name: displayName }, `Image attachment: ${displayName}`);
-      img.src = att.downloadUrl;
 
-      // Safe non-looping error fallback
+      const thumbSrc = att.thumbnailUrl || att.downloadUrl;
+      img.src = thumbSrc;
+
+      // Safe non-looping error fallback: try original if thumbnail failed; if original fails, collapse preview
       img.addEventListener('error', function onThumbnailError() {
-        img.removeEventListener('error', onThumbnailError);
-        previewDiv.classList.add('hidden');
-        card.classList.remove('message-attachment-card-image');
-        card.classList.add('preview-failed');
-      }, { once: true });
+        if (img.src !== att.downloadUrl) {
+          img.src = att.downloadUrl;
+        } else {
+          img.removeEventListener('error', onThumbnailError);
+          previewDiv.classList.add('hidden');
+          card.classList.remove('message-attachment-card-image');
+          card.classList.add('preview-failed');
+        }
+      });
 
       // Maintain scroll anchor on lazy image decode/load
       img.addEventListener('load', function onThumbnailLoad() {

@@ -23,6 +23,7 @@ import type {
   PublicSession,
   ForkSessionOptions,
 } from '@enkeep/web-channel';
+import { isEligibleForThumbnail } from '../files/attachment-thumbnail-service.js';
 import { generate32HexId } from '../storage/web-messages.js';
 import type {
   RuntimeArtifactPort,
@@ -620,6 +621,8 @@ export class ForkService {
             att.display_name,
             att.created_at
           );
+          const baseDownloadUrl = `/api/spaces/${encodeURIComponent(targetSpaceId)}/files/download?path=${encodeURIComponent(att.snapshot_path)}`;
+          const eligible = isEligibleForThumbnail(att.media_type, att.size);
           publicAttachments.push({
             id: newAttId,
             relativePath: att.relative_path,
@@ -627,7 +630,8 @@ export class ForkService {
             size: att.size,
             mediaType: att.media_type,
             ...(att.display_name ? { displayName: att.display_name } : {}),
-            downloadUrl: `/api/spaces/${encodeURIComponent(targetSpaceId)}/files/download?path=${encodeURIComponent(att.snapshot_path)}`,
+            downloadUrl: baseDownloadUrl,
+            ...(eligible ? { thumbnailUrl: `${baseDownloadUrl}&variant=thumb` } : {}),
           });
         }
 

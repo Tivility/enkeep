@@ -265,6 +265,11 @@ export interface PublicMessageAttachment {
   readonly mediaType: string;
   readonly displayName?: string;
   readonly downloadUrl: string;
+  /**
+   * Optional thumbnail download URL (long-edge 480px JPEG) for large image attachments.
+   * Undefined for non-image, GIF, or images under 64KB.
+   */
+  readonly thumbnailUrl?: string;
 }
 
 export interface RuntimeFallbackTarget {

@@ -33,6 +33,7 @@ import {
 import type { RuntimeAgentProfileSnapshot } from '../profiles/profile-service.js';
 import type { RuntimeFileApiService, TenantRuntimeFileProvider } from '../files/runtime-file-api.js';
 import { sniffMimeType } from '../files/file-transport-utils.js';
+import { isEligibleForThumbnail } from '../files/attachment-thumbnail-service.js';
 import type { CanonicalAttachment, PublicMessageAttachment } from '@enkeep/protocol';
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 import { ModelSelectionService as ModelSelectionServiceImpl } from '../models/model-selection-service.js';
@@ -1297,15 +1298,19 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         createdAt: msgRow.created_at,
         ...(existingAttachments.length > 0
           ? {
-              attachments: existingAttachments.map((a) => ({
-                id: a.id,
-                relativePath: a.relativePath,
-                etag: a.etag,
-                size: a.size,
-                mediaType: a.mediaType,
-                displayName: a.displayName,
-                downloadUrl: a.downloadReference,
-              })),
+              attachments: existingAttachments.map((a) => {
+                const eligible = isEligibleForThumbnail(a.mediaType, a.size);
+                return {
+                  id: a.id,
+                  relativePath: a.relativePath,
+                  etag: a.etag,
+                  size: a.size,
+                  mediaType: a.mediaType,
+                  displayName: a.displayName,
+                  downloadUrl: a.downloadReference,
+                  ...(eligible ? { thumbnailUrl: `${a.downloadReference}&variant=thumb` } : {}),
+                };
+              }),
             }
           : {}),
         ...(existingReplyRef ? { replyReference: existingReplyRef } : {}),

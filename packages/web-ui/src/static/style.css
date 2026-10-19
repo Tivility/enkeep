@@ -2690,6 +2690,49 @@ aside.workspace-sidebar.is-collapsed {
   object-fit: contain;
   display: block;
   border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+/* Lightbox Modal Styles */
+.lightbox-backdrop {
+  z-index: 1200;
+  padding: 1.5rem;
+}
+
+.lightbox-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 95vw;
+  max-height: 95vh;
+}
+
+.lightbox-close {
+  position: absolute;
+  top: -2rem;
+  right: -1rem;
+  font-size: 2rem;
+  color: var(--text-inverse);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  z-index: 1210;
+  line-height: 1;
+}
+
+.lightbox-image-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lightbox-img {
+  max-width: 90vw;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-xl);
 }
 
 /* Workspace File Picker Modal Styles */
