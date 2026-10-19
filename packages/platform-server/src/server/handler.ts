@@ -4573,6 +4573,39 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                 return;
               }
 
+              if (method === "DELETE") {
+                validateCsrf(req, { csrfToken });
+                if (!operations && !opsProvider) {
+                  throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
+                }
+
+                const existing = opsProvider
+                  ? await opsProvider.getTask(user.id, taskId)
+                  : await (operations as PlatformOperationsService).forTenant(user.id).tasks.getTask(taskId);
+                if (!existing) {
+                  throw new NotFoundError(`Task "${taskId}" not found`);
+                }
+
+                if (existing.status === "running" || existing.status === "claimed") {
+                  throw new ConflictError(`Cannot delete running task "${taskId}". Please cancel or wait for completion first.`);
+                }
+
+                if (opsProvider && opsProvider.deleteTask) {
+                  await opsProvider.deleteTask(user.id, taskId);
+                } else if (operations) {
+                  await (operations as PlatformOperationsService).forTenant(user.id).tasks.deleteTask(taskId);
+                } else {
+                  throw new PlatformError("Platform Operations service is not configured or unavailable", "OPERATIONS_UNAVAILABLE", 503);
+                }
+
+                sendJsonResponse(res, 200, createSuccessEnvelope({
+                  id: taskId,
+                  deleted: true,
+                  success: true,
+                }));
+                return;
+              }
+
               throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
             }
 

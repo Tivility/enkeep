@@ -719,6 +719,25 @@ export class FakeTenantScopedTaskRepository implements TenantScopedTaskRepositor
     return { ...updated };
   }
 
+  async delete(id: string): Promise<boolean> {
+    const validId = validateTaskId(id);
+    const existing = this.tasks.get(validId);
+    if (!existing || existing.userId !== this.userId) {
+      throw new TaskNotFoundError(validId);
+    }
+    if (existing.status === 'running' || existing.status === 'claimed') {
+      throw new TaskConflictError(validId, `Cannot delete task ${validId} while in status "${existing.status}"`);
+    }
+    this.tasks.delete(validId);
+    this.schedules.delete(validId);
+    for (const [runId, run] of this.runs.entries()) {
+      if (run.taskId === validId) {
+        this.runs.delete(runId);
+      }
+    }
+    return true;
+  }
+
   async pause(id: string): Promise<Task> {
     const validId = validateTaskId(id);
     const existing = this.tasks.get(validId);

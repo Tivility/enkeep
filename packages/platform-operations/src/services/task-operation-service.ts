@@ -39,7 +39,7 @@ import {
   validateOverlapPolicy,
   validateTimezone,
 } from '../tasks/schedule-calculator.js';
-import { ValidationError } from '../errors/index.js';
+import { ValidationError, TaskNotFoundError, TaskConflictError } from '../errors/index.js';
 import type { TenantScopedTaskRepository } from '../ports/task-port.js';
 import type { OperationsAuditPort } from '../ports/audit-port.js';
 
@@ -364,6 +364,43 @@ export class TaskOperationService {
     }
 
     return task;
+  }
+
+  /**
+   * Permanently delete a task. Only non-active (not running/claimed) tasks can be deleted.
+   */
+  async deleteTask(taskId: string): Promise<{ success: boolean; id: string }> {
+    const validTaskId = validateTaskId(taskId);
+
+    const existing = await this.tasks.findById(validTaskId);
+    if (!existing) {
+      throw new TaskNotFoundError(validTaskId);
+    }
+
+    if (existing.status === 'running' || existing.status === 'claimed') {
+      throw new TaskConflictError(
+        validTaskId,
+        `Task "${validTaskId}" is currently running or claimed. Please cancel or stop it before deleting.`
+      );
+    }
+
+    await this.tasks.delete(validTaskId);
+
+    if (this.auditLogs) {
+      await this.auditLogs.record({
+        userId: this.userId,
+        action: 'task_deleted',
+        resourceType: 'task',
+        resourceId: validTaskId,
+        details: {
+          title: existing.title,
+          scheduleType: existing.scheduleType,
+          previousStatus: existing.status,
+        },
+      });
+    }
+
+    return { success: true, id: validTaskId };
   }
 
   /**

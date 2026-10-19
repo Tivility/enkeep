@@ -1485,6 +1485,47 @@ export class SqliteTenantScopedTaskRepository implements TenantScopedTaskReposit
     });
   }
 
+  async delete(id: string): Promise<boolean> {
+    const validId = validateTaskId(id);
+
+    return withImmediateTransactionSync(this.db, () => {
+      // 1. 查询当前任务
+      const taskRow = this.db
+        .prepare('SELECT id, status FROM platform_tasks WHERE id = ? AND user_id = ?')
+        .get(validId, this.userId) as DbRow | undefined;
+
+      if (!taskRow) {
+        throw new TaskNotFoundError(validId);
+      }
+
+      const status = String(taskRow.status);
+      if (status === 'running' || status === 'claimed') {
+        throw new TaskConflictError(validId, `Cannot delete task ${validId} while in status "${status}"`);
+      }
+
+      // 2. 双重检查：确保 task_runs 中没有活跃执行（running 或 claimed）
+      if (this.hasScheduleSchema()) {
+        const activeRun = this.db
+          .prepare(
+            `SELECT id FROM task_runs
+             WHERE task_id = ? AND user_id = ? AND status IN ('running', 'claimed')
+             LIMIT 1`
+          )
+          .get(validId, this.userId);
+        if (activeRun) {
+          throw new TaskConflictError(validId, `Task ${validId} has an active execution run`);
+        }
+      }
+
+      // 3. 执行删除（外键 ON DELETE CASCADE 自动联动清理 task_schedules, task_runs, task_notification_*）
+      const deleteStmt = this.db.prepare(
+        'DELETE FROM platform_tasks WHERE id = ? AND user_id = ?'
+      );
+      const res = deleteStmt.run(validId, this.userId);
+      return res.changes > 0;
+    });
+  }
+
   async pause(id: string): Promise<Task> {
     const validId = validateTaskId(id);
     const now = new Date().toISOString();

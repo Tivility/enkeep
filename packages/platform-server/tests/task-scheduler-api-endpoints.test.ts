@@ -829,5 +829,55 @@ describe('Task Scheduler Management APIs (Cron, Interval, Pause/Resume, Runs, Ru
       });
       expect(patchRes.status).toBe(405);
     });
+
+    it('DELETE /api/manage/tasks/:id removes task, rejects non-owner, and rejects running task', async () => {
+      // 1. Create a task for tenant 1
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          ...getHeaders(tenant1Cookie),
+          'Idempotency-Key': '11111111-aaaa-4bbb-8ccc-000000000010',
+        },
+        body: JSON.stringify({
+          title: 'Delete Target Task',
+          prompt: 'To be deleted',
+          sessionId: sessionRouteId,
+        }),
+      });
+      const { data: { task: created } } = await createRes.json();
+
+      // 2. Tenant 2 (bob) attempts to delete -> 404 Not Found
+      const crossDeleteRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'DELETE',
+        headers: getHeaders(tenant2Cookie),
+      });
+      expect(crossDeleteRes.status).toBe(404);
+
+      // 3. Mark task running in DB directly to verify running task rejection -> 409 Conflict
+      db.prepare("UPDATE platform_tasks SET status = 'running' WHERE id = ?").run(created.id);
+      const runningDeleteRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'DELETE',
+        headers: getHeaders(tenant1Cookie),
+      });
+      expect(runningDeleteRes.status).toBe(409);
+
+      // 4. Reset task to pending/completed and delete successfully -> 200
+      db.prepare("UPDATE platform_tasks SET status = 'pending' WHERE id = ?").run(created.id);
+      const deleteRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'DELETE',
+        headers: getHeaders(tenant1Cookie),
+      });
+      const deleteJson = await deleteRes.json();
+      expect(deleteRes.status).toBe(200);
+      expect(deleteJson.success).toBe(true);
+      expect(deleteJson.data.deleted).toBe(true);
+
+      // 5. Subsequent GET returns 404
+      const getRes = await fetch(`${baseUrl}/api/manage/tasks/${created.id}`, {
+        method: 'GET',
+        headers: getHeaders(tenant1Cookie),
+      });
+      expect(getRes.status).toBe(404);
+    });
   });
 });

@@ -113,4 +113,11 @@ export interface TenantScopedTaskRepository {
    * Create an immediate execution run for a task (e.g. manual Run Now) without shifting next scheduled run.
    */
   createManualRun(taskId: string, claimantId?: string, leaseDurationMs?: number, now?: Date | string): Promise<{ task: Task; run: TaskRun }>;
+
+  /**
+   * Permanently delete a task and its associated schedules/runs.
+   * Throws TaskNotFoundError if task doesn't exist for the user.
+   * Throws TaskConflictError if task is currently running or claimed.
+   */
+  delete(id: string): Promise<boolean>;
 }

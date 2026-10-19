@@ -531,6 +531,7 @@ export interface ManagementOperationsProvider {
   pauseTask?(userId: string, taskId: string): Promise<SafeTask>;
   resumeTask?(userId: string, taskId: string): Promise<SafeTask>;
   updateTask?(userId: string, taskId: string, input: UpdateTaskInput): Promise<SafeTask>;
+  deleteTask?(userId: string, taskId: string): Promise<{ success: boolean; id: string }>;
   getTask(userId: string, taskId: string): Promise<SafeTask | null>;
   setQuotaLimit(userId: string, input: StrictSetQuotaLimitInput): Promise<TenantQuotaLimit>;
   checkQuota(userId: string, query?: CheckQuotaQuery): Promise<CheckQuotaResult>;

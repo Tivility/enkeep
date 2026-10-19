@@ -1124,5 +1124,62 @@ describe('Task Schedules, Recurrences and Execution Runs Storage', () => {
       expect(normal).toBeDefined();
       expect(normal?.payload.prompt).toBe('Execute normal check');
     });
+
+    it('delete removes task and cascades to task_schedules and task_runs atomically', async () => {
+      const task = await repo1.create({
+        title: 'Task To Delete',
+        scheduleType: 'cron',
+        cronExpression: '0 5 * * *',
+        timezone: 'UTC',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute deletion test',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      // Insert fake run for this task
+      const runId = 'run_del00000000000000000000000000001';
+      db.prepare(`
+        INSERT INTO task_runs (
+          id, task_id, schedule_id, user_id, attempt_number, status, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, 1, 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+      `).run(runId, task.id, task.schedule?.id, user1);
+
+      // Verify records exist
+      expect(db.prepare('SELECT COUNT(*) as c FROM platform_tasks WHERE id = ?').get(task.id)).toEqual({ c: 1 });
+      expect(db.prepare('SELECT COUNT(*) as c FROM task_schedules WHERE task_id = ?').get(task.id)).toEqual({ c: 1 });
+      expect(db.prepare('SELECT COUNT(*) as c FROM task_runs WHERE task_id = ?').get(task.id)).toEqual({ c: 1 });
+
+      // Delete task
+      const deleted = await repo1.delete(task.id);
+      expect(deleted).toBe(true);
+
+      // Verify cascading deletion
+      expect(db.prepare('SELECT COUNT(*) as c FROM platform_tasks WHERE id = ?').get(task.id)).toEqual({ c: 0 });
+      expect(db.prepare('SELECT COUNT(*) as c FROM task_schedules WHERE task_id = ?').get(task.id)).toEqual({ c: 0 });
+      expect(db.prepare('SELECT COUNT(*) as c FROM task_runs WHERE task_id = ?').get(task.id)).toEqual({ c: 0 });
+    });
+
+    it('delete rejects running or claimed task with TaskConflictError', async () => {
+      const task = await repo1.create({
+        title: 'Running Task To Reject',
+        scheduleType: 'once',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Execute run test',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      await repo1.claim({ claimantId: 'worker_del_test', leaseDurationMs: 30000, preferredTaskId: task.id });
+
+      await expect(repo1.delete(task.id)).rejects.toThrow(TaskConflictError);
+      expect(db.prepare('SELECT COUNT(*) as c FROM platform_tasks WHERE id = ?').get(task.id)).toEqual({ c: 1 });
+    });
   });
 });
