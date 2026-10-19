@@ -163,29 +163,20 @@ describe('Full Defense-in-Depth Session Serialization & Recovery (E1 - E8)', () 
     // Concurrency must never exceed 1
     expect(maxObservedConcurrency).toBe(1);
 
-    // Execution order must be strictly FIFO 1 through 10
-    expect(executedTurns.map((t) => t.content)).toEqual([
-      'Prompt 1',
-      'Prompt 2',
-      'Prompt 3',
-      'Prompt 4',
-      'Prompt 5',
-      'Prompt 6',
-      'Prompt 7',
-      'Prompt 8',
-      'Prompt 9',
-      'Prompt 10',
-    ]);
-
-    // Execution intervals must not overlap
-    for (let i = 1; i < executedTurns.length; i++) {
-      expect(executedTurns[i].start).toBeGreaterThanOrEqual(executedTurns[i - 1].end - 5);
+    // With batch merging, queued turns 1..10 were merged into a single execution
+    expect(executedTurns.length).toBe(1);
+    for (let i = 1; i <= 10; i++) {
+      expect(executedTurns[0].content).toContain(`Prompt ${i}`);
     }
 
-    // All 10 turn_runs completed
-    const turns = db.prepare("SELECT turn_id, status FROM turn_runs WHERE route_id = 'ses1' ORDER BY created_at ASC").all() as any[];
+    // All 10 turn_runs completed (first 9 merged into the 10th)
+    const turns = db.prepare("SELECT turn_id, status, error FROM turn_runs WHERE route_id = 'ses1' ORDER BY created_at ASC").all() as any[];
     expect(turns.length).toBe(10);
     expect(turns.every((t) => t.status === 'completed')).toBe(true);
+    for (let i = 0; i < 9; i++) {
+      expect(turns[i].error).toMatch(/^merged into /);
+    }
+    expect(turns[9].error).toBeNull();
 
     // Leases table recorded leases and released them
     const leases = db.prepare("SELECT * FROM session_execution_leases WHERE route_id = 'ses1'").all() as any[];
@@ -727,11 +718,18 @@ describe('Full Defense-in-Depth Session Serialization & Recovery (E1 - E8)', () 
 
     await freshGateway.drain(2000);
 
-    expect(executedContents).toEqual(['Durable Msg 1', 'Durable Msg 2', 'Durable Msg 3']);
+    // With batch merging, all 3 queued turns are merged into a single turn execution
+    expect(executedContents.length).toBe(1);
+    expect(executedContents[0]).toContain('Durable Msg 1');
+    expect(executedContents[0]).toContain('Durable Msg 2');
+    expect(executedContents[0]).toContain('Durable Msg 3');
 
-    const allTurns = db.prepare("SELECT turn_id, status FROM turn_runs WHERE route_id = 'ses1' ORDER BY created_at ASC").all() as any[];
+    const allTurns = db.prepare("SELECT turn_id, status, error FROM turn_runs WHERE route_id = 'ses1' ORDER BY created_at ASC").all() as any[];
     expect(allTurns.length).toBe(3);
     expect(allTurns.every((t) => t.status === 'completed')).toBe(true);
+    expect(allTurns[0].error).toMatch(/^merged into /);
+    expect(allTurns[1].error).toMatch(/^merged into /);
+    expect(allTurns[2].error).toBeNull();
   });
 
   // E10: Two gateway instances on shared DB: only ONE can claim lease

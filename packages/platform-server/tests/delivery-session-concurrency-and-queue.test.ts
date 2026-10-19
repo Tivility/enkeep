@@ -41,7 +41,7 @@ async function setupTestEnv() {
 }
 
 describe('DeliveryRuntimeGateway Per-Session Concurrency & FIFO Queueing', () => {
-  it('1. Serializes concurrent turns to the SAME session strictly in FIFO order with max concurrency = 1', async () => {
+  it('1. Merges concurrent queued turns to the SAME session into one batch turn', async () => {
     const { db, storage, messageStore, profileResolver } = await setupTestEnv();
 
     let activeExecutions = 0;
@@ -115,31 +115,27 @@ describe('DeliveryRuntimeGateway Per-Session Concurrency & FIFO Queueing', () =>
     // Drain all queued and running turns
     await gateway.drain(3000);
 
-    // Max concurrency for the same session MUST be strictly 1
+    // Concurrency for the session was 1
     expect(maxObservedConcurrency).toBe(1);
 
-    // Execution order MUST match arrival order (FIFO)
-    expect(executionOrder).toEqual(['Message 1', 'Message 2', 'Message 3']);
+    // All 3 queued turns were merged into a single execution
+    expect(executionOrder.length).toBe(1);
+    expect(executionOrder[0]).toContain('Message 1');
+    expect(executionOrder[0]).toContain('Message 2');
+    expect(executionOrder[0]).toContain('Message 3');
 
-    // Execution time intervals MUST not overlap
-    expect(executionTimes.length).toBe(3);
-    expect(executionTimes[1].start).toBeGreaterThanOrEqual(executionTimes[0].end - 5);
-    expect(executionTimes[2].start).toBeGreaterThanOrEqual(executionTimes[1].end - 5);
+    // Exactly 1 turn execution
+    expect(executionTimes.length).toBe(1);
 
     // All 3 turns in SQLite turn_runs should be completed
     const turns = db.prepare(
-      "SELECT turn_id, status FROM turn_runs WHERE route_id = 'ses1' ORDER BY created_at ASC"
-    ).all() as Array<{ turn_id: string; status: string }>;
+      "SELECT turn_id, status, error FROM turn_runs WHERE route_id = 'ses1' ORDER BY created_at ASC"
+    ).all() as Array<{ turn_id: string; status: string; error?: string }>;
     expect(turns.length).toBe(3);
     expect(turns.every((t) => t.status === 'completed')).toBe(true);
-
-    // Web messages history has all 3 user messages and 3 assistant replies
-    const history = await messageStore.listMessages('u1', 'ses1');
-    expect(history.messages.length).toBe(6);
-    const userMessages = history.messages.filter((m) => m.role === 'user').map((m) => m.content);
-    const assistantMessages = history.messages.filter((m) => m.role === 'assistant').map((m) => m.content);
-    expect(userMessages).toEqual(['Message 1', 'Message 2', 'Message 3']);
-    expect(assistantMessages).toEqual(['Echo: Message 1', 'Echo: Message 2', 'Echo: Message 3']);
+    expect(turns[0].error).toMatch(/^merged into /);
+    expect(turns[1].error).toMatch(/^merged into /);
+    expect(turns[2].error).toBeNull();
   });
 
   it('2. Allows parallel execution across DIFFERENT sessions simultaneously', async () => {
@@ -259,6 +255,9 @@ describe('DeliveryRuntimeGateway Per-Session Concurrency & FIFO Queueing', () =>
       timestamp: new Date().toISOString(),
     });
 
+    // Wait a tick for Turn 1 to start running
+    await new Promise((r) => setTimeout(r, 20));
+
     const res2 = await gateway.dispatchInbound({
       id: createValidDeliveryId(),
       sessionId: 'ses1',
@@ -274,9 +273,6 @@ describe('DeliveryRuntimeGateway Per-Session Concurrency & FIFO Queueing', () =>
       content: 'Turn 3',
       timestamp: new Date().toISOString(),
     });
-
-    // Wait a tick for Turn 1 to start running
-    await new Promise((r) => setTimeout(r, 20));
 
     // Turn 2 is currently queued. Cancel Turn 2!
     const cancelRes2 = await gateway.cancelTurn('u1', res2.turnId!);
@@ -352,6 +348,9 @@ describe('DeliveryRuntimeGateway Per-Session Concurrency & FIFO Queueing', () =>
       timestamp: new Date().toISOString(),
     });
 
+    // Wait until Turn 1 is genuinely executing in executor
+    await turn1Started;
+
     const res2 = await gateway.dispatchInbound({
       id: createValidDeliveryId(),
       sessionId: 'ses1',
@@ -359,9 +358,6 @@ describe('DeliveryRuntimeGateway Per-Session Concurrency & FIFO Queueing', () =>
       content: 'Turn 2 Fast',
       timestamp: new Date().toISOString(),
     });
-
-    // Wait until Turn 1 is genuinely executing in executor
-    await turn1Started;
 
     // Turn 1 is currently running. Cancel it via cancelCurrentTurn!
     const cancelRes = await gateway.cancelCurrentTurn('u1', 'ses1');

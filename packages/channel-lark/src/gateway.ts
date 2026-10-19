@@ -1713,6 +1713,7 @@ export class LarkChannelGateway {
           onRunning: () => {
             // When turn actually starts running, switch reaction to OnIt
             if (dispatchResult.turnId) this.queuedReactionTurns.get(route.id)?.delete(dispatchResult.turnId);
+            this.refreshPromotedReactions(route.id).catch(() => {});
             this.switchReaction(platformIdempotencyKey, LARK_ONIT_REACTION).catch(() => {});
           },
           cardParams: {

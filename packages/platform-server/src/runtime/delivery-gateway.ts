@@ -1882,6 +1882,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     timestamp: string;
     leaseId: string;
     workerId: string;
+    mergedUserMessageIds?: string[];
   } | null {
     let inTx = false;
     try {
@@ -2067,6 +2068,186 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         if (msgRow?.content) content = msgRow.content;
       }
 
+      // Check if multiple queued turns for the same session can be merged into a single turn
+      let effectiveTurnId = turnId;
+      let effectiveDeliveryId = deliveryId;
+      let effectiveUserMessageId = userMessageId;
+      let effectiveIdempotencyKey = idempotencyKey;
+      let effectiveContent = content;
+      let effectiveSenderName = senderName;
+      let effectiveChatType = chatType;
+      let effectiveTimestamp = timestamp;
+      let mergedUserMessageIds: string[] | undefined;
+
+      const queuedTurnsQuery = `
+        SELECT
+          tr.turn_id,
+          tr.space_id,
+          di.delivery_id,
+          di.message_id as user_message_id,
+          di.payload as inbox_payload,
+          di.created_at as inbox_timestamp,
+          idem.idempotency_key
+        FROM turn_runs tr
+        JOIN delivery_inbox di ON tr.turn_id = di.turn_id AND tr.user_id = di.user_id
+        LEFT JOIN idempotency_records idem ON tr.turn_id = idem.turn_id AND tr.user_id = idem.user_id
+        WHERE tr.user_id = ?
+          AND tr.route_id = ?
+          AND tr.status = 'queued'
+          AND di.status = 'held'
+        ORDER BY tr.rowid ASC
+        LIMIT 10
+      `;
+
+      const sessionQueuedRows = this.db.prepare(queuedTurnsQuery).all(userId, sessionId) as Array<{
+        turn_id: string;
+        space_id: string;
+        delivery_id: string | null;
+        user_message_id: string | null;
+        inbox_payload: string | null;
+        inbox_timestamp: string | null;
+        idempotency_key: string | null;
+      }>;
+
+      if (sessionQueuedRows.length >= 2 && sessionQueuedRows[0]?.turn_id === candidate.turn_id) {
+        interface ParsedPrefixTurn {
+          turnId: string;
+          deliveryId: string;
+          userMessageId: string;
+          idempotencyKey: string;
+          rawContent: string;
+          senderName: string | null;
+          chatType: string | null;
+          timestamp: string;
+          nativeContextId: string | null;
+        }
+
+        const parsedRows: ParsedPrefixTurn[] = [];
+        let firstNativeContextId: string | null = null;
+        let prefixValid = true;
+
+        for (let i = 0; i < sessionQueuedRows.length; i++) {
+          const row = sessionQueuedRows[i];
+          let rowPayload: any = null;
+          let rowContent = '';
+          let rowSenderName: string | null = null;
+          let rowChatType: string | null = null;
+          let rowTimestamp = row.inbox_timestamp || nowIso;
+          let rowNativeContextId: string | null = null;
+
+          if (row.inbox_payload) {
+            try {
+              rowPayload = JSON.parse(row.inbox_payload);
+              if (rowPayload && typeof rowPayload === 'object') {
+                if (typeof rowPayload.content === 'string') rowContent = rowPayload.content;
+                if (typeof rowPayload.senderName === 'string') rowSenderName = rowPayload.senderName;
+                if (typeof rowPayload.chatType === 'string') rowChatType = rowPayload.chatType;
+                if (typeof rowPayload.timestamp === 'string') rowTimestamp = rowPayload.timestamp;
+                if (rowPayload.channelContext && typeof rowPayload.channelContext.nativeContextId === 'string') {
+                  rowNativeContextId = rowPayload.channelContext.nativeContextId;
+                }
+              }
+            } catch {}
+          }
+
+          if (!rowNativeContextId) {
+            try {
+              const originRow = this.db.prepare(
+                'SELECT native_context_id FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? LIMIT 1'
+              ).get(row.turn_id, userId) as { native_context_id?: string } | undefined;
+              if (originRow?.native_context_id) {
+                rowNativeContextId = originRow.native_context_id;
+              }
+            } catch {}
+          }
+
+          if (!rowContent && row.user_message_id) {
+            const wmRow = this.db.prepare('SELECT content FROM web_messages WHERE id = ?').get(row.user_message_id) as { content?: string } | undefined;
+            if (wmRow?.content) rowContent = wmRow.content;
+          }
+
+          // Content starting with '/' cannot be merged
+          if (rowContent.trim().startsWith('/')) {
+            break;
+          }
+
+          if (i === 0) {
+            firstNativeContextId = rowNativeContextId;
+          } else {
+            if (rowNativeContextId !== firstNativeContextId) {
+              break;
+            }
+          }
+
+          parsedRows.push({
+            turnId: row.turn_id,
+            deliveryId: row.delivery_id || row.turn_id,
+            userMessageId: row.user_message_id || '',
+            idempotencyKey: row.idempotency_key || row.delivery_id || row.turn_id,
+            rawContent: rowContent,
+            senderName: rowSenderName,
+            chatType: rowChatType,
+            timestamp: rowTimestamp,
+            nativeContextId: rowNativeContextId,
+          });
+        }
+
+        if (parsedRows.length >= 2) {
+          const lastItem = parsedRows[parsedRows.length - 1];
+          effectiveTurnId = lastItem.turnId;
+          effectiveDeliveryId = lastItem.deliveryId;
+          effectiveUserMessageId = lastItem.userMessageId;
+          effectiveIdempotencyKey = lastItem.idempotencyKey;
+          effectiveSenderName = null;
+          effectiveChatType = lastItem.chatType;
+          effectiveTimestamp = lastItem.timestamp;
+
+          const mergedLines: string[] = [];
+          const mergedMsgIds: string[] = [];
+
+          for (let i = 0; i < parsedRows.length; i++) {
+            const item = parsedRows[i];
+            const dateObj = new Date(item.timestamp);
+            const hh = String(dateObj.getHours()).padStart(2, '0');
+            const mm = String(dateObj.getMinutes()).padStart(2, '0');
+            const timePrefix = `[${hh}:${mm}] `;
+            const isGroupChat = Boolean(item.chatType && item.chatType !== 'p2p');
+            const senderPrefix = isGroupChat && item.senderName && item.senderName.trim().length > 0
+              ? `[发送者: ${item.senderName.trim()}] `
+              : '';
+            mergedLines.push(`${timePrefix}${senderPrefix}${item.rawContent}`);
+
+            // Mark earlier merged items completed
+            if (i < parsedRows.length - 1) {
+              if (item.userMessageId) {
+                mergedMsgIds.push(item.userMessageId);
+              }
+              const mergeError = `merged into ${effectiveTurnId}`;
+              this.db.prepare(`
+                UPDATE turn_runs
+                SET status = 'completed', error = ?, finished_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE turn_id = ? AND user_id = ?
+              `).run(mergeError, nowIso, item.turnId, userId);
+
+              this.db.prepare(`
+                UPDATE delivery_inbox
+                SET status = 'delivered', processed_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE turn_id = ? AND user_id = ?
+              `).run(nowIso, item.turnId, userId);
+
+              this.db.prepare(`
+                UPDATE idempotency_records
+                SET state = 'completed', updated_at = CURRENT_TIMESTAMP
+                WHERE turn_id = ? AND user_id = ?
+              `).run(item.turnId, userId);
+            }
+          }
+
+          effectiveContent = mergedLines.join('\n');
+          mergedUserMessageIds = mergedMsgIds;
+        }
+      }
+
       // 3. Acquire active lease in session_execution_leases (phase = 'claimed')
       const leaseId = generate32HexId('lease');
       const workerId = this.workerBootId;
@@ -2077,7 +2258,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           INSERT INTO session_execution_leases (
             id, user_id, route_id, turn_id, generation, phase, status, worker_id, acquired_at, heartbeat_at, expires_at
           ) VALUES (?, ?, ?, ?, ?, 'claimed', 'active', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
-        `).run(leaseId, userId, sessionId, turnId, currentGeneration, workerId, expiresAt);
+        `).run(leaseId, userId, sessionId, effectiveTurnId, currentGeneration, workerId, expiresAt);
       }
 
       // 4. Atomic CAS on turn_runs: queued -> running
@@ -2085,7 +2266,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         UPDATE turn_runs
         SET status = 'running', started_at = ?, updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status = 'queued'
-      `).run(nowIso, turnId, userId);
+      `).run(nowIso, effectiveTurnId, userId);
 
       if (safeChangesCount(turnRes.changes) === 0) {
         this.db.exec('ROLLBACK');
@@ -2098,34 +2279,35 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         UPDATE delivery_inbox
         SET status = 'processing', updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status = 'held'
-      `).run(turnId, userId);
+      `).run(effectiveTurnId, userId);
 
       // 6. Update idempotency_records: held -> processing
       this.db.prepare(`
         UPDATE idempotency_records
         SET state = 'processing', updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND state = 'held'
-      `).run(turnId, userId);
+      `).run(effectiveTurnId, userId);
 
       this.db.exec('COMMIT');
       inTx = false;
 
       return {
-        turnId,
+        turnId: effectiveTurnId,
         userId,
         sessionId,
         spaceId,
         dshSessionId,
         currentGeneration,
-        deliveryId,
-        userMessageId,
-        idempotencyKey,
-        content,
-        senderName,
-        chatType,
-        timestamp,
+        deliveryId: effectiveDeliveryId,
+        userMessageId: effectiveUserMessageId,
+        idempotencyKey: effectiveIdempotencyKey,
+        content: effectiveContent,
+        senderName: effectiveSenderName,
+        chatType: effectiveChatType,
+        timestamp: effectiveTimestamp,
         leaseId,
         workerId,
+        mergedUserMessageIds,
       };
     } catch (err) {
       if (inTx) {
@@ -2164,6 +2346,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     timestamp: string;
     leaseId: string;
     workerId: string;
+    mergedUserMessageIds?: string[];
   }): void {
     const {
       turnId,
@@ -2181,6 +2364,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       timestamp,
       leaseId,
       workerId,
+      mergedUserMessageIds,
     } = claim;
 
     let heartbeatTimer: NodeJS.Timeout | undefined;
@@ -2382,7 +2566,11 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         }
 
         // 5. Resolve canonical attachments and space folder
-        const canonicalAttachments = userMessageId ? this.queryAttachmentsByMessageId(userMessageId, spaceId) : [];
+        const mergedAttachments = (mergedUserMessageIds && mergedUserMessageIds.length > 0)
+          ? mergedUserMessageIds.flatMap((mId) => (mId ? this.queryAttachmentsByMessageId(mId, spaceId) : []))
+          : [];
+        const currentAttachments = userMessageId ? this.queryAttachmentsByMessageId(userMessageId, spaceId) : [];
+        const canonicalAttachments = [...mergedAttachments, ...currentAttachments];
         const resolvedEnvelope: ResolvedDeliveryTurnEnvelope = {
           id: idempotencyKey,
           userId,
