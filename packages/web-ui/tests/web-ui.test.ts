@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { symlinkSync, unlinkSync, writeFileSync, rmSync, mkdirSync, existsSync, lstatSync } from 'node:fs';
+import { symlinkSync, unlinkSync, writeFileSync, readFileSync, rmSync, mkdirSync, existsSync, lstatSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -804,6 +804,72 @@ describe('@enkeep/web-ui', () => {
       expect(distHtml).toMatch(/<script\s+src="\/static\/theme-bootstrap\.js\?v=[0-9a-f]{12}"><\/script>/);
       expect(distHtml).toMatch(/<link\s+rel="stylesheet"\s+href="\/static\/style\.css\?v=[0-9a-f]{12}">/);
       expect(distHtml).toMatch(/<script\s+type="module"\s+src="\/static\/app\.js\?v=[0-9a-f]{12}"><\/script>/);
+    });
+  });
+
+  describe('generateUUID Insecure Context Fallback', () => {
+    const appJsPath = resolve(__dirname, '../src/static/app.js');
+    const appJsContent = readFileSync(appJsPath, 'utf-8');
+    const fnMatch = appJsContent.match(/function generateUUID\(\) \{[\s\S]*?\n\}/);
+
+    it('generates valid RFC 4122 v4 UUID in secure context using crypto.randomUUID', () => {
+      expect(fnMatch).not.toBeNull();
+      const fn = new Function(`${fnMatch![0]}; return generateUUID;`)();
+      const uuid = fn();
+      const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      expect(uuid).toMatch(UUID_V4_REGEX);
+    });
+
+    it('falls back to crypto.getRandomValues CSPRNG when crypto.randomUUID is unavailable (insecure context)', () => {
+      expect(fnMatch).not.toBeNull();
+      const originalCrypto = globalThis.crypto;
+      try {
+        const mockCrypto = {
+          getRandomValues: <T extends ArrayBufferView | null>(array: T): T => {
+            return originalCrypto.getRandomValues(array);
+          },
+        };
+        Object.defineProperty(globalThis, 'crypto', {
+          value: mockCrypto,
+          configurable: true,
+          writable: true,
+        });
+
+        const fn = new Function(`${fnMatch![0]}; return generateUUID;`)();
+        const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+        for (let i = 0; i < 50; i++) {
+          const uuid = fn();
+          expect(uuid).toMatch(UUID_V4_REGEX);
+        }
+      } finally {
+        Object.defineProperty(globalThis, 'crypto', {
+          value: originalCrypto,
+          configurable: true,
+          writable: true,
+        });
+      }
+    });
+
+    it('throws descriptive error if Web Cryptography API is completely missing', () => {
+      expect(fnMatch).not.toBeNull();
+      const originalCrypto = globalThis.crypto;
+      try {
+        Object.defineProperty(globalThis, 'crypto', {
+          value: undefined,
+          configurable: true,
+          writable: true,
+        });
+
+        const fn = new Function(`${fnMatch![0]}; return generateUUID;`)();
+        expect(() => fn()).toThrow('Web Cryptography API (crypto.getRandomValues) is required');
+      } finally {
+        Object.defineProperty(globalThis, 'crypto', {
+          value: originalCrypto,
+          configurable: true,
+          writable: true,
+        });
+      }
     });
   });
 });

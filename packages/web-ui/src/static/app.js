@@ -1658,6 +1658,31 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
+// RFC 4122 Version 4 UUID Generator with Insecure Context Fallback
+/**
+ * Generate a canonical RFC 4122 Version 4 UUID.
+ * Works seamlessly in both Secure Contexts (HTTPS/localhost) and Insecure Contexts (LAN plain HTTP).
+ * 1. Primary: crypto.randomUUID() when exposed by browser secure context.
+ * 2. Secondary fallback: crypto.getRandomValues() CSPRNG (available on plain-HTTP LAN hosts).
+ *
+ * @returns {string} Canonical UUIDv4 (lowercase, 8-4-4-4-12 hex format)
+ */
+function generateUUID() {
+  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : (typeof crypto !== 'undefined' ? crypto : null);
+  if (c && typeof c.randomUUID === 'function') {
+    return c.randomUUID();
+  }
+  if (c && typeof c.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16);
+    c.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // RFC 4122 Version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 Variant 1 (10xx)
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  throw new Error('Web Cryptography API (crypto.getRandomValues) is required');
+}
+
 // Idempotency Key Validation Helper using exact Fetch Headers semantics
 function getIdempotencyKey(headers) {
   if (!headers) return null;
@@ -3944,9 +3969,7 @@ function uploadSingleFile(item) {
           // Retry single file with overwrite=true and If-Match and fresh idempotency key
           item.isOverwrite = true;
           item.overwriteEtag = existingEtag;
-          if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-            item.idempotencyKey = crypto.randomUUID();
-          }
+          item.idempotencyKey = generateUUID();
           item.status = 'pending';
           item.percent = 0;
           processFileUploadQueue();
@@ -4008,22 +4031,17 @@ function uploadSingleFile(item) {
 function enqueueFilesUpload(fileList, spaceId, targetPath) {
   if (!fileList || fileList.length === 0) return;
 
-  if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-    showToast(tr('toast.cryptoUnavailable', null, 'Cryptographic context unavailable. Cannot generate Idempotency-Key.'), 'error');
-    return;
-  }
-
   const currentGen = state.managementRenderGen;
 
   for (let i = 0; i < fileList.length; i++) {
     const file = fileList[i];
     const uploadItem = {
-      id: `up_${crypto.randomUUID().replace(/-/g, '')}`,
+      id: `up_${generateUUID().replace(/-/g, '')}`,
       file,
       spaceId,
       targetPath,
       routeGeneration: currentGen,
-      idempotencyKey: crypto.randomUUID(),
+      idempotencyKey: generateUUID(),
       percent: 0,
       status: 'pending',
       xhr: null,
@@ -4222,14 +4240,10 @@ async function renderFilesView(container) {
     const targetPath = currentPath === '.' ? cleanName : `${currentPath}/${cleanName}`;
 
     try {
-      if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-        showToast(tr('toast.cryptoUnavailable', null, 'Cryptographic context unavailable. Cannot generate Idempotency-Key.'), 'error');
-        return;
-      }
       await apiRequest(`/api/spaces/${encodeURIComponent(activeSpaceId)}/files/mkdir`, {
         method: 'POST',
         headers: {
-          'Idempotency-Key': crypto.randomUUID(),
+          'Idempotency-Key': generateUUID(),
         },
         body: {
           path: targetPath,
@@ -4660,14 +4674,9 @@ async function renderFilesView(container) {
         const deleteConfirmMsg = getLocale() === 'zh-CN' ? `确定要删除 "${entry.name}" 吗？` : `Are you sure you want to delete "${entry.name}"?`;
 
         showConfirmation(deleteConfirmTitle, deleteConfirmMsg, async () => {
-          if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-            showToast(tr('toast.cryptoUnavailable', null, 'Cryptographic context unavailable. Cannot generate Idempotency-Key.'), 'error');
-            return;
-          }
-
           try {
             const delHeaders = {
-              'Idempotency-Key': crypto.randomUUID(),
+              'Idempotency-Key': generateUUID(),
             };
             const delBody = {
               path: itemRelPath,
@@ -5009,12 +5018,8 @@ async function renderFilesView(container) {
         btnSave.addEventListener('click', async () => {
           const updatedContent = textarea ? textarea.value : (activeFile.content || '');
 
-          if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-            showToast(tr('toast.cryptoSendUnavailable', null, 'Secure cryptographic context (crypto.randomUUID) is unavailable. Save aborted.'), 'error');
-            return;
-          }
           const headers = {
-            'Idempotency-Key': crypto.randomUUID(),
+            'Idempotency-Key': generateUUID(),
           };
 
           const body = activeFile.isNew
@@ -6039,16 +6044,11 @@ async function renderTasksView(container) {
       return;
     }
 
-    if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-      showToast(tr('toast.cryptoUnavailable', null, 'Cryptographic context unavailable. Cannot generate Idempotency-Key.'), 'error');
-      return;
-    }
-
     submitBtn.disabled = true;
     submitBtn.textContent = getLocale() === 'zh-CN' ? '正在提交...' : 'Scheduling...';
 
     try {
-      const idempotencyKey = crypto.randomUUID();
+      const idempotencyKey = generateUUID();
       const body = {
         title,
         prompt,
@@ -8757,10 +8757,10 @@ function renderApprovalsList(container, approvals) {
 
 async function decideApproval(approvalId, outcome, container) {
   try {
-    const idempotencyKey = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : undefined;
+    const idempotencyKey = generateUUID();
     await apiRequest(`/api/interactions/approvals/${approvalId}/decide`, {
       method: 'POST',
-      headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {},
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: { outcome },
     });
     showToast(outcome === 'allowed-once' ? t('approvals.allowSuccess', null, 'Tool execution allowed.') : t('approvals.rejectSuccess', null, 'Tool execution rejected.'), 'success');
@@ -8774,10 +8774,10 @@ async function decideApproval(approvalId, outcome, container) {
 
 async function cancelApproval(approvalId, reason, container) {
   try {
-    const idempotencyKey = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : undefined;
+    const idempotencyKey = generateUUID();
     await apiRequest(`/api/interactions/approvals/${approvalId}/cancel`, {
       method: 'POST',
-      headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {},
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: { reason },
     });
     showToast(t('approvals.cancelSuccess', null, 'Approval request cancelled.'), 'info');
@@ -9207,11 +9207,7 @@ async function openProfileVersionsModal(profileId, profileName, activeVersion) {
               btnRollback.disabled = true;
               btnRollback.textContent = t('profiles.rollingBack', null, 'Rolling back...');
 
-              if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-                showToast(t('toast.cryptoUnavailable', null, 'Cryptographic context unavailable. Cannot generate Idempotency-Key.'), 'error');
-                return;
-              }
-              const idempotencyKey = crypto.randomUUID();
+              const idempotencyKey = generateUUID();
 
               const rollbackRes = await apiRequest(`/api/manage/agent-profiles/${encodeURIComponent(profileId)}/rollback`, {
                 method: 'POST',
@@ -11417,7 +11413,7 @@ function renderStagedWizardComponent(container, onCompleteRefresh) {
     v2DryRunResult: null,
     v2StageResult: null,
     credentialStatusList: [],
-    credentialCapabilityToken: 'cap_' + ((typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID().slice(0, 8) : 'demo1234'),
+    credentialCapabilityToken: 'cap_' + generateUUID().slice(0, 8),
     migrationResult: null,
     jobId: null,
     isLoading: false,
@@ -12683,7 +12679,7 @@ function renderStagedWizardComponent(container, onCompleteRefresh) {
 
   const executeRealMigration = async () => {
     try {
-      const idempKey = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : 'idemp_mig_' + Date.now();
+      const idempKey = generateUUID();
       const res = await apiRequest(`/api/admin/imports/staged/${wizard.selectedStagedId}/migrate`, {
         method: 'POST',
         headers: {
@@ -13570,11 +13566,7 @@ async function renderAdminRuntimeView(container) {
             btnRestart.disabled = true;
             btnRestart.textContent = t('runtime.restarting', null, 'Restarting...');
 
-            if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-              showToast(t('toast.cryptoUnavailable', null, 'Cryptographic context unavailable. Cannot generate Idempotency-Key.'), 'error');
-              return;
-            }
-            const idempotencyKey = crypto.randomUUID();
+            const idempotencyKey = generateUUID();
 
             const restartUrl = isHostInstance
               ? `/api/admin/runtime/${encodeURIComponent(r.userId)}/restart?mode=host`
@@ -14753,7 +14745,6 @@ const CHAT_I18N_EN = {
   'toast.sessionRestored': 'Session "{title}" restored successfully',
   'toast.sessionForked': 'Session forked successfully! Switched to new branch.',
   'toast.failedArchiveSession': 'Failed to archive session.',
-  'toast.cryptoUnavailable': 'Cryptographic context unavailable. Cannot generate Idempotency-Key.',
   'toast.sessionResetSuccess': 'Session reset successfully to Generation {gen}. History preserved!',
   'toast.failedResetSession': 'Failed to reset session.',
   'toast.selectTargetSpaceFirst': 'Please select a target space first',
@@ -14790,7 +14781,6 @@ const CHAT_I18N_EN = {
   'toast.idempotencyConflict': 'Message submission conflict. Please retry.',
   'toast.turnNotFound': 'Turn not found or session closed.',
   'toast.turnStateConflict': 'Turn state conflict (already finished).',
-  'toast.cryptoSendUnavailable': 'Secure cryptographic context (crypto.randomUUID) is unavailable. Message sending disabled.',
   'toast.sessionExpired': 'Session expired or unauthorized. Please sign in again.',
   'toast.pollingForbidden': 'Access forbidden (403). Polling stopped.',
   'toast.pollingNotFound': 'Session not found. Polling stopped.',
@@ -14990,7 +14980,6 @@ const CHAT_I18N_ZH = {
   'toast.sessionRestored': '会话“{title}”已成功恢复',
   'toast.sessionForked': '会话分支派生成功！已切换至新分支。',
   'toast.failedArchiveSession': '归档会话失败。',
-  'toast.cryptoUnavailable': '密码学安全上下文不可用，无法生成幂等键。',
   'toast.sessionResetSuccess': '会话已成功重置至第 {gen} 代，历史记录完整保留！',
   'toast.failedResetSession': '重置会话失败。',
   'toast.selectTargetSpaceFirst': '请先选择目标空间',
@@ -15027,7 +15016,6 @@ const CHAT_I18N_ZH = {
   'toast.idempotencyConflict': '消息提交冲突，请重试。',
   'toast.turnNotFound': '未找到轮次或会话已关闭。',
   'toast.turnStateConflict': '轮次状态冲突（已结束）。',
-  'toast.cryptoSendUnavailable': '安全密码学上下文不可用，消息发送已禁用。',
   'toast.sessionExpired': '登录会话已过期或未授权，请重新登录。',
   'toast.pollingForbidden': '访问被禁止 (403)，轮询已停止。',
   'toast.pollingNotFound': '会话不存在，轮询已停止。',
@@ -17501,16 +17489,10 @@ async function handleSteerMessage() {
     return;
   }
 
-  // Enforce secure cryptographic context for clientRequestId
-  if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-    showToast(tr('toast.cryptoSendUnavailable', null, 'Secure cryptographic context (crypto.randomUUID) is unavailable. Message sending disabled.'), 'error');
-    return;
-  }
-
   state.isSteeringMessage = true;
   updateComposerControlsState();
 
-  const clientRequestId = crypto.randomUUID();
+  const clientRequestId = generateUUID();
 
   try {
     const res = await apiRequest(`/api/sessions/${sessionId}/steer`, {
@@ -17711,12 +17693,7 @@ async function handleResetSession(e) {
   const reasonInput = document.getElementById("reset-session-reason-input");
   const reason = reasonInput ? reasonInput.value.trim() : undefined;
 
-  if (typeof crypto === "undefined" || typeof crypto.randomUUID !== "function") {
-    showToast(tr("toast.cryptoUnavailable", null, "Cryptographic context unavailable. Cannot generate Idempotency-Key."), "error");
-    return;
-  }
-
-  const idempotencyKey = crypto.randomUUID();
+  const idempotencyKey = generateUUID();
   try {
     const res = await apiRequest(`/api/sessions/${sessionId}/reset`, {
       method: "POST",
@@ -19074,7 +19051,7 @@ function handleFilesSelected(files) {
     }
 
     const item = {
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       type: 'upload',
       displayName: file.name,
       size: file.size,
@@ -19130,7 +19107,7 @@ async function processComposerUploadQueue() {
         await ensureUploadsDir(spaceId);
 
         const formData = new FormData();
-        const uuidPrefix = crypto.randomUUID().slice(0, 8);
+        const uuidPrefix = generateUUID().slice(0, 8);
         const safeName = sanitizeClientFilename(item.file.name);
         const destFilename = `${uuidPrefix}-${safeName}`;
 
@@ -19138,7 +19115,7 @@ async function processComposerUploadQueue() {
 
         const uploadUrl = `/api/spaces/${encodeURIComponent(spaceId)}/files/upload?path=uploads`;
         const csrf = state.csrfToken || (await fetchCsrfToken());
-        const idempotencyKey = crypto.randomUUID();
+        const idempotencyKey = generateUUID();
 
         await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
@@ -19482,7 +19459,7 @@ function handleApplyWorkspacePickerSelection() {
     }
 
     state.activeAttachments.push({
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       type: 'workspace',
       displayName: entry.name,
       size: entry.size,
@@ -20327,16 +20304,11 @@ async function handleStopCurrentTurn() {
     return;
   }
 
-  if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-    showToast(tr('toast.cryptoUnavailable', null, 'Cryptographic context unavailable. Cannot generate Idempotency-Key.'), 'error');
-    return;
-  }
-
   state.isCancellingTurn = true;
   updateStopTurnControl();
 
   try {
-    const idempotencyKey = crypto.randomUUID();
+    const idempotencyKey = generateUUID();
     const res = await apiRequest(`/api/sessions/${sessionId}/turn/cancel-current`, {
       method: 'POST',
       headers: {
@@ -20407,16 +20379,10 @@ async function handleSendMessage() {
 
   const btn = document.getElementById('btn-send-message');
 
-  // Enforce secure cryptographic context: crypto.randomUUID() without non-secure fallback
-  if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
-    showToast(tr('toast.cryptoSendUnavailable', null, 'Secure cryptographic context (crypto.randomUUID) is unavailable. Message sending disabled.'), 'error');
-    return;
-  }
-
   state.isSendingMessage = true;
   updateComposerControlsState();
 
-  const idempotencyKey = crypto.randomUUID();
+  const idempotencyKey = generateUUID();
 
   // Filter ready attachments with path and etag
   const readyAttachments = state.activeAttachments
@@ -21154,9 +21120,7 @@ export async function handleThemeSelectChange(newTheme) {
   // 2. If user is logged in, sync with canonical backend preference API (PUT /api/account/preferences/theme)
   if (state.currentUser) {
     try {
-      const idempotencyKey = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
-        ? crypto.randomUUID()
-        : 'idem-' + Date.now();
+      const idempotencyKey = generateUUID();
 
       await apiRequest('/api/account/preferences/theme', {
         method: 'PUT',
@@ -21221,17 +21185,15 @@ function onLocaleChangeEvent() {
   const currentLoc = getLocale();
   if (state.currentUser && state.currentUser.locale !== currentLoc) {
     state.currentUser.locale = currentLoc;
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      try {
-        const idempotencyKey = crypto.randomUUID();
-        apiRequest('/api/account/preferences', {
-          method: 'PATCH',
-          headers: { 'Idempotency-Key': idempotencyKey },
-          body: { locale: currentLoc },
-        }).catch(() => {});
-      } catch (prefErr) {
-        // Non-critical background preference sync error
-      }
+    try {
+      const idempotencyKey = generateUUID();
+      apiRequest('/api/account/preferences', {
+        method: 'PATCH',
+        headers: { 'Idempotency-Key': idempotencyKey },
+        body: { locale: currentLoc },
+      }).catch(() => {});
+    } catch (prefErr) {
+      // Non-critical background preference sync error
     }
   }
 }
@@ -21262,7 +21224,7 @@ async function handleLocaleSelectChange(newLocale) {
   // 3. If user is logged in, sync with canonical backend preference API
   if (state.currentUser) {
     try {
-      const idempotencyKey = crypto.randomUUID();
+      const idempotencyKey = generateUUID();
       await apiRequest('/api/account/preferences', {
         method: 'PATCH',
         headers: { 'Idempotency-Key': idempotencyKey },
@@ -21942,7 +21904,7 @@ document.addEventListener('DOMContentLoaded', () => {
           submitBtn.textContent = 'Installing...';
         }
 
-        const idempotencyKey = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : undefined;
+        const idempotencyKey = generateUUID();
         let payload;
 
         if (sourceType === 'git') {
