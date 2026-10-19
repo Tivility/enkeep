@@ -92,6 +92,10 @@ import {
   type TenantRuntimeFileProvider,
 } from "../files/runtime-file-api.js";
 import {
+  AttachmentThumbnailService,
+  isEligibleForThumbnail,
+} from "../files/attachment-thumbnail-service.js";
+import {
   sniffMimeType,
   buildContentDispositionHeader,
   sanitizeMultipartFilename,
@@ -566,6 +570,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
   const usageExportService = customUsageExportService ?? (db ? new UsageExportService(db) : undefined)!;
   const taskNotificationService = customTaskNotificationService ?? (db ? new TaskNotificationService({ db }) : undefined)!;
   const effectiveDshHome = resolvePlatformDshHome(options.dshHome);
+  const thumbnailService = new AttachmentThumbnailService({ dshHome: effectiveDshHome ?? undefined });
   const modelSelectionService = customModelSelectionService ?? customCds?.modelSelectionService ?? (db ? new ModelSelectionService({ db, operations, customDshHome: effectiveDshHome ?? undefined }) : undefined)!;
 
   const fileService = options.fileService ?? (options.fileProvider ? new RuntimeFileApiService({ fileProvider: options.fileProvider, platformApi, operations }) : undefined);
@@ -1711,9 +1716,65 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
               return;
             }
 
+            const variant = parsedUrl.searchParams.get("variant");
             const filename = rawPath.split("/").pop() || "download";
             const contentType = sniffMimeType(filename);
-            const contentDisposition = buildContentDispositionHeader(filename, "attachment");
+
+            // Handle thumbnail variant (?variant=thumb)
+            if (variant === "thumb") {
+              // Check if eligible for thumbnailing
+              if (isEligibleForThumbnail(contentType, streamRes.totalSize)) {
+                const thumbEtag = thumbnailService.computeThumbnailEtag(streamRes.etag);
+
+                // Check If-None-Match for thumbnail
+                if (ifNoneMatch && (ifNoneMatch === thumbEtag || ifNoneMatch === "*")) {
+                  if (streamRes.stream && typeof (streamRes.stream as any).destroy === "function") {
+                    (streamRes.stream as any).destroy();
+                  }
+                  res.writeHead(304, {
+                    "ETag": thumbEtag,
+                    "Cache-Control": "private, max-age=86400, no-transform",
+                  });
+                  res.end();
+                  return;
+                }
+
+                // Check or generate thumbnail
+                const thumbResult = await thumbnailService.getOrRenderThumbnail(
+                  spaceId,
+                  rawPath,
+                  streamRes.etag,
+                  streamRes.stream
+                );
+
+                if (thumbResult) {
+                  const thumbDisposition = buildContentDispositionHeader(filename, "inline");
+                  const thumbHeaders: Record<string, string | number> = {
+                    "Content-Type": thumbResult.mimeType,
+                    "Content-Disposition": thumbDisposition,
+                    "ETag": thumbResult.etag,
+                    "Content-Length": thumbResult.buffer.length,
+                    "X-Content-Type-Options": "nosniff",
+                    "Content-Security-Policy": "default-src 'none'; sandbox",
+                    "Cache-Control": "private, max-age=86400, no-transform",
+                  };
+
+                  res.writeHead(200, thumbHeaders);
+                  if (method === "HEAD") {
+                    res.end();
+                    return;
+                  }
+                  res.end(thumbResult.buffer);
+                  return;
+                }
+                // If thumbnail generation failed (e.g. sharp failure), fall back to original below
+              }
+            }
+
+            const contentDisposition = buildContentDispositionHeader(
+              filename,
+              variant === "thumb" ? "inline" : "attachment"
+            );
 
             const actualRange = streamRes.range;
             const statusCode = actualRange ? 206 : 200;

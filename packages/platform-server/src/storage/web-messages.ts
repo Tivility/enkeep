@@ -3,6 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { PlatformError, ValidationError, NotFoundError } from '@enkeep/platform-core';
 import type { CanonicalAttachment, PublicMessageAttachment } from '@enkeep/protocol';
 import type { InboundEnvelopeChannelContext } from '@enkeep/web-channel';
+import { isEligibleForThumbnail } from '../files/attachment-thumbnail-service.js';
 
 export interface WebMessageReplyReference {
   messageId: string;
@@ -610,6 +611,9 @@ function parseMessageAttachmentRow(r: MessageAttachmentRow, spaceIdOverride?: st
     ? r.display_name.trim().normalize('NFC')
     : undefined;
 
+  const baseDownloadUrl = `/api/spaces/${encodeURIComponent(spaceId)}/files/download?path=${encodeURIComponent(r.snapshot_path)}`;
+  const eligible = isEligibleForThumbnail(r.media_type, r.size);
+
   return {
     id: r.id,
     relativePath: r.relative_path,
@@ -617,7 +621,8 @@ function parseMessageAttachmentRow(r: MessageAttachmentRow, spaceIdOverride?: st
     size: r.size,
     mediaType: r.media_type,
     ...(displayName ? { displayName } : {}),
-    downloadUrl: `/api/spaces/${encodeURIComponent(spaceId)}/files/download?path=${encodeURIComponent(r.snapshot_path)}`,
+    downloadUrl: baseDownloadUrl,
+    ...(eligible ? { thumbnailUrl: `${baseDownloadUrl}&variant=thumb` } : {}),
   };
 }
 
@@ -1076,15 +1081,20 @@ export class SqliteWebMessageStore {
       }
 
       const publicAttachments: PublicMessageAttachment[] = (params.attachments && params.attachments.length > 0)
-        ? params.attachments.map((att) => ({
-            id: att.id,
-            relativePath: att.relativePath,
-            etag: att.etag,
-            size: att.size,
-            mediaType: att.mediaType,
-            ...(att.displayName ? { displayName: att.displayName } : {}),
-            downloadUrl: att.downloadReference || `/api/spaces/${encodeURIComponent(spaceId)}/files/download?path=${encodeURIComponent(att.snapshotPath)}`,
-          }))
+        ? params.attachments.map((att) => {
+            const baseDownloadUrl = att.downloadReference || `/api/spaces/${encodeURIComponent(spaceId)}/files/download?path=${encodeURIComponent(att.snapshotPath)}`;
+            const eligible = isEligibleForThumbnail(att.mediaType, att.size);
+            return {
+              id: att.id,
+              relativePath: att.relativePath,
+              etag: att.etag,
+              size: att.size,
+              mediaType: att.mediaType,
+              ...(att.displayName ? { displayName: att.displayName } : {}),
+              downloadUrl: baseDownloadUrl,
+              ...(eligible ? { thumbnailUrl: `${baseDownloadUrl}&variant=thumb` } : {}),
+            };
+          })
         : [];
 
       // 2d. Insert minimal safe user message event into web_events
