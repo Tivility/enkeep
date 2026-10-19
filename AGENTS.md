@@ -62,6 +62,18 @@ Do not `git add -f` anything under these paths. Do not weaken `.gitignore` or `.
 - Tests must run offline. Never call real Feishu/Lark, WeChat, or model provider endpoints from tests; use local fake servers or in-memory transports.
 - Services bind to `127.0.0.1` only. Do not start, stop, or bind to ports used by other local services (see `docs/safety.md`).
 
-## 7. When in doubt
+## 7. From change to production
+
+Every change follows the same path; do not skip or reorder steps.
+
+1. **Branch** from the latest `origin/main`; one logical change per pull request.
+2. **Test what you changed**: run the focused tests for the touched behavior (`pnpm --filter <package> test <file>`), add a synthetic test for each new behavior, and build the touched packages. Do not run the full suite or browser e2e by default; note pre-existing failures instead of editing assertions to hide them.
+3. **Sanitize** before every commit and push (§1, §5).
+4. **Open a pull request against `main` and merge it**; production only ever runs merged `main`.
+5. **Deploy only with `scripts/deploy-release.mjs`** as described in [`docs/deployment-recipe.md`](docs/deployment-recipe.md). Do not edit the LaunchAgent plist, run `launchctl`, or build release worktrees by hand; for a restart without a release use `--only restart-platform`.
+6. **Never restart while work is active.** The script waits for quiescence (active or queued turns, scheduled tasks, background jobs, workflows, subagents) and gives up instead of forcing a restart. Runtime-only changes roll out per user when that user's runtime is idle; frontend-only changes need no restart.
+7. **Verify** with the script's post-deploy checks. Do not send test messages to real chat channels; ask the operator to confirm user-facing behavior.
+
+## 8. When in doubt
 
 If you are unsure whether a value is real, treat it as real and replace it with a synthetic one.
