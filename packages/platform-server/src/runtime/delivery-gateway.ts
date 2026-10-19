@@ -1367,6 +1367,61 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       };
     }
 
+    // Check default steer injection (busy_mode = 'steer') before ordinary ingestion
+    if (envelope.channelContext && envelope.channelContext.accountId && envelope.channelContext.nativeContextId) {
+      const channelCtx = envelope.channelContext;
+      try {
+        const bindingRow = this.db.prepare(`
+          SELECT busy_mode FROM channel_bindings
+          WHERE user_id = ? AND account_id = ? AND native_context_id = ?
+          LIMIT 1
+        `).get(userId, channelCtx.accountId, channelCtx.nativeContextId) as { busy_mode?: string } | undefined;
+
+        if (bindingRow?.busy_mode === 'steer') {
+          const runningRow = this.db.prepare(`
+            SELECT turn_id FROM turn_runs
+            WHERE user_id = ? AND route_id = ? AND status = 'running'
+            LIMIT 1
+          `).get(userId, sessionId) as { turn_id: string } | undefined;
+
+          if (runningRow?.turn_id) {
+            const isGroupChat = channelCtx.chatType === 'group' || (typeof channelCtx.chatType === 'string' && channelCtx.chatType !== 'p2p');
+            const senderName = typeof channelCtx.senderName === 'string' ? channelCtx.senderName.trim() : '';
+            const steerContent = isGroupChat && senderName
+              ? `[发送者: ${senderName}] ${envelope.content}`
+              : envelope.content;
+
+            const steerRes = await this.steerTurn(userId, sessionId, {
+              clientRequestId: idempotencyKey,
+              expectedTurnId: runningRow.turn_id,
+              content: steerContent,
+              attachments: canonicalAttachments.length > 0 ? canonicalAttachments : undefined,
+            });
+
+            if (steerRes && steerRes.ok) {
+              const userMessageRecord: WebMessageRecord = {
+                id: steerRes.messageId,
+                role: 'user',
+                content: envelope.content,
+                status: 'delivered',
+                createdAt: timestamp,
+              };
+
+              return {
+                accepted: true,
+                turnId: runningRow.turn_id,
+                message: userMessageRecord,
+                isDuplicate: false,
+                executionMode: 'runtime',
+              };
+            }
+          }
+        }
+      } catch {
+        // Any exception is ignored to fall through to normal ingestion
+      }
+    }
+
     const proposedDeliveryId =
       envelope.id && DELIVERY_ID_REGEX.test(envelope.id)
         ? envelope.id

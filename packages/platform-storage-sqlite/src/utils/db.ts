@@ -564,6 +564,7 @@ export function parseChannelBindingRow(row: DbRow): ChannelBinding {
     spaceId: getString(row, 'space_id'),
     nativeContextId: getString(row, 'native_context_id'),
     activationMode: getString(row, 'activation_mode') as ChannelBinding['activationMode'],
+    busyMode: (getNullableString(row, 'busy_mode') ?? 'queue') as ChannelBinding['busyMode'],
     chatType: getNullableString(row, 'chat_type'),
     sessionRouteId: getNullableString(row, 'session_route_id'),
     createdAt: getString(row, 'created_at'),

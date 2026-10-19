@@ -3,6 +3,7 @@ export type ChannelType = 'lark' | string;
 export type ChannelAccountStatus = 'active' | 'disabled' | 'unverified';
 
 export type ChannelActivationMode = 'mention' | 'always';
+export type ChannelBusyMode = 'queue' | 'steer';
 
 export type ChannelInboxStatus = 'held' | 'processing' | 'delivered' | 'failed';
 
@@ -85,6 +86,7 @@ export interface ChannelBinding {
   spaceId: string;
   nativeContextId: string;
   activationMode: ChannelActivationMode;
+  busyMode: ChannelBusyMode;
   chatType?: string | null;
   sessionRouteId?: string | null;
   createdAt: string;
@@ -98,6 +100,7 @@ export interface CreateChannelBindingInput {
   spaceId: string;
   nativeContextId: string;
   activationMode?: ChannelActivationMode;
+  busyMode?: ChannelBusyMode;
   chatType?: string | null;
   sessionRouteId?: string | null;
 }
@@ -105,6 +108,7 @@ export interface CreateChannelBindingInput {
 export interface UpdateChannelBindingInput {
   spaceId?: string;
   activationMode?: ChannelActivationMode;
+  busyMode?: ChannelBusyMode;
   chatType?: string | null;
   sessionRouteId?: string | null;
 }

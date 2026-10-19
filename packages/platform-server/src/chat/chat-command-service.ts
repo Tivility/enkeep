@@ -11,7 +11,7 @@ import {
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 import type { BackgroundTask } from '../runtime/delivery-gateway.js';
 
-export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention' | 'bg' | 'background' | 'steer' | 'unknown';
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention' | 'busy' | 'bg' | 'background' | 'steer' | 'unknown';
 
 export interface ParsedChatCommand {
   command: ChatCommandType;
@@ -61,6 +61,7 @@ export const HELP_USAGE = `Available commands:
   /effort - List, set, or reset reasoning effort override
   /sw - Start parallel background task in current space (alias: /spawn)
   /mention [on|off] - 查看或设置群聊回复模式 (别名: /require_mention true|false)
+  /busy [steer|queue] - 运行中的新消息默认插队或排队 (steer: 默认插队; queue: 正常排队)
   /help - Show this help message
 
 过渡期兼容提示:
@@ -208,6 +209,7 @@ export const KNOWN_CHAT_COMMANDS = [
   'ses',
   'mention',
   'require_mention',
+  'busy',
 ] as const;
 
 export function levenshteinDistance(a: string, b: string): number {
@@ -292,7 +294,7 @@ export function parseChatCommand(
   }
 
   const trimmed = content.trim();
-  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention|bg|background|steer)(?:[\s\t\r\n]+([\s\S]*))?$/i);
+  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention|busy|bg|background|steer)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
     if (options?.allowUnknown) {
       const unknown = parseUnknownChatCommand(trimmed);
@@ -583,6 +585,49 @@ export function parseChatCommand(
     return {
       command: cmd,
       type: cmd,
+      subcommand: 'unknown',
+      action: 'unknown',
+      arg: rest,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'busy') {
+    if (!rest) {
+      return {
+        command: 'busy',
+        type: 'busy',
+        subcommand: 'show',
+        action: 'show',
+        raw: trimmed,
+      };
+    }
+    const low = rest.toLowerCase();
+    if (low === 'steer') {
+      return {
+        command: 'busy',
+        type: 'busy',
+        subcommand: 'set',
+        action: 'set',
+        target: 'steer',
+        arg: 'steer',
+        raw: trimmed,
+      };
+    }
+    if (low === 'queue') {
+      return {
+        command: 'busy',
+        type: 'busy',
+        subcommand: 'set',
+        action: 'set',
+        target: 'queue',
+        arg: 'queue',
+        raw: trimmed,
+      };
+    }
+    return {
+      command: 'busy',
+      type: 'busy',
       subcommand: 'unknown',
       action: 'unknown',
       arg: rest,
@@ -1279,6 +1324,9 @@ export class ChatCommandService {
         case 'require_mention':
           result = await this.executeMentionCommand(params, parsed);
           break;
+        case 'busy':
+          result = await this.executeBusyCommand(params, parsed);
+          break;
         case 'bg':
         case 'background' as any:
           if (parsed.subcommand === 'stop') {
@@ -1328,6 +1376,9 @@ export class ChatCommandService {
       return true;
     }
     if (parsed.command === 'mention' || parsed.command === 'require_mention') {
+      return parsed.subcommand === 'set';
+    }
+    if (parsed.command === 'busy') {
       return parsed.subcommand === 'set';
     }
     return false;
@@ -2810,6 +2861,77 @@ export class ChatCommandService {
         return { replyText: '已关闭 @ 模式：机器人将回复群内所有消息。\n提示：需要在飞书开放平台开通“获取群组中所有消息”权限。' };
       }
       return { replyText: '已开启 @ 模式：仅在被 @ 机器人时回复。' };
+    } catch (err: unknown) {
+      return { replyText: `配置失败: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  private async executeBusyCommand(
+    params: { userId: string; sessionId: string; spaceId: string; channelContext?: ChatCommandChannelContext },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId } = params;
+    const { channel, accountId, chatNativeContextId, nativeContextId } = this.getChatAndTopicIds(params);
+
+    if (parsed.subcommand === 'unknown') {
+      return { replyText: '用法: /busy [steer|queue]' };
+    }
+
+    const targetCtxId = chatNativeContextId || nativeContextId;
+    if (!this.db || !accountId || !targetCtxId) {
+      return { replyText: '当前会话缺少渠道上下文，无法配置插队模式。' };
+    }
+
+    if (parsed.subcommand === 'show') {
+      let mode = 'queue';
+      try {
+        const binding = this.db.prepare(
+          'SELECT busy_mode FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+        ).get(userId, accountId, targetCtxId) as { busy_mode?: string } | undefined;
+        if (binding?.busy_mode) {
+          mode = binding.busy_mode;
+        }
+      } catch {}
+
+      if (mode === 'steer') {
+        return { replyText: '当前设置: 默认插队 (steer)' };
+      }
+      return { replyText: '当前设置: 默认排队 (queue)' };
+    }
+
+    // parsed.subcommand === 'set'
+    const targetMode = parsed.target === 'steer' ? 'steer' : 'queue';
+    try {
+      const existing = this.db.prepare(
+        'SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, targetCtxId) as { id: string } | undefined;
+
+      if (existing) {
+        this.db.prepare(
+          'UPDATE channel_bindings SET busy_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+        ).run(targetMode, existing.id);
+      } else {
+        let defaultSpaceId = params.spaceId;
+        try {
+          const acc = this.db.prepare(
+            'SELECT default_space_id FROM channel_accounts WHERE id = ? AND user_id = ?'
+          ).get(accountId, userId) as { default_space_id?: string | null } | undefined;
+          if (acc?.default_space_id) {
+            defaultSpaceId = acc.default_space_id;
+          }
+        } catch {}
+
+        const newId = `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+        this.db.prepare(`
+          INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, busy_mode, session_route_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, 'mention', ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `).run(newId, userId, accountId, defaultSpaceId, targetCtxId, targetMode);
+      }
+
+      if (targetMode === 'steer') {
+        return { replyText: '已开启默认插队模式：忙碌时发送的新消息将直接注入运行中回合。' };
+      }
+      return { replyText: '已开启默认排队模式：忙碌时发送的新消息将正常排队。' };
     } catch (err: unknown) {
       return { replyText: `配置失败: ${err instanceof Error ? err.message : String(err)}` };
     }

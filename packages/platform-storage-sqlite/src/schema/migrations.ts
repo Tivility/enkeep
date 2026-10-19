@@ -1654,6 +1654,13 @@ ALTER TABLE turn_runs ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_044_CHANNEL_BINDING_BUSY_MODE_SQL = `
+-- Migration 44: Add busy_mode to channel_bindings
+ALTER TABLE channel_bindings ADD COLUMN busy_mode TEXT NOT NULL DEFAULT 'queue' CHECK(busy_mode IN ('queue', 'steer'));
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

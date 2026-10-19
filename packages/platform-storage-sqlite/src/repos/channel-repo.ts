@@ -198,14 +198,15 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
       : `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
     const activationMode = input.activationMode ?? 'mention';
+    const busyMode = input.busyMode ?? 'queue';
     const chatType = input.chatType ?? null;
     const sessionRouteId = input.sessionRouteId ?? null;
 
     const insertStmt = this.db.prepare(`
-      INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, chat_type, session_route_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, busy_mode, chat_type, session_route_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
-    insertStmt.run(id, this.userId, accountId, spaceId, nativeContextId, activationMode, chatType, sessionRouteId);
+    insertStmt.run(id, this.userId, accountId, spaceId, nativeContextId, activationMode, busyMode, chatType, sessionRouteId);
 
     const created = await this.findBindingById(id);
     if (!created) {
@@ -234,6 +235,10 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
     if (input.activationMode !== undefined) {
       updates.push('activation_mode = ?');
       params.push(input.activationMode);
+    }
+    if (input.busyMode !== undefined) {
+      updates.push('busy_mode = ?');
+      params.push(input.busyMode);
     }
     if (input.chatType !== undefined) {
       updates.push('chat_type = ?');
