@@ -161,6 +161,7 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
         'renderMessages',
         'pollEvents',
         'syncActiveTurnStatus',
+        'generateUUID',
         `
         ${fnMatch![0]}
         return handleSteerMessage;
@@ -177,7 +178,8 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
         () => {},
         () => {},
         () => {},
-        () => {}
+        () => {},
+        () => '11111111-2222-4333-8444-555555555555'
       );
 
       await steerFn();
@@ -222,6 +224,7 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
         'renderMessages',
         'pollEvents',
         'syncActiveTurnStatus',
+        'generateUUID',
         `
         ${fnMatch![0]}
         return handleSteerMessage;
@@ -238,7 +241,8 @@ describe('D-05 Steer & Queue Web UI Subsystem', () => {
         () => {},
         () => {},
         () => {},
-        () => {}
+        () => {},
+        () => '11111111-2222-4333-8444-555555555555'
       );
 
       await steerFn();
