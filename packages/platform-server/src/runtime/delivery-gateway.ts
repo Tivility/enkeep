@@ -4604,6 +4604,15 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         } catch {}
       }
       turnContent = turnContent || '';
+      if (cand.payload) {
+        try {
+          const ctx = JSON.parse(cand.payload)?.channelContext;
+          const senderName = typeof ctx?.senderName === 'string' ? ctx.senderName.trim() : '';
+          if (senderName && typeof ctx?.chatType === 'string' && ctx.chatType !== 'p2p') {
+            turnContent = `[发送者: ${senderName}] ${turnContent}`;
+          }
+        } catch {}
+      }
 
       if (candidatesToPromote.length === 1) {
         messageParts.push(turnContent);
