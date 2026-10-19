@@ -9085,7 +9085,8 @@ async function renderEffectiveModelPreview(container, spaceId, sessionId) {
     // Update Chat Header Model Badge if in chat session context
     const headerModelBadge = document.getElementById('session-model-badge');
     if (headerModelBadge) {
-      headerModelBadge.textContent = `⚡ ${eff.model}`;
+      const effortSuffix = eff.reasoningEffort ? ` · ${eff.reasoningEffort}` : '';
+      headerModelBadge.textContent = `⚡ ${eff.model}${effortSuffix}`;
       headerModelBadge.classList.remove('hidden');
     }
   } catch (err) {
@@ -14739,6 +14740,17 @@ const CHAT_I18N_EN = {
   'chat.unsavedDraftWarning': 'You have unsaved text in your composer. Switching to a new branch will preserve your draft in the previous session. Continue?',
   'chat.turnActiveCannotAction': 'Cannot perform this action while a turn is active.',
   'chat.messageNotFound': 'Referenced message not found.',
+  'chat.modelTriggerTitle': 'Inspect or switch effective model',
+  'chat.modelPickerTitle': 'Session Model & Reasoning Effort',
+  'chat.modelEffectiveLabel': 'Current Effective Model',
+  'chat.modelSelectLabel': 'Model Selection',
+  'chat.effortSelectLabel': 'Reasoning Effort',
+  'chat.effortDefault': 'Default',
+  'chat.inheritDefault': 'Inherit Default ({model})',
+  'chat.btnResetOverride': 'Restore Default',
+  'chat.manageModelsLink': 'Manage Models →',
+  'chat.modelSwitchSuccess': 'Model switched to {model}, takes effect on next turn.',
+  'chat.modelResetSuccess': 'Session override cleared, restored to default ({model}).',
   'chat.searchSessionsPlaceholder': 'Search sessions...',
   'chat.searchSessionsAria': 'Search sessions',
   'chat.emptySessionsInSpace': 'No sessions in this space',
@@ -14974,6 +14986,17 @@ const CHAT_I18N_ZH = {
   'chat.unsavedDraftWarning': '当前输入框中有未发送的内容，切换到新分支将保留原草稿，是否继续？',
   'chat.turnActiveCannotAction': '当前轮次正在执行中，无法执行此操作。',
   'chat.messageNotFound': '引用的消息未找到。',
+  'chat.modelTriggerTitle': '查看或切换当前会话生效模型',
+  'chat.modelPickerTitle': '会话模型与推理深度',
+  'chat.modelEffectiveLabel': '当前生效模型',
+  'chat.modelSelectLabel': '选择模型',
+  'chat.effortSelectLabel': '推理深度 (Reasoning Effort)',
+  'chat.effortDefault': '默认',
+  'chat.inheritDefault': '跟随默认配置 ({model})',
+  'chat.btnResetOverride': '恢复默认',
+  'chat.manageModelsLink': '管理模型配置 →',
+  'chat.modelSwitchSuccess': '已切换模型为 {model}，将在下一轮对话生效。',
+  'chat.modelResetSuccess': '已清除会话覆盖，恢复为默认模型 ({model})。',
   'chat.searchSessionsPlaceholder': '搜索会话...',
   'chat.searchSessionsAria': '搜索会话',
   'chat.emptySessionsInSpace': '该空间下暂无会话',
@@ -16372,6 +16395,267 @@ async function handleSaveSessionWindow(e) {
   }
 }
 
+// ----------------------------------------------------
+// Session Model & Effort Picker (Inline / Modal)
+// ----------------------------------------------------
+
+let cachedPlatformModels = null;
+let cachedCatalogTime = 0;
+let activeModelSessionId = null;
+let activeModelEffective = null;
+let activeModelOverride = null;
+let activeModelCatalog = null;
+let selectedEffortValue = null;
+
+async function getCachedPlatformModels() {
+  const now = Date.now();
+  if (cachedPlatformModels && now - cachedCatalogTime < 30_000) {
+    return cachedPlatformModels;
+  }
+  const res = await apiRequest('/api/models');
+  cachedPlatformModels = res && res.data;
+  cachedCatalogTime = now;
+  return cachedPlatformModels;
+}
+
+async function syncSessionModelBadge(sessionId = state.currentSessionId) {
+  const badge = document.getElementById('session-model-badge');
+  if (!badge) return;
+  if (!sessionId) {
+    badge.classList.add('hidden');
+    return;
+  }
+
+  try {
+    const params = new URLSearchParams({ sessionId });
+    if (state.currentSpaceId) params.append('spaceId', state.currentSpaceId);
+    const res = await apiRequest(`/api/models/effective?${params.toString()}`);
+    if (state.currentSessionId !== sessionId) return;
+
+    const eff = res && res.data;
+    if (eff && eff.model) {
+      const effortSuffix = eff.reasoningEffort ? ` · ${eff.reasoningEffort}` : '';
+      badge.textContent = `⚡ ${eff.model}${effortSuffix}`;
+      badge.title = `${tr('chat.modelTriggerTitle', null, 'Inspect or switch effective model')}: ${eff.provider}/${eff.model} (${eff.source || 'default'})`;
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  } catch (err) {
+    badge.classList.add('hidden');
+  }
+}
+
+async function openSessionModelModal(sessionId = state.currentSessionId) {
+  if (!sessionId) return;
+  activeModelSessionId = sessionId;
+
+  const effEl = document.getElementById('session-model-effective');
+  const selectEl = document.getElementById('session-model-select');
+  const effortGroup = document.getElementById('session-model-effort-group');
+  const effortBtns = document.getElementById('session-model-effort-buttons');
+  const resetBtn = document.getElementById('btn-session-model-reset');
+
+  if (effEl) effEl.textContent = tr('common.loading', null, 'Loading...');
+  if (selectEl) {
+    selectEl.replaceChildren();
+    const optLoading = document.createElement('option');
+    optLoading.textContent = tr('common.loading', null, 'Loading...');
+    selectEl.appendChild(optLoading);
+  }
+  if (effortGroup) effortGroup.classList.add('hidden');
+  if (effortBtns) effortBtns.replaceChildren();
+  if (resetBtn) resetBtn.classList.add('hidden');
+
+  openModal('modal-session-model');
+
+  try {
+    const spaceIdParam = state.currentSpaceId || '';
+    const [catalogData, effectiveRes, overrideRes] = await Promise.all([
+      getCachedPlatformModels(),
+      apiRequest(`/api/models/effective?sessionId=${encodeURIComponent(sessionId)}&spaceId=${encodeURIComponent(spaceIdParam)}`),
+      apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/model-override`).catch(() => ({ data: null })),
+    ]);
+
+    if (activeModelSessionId !== sessionId) return;
+
+    activeModelCatalog = catalogData;
+    activeModelEffective = effectiveRes && effectiveRes.data;
+    activeModelOverride = overrideRes && overrideRes.data;
+
+    const eff = activeModelEffective;
+    const currentOverride = activeModelOverride;
+    const providers = (catalogData && catalogData.providers) || {};
+
+    if (effEl && eff) {
+      const effSuffix = eff.reasoningEffort ? ` · ${eff.reasoningEffort}` : '';
+      effEl.textContent = `${eff.provider} / ${eff.model}${effSuffix} (Source: ${eff.source || 'default'})`;
+    }
+
+    const availableModels = [];
+    for (const [pKey, pDef] of Object.entries(providers)) {
+      if (!pDef.configured) continue;
+      for (const m of pDef.models || []) {
+        availableModels.push({
+          provider: pKey,
+          providerName: pDef.displayName || pKey,
+          model: m.id,
+          modelName: m.name || m.id,
+          reasoningEfforts: m.reasoningEfforts || null,
+        });
+      }
+    }
+
+    if (selectEl) {
+      selectEl.replaceChildren();
+
+      const optDefault = document.createElement('option');
+      optDefault.value = '__inherit__';
+      const defHintText = eff && eff.source !== 'session' ? `${eff.provider}/${eff.model}` : 'default';
+      optDefault.textContent = tr('chat.inheritDefault', { model: defHintText }, `Inherit Default (${defHintText})`);
+      if (!currentOverride) optDefault.selected = true;
+      selectEl.appendChild(optDefault);
+
+      let currentOptGroup = null;
+      let lastProvider = '';
+      availableModels.forEach((item) => {
+        if (item.provider !== lastProvider) {
+          currentOptGroup = document.createElement('optgroup');
+          currentOptGroup.label = item.providerName;
+          selectEl.appendChild(currentOptGroup);
+          lastProvider = item.provider;
+        }
+        const opt = document.createElement('option');
+        opt.value = `${item.provider}:${item.model}`;
+        opt.textContent = item.modelName;
+        if (currentOverride && currentOverride.provider === item.provider && currentOverride.model === item.model) {
+          opt.selected = true;
+        }
+        currentOptGroup.appendChild(opt);
+      });
+    }
+
+    selectedEffortValue = currentOverride ? currentOverride.reasoningEffort : (eff ? eff.reasoningEffort : null);
+
+    function renderEffortControls(selectedVal) {
+      if (!effortGroup || !effortBtns) return;
+      if (selectedVal === '__inherit__') {
+        effortGroup.classList.add('hidden');
+        effortBtns.replaceChildren();
+        return;
+      }
+      const [p, m] = selectedVal.split(':');
+      const targetMeta = availableModels.find((x) => x.provider === p && x.model === m);
+      const supportedEfforts = targetMeta && targetMeta.reasoningEfforts
+        ? Object.keys(targetMeta.reasoningEfforts)
+        : [];
+
+      if (supportedEfforts.length === 0) {
+        effortGroup.classList.add('hidden');
+        effortBtns.replaceChildren();
+        selectedEffortValue = null;
+        return;
+      }
+
+      if (selectedEffortValue && !supportedEfforts.includes(selectedEffortValue)) {
+        selectedEffortValue = null;
+      }
+
+      effortGroup.classList.remove('hidden');
+      effortBtns.replaceChildren();
+
+      const btnDef = document.createElement('button');
+      btnDef.type = 'button';
+      btnDef.className = `effort-btn ${!selectedEffortValue ? 'active' : ''}`;
+      btnDef.textContent = tr('chat.effortDefault', null, 'Default');
+      btnDef.addEventListener('click', () => {
+        selectedEffortValue = null;
+        renderEffortControls(selectEl.value);
+      });
+      effortBtns.appendChild(btnDef);
+
+      supportedEfforts.forEach((effName) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `effort-btn ${selectedEffortValue === effName ? 'active' : ''}`;
+        btn.textContent = effName;
+        btn.addEventListener('click', () => {
+          selectedEffortValue = effName;
+          renderEffortControls(selectEl.value);
+        });
+        effortBtns.appendChild(btn);
+      });
+    }
+
+    if (selectEl) {
+      selectEl.addEventListener('change', () => {
+        renderEffortControls(selectEl.value);
+      });
+      renderEffortControls(selectEl.value);
+    }
+
+    if (resetBtn) {
+      if (currentOverride) {
+        resetBtn.classList.remove('hidden');
+      } else {
+        resetBtn.classList.add('hidden');
+      }
+    }
+  } catch (err) {
+    if (effEl) effEl.textContent = getSafeErrorMessage(err, 'Failed to load model options');
+  }
+}
+
+async function handleSaveSessionModel(e) {
+  e.preventDefault();
+  if (!activeModelSessionId) return;
+  const sessionId = activeModelSessionId;
+  const selectEl = document.getElementById('session-model-select');
+  if (!selectEl) return;
+
+  const val = selectEl.value;
+  if (val === '__inherit__') {
+    await handleResetSessionModel(sessionId);
+    return;
+  }
+
+  const [provider, model] = val.split(':');
+  const reasoningEffort = selectedEffortValue || null;
+
+  try {
+    await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/model-override`, {
+      method: 'PUT',
+      body: {
+        provider,
+        model,
+        reasoningEffort,
+        fallbackChain: null,
+      },
+    });
+    const effortSuffix = reasoningEffort ? ` (${reasoningEffort})` : '';
+    showToast(tr('chat.modelSwitchSuccess', { model: `${model}${effortSuffix}` }, `Model switched to ${model}${effortSuffix}, takes effect on next turn.`), 'success');
+    closeModal('modal-session-model');
+    await syncSessionModelBadge(sessionId);
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, 'Failed to update session model override.'), 'error');
+  }
+}
+
+async function handleResetSessionModel(sessionId) {
+  try {
+    await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/model-override`, {
+      method: 'DELETE',
+    });
+    const effRes = await apiRequest(`/api/models/effective?sessionId=${encodeURIComponent(sessionId)}`);
+    const effModel = (effRes && effRes.data && effRes.data.model) || 'default';
+    showToast(tr('chat.modelResetSuccess', { model: effModel }, `Session override cleared, restored to default (${effModel}).`), 'info');
+    closeModal('modal-session-model');
+    await syncSessionModelBadge(sessionId);
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, 'Failed to reset session model override.'), 'error');
+  }
+}
+
 let activeMountsSpaceId = null;
 
 async function loadSpaceMounts(spaceId) {
@@ -16958,6 +17242,9 @@ function deselectSession() {
   const bgBadge = document.getElementById("btn-session-bg");
   if (bgBadge) bgBadge.classList.add("hidden");
 
+  const modelBadge = document.getElementById("session-model-badge");
+  if (modelBadge) modelBadge.classList.add("hidden");
+
   const chatInput = document.getElementById("chat-input");
   if (chatInput) {
     chatInput.disabled = true;
@@ -17122,6 +17409,10 @@ async function selectSession(sessionId) {
 
     if (typeof loadSessionBackgroundTasks === 'function') {
       void loadSessionBackgroundTasks(sessionId);
+    }
+
+    if (typeof syncSessionModelBadge === 'function') {
+      void syncSessionModelBadge(sessionId);
     }
 
     const isArchived = Boolean(res.data && res.data.status === "archived");
@@ -22028,7 +22319,21 @@ document.addEventListener('DOMContentLoaded', () => {
   const sessionModelBadge = document.getElementById('session-model-badge');
   if (sessionModelBadge) {
     sessionModelBadge.addEventListener('click', () => {
-      window.location.hash = '#management/models/model-config';
+      openSessionModelModal(state.currentSessionId);
+    });
+  }
+
+  const sessionModelForm = document.getElementById('form-session-model');
+  if (sessionModelForm) {
+    sessionModelForm.addEventListener('submit', handleSaveSessionModel);
+  }
+
+  const sessionModelResetBtn = document.getElementById('btn-session-model-reset');
+  if (sessionModelResetBtn) {
+    sessionModelResetBtn.addEventListener('click', () => {
+      if (activeModelSessionId) {
+        handleResetSessionModel(activeModelSessionId);
+      }
     });
   }
 
