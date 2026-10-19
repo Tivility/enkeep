@@ -95,13 +95,20 @@ describe('Lark Offline Backfill', () => {
     expect(parsed!.mentions?.length).toBe(1);
     expect(parsed!.mentions![0].openId).toBe(botOpenId);
 
-    // Bot's own messages return null
+    // Bot's own messages return null (by sender_type: app or by botOpenId)
     const botMsg: LarkRestMessageItem = {
       ...rawRestItem,
       message_id: 'om_synth_bot_001',
       sender: { id: botOpenId, id_type: 'open_id', sender_type: 'app' },
     };
-    expect(normalizeRestMessageToParsed(botMsg, { chatType: 'group' })).toBeNull();
+    expect(normalizeRestMessageToParsed(botMsg, { chatType: 'group', botOpenId })).toBeNull();
+
+    const botUserMsg: LarkRestMessageItem = {
+      ...rawRestItem,
+      message_id: 'om_synth_bot_user_001',
+      sender: { id: botOpenId, id_type: 'open_id', sender_type: 'user' },
+    };
+    expect(normalizeRestMessageToParsed(botUserMsg, { chatType: 'group', botOpenId })).toBeNull();
   });
 
   // Test 2: Realtime WS event vs Backfill deduplication alignment

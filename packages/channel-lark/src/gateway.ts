@@ -2971,7 +2971,11 @@ export class LarkChannelGateway {
         continue;
       }
 
-      const parsed = normalizeRestMessageToParsed(item, { chatType });
+      const parsed = normalizeRestMessageToParsed(item, {
+        chatType,
+        botOpenId: this.botOpenId,
+        botAppId: this.botAppId,
+      });
       if (!parsed) continue;
 
       // Group chat activation_mode check: discard unmentioned messages

@@ -932,13 +932,19 @@ export function parseLarkCardAction(rawEvent: LarkRawEvent | null | undefined): 
  */
 export function normalizeRestMessageToParsed(
   item: LarkRestMessageItem,
-  context: { chatType: 'p2p' | 'group' }
+  context: { chatType: 'p2p' | 'group'; botOpenId?: string; botAppId?: string }
 ): LarkParsedMessage | null {
   if (!item || !item.message_id || item.deleted) {
     return null;
   }
   // Bot's own messages must not be ingested as inbound user messages
   if (item.sender?.sender_type === 'app') {
+    return null;
+  }
+  if (context.botOpenId && item.sender?.id === context.botOpenId) {
+    return null;
+  }
+  if (context.botAppId && item.sender?.id === context.botAppId) {
     return null;
   }
 
