@@ -730,17 +730,14 @@ describe('Lark Channel Closed-Loop Communication', () => {
       const forMsg = () => qTransport.addedReactions.filter((r: any) => r.messageId === 'om_queue_msg_rx_001').map((r: any) => r.emojiType);
       expect(forMsg()).toEqual(['OnIt', 'OneSecond']);
 
-      // 1. Simulate sender reacting with Fire -> promotes to steer
-      const rxEvent = {
-        header: { event_id: 'evt_rx_fire_01', event_type: 'im.message.reaction.created_v1', create_time: '1700000001000' },
-        event: {
-          message_id: 'om_queue_msg_rx_001',
-          reaction_type: { emoji_type: 'Fire' },
-          user_id: { open_id: 'ou_developer_1' },
-          action_time: '1700000001000',
-        },
-      };
-      const res = await qGateway.handleInboundEvent(rxEvent as any);
+      // 1. Simulate sender reacting with Fire -> promotes to steer (using transport.simulateInboundReaction)
+      const res = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_fire_01',
+        messageId: 'om_queue_msg_rx_001',
+        emojiType: 'Fire',
+        operatorOpenId: 'ou_developer_1',
+        createTime: '1700000001000',
+      });
       expect(res.handled).toBe(true);
       expect(promoteQueuedToSteerMock).toHaveBeenCalledTimes(1);
       expect(promoteQueuedToSteerMock).toHaveBeenCalledWith(userId, expect.any(String), { turnIds: ['turn_queued_001'] });
@@ -792,45 +789,36 @@ describe('Lark Channel Closed-Loop Communication', () => {
       await settle();
 
       // 1. Other emoji (e.g. 'THUMBSUP') is ignored
-      const otherEmojiEvent = {
-        header: { event_id: 'evt_rx_other_01', event_type: 'im.message.reaction.created_v1', create_time: '1700000001000' },
-        event: {
-          message_id: 'om_queue_msg_rx_002',
-          reaction_type: { emoji_type: 'THUMBSUP' },
-          user_id: { open_id: 'ou_developer_1' },
-          action_time: '1700000001000',
-        },
-      };
-      const resOtherEmoji = await qGateway.handleInboundEvent(otherEmojiEvent as any);
+      const resOtherEmoji = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_other_01',
+        messageId: 'om_queue_msg_rx_002',
+        emojiType: 'THUMBSUP',
+        operatorOpenId: 'ou_developer_1',
+        createTime: '1700000001000',
+      });
       expect(resOtherEmoji.handled).toBe(false);
       expect(promoteQueuedToSteerMock).not.toHaveBeenCalled();
 
       // 2. Different operator (not sender) is ignored
-      const otherUserEvent = {
-        header: { event_id: 'evt_rx_other_user', event_type: 'im.message.reaction.created_v1', create_time: '1700000002000' },
-        event: {
-          message_id: 'om_queue_msg_rx_002',
-          reaction_type: { emoji_type: 'Fire' },
-          user_id: { open_id: 'ou_other_person' },
-          action_time: '1700000002000',
-        },
-      };
-      const resOtherUser = await qGateway.handleInboundEvent(otherUserEvent as any);
+      const resOtherUser = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_other_user',
+        messageId: 'om_queue_msg_rx_002',
+        emojiType: 'Fire',
+        operatorOpenId: 'ou_other_person',
+        createTime: '1700000002000',
+      });
       expect(resOtherUser.handled).toBe(false);
       expect(resOtherUser.ignoredReason).toBe('permission_denied');
       expect(promoteQueuedToSteerMock).not.toHaveBeenCalled();
 
       // 3. Bot itself reacting is ignored
-      const botReactionEvent = {
-        header: { event_id: 'evt_rx_bot', event_type: 'im.message.reaction.created_v1', create_time: '1700000003000' },
-        event: {
-          message_id: 'om_queue_msg_rx_002',
-          reaction_type: { emoji_type: 'Fire' },
-          user_id: { open_id: botOpenId },
-          action_time: '1700000003000',
-        },
-      };
-      const resBot = await qGateway.handleInboundEvent(botReactionEvent as any);
+      const resBot = await qTransport.simulateInboundReaction({
+        eventId: 'evt_rx_bot',
+        messageId: 'om_queue_msg_rx_002',
+        emojiType: 'Fire',
+        operatorOpenId: botOpenId,
+        createTime: '1700000003000',
+      });
       expect(resBot.handled).toBe(false);
       expect(promoteQueuedToSteerMock).not.toHaveBeenCalled();
     });
