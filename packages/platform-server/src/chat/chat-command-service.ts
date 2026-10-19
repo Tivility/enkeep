@@ -3006,14 +3006,11 @@ export class ChatCommandService {
               content: steerContent,
             });
             return {
-              replyText: '',
+              replyText: '已插入当前任务',
               isSteerExecuted: true,
             };
           } catch (err: any) {
-            if (err?.code === 'NOT_RUNNING' || err?.message?.includes('not running')) {
-              return { replyText: '', fallbackToOrdinary: true };
-            }
-            return { replyText: `插队纠偏失败: ${err?.message || '未知错误'}` };
+            return { replyText: '', fallbackToOrdinary: true };
           }
         }
       }
@@ -3061,12 +3058,7 @@ export class ChatCommandService {
       return { replyText: '没有排队中的消息' };
     }
     if (promoteRes.status === 'steered') {
-      const channel = params.channelContext?.channel;
-      if (channel === 'wechat') {
-        return { replyText: `已插入当前任务（${promoteRes.count} 条）`, isSteerExecuted: true };
-      }
-      // For Lark, Feishu will use reactions (e.g. OnIt) so return empty replyText or confirmation
-      return { replyText: '', isSteerExecuted: true };
+      return { replyText: `已插入当前任务（${promoteRes.count} 条）`, isSteerExecuted: true };
     }
     if (promoteRes.status === 'requeued') {
       return { replyText: '任务已结束，消息已重新排队等待处理' };

@@ -1504,6 +1504,14 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       idempotencyKey,
       channelContext: envelope.channelContext,
     });
+    if (commandRes.fallbackToOrdinary) {
+      // /steer <text> could not be injected (nothing running, or the steer was rejected):
+      // deliver the text as an ordinary message so the user's input is never dropped.
+      const ordinaryContent = envelope.content.trim().replace(/^\/steer\b\s*/i, '');
+      if (ordinaryContent) {
+        return await this.dispatchInbound({ ...envelope, content: ordinaryContent });
+      }
+    }
     let replyText = commandRes.replyText;
     if (envelope.channelContext?.fallbackNotice) {
       replyText = `${envelope.channelContext.fallbackNotice}\n\n${replyText}`;
