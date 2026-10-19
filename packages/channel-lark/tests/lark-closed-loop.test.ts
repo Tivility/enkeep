@@ -634,6 +634,95 @@ describe('Lark Channel Closed-Loop Communication', () => {
       );
       expect(mentionsBot).toBe(true);
     });
+
+    it('processes inbound merge_forward event, enriches sub-messages via getMessage, and reparents image attachment', async () => {
+      const forwardTransport = new FakeLarkTransport();
+      await forwardTransport.start();
+
+      const dispatchedEnvelopes: any[] = [];
+      const mockRuntime: any = {
+        dispatchInbound: vi.fn().mockImplementation(async (env) => {
+          dispatchedEnvelopes.push(env);
+          return {
+            turnId: 'turn_forward_001',
+            executionMode: 'agent',
+          };
+        }),
+      };
+
+      const forwardGateway = new LarkChannelGateway({
+        account: {
+          id: gateway.accountId,
+          userId,
+          appId: 'cli_test_forward_01',
+          botOpenId,
+          groupActivationMode: 'always',
+        },
+        transport: forwardTransport,
+        channelRepo,
+        sessionRouteRepo,
+        spaceRepo,
+        runtimeGateway: mockRuntime,
+      });
+
+      const forwardChatId = 'oc_forward_chat_1';
+      await channelRepo.createBinding({
+        accountId: gateway.accountId,
+        spaceId,
+        nativeContextId: forwardChatId,
+        activationMode: 'always',
+      });
+
+      const forwardMsgId = 'om_forward_root_001';
+      forwardTransport.mockMessages.set(forwardMsgId, [
+        {
+          message_id: 'om_sub_001',
+          msg_type: 'text',
+          create_time: '1700000000000',
+          sender: { name: 'Alice' },
+          body: { content: JSON.stringify({ text: '讨论第一阶段' }) },
+        },
+        {
+          message_id: 'om_sub_002',
+          msg_type: 'image',
+          create_time: '1700000060000',
+          sender: { name: 'Bob' },
+          body: { content: JSON.stringify({ image_key: 'img_forward_sub_001' }) },
+        },
+      ]);
+
+      const subImageBuffer = Buffer.from(
+        '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82',
+        'binary'
+      );
+      // Register mock image with the root messageId because reparenting directs it to root message
+      forwardTransport.registerMockImage('img_forward_sub_001', subImageBuffer, 'image/png', forwardMsgId);
+
+      const rawForwardEvent = {
+        header: { event_id: 'evt_forward_001', event_type: 'im.message.receive_v1', create_time: '1700000000000' },
+        event: {
+          sender: { sender_id: { open_id: 'ou_developer_1' } },
+          message: {
+            message_id: forwardMsgId,
+            chat_id: 'oc_forward_chat_1',
+            chat_type: 'p2p',
+            message_type: 'merge_forward',
+            content: 'Merged and Forwarded Message',
+            create_time: '1700000000000',
+          },
+        },
+      };
+
+      const result = await forwardGateway.handleInboundEvent(rawForwardEvent);
+      expect(result.handled).toBe(true);
+      expect(dispatchedEnvelopes.length).toBeGreaterThan(0);
+      const lastEnvelope = dispatchedEnvelopes[dispatchedEnvelopes.length - 1];
+      expect(lastEnvelope.content).toContain('[合并转发]');
+      expect(lastEnvelope.content).toContain('Alice');
+      expect(lastEnvelope.content).toContain('讨论第一阶段');
+      expect(lastEnvelope.content).toContain('Bob');
+      expect(lastEnvelope.content).toContain('[图片]');
+    });
   });
 
   describe('8. Batch 1: Reaction Lifecycle, Thread Reply, & Mention Waiver', () => {

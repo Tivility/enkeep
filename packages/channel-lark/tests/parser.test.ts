@@ -4,6 +4,7 @@ import {
   extractTextAndResources,
   isCardActionEvent,
   parseLarkCardAction,
+  expandMergeForwardContent,
 } from '../src/parser.js';
 
 describe('parser: stripBotMentions', () => {
@@ -260,5 +261,128 @@ describe('parser: card.action.trigger (C3: card-stop-reply-button)', () => {
         message: { content: 'hello' },
       } as any)
     ).toBeNull();
+  });
+});
+
+describe('parser: new message types (P1: interactive, audio, media, sticker, etc.)', () => {
+  it('parses interactive card messages recursively extracting text and images without styling leakage', () => {
+    const cardJson = {
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: '告警通知',
+        },
+      },
+      elements: [
+        {
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: '服务 CPU 使用率超过 90%',
+          },
+        },
+        {
+          tag: 'img',
+          img_key: 'img_test_card_001',
+        },
+        {
+          tag: 'action',
+          actions: [
+            {
+              tag: 'button',
+              text: {
+                tag: 'plain_text',
+                content: '去处理',
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const res = extractTextAndResources('interactive', JSON.stringify(cardJson));
+    expect(res.text).toContain('告警通知');
+    expect(res.text).toContain('服务 CPU 使用率超过 90%');
+    expect(res.text).toContain('[按钮: 去处理]');
+    expect(res.resources).toHaveLength(1);
+    expect(res.resources[0]).toEqual({
+      type: 'image',
+      key: 'img_test_card_001',
+      name: 'img_test_card_001.jpg',
+    });
+  });
+
+  it('parses audio, media, sticker, share_chat, share_user, and location placeholders cleanly', () => {
+    const audioRes = extractTextAndResources('audio', JSON.stringify({ file_key: 'audio_001', duration: 12000 }));
+    expect(audioRes.text).toBe('[语音消息: 12s]');
+
+    const mediaRes = extractTextAndResources(
+      'media',
+      JSON.stringify({ file_key: 'video_key_001', file_name: 'test-demo.mp4' })
+    );
+    expect(mediaRes.text).toBe('[视频: test-demo.mp4]');
+    expect(mediaRes.resources).toHaveLength(1);
+    expect(mediaRes.resources[0]).toEqual({
+      type: 'file',
+      key: 'video_key_001',
+      name: 'test-demo.mp4',
+    });
+
+    const stickerRes = extractTextAndResources('sticker', JSON.stringify({ file_key: 'stk_001', description: '点赞' }));
+    expect(stickerRes.text).toBe('[表情包: 点赞]');
+
+    const shareChatRes = extractTextAndResources(
+      'share_chat',
+      JSON.stringify({ chat_id: 'oc_test_001', chat_name: '测试群聊' })
+    );
+    expect(shareChatRes.text).toBe('[分享群聊: 测试群聊]');
+
+    const locRes = extractTextAndResources(
+      'location',
+      JSON.stringify({ name: '科技园区', address: '高新南路 1 号' })
+    );
+    expect(locRes.text).toBe('[位置: 科技园区 - 高新南路 1 号]');
+  });
+
+  it('expands merge_forward sub-messages and reparents sub-message images to the root messageId', () => {
+    const rawItems = [
+      {
+        message_id: 'om_child_001',
+        msg_type: 'text',
+        create_time: '1700000000000',
+        sender: { name: 'Alice' },
+        body: { content: JSON.stringify({ text: '第一条讨论' }) },
+      },
+      {
+        message_id: 'om_child_002',
+        msg_type: 'image',
+        create_time: '1700000060000',
+        sender: { name: 'Bob' },
+        body: { content: JSON.stringify({ image_key: 'img_child_002' }) },
+      },
+      {
+        message_id: 'om_child_003',
+        msg_type: 'text',
+        deleted: true,
+        create_time: '1700000120000',
+        sender: { name: 'Charlie' },
+      },
+    ];
+
+    const rootMessageId = 'om_root_forward_001';
+    const forwardRes = expandMergeForwardContent(rawItems, rootMessageId);
+    expect(forwardRes.text).toContain('[合并转发]');
+    expect(forwardRes.text).toContain('Alice');
+    expect(forwardRes.text).toContain('第一条讨论');
+    expect(forwardRes.text).toContain('Bob');
+    expect(forwardRes.text).toContain('[图片]');
+    expect(forwardRes.text).toContain('Charlie');
+    expect(forwardRes.text).toContain('[已撤回]');
+
+    // Image resource must be reparented to rootMessageId
+    expect(forwardRes.resources).toHaveLength(1);
+    expect(forwardRes.resources[0].type).toBe('image');
+    expect(forwardRes.resources[0].key).toBe('img_child_002');
+    expect(forwardRes.resources[0].messageId).toBe(rootMessageId);
   });
 });
