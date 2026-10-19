@@ -189,4 +189,64 @@ describe('Script Task Execution via Task Worker (0-Token, Exit Codes, Timeout, C
     expect(failedTask?.status).toBe('failed');
     expect(failedTask?.error).toContain('container mode rejected');
   });
+
+  it('marks task as failed when script is terminated by self signal (e.g. kill -9 $$)', async () => {
+    const ops = service.forTenant('user_admin');
+    const { task } = await ops.tasks.createTask({
+      title: 'Self-Signal Kill Task',
+      payload: {
+        type: 'script',
+        command: '/bin/sh -c "kill -9 $$"',
+        spaceId: validSpaceId,
+      } as ScriptTaskPayload,
+    });
+
+    const worker = createWorker();
+    const tickResult = await worker.tick();
+
+    expect(tickResult.processed).toBe(true);
+    expect(tickResult.status).toBe('failed');
+    expect(tickResult.error).toBe(TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED);
+
+    const failedTask = await ops.tasks.getTask(task.id);
+    expect(failedTask?.status).toBe('failed');
+    expect(failedTask?.error).toContain('脚本被信号终止: SIGKILL');
+
+    const runsRes = await (storage.forTenant('user_admin').tasks as any).listRuns(task.id);
+    const runs = runsRes.items || runsRes;
+    expect(runs.length).toBe(1);
+    expect(runs[0].status).toBe('failed');
+    expect(runs[0].errorCode).toBe(TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED);
+    expect(runs[0].error).toContain('脚本被信号终止: SIGKILL');
+  });
+
+  it('marks task as failed when child process is terminated by external signal', async () => {
+    const ops = service.forTenant('user_admin');
+    const { task } = await ops.tasks.createTask({
+      title: 'External Signal Kill Task',
+      payload: {
+        type: 'script',
+        command: '/bin/sh -c "(sleep 0.1 && kill -TERM $$) & exec sleep 10"',
+        spaceId: validSpaceId,
+      } as ScriptTaskPayload,
+    });
+
+    const worker = createWorker();
+    const tickResult = await worker.tick();
+
+    expect(tickResult.processed).toBe(true);
+    expect(tickResult.status).toBe('failed');
+    expect(tickResult.error).toBe(TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED);
+
+    const failedTask = await ops.tasks.getTask(task.id);
+    expect(failedTask?.status).toBe('failed');
+    expect(failedTask?.error).toContain('脚本被信号终止: SIGTERM');
+
+    const runsRes = await (storage.forTenant('user_admin').tasks as any).listRuns(task.id);
+    const runs = runsRes.items || runsRes;
+    expect(runs.length).toBe(1);
+    expect(runs[0].status).toBe('failed');
+    expect(runs[0].errorCode).toBe(TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED);
+    expect(runs[0].error).toContain('脚本被信号终止: SIGTERM');
+  });
 });
