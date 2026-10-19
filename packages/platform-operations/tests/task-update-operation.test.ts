@@ -486,4 +486,67 @@ describe('Task Update Domain Operation & Fake Repository (G07)', () => {
       ).rejects.toThrow(TaskNotFoundError);
     });
   });
+
+  describe('6. Task Deletion (P2 / Issue 11)', () => {
+    it('deletes task successfully and records audit log', async () => {
+      const { task: created } = await serviceA.createTask({
+        title: 'Task To Delete',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Delete me',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const res = await serviceA.deleteTask(created.id);
+      expect(res.success).toBe(true);
+      expect(res.id).toBe(created.id);
+
+      await expect(serviceA.getTask(created.id)).resolves.toBeNull();
+
+      const audit = auditLogsA.logs.find(
+        (r) => r.action === 'task_deleted' && r.resourceId === created.id
+      );
+      expect(audit).toBeDefined();
+      expect(audit?.userId).toBe(tenantA);
+      expect(audit?.details?.title).toBe('Task To Delete');
+    });
+
+    it('rejects deletion when task is running or claimed', async () => {
+      const { task: created } = await serviceA.createTask({
+        title: 'Active Task To Reject',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Active run',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      // Claim task so status becomes claimed
+      await repoA.claim({ claimantId: 'worker_test_del', leaseDurationMs: 30000, preferredTaskId: created.id });
+
+      await expect(serviceA.deleteTask(created.id)).rejects.toThrow(TaskConflictError);
+      const remaining = await serviceA.getTask(created.id);
+      expect(remaining).not.toBeNull();
+    });
+
+    it('rejects deletion across tenants (Tenant B cannot delete Tenant A task)', async () => {
+      const { task: created } = await serviceA.createTask({
+        title: 'Tenant A Task',
+        payload: {
+          type: 'agent_prompt',
+          prompt: 'Tenant A task',
+          sessionId: 'ses_0123456789abcdef0123456789abcdef',
+          sessionPolicy: 'existing_session',
+        },
+      });
+
+      const repoB = new FakeTenantScopedTaskRepository(tenantB);
+      const serviceB = new TaskOperationService({ tasks: repoB });
+
+      await expect(serviceB.deleteTask(created.id)).rejects.toThrow(TaskNotFoundError);
+    });
+  });
 });
