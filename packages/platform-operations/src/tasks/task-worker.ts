@@ -156,6 +156,7 @@ export interface TaskWorkerOptions {
     stdout: string;
     stderr: string;
     exitCode: number | null;
+    signal?: NodeJS.Signals | string | null;
     timedOut: boolean;
     aborted: boolean;
     durationMs: number;
@@ -1670,6 +1671,7 @@ export class AgentPromptTaskWorker {
       stdout: string;
       stderr: string;
       exitCode: number | null;
+      signal?: NodeJS.Signals | string | null;
       timedOut: boolean;
       aborted: boolean;
       durationMs: number;
@@ -1764,24 +1766,41 @@ export class AgentPromptTaskWorker {
           }
         });
 
-        const finish = (code: number | null, err?: Error) => {
+        const finish = (
+          code: number | null,
+          closeSignal: NodeJS.Signals | null = null,
+          err?: Error
+        ) => {
           if (finished) return;
           finished = true;
           clearTimeout(timer);
           abortController.signal.removeEventListener('abort', onAbort);
           const durationMs = Date.now() - startTime;
+
+          let resolvedExit: number | null;
+          if (timedOut || aborted) {
+            resolvedExit = null;
+          } else if (code != null) {
+            resolvedExit = code;
+          } else if (err) {
+            resolvedExit = 1;
+          } else {
+            resolvedExit = null;
+          }
+
           resolve({
             stdout: stdout.slice(0, MAX_BUFFER),
             stderr: (err?.message || stderr).slice(0, MAX_BUFFER),
-            exitCode: timedOut || aborted ? null : (code ?? (err ? 1 : 0)),
+            exitCode: resolvedExit,
+            signal: closeSignal ?? null,
             timedOut,
             aborted,
             durationMs,
           });
         };
 
-        child.once('error', (err) => finish(1, err));
-        child.once('close', (code) => finish(code));
+        child.once('error', (err) => finish(1, null, err));
+        child.once('close', (code, signal) => finish(code, signal));
       });
     }
 
@@ -1849,6 +1868,40 @@ export class AgentPromptTaskWorker {
         tenantId,
         status: 'failed',
         error: timeoutCode,
+      };
+    }
+
+    if (scriptResult.signal) {
+      const failCode = TASK_PROTOCOL_ERROR_CODES.EXECUTION_FAILED;
+      const rawStderr = scriptResult.stderr.trim();
+      const errorMsg = `脚本被信号终止: ${scriptResult.signal}${rawStderr ? `\n${rawStderr}` : ''}`;
+
+      try {
+        if (ops.tasks instanceof TaskOperationService) {
+          await ops.tasks.failTask(task.id, {
+            claimantId: this.workerId,
+            error: errorMsg,
+            retryable: false,
+            runId: task.currentRun?.id,
+            errorCode: failCode,
+          });
+        } else {
+          await (ops.tasks as TenantScopedTaskRepository).fail(
+            task.id,
+            this.workerId,
+            errorMsg,
+            false,
+            task.currentRun?.id,
+            failCode
+          );
+        }
+      } catch {}
+
+      return {
+        taskId: task.id,
+        tenantId,
+        status: 'failed',
+        error: failCode,
       };
     }
 
