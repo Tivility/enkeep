@@ -1061,22 +1061,23 @@ describe('DeliveryGateway Quota Lifecycle, Crash Recovery & Heartbeat Safety', (
       const turn1Status = await gateway.getTurnStatus('u1', turn1Id);
       expect(turn1Status.status).toBe('interrupted');
 
-      // Verify Turn 2 and Turn 3 executed and completed in sequence
-      expect(executedTurnIds).toEqual([turn2Id, turn3Id]);
+      // Verify Turn 2 and Turn 3 were batch-merged into Turn 3 (Turn 3 executed, Turn 2 merged)
+      expect(executedTurnIds).toEqual([turn3Id]);
 
       const turn2Status = await gateway.getTurnStatus('u1', turn2Id);
       expect(turn2Status.status).toBe('completed');
+      const turn2Row = db.prepare('SELECT error FROM turn_runs WHERE turn_id = ?').get(turn2Id) as { error?: string };
+      expect(turn2Row?.error).toBe(`merged into ${turn3Id}`);
 
       const turn3Status = await gateway.getTurnStatus('u1', turn3Id);
       expect(turn3Status.status).toBe('completed');
 
-      // Verify web_messages contains assistant replies only for Turn 2 and Turn 3
+      // Verify web_messages contains assistant reply for merged Turn 3
       const assistantMsgs = db.prepare("SELECT turn_id, content, status FROM web_messages WHERE role = 'assistant' ORDER BY created_at ASC").all() as Array<{ turn_id: string; content: string; status: string }>;
-      expect(assistantMsgs.length).toBe(2);
-      expect(assistantMsgs[0].turn_id).toBe(turn2Id);
-      expect(assistantMsgs[0].content).toBe('Reply for Turn 2 Message');
-      expect(assistantMsgs[1].turn_id).toBe(turn3Id);
-      expect(assistantMsgs[1].content).toBe('Reply for Turn 3 Message');
+      expect(assistantMsgs.length).toBe(1);
+      expect(assistantMsgs[0].turn_id).toBe(turn3Id);
+      expect(assistantMsgs[0].content).toContain('Turn 2 Message');
+      expect(assistantMsgs[0].content).toContain('Turn 3 Message');
     });
   });
 });

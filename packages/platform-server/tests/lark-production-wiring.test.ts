@@ -1868,7 +1868,13 @@ describe('Production Lark Channel Wiring & Runtime End-to-End Acceptance', () =>
       });
       expect(inRes1.handled).toBe(true);
 
-      // Immediately dispatch message 2 back-to-back on same chat (turn 2 is queued behind turn 1)
+      // Wait for turn 1 to be claimed and start executing
+      await vi.waitFor(() => {
+        const turn1Row = db!.prepare('SELECT status FROM turn_runs WHERE turn_id = ?').get(inRes1.turnId!) as { status: string } | undefined;
+        expect(turn1Row?.status).toBe('running');
+      }, { timeout: 5000 });
+
+      // Immediately dispatch message 2 back-to-back on same chat (turn 2 is queued behind running turn 1)
       const inRes2 = await gateway.handleInboundEvent({
         header: {
           event_id: 'evt_lark_btb_2',
