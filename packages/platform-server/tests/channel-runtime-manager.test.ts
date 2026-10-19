@@ -403,4 +403,169 @@ describe('ChannelRuntimeManager - Proactive Scheduled Deliveries & Web Isolation
     const outboxRowsAfter = db.prepare('SELECT * FROM channel_outbox WHERE account_id = ?').all(accountId) as any[];
     expect(outboxRowsAfter.length).toBe(1);
   });
+
+  describe('Orphan Streaming Cards Reconciliation (HC Delta 13)', () => {
+    it('1. Completed turn: rewrites card with final web_messages text and no aborted banner', async () => {
+      const turnId = 'turn_test_reconcile_completed';
+      const sessionRouteId = 'ses_reconcile_001';
+
+      db.prepare(`
+        INSERT INTO session_routes (id, user_id, space_id, channel, native_context_id, dsh_session_id)
+        VALUES (?, ?, ?, 'lark', ?, 'dsh_ses_rec_1')
+      `).run(sessionRouteId, userId, spaceId, chatId);
+
+      // Create orphan streaming card in db
+      db.prepare(`
+        INSERT INTO channel_streaming_cards (
+          id, user_id, account_id, session_id, turn_id, native_context_id, chat_id,
+          card_id, message_id, version, status, snapshot_text, created_at, updated_at
+        ) VALUES (
+          'strc_rec_001', ?, ?, ?, ?, ?, ?,
+          'crd_orphan_1', 'om_orphan_1', 1, 'streaming', 'Partial text before restart...', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+      `).run(userId, accountId, sessionRouteId, turnId, chatId, chatId);
+
+      // Turn finished and assistant message persisted in web_messages
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, user_id, route_id, space_id, status)
+        VALUES ('run_rec_001', ?, ?, ?, ?, 'completed')
+      `).run(turnId, userId, sessionRouteId, spaceId);
+
+      db.prepare(`
+        INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id)
+        VALUES ('msg_asst_001', ?, ?, 'assistant', 'This is the complete assistant answer.', 'delivered', 'rt_rec_1', ?)
+      `).run(sessionRouteId, userId, turnId);
+
+      const res = await runtimeManager.reconcileOrphanStreamingCardsOnStartup();
+      expect(res.reconciled).toBe(1);
+
+      // Verify transport received reconcile call
+      const recCall = transport.streamingCalls.find((c) => c.type === 'reconcile');
+      expect(recCall).toBeDefined();
+      expect(recCall?.status).toBe('completed');
+      expect(recCall?.content).toBe('This is the complete assistant answer.');
+      expect(recCall?.card.header.template).toBe('violet');
+      expect(recCall?.card.body.elements[0].content).not.toContain('⚠️');
+
+      // Verify card marked as completed in DB
+      const cardRow = db.prepare('SELECT * FROM channel_streaming_cards WHERE id = ?').get('strc_rec_001') as any;
+      expect(cardRow.status).toBe('completed');
+      expect(cardRow.completed_at).toBeDefined();
+
+      // Verify delivered outbox item created to prevent re-delivery
+      const outboxRows = db.prepare('SELECT * FROM channel_outbox WHERE account_id = ?').all(accountId) as any[];
+      expect(outboxRows.some((o) => o.status === 'delivered')).toBe(true);
+    });
+
+    it('2. Aborted/failed turn: preserves snapshot text without misleading banner, empty text shows interrupted notice', async () => {
+      const turnIdWithSnapshot = 'turn_test_reconcile_aborted_snap';
+      const sessionRouteId1 = 'ses_reconcile_002';
+
+      db.prepare(`
+        INSERT INTO session_routes (id, user_id, space_id, channel, native_context_id, dsh_session_id)
+        VALUES (?, ?, ?, 'lark', ?, 'dsh_ses_rec_2')
+      `).run(sessionRouteId1, userId, spaceId, chatId);
+
+      // Card with snapshot text
+      db.prepare(`
+        INSERT INTO channel_streaming_cards (
+          id, user_id, account_id, session_id, turn_id, native_context_id, chat_id,
+          card_id, message_id, version, status, snapshot_text, created_at, updated_at
+        ) VALUES (
+          'strc_rec_002', ?, ?, ?, ?, ?, ?,
+          'crd_orphan_2', 'om_orphan_2', 1, 'streaming', 'Calculated halfway result...', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+      `).run(userId, accountId, sessionRouteId1, turnIdWithSnapshot, chatId, chatId);
+
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, user_id, route_id, space_id, status)
+        VALUES ('run_rec_002', ?, ?, ?, ?, 'interrupted')
+      `).run(turnIdWithSnapshot, userId, sessionRouteId1, spaceId);
+
+      // Card with empty snapshot text
+      const turnIdEmpty = 'turn_test_reconcile_aborted_empty';
+      const sessionRouteId2 = 'ses_reconcile_003';
+      const chatId2 = 'oc_crm_chat_002';
+
+      db.prepare(`
+        INSERT INTO session_routes (id, user_id, space_id, channel, native_context_id, dsh_session_id)
+        VALUES (?, ?, ?, 'lark', ?, 'dsh_ses_rec_3')
+      `).run(sessionRouteId2, userId, spaceId, chatId2);
+
+      db.prepare(`
+        INSERT INTO channel_streaming_cards (
+          id, user_id, account_id, session_id, turn_id, native_context_id, chat_id,
+          card_id, message_id, version, status, snapshot_text, created_at, updated_at
+        ) VALUES (
+          'strc_rec_003', ?, ?, ?, ?, ?, ?,
+          'crd_orphan_3', 'om_orphan_3', 1, 'streaming', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+      `).run(userId, accountId, sessionRouteId2, turnIdEmpty, chatId2, chatId2);
+
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, user_id, route_id, space_id, status)
+        VALUES ('run_rec_003', ?, ?, ?, ?, 'interrupted')
+      `).run(turnIdEmpty, userId, sessionRouteId2, spaceId);
+
+      const res = await runtimeManager.reconcileOrphanStreamingCardsOnStartup();
+      expect(res.reconciled).toBe(2);
+
+      const calls = transport.streamingCalls.filter((c) => c.type === 'reconcile');
+      const snapCall = calls.find((c) => c.cardId === 'crd_orphan_2');
+      const emptyCall = calls.find((c) => c.cardId === 'crd_orphan_3');
+
+      // Card with content retains content and does NOT append misleading banner
+      expect(snapCall).toBeDefined();
+      expect(snapCall?.status).toBe('aborted');
+      expect(snapCall?.content).toBe('Calculated halfway result...');
+      expect(snapCall?.content).not.toContain('⚠️');
+
+      // Card without content has interrupted banner
+      expect(emptyCall).toBeDefined();
+      expect(emptyCall?.status).toBe('aborted');
+      expect(emptyCall?.content).toContain('⚠️ 上次服务中断，本次任务未完成');
+
+      // Both marked aborted in DB
+      const row2 = db.prepare('SELECT status FROM channel_streaming_cards WHERE id = ?').get('strc_rec_002') as any;
+      const row3 = db.prepare('SELECT status FROM channel_streaming_cards WHERE id = ?').get('strc_rec_003') as any;
+      expect(row2.status).toBe('aborted');
+      expect(row3.status).toBe('aborted');
+    });
+
+    it('3. Queued turn for redrive: marks old card as being re-executed and closes streaming', async () => {
+      const turnId = 'turn_test_reconcile_queued';
+      const sessionRouteId = 'ses_reconcile_004';
+
+      db.prepare(`
+        INSERT INTO session_routes (id, user_id, space_id, channel, native_context_id, dsh_session_id)
+        VALUES (?, ?, ?, 'lark', ?, 'dsh_ses_rec_4')
+      `).run(sessionRouteId, userId, spaceId, chatId);
+
+      db.prepare(`
+        INSERT INTO channel_streaming_cards (
+          id, user_id, account_id, session_id, turn_id, native_context_id, chat_id,
+          card_id, message_id, version, status, snapshot_text, created_at, updated_at
+        ) VALUES (
+          'strc_rec_004', ?, ?, ?, ?, ?, ?,
+          'crd_orphan_4', 'om_orphan_4', 1, 'streaming', 'Partial text before restart', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+      `).run(userId, accountId, sessionRouteId, turnId, chatId, chatId);
+
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, user_id, route_id, space_id, status)
+        VALUES ('run_rec_004', ?, ?, ?, ?, 'queued')
+      `).run(turnId, userId, sessionRouteId, spaceId);
+
+      const res = await runtimeManager.reconcileOrphanStreamingCardsOnStartup();
+      expect(res.reconciled).toBe(1);
+
+      const recCall = transport.streamingCalls.find((c) => c.cardId === 'crd_orphan_4' && c.type === 'reconcile');
+      expect(recCall).toBeDefined();
+      expect(recCall?.status).toBe('aborted');
+      expect(recCall?.content).toContain('⚠️ 服务重启，任务正在重新执行');
+
+      const cardRow = db.prepare('SELECT status FROM channel_streaming_cards WHERE id = ?').get('strc_rec_004') as any;
+      expect(cardRow.status).toBe('aborted');
+    });
+  });
 });

@@ -272,6 +272,17 @@ export interface LarkStreamingCardSession {
 
 export type LarkEventHandler = (event: LarkRawEvent) => Promise<any>;
 
+export interface ReconcileStreamingCardParams {
+  chatId: string;
+  cardId?: string;
+  messageId?: string;
+  version?: number;
+  finalText: string;
+  status: 'completed' | 'aborted' | 'failed';
+  title?: string;
+  reasonBanner?: string;
+}
+
 export interface LarkTransport {
   readonly connected: boolean;
   start(): Promise<void>;
@@ -345,6 +356,11 @@ export interface LarkTransport {
     }
   ): Promise<{ buffer: Buffer; mimeType: string } | null>;
   getMessage?(messageId: string): Promise<any | null>;
+  reconcileInterruptedCard?(params: ReconcileStreamingCardParams): Promise<{
+    success: boolean;
+    method: 'cardkit' | 'message_patch';
+    version: number;
+  }>;
 }
 
 export interface LarkImageAttachmentIngestor {

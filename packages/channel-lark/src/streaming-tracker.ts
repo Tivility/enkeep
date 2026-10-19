@@ -116,6 +116,8 @@ export interface StreamingReplyTrackerOptions {
   cotEnabled?: boolean;
   isCotEnabled?: (chatId?: string) => boolean;
   backgroundPanelManager?: LarkBackgroundPanelManager;
+  onCardCreated?: (info: { cardId: string; messageId: string }) => Promise<void> | void;
+  onSnapshotFlush?: (snapshotText: string) => Promise<void> | void;
 }
 
 /**
@@ -362,6 +364,9 @@ export class StreamingReplyTracker {
   private seenOwnRunning = false;
 
   private readonly backgroundPanelManager?: LarkBackgroundPanelManager;
+  private readonly onCardCreated?: (info: { cardId: string; messageId: string }) => Promise<void> | void;
+  private readonly onSnapshotFlush?: (snapshotText: string) => Promise<void> | void;
+  private lastFlushedSnapshotText = '';
 
   constructor(options: StreamingReplyTrackerOptions) {
     this.transport = options.transport;
@@ -378,6 +383,8 @@ export class StreamingReplyTracker {
     this.withStopButton = options.withStopButton ?? options.cardParams?.withStopButton;
     this.senderId = options.senderId;
     this.backgroundPanelManager = options.backgroundPanelManager;
+    this.onCardCreated = options.onCardCreated;
+    this.onSnapshotFlush = options.onSnapshotFlush;
     this.startTime = Date.now();
     this.lastActivityAt = this.startTime;
     this.lastPushedStatusBucket = Math.floor(this.startTime / 5000);
@@ -489,15 +496,24 @@ export class StreamingReplyTracker {
         sessionId: this.sessionRouteId ?? this.cardParams?.sessionId,
       };
       this.cardSessionPromise = this.transport.createStreamingCard(cardParams).then(
-        (session) => {
+        async (session) => {
           this.cardSession = session;
-          if (session && this.backgroundPanelManager) {
-            void this.backgroundPanelManager.registerCard(
-              this.sessionRouteId,
-              this.cardParams.chatId,
-              session,
-              this.turnId
-            );
+          if (session) {
+            if (this.onCardCreated) {
+              try {
+                await this.onCardCreated({ cardId: session.cardId, messageId: session.messageId });
+              } catch (e) {
+                console.warn('[lark-stream] onCardCreated hook failed', e);
+              }
+            }
+            if (this.backgroundPanelManager) {
+              void this.backgroundPanelManager.registerCard(
+                this.sessionRouteId,
+                this.cardParams.chatId,
+                session,
+                this.turnId
+              );
+            }
           }
           return session;
         },
@@ -865,6 +881,12 @@ export class StreamingReplyTracker {
               }
               await session.pushText(textToPush, statusMarkdown ?? undefined, thinkingToPush, statusLineToPush);
               didPushText = true;
+              if (this.onSnapshotFlush && textToPush !== this.lastFlushedSnapshotText) {
+                this.lastFlushedSnapshotText = textToPush;
+                Promise.resolve(this.onSnapshotFlush(textToPush)).catch((e) => {
+                  console.warn('[lark-stream] onSnapshotFlush hook failed', e);
+                });
+              }
             }
           } else {
             const subagentCount = this.runningTools.get('subagent') ?? 0;
@@ -882,6 +904,12 @@ export class StreamingReplyTracker {
               }
               await session.pushText(textToPush, undefined, thinkingToPush, statusLineToPush);
               didPushText = true;
+              if (this.onSnapshotFlush && textToPush !== this.lastFlushedSnapshotText) {
+                this.lastFlushedSnapshotText = textToPush;
+                Promise.resolve(this.onSnapshotFlush(textToPush)).catch((e) => {
+                  console.warn('[lark-stream] onSnapshotFlush hook failed', e);
+                });
+              }
             }
           }
 

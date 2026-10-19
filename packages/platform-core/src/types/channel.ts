@@ -8,6 +8,47 @@ export type ChannelInboxStatus = 'held' | 'processing' | 'delivered' | 'failed';
 
 export type ChannelOutboxStatus = 'pending' | 'sending' | 'delivered' | 'failed';
 
+export type ChannelStreamingCardStatus = 'creating' | 'streaming' | 'recovering' | 'completed' | 'aborted' | 'failed';
+
+export interface ChannelStreamingCardRecord {
+  id: string;
+  userId: string;
+  accountId: string;
+  sessionId: string;
+  turnId: string;
+  nativeContextId: string;
+  chatId: string;
+  replyToMessageId?: string | null;
+  rootId?: string | null;
+  threadId?: string | null;
+  cardId?: string | null;
+  messageId?: string | null;
+  version: number;
+  status: ChannelStreamingCardStatus;
+  snapshotText?: string | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+}
+
+export interface UpsertStreamingCardInput {
+  turnId: string;
+  accountId: string;
+  sessionId: string;
+  nativeContextId: string;
+  chatId: string;
+  replyToMessageId?: string | null;
+  rootId?: string | null;
+  threadId?: string | null;
+  cardId?: string | null;
+  messageId?: string | null;
+  version?: number;
+  status?: ChannelStreamingCardStatus;
+  snapshotText?: string | null;
+  error?: string | null;
+}
+
 export interface ChannelAccount {
   id: string;
   userId: string;
@@ -193,4 +234,11 @@ export interface TenantScopedChannelRepository {
   findTurnOriginsBySessionId(sessionId: string): Promise<ChannelTurnOrigin[]>;
   findTurnOriginsByOriginTurnId(originTurnId: string): Promise<ChannelTurnOrigin[]>;
   hasTurnOriginForContext?(accountId: string, nativeContextId: string): Promise<boolean>;
+
+  // Streaming card operations (durable Feishu/Lark streaming card lifecycle & recovery)
+  upsertStreamingCard(input: UpsertStreamingCardInput): Promise<ChannelStreamingCardRecord>;
+  findStreamingCardByTurn(accountId: string, turnId: string): Promise<ChannelStreamingCardRecord | null>;
+  listNonterminalStreamingCards(limit?: number, accountId?: string): Promise<ChannelStreamingCardRecord[]>;
+  claimStreamingCardForRecovery(id: string, expectedStatus?: ChannelStreamingCardStatus): Promise<ChannelStreamingCardRecord | null>;
+  finalizeStreamingCard(id: string, status: 'completed' | 'aborted' | 'failed', error?: string | null): Promise<ChannelStreamingCardRecord>;
 }

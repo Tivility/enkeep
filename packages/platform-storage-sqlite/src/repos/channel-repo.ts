@@ -7,6 +7,9 @@ import type {
   ChannelInboxItem,
   ChannelOutboxItem,
   ChannelTurnOrigin,
+  ChannelStreamingCardRecord,
+  ChannelStreamingCardStatus,
+  UpsertStreamingCardInput,
   CreateChannelAccountInput,
   CreateChannelBindingInput,
   CreateChannelInboxInput,
@@ -27,6 +30,7 @@ import {
   parseChannelInboxRow,
   parseChannelOutboxRow,
   parseChannelTurnOriginRow,
+  parseChannelStreamingCardRow,
   queryOne,
   queryAll,
 } from '../utils/db.js';
@@ -662,5 +666,161 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
     );
     const row = stmt.get(this.userId, accountId, nativeContextId);
     return Boolean(row);
+  }
+
+  // ──────────────── Streaming Card Operations ────────────────
+
+  async upsertStreamingCard(input: UpsertStreamingCardInput): Promise<ChannelStreamingCardRecord> {
+    const {
+      turnId,
+      accountId,
+      sessionId,
+      nativeContextId,
+      chatId,
+      replyToMessageId,
+      rootId,
+      threadId,
+      cardId,
+      messageId,
+      version = 0,
+      status = 'streaming',
+      snapshotText,
+      error,
+    } = input;
+
+    if (!turnId || typeof turnId !== 'string' || turnId.trim().length === 0) {
+      throw new ValidationError('Mandatory turnId missing or empty in upsertStreamingCard');
+    }
+    if (!accountId || typeof accountId !== 'string' || accountId.trim().length === 0) {
+      throw new ValidationError('Mandatory accountId missing or empty in upsertStreamingCard');
+    }
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      throw new ValidationError('Mandatory sessionId missing or empty in upsertStreamingCard');
+    }
+    if (!chatId || typeof chatId !== 'string' || chatId.trim().length === 0) {
+      throw new ValidationError('Mandatory chatId missing or empty in upsertStreamingCard');
+    }
+
+    const id = `strc_${randomUUID().replace(/-/g, '')}`;
+
+    const stmt = this.db.prepare(`
+      INSERT INTO channel_streaming_cards (
+        id, user_id, account_id, session_id, turn_id, native_context_id, chat_id,
+        reply_to_message_id, root_id, thread_id, card_id, message_id,
+        version, status, snapshot_text, error, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT(account_id, turn_id) DO UPDATE SET
+        card_id = COALESCE(excluded.card_id, channel_streaming_cards.card_id),
+        message_id = COALESCE(excluded.message_id, channel_streaming_cards.message_id),
+        version = CASE WHEN excluded.version > channel_streaming_cards.version THEN excluded.version ELSE channel_streaming_cards.version END,
+        status = CASE
+          WHEN channel_streaming_cards.status IN ('completed', 'aborted', 'failed') THEN channel_streaming_cards.status
+          ELSE excluded.status
+        END,
+        snapshot_text = COALESCE(excluded.snapshot_text, channel_streaming_cards.snapshot_text),
+        error = COALESCE(excluded.error, channel_streaming_cards.error),
+        updated_at = CURRENT_TIMESTAMP
+    `);
+
+    stmt.run(
+      id,
+      this.userId,
+      accountId,
+      sessionId,
+      turnId,
+      nativeContextId,
+      chatId,
+      replyToMessageId ?? null,
+      rootId ?? null,
+      threadId ?? null,
+      cardId ?? null,
+      messageId ?? null,
+      version,
+      status,
+      snapshotText ?? null,
+      error ?? null
+    );
+
+    const record = await this.findStreamingCardByTurn(accountId, turnId);
+    if (!record) {
+      throw new Error(`Failed to retrieve upserted streaming card for turn "${turnId}"`);
+    }
+    return record;
+  }
+
+  async findStreamingCardByTurn(accountId: string, turnId: string): Promise<ChannelStreamingCardRecord | null> {
+    if (!accountId || !turnId) return null;
+    const stmt = this.db.prepare(
+      'SELECT * FROM channel_streaming_cards WHERE user_id = ? AND account_id = ? AND turn_id = ? LIMIT 1'
+    );
+    return queryOne(stmt, parseChannelStreamingCardRow, this.userId, accountId, turnId);
+  }
+
+  async listNonterminalStreamingCards(limit = 100, accountId?: string): Promise<ChannelStreamingCardRecord[]> {
+    if (accountId) {
+      const stmt = this.db.prepare(`
+        SELECT * FROM channel_streaming_cards
+        WHERE user_id = ? AND account_id = ? AND status IN ('creating', 'streaming', 'recovering')
+        ORDER BY created_at ASC LIMIT ?
+      `);
+      return queryAll(stmt, parseChannelStreamingCardRow, this.userId, accountId, limit);
+    }
+    const stmt = this.db.prepare(`
+      SELECT * FROM channel_streaming_cards
+      WHERE user_id = ? AND status IN ('creating', 'streaming', 'recovering')
+      ORDER BY created_at ASC LIMIT ?
+    `);
+    return queryAll(stmt, parseChannelStreamingCardRow, this.userId, limit);
+  }
+
+  async claimStreamingCardForRecovery(id: string, expectedStatus?: ChannelStreamingCardStatus): Promise<ChannelStreamingCardRecord | null> {
+    if (!id) return null;
+    let stmt: any;
+    if (expectedStatus) {
+      stmt = this.db.prepare(`
+        UPDATE channel_streaming_cards
+        SET status = 'recovering', updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND user_id = ? AND status = ?
+      `);
+      const res = stmt.run(id, this.userId, expectedStatus);
+      if (Number(res.changes) === 0) return null;
+    } else {
+      stmt = this.db.prepare(`
+        UPDATE channel_streaming_cards
+        SET status = 'recovering', updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND user_id = ? AND status IN ('creating', 'streaming', 'recovering')
+      `);
+      const res = stmt.run(id, this.userId);
+      if (Number(res.changes) === 0) return null;
+    }
+
+    const getStmt = this.db.prepare('SELECT * FROM channel_streaming_cards WHERE id = ? AND user_id = ?');
+    return queryOne(getStmt, parseChannelStreamingCardRow, id, this.userId);
+  }
+
+  async finalizeStreamingCard(
+    id: string,
+    status: 'completed' | 'aborted' | 'failed',
+    error?: string | null
+  ): Promise<ChannelStreamingCardRecord> {
+    if (!id) {
+      throw new ValidationError('Mandatory id missing in finalizeStreamingCard');
+    }
+    const stmt = this.db.prepare(`
+      UPDATE channel_streaming_cards
+      SET status = ?, error = COALESCE(?, error), completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND user_id = ?
+    `);
+    const res = stmt.run(status, error ?? null, id, this.userId);
+    if (Number(res.changes) === 0) {
+      throw new NotFoundError(`Channel streaming card "${id}" not found or unauthorized`);
+    }
+
+    const getStmt = this.db.prepare('SELECT * FROM channel_streaming_cards WHERE id = ? AND user_id = ?');
+    const record = queryOne(getStmt, parseChannelStreamingCardRow, id, this.userId);
+    if (!record) {
+      throw new NotFoundError(`Channel streaming card "${id}" not found after finalize`);
+    }
+    return record;
   }
 }

@@ -23,6 +23,7 @@ import type {
   ChannelInboxItem,
   ChannelOutboxItem,
   ChannelTurnOrigin,
+  ChannelStreamingCardRecord,
 } from '@enkeep/platform-core';
 import type {
   FileMetadata,
@@ -614,6 +615,30 @@ export function parseChannelTurnOriginRow(row: DbRow): ChannelTurnOrigin {
     threadId: getNullableString(row, 'thread_id'),
     originTurnId: getNullableString(row, 'origin_turn_id'),
     createdAt: getString(row, 'created_at'),
+  };
+}
+
+export function parseChannelStreamingCardRow(row: DbRow): ChannelStreamingCardRecord {
+  return {
+    id: getString(row, 'id'),
+    userId: getString(row, 'user_id'),
+    accountId: getString(row, 'account_id'),
+    sessionId: getString(row, 'session_id'),
+    turnId: getString(row, 'turn_id'),
+    nativeContextId: getString(row, 'native_context_id'),
+    chatId: getString(row, 'chat_id'),
+    replyToMessageId: getNullableString(row, 'reply_to_message_id'),
+    rootId: getNullableString(row, 'root_id'),
+    threadId: getNullableString(row, 'thread_id'),
+    cardId: getNullableString(row, 'card_id'),
+    messageId: getNullableString(row, 'message_id'),
+    version: getNumber(row, 'version'),
+    status: getString(row, 'status') as ChannelStreamingCardRecord['status'],
+    snapshotText: getNullableString(row, 'snapshot_text'),
+    error: getNullableString(row, 'error'),
+    createdAt: getString(row, 'created_at'),
+    updatedAt: getString(row, 'updated_at'),
+    completedAt: getNullableString(row, 'completed_at'),
   };
 }
 

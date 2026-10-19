@@ -25,6 +25,7 @@ import {
   type LarkStreamingCardSession,
   type LarkTransport,
   type OutboundReplyResult,
+  type ReconcileStreamingCardParams,
   type ILarkApiClient,
   type ILarkWSClient,
 } from './types.js';
@@ -288,14 +289,14 @@ export interface FakeRemovedReactionRecord {
 }
 
 export interface FakeStreamingCallRecord {
-  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'push_status_line' | 'finalize' | 'update_background_panel';
+  readonly type: 'card_create' | 'push' | 'push_status' | 'push_thinking' | 'push_status_line' | 'finalize' | 'update_background_panel' | 'reconcile';
   readonly cardId?: string;
   readonly messageId?: string;
   readonly content?: string;
   readonly toolStatus?: string | readonly CardToolStatusEntry[];
   readonly thinkingText?: string;
   readonly statusLine?: string;
-  readonly status?: 'completed' | 'failed' | 'stopped';
+  readonly status?: 'completed' | 'failed' | 'stopped' | 'aborted';
   readonly metadata?: CardFinalMetadata;
   readonly card?: any;
   readonly params?: any;
@@ -1589,6 +1590,52 @@ export class FakeLarkTransport implements LarkTransport {
     };
 
     return session;
+  }
+
+  async reconcileInterruptedCard(params: ReconcileStreamingCardParams): Promise<{
+    success: boolean;
+    method: 'cardkit' | 'message_patch';
+    version: number;
+  }> {
+    const isCompleted = params.status === 'completed';
+    let body = params.finalText.trim();
+    if (!isCompleted && params.reasonBanner) {
+      const banner = params.reasonBanner.trim();
+      body = body ? `${body}\n\n> ⚠️ ${banner}` : `> ⚠️ ${banner}`;
+    }
+
+    const contentElements = markdownToCardElements(body, {
+      maxChunkLen: 4000,
+      emptyFallback: isCompleted ? '(空回复)' : '(任务中断)',
+    });
+    const cardJson = {
+      schema: '2.0',
+      header: isCompleted
+        ? { title: { tag: 'plain_text', content: params.title ?? '已完成' }, template: 'violet' }
+        : { title: { tag: 'plain_text', content: params.title ? `${params.title} (已中断)` : '已中断' }, template: 'orange' },
+      body: {
+        direction: 'vertical',
+        elements: contentElements,
+      },
+    };
+
+    const nextVersion = (params.version ?? 0) + 1;
+    this._streamingCalls.push({
+      type: 'reconcile',
+      cardId: params.cardId,
+      messageId: params.messageId,
+      content: body,
+      status: params.status,
+      card: cardJson,
+      params,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      success: true,
+      method: params.cardId ? 'cardkit' : 'message_patch',
+      version: nextVersion,
+    };
   }
 
   simulateDisconnect(): void {
@@ -3787,5 +3834,85 @@ export class CredentialedLarkTransport implements LarkTransport {
       });
       return null;
     }
+  }
+
+  async reconcileInterruptedCard(params: ReconcileStreamingCardParams): Promise<{
+    success: boolean;
+    method: 'cardkit' | 'message_patch';
+    version: number;
+  }> {
+    const isCompleted = params.status === 'completed';
+    let body = params.finalText.trim();
+    if (!isCompleted && params.reasonBanner) {
+      const banner = params.reasonBanner.trim();
+      body = body ? `${body}\n\n> ⚠️ ${banner}` : `> ⚠️ ${banner}`;
+    }
+
+    const contentElements = markdownToCardElements(body, {
+      maxChunkLen: 4000,
+      emptyFallback: isCompleted ? '(空回复)' : '(任务中断)',
+    });
+    const cardJson = {
+      schema: '2.0',
+      header: isCompleted
+        ? { title: { tag: 'plain_text', content: params.title ?? '已完成' }, template: 'violet' }
+        : { title: { tag: 'plain_text', content: params.title ? `${params.title} (已中断)` : '已中断' }, template: 'orange' },
+      body: {
+        direction: 'vertical',
+        elements: contentElements,
+      },
+    };
+
+    let nextVersion = (params.version ?? 0) + 1;
+
+    // 1. Try CardKit
+    if (params.cardId && this.apiClient?.cardkit?.v1?.card) {
+      try {
+        const settingsFn = this.apiClient.cardkit.v1.card.settings;
+        if (typeof settingsFn === 'function') {
+          await settingsFn({
+            path: { card_id: params.cardId },
+            data: {
+              settings: JSON.stringify({ config: { streaming_mode: false } }),
+              sequence: nextVersion++,
+            },
+          });
+        }
+      } catch (err) {
+        this.logger.debug?.('[lark-reconcile] streaming disable failed (safe to proceed to update)', { err });
+      }
+
+      try {
+        const updateFn = this.apiClient.cardkit.v1.card.update;
+        if (typeof updateFn === 'function') {
+          const res = await updateFn({
+            path: { card_id: params.cardId },
+            data: {
+              card: { type: 'card_json', data: JSON.stringify(cardJson) },
+              sequence: nextVersion++,
+            },
+          });
+          if (res?.code === 0 || (!res?.code && !res?.msg)) {
+            return { success: true, method: 'cardkit', version: nextVersion };
+          }
+        }
+      } catch (err) {
+        this.logger.warn('[lark-reconcile] card.update failed, trying message.patch fallback', { err });
+      }
+    }
+
+    // 2. Fallback to im.v1.message.patch
+    if (params.messageId) {
+      const patchFn = this.apiClient?.im?.v1?.message?.patch || this.apiClient?.im?.message?.patch;
+      if (typeof patchFn === 'function') {
+        await patchFn({
+          path: { message_id: params.messageId },
+          data: { content: JSON.stringify(cardJson) },
+        });
+        return { success: true, method: 'message_patch', version: nextVersion };
+      }
+    }
+
+    throw new Error('Neither cardId nor messageId available for card reconciliation');
   }
 }
