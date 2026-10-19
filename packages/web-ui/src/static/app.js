@@ -289,6 +289,7 @@ const MANAGEMENT_LOCALES = {
     'files.noFileSelected': 'No File Selected',
     'files.noFileSelectedSub': 'Select a file from the directory tree on the left to view or edit UTF-8 content.',
     'files.uploadProgress': 'Uploading "{name}": {percent}%',
+    'files.uploadRetrying': 'Retrying ({attempt}/3)...',
     'files.uploadSuccess': 'Uploaded "{name}" successfully.',
     'files.uploadFailed': 'Failed to upload "{name}": {error}',
     'files.uploadCancelled': 'Upload cancelled for "{name}".',
@@ -832,6 +833,7 @@ const MANAGEMENT_LOCALES = {
     'files.noFileSelected': '未选择任何文件',
     'files.noFileSelectedSub': '请从左侧目录树中选择一个文件以查看或编辑 UTF-8 文本内容。',
     'files.uploadProgress': '正在上传 "{name}": {percent}%',
+    'files.uploadRetrying': '重试中 ({attempt}/3)...',
     'files.uploadSuccess': '成功上传 "{name}"。',
     'files.uploadFailed': '上传 "{name}" 失败: {error}',
     'files.uploadCancelled': '已取消上传 "{name}"。',
@@ -3813,22 +3815,33 @@ function renderFilesUploadTray() {
 
     const progressText = document.createElement('span');
     progressText.className = 'files-upload-item-progress-text';
-    progressText.textContent = item.status === 'completed'
-      ? (getLocale() === 'zh-CN' ? '已完成' : '100%')
-      : item.status === 'cancelled'
-        ? (getLocale() === 'zh-CN' ? '已取消' : 'Cancelled')
-        : item.status === 'failed'
-          ? (getLocale() === 'zh-CN' ? '已失败' : 'Failed')
-          : `${item.percent}%`;
+    if (item.status === 'completed') {
+      progressText.textContent = getLocale() === 'zh-CN' ? '已完成' : '100%';
+    } else if (item.status === 'cancelled') {
+      progressText.textContent = getLocale() === 'zh-CN' ? '已取消' : 'Cancelled';
+    } else if (item.status === 'failed') {
+      progressText.textContent = getLocale() === 'zh-CN' ? '已失败' : 'Failed';
+    } else if (item.status === 'retrying' || (item.retryAttempt && item.retryAttempt > 1)) {
+      progressText.textContent = tr(
+        'files.uploadRetrying',
+        { attempt: formatNumber(item.retryAttempt || 1) },
+        getLocale() === 'zh-CN' ? `重试中 (${item.retryAttempt || 1}/3)...` : `Retrying (${item.retryAttempt || 1}/3)...`
+      );
+    } else {
+      progressText.textContent = `${item.percent}%`;
+    }
     actions.appendChild(progressText);
 
-    if (item.status === 'uploading' || item.status === 'pending') {
+    if (item.status === 'uploading' || item.status === 'pending' || item.status === 'retrying') {
       const btnCancel = document.createElement('button');
       btnCancel.type = 'button';
       btnCancel.className = 'btn btn-secondary btn-xs';
       btnCancel.textContent = tr('files.btnCancelUpload', null, 'Cancel');
       btnCancel.title = `${tr('files.btnCancelUpload', null, 'Cancel')} ${item.file.name}`;
       btnCancel.addEventListener('click', () => {
+        if (item.abortController) {
+          try { item.abortController.abort(); } catch {}
+        }
         if (item.xhr && typeof item.xhr.abort === 'function') {
           item.xhr.abort();
         }
@@ -3889,53 +3902,166 @@ function processFileUploadQueue() {
   }
 }
 
+// ====================================================
+// File Upload Retry Infrastructure
+// ====================================================
+const UPLOAD_MAX_ATTEMPTS = 3;
+const UPLOAD_RETRY_DELAYS_MS = [2000, 5000];
+
+function isRetriableUploadStatus(status) {
+  return (
+    status === 0 ||
+    status === 408 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  );
+}
+
+function uploadSleep(ms, abortSignal) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer) clearTimeout(timer);
+      reject(new Error('Upload aborted'));
+    };
+    if (abortSignal && abortSignal.aborted) {
+      return reject(new Error('Upload aborted'));
+    }
+    if (abortSignal) {
+      abortSignal.addEventListener('abort', onAbort, { once: true });
+    }
+    timer = setTimeout(() => {
+      if (abortSignal) {
+        abortSignal.removeEventListener('abort', onAbort);
+      }
+      resolve();
+    }, ms);
+  });
+}
+
+function getUploadDetailedErrorMessage(status, responseText, fallbackMsg) {
+  let serverMsg = null;
+  if (responseText) {
+    try {
+      const parsed = JSON.parse(responseText);
+      serverMsg = parsed?.error?.message;
+    } catch {
+      // Non-JSON response
+    }
+  }
+  if (serverMsg) {
+    return status ? `${serverMsg} (HTTP ${status})` : serverMsg;
+  }
+  return status ? `${fallbackMsg} (HTTP ${status})` : fallbackMsg;
+}
+
 /**
  * Perform single file multipart upload via XHR with upload progress, CSRF/cookie/Origin support, and 409 conflict handling.
  */
-function uploadSingleFile(item) {
-  const xhr = new XMLHttpRequest();
-  item.xhr = xhr;
+async function uploadSingleFile(item) {
+  item.retryAttempt = item.retryAttempt || 1;
+  item.abortController = item.abortController || new AbortController();
 
   let uploadUrl = `/api/spaces/${encodeURIComponent(item.spaceId)}/files/upload?path=${encodeURIComponent(item.targetPath)}`;
   if (item.isOverwrite && item.overwriteEtag) {
     uploadUrl += '&overwrite=true';
   }
 
-  xhr.open('POST', uploadUrl, true);
-  xhr.withCredentials = true;
-
-  // Header Idempotency-Key (independent crypto UUID)
-  xhr.setRequestHeader('Idempotency-Key', item.idempotencyKey);
-
-  // X-Enkeep-CSRF token
-  if (state.csrfToken) {
-    xhr.setRequestHeader('X-Enkeep-CSRF', state.csrfToken);
-  }
-
-  // If-Match when overwriting
-  if (item.isOverwrite && item.overwriteEtag) {
-    xhr.setRequestHeader('If-Match', item.overwriteEtag);
-  }
-
-  xhr.upload.addEventListener('progress', (e) => {
-    if (e.lengthComputable && e.total > 0) {
-      const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
-      item.percent = pct;
+  for (let attempt = item.retryAttempt; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
+    item.retryAttempt = attempt;
+    if (attempt > 1) {
+      item.status = 'retrying';
       renderFilesUploadTray();
     }
-  });
 
-  xhr.addEventListener('load', async () => {
-    state.activeUploadCount = Math.max(0, state.activeUploadCount - 1);
+    const isLastAttempt = attempt === UPLOAD_MAX_ATTEMPTS;
 
-    if (xhr.status >= 200 && xhr.status < 300) {
+    const result = await new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      item.xhr = xhr;
+
+      xhr.open('POST', uploadUrl, true);
+      xhr.withCredentials = true;
+
+      // Header Idempotency-Key (strictly reused across retries)
+      xhr.setRequestHeader('Idempotency-Key', item.idempotencyKey);
+
+      // X-Enkeep-CSRF token
+      if (state.csrfToken) {
+        xhr.setRequestHeader('X-Enkeep-CSRF', state.csrfToken);
+      }
+
+      // If-Match when overwriting
+      if (item.isOverwrite && item.overwriteEtag) {
+        xhr.setRequestHeader('If-Match', item.overwriteEtag);
+      }
+
+      const onAbort = () => {
+        try { xhr.abort(); } catch {}
+      };
+      if (item.abortController) {
+        item.abortController.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable && e.total > 0) {
+          const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
+          item.percent = pct;
+          renderFilesUploadTray();
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        if (item.abortController) {
+          item.abortController.signal.removeEventListener('abort', onAbort);
+        }
+        resolve({ type: 'load', status: xhr.status, responseText: xhr.responseText, xhr });
+      });
+
+      xhr.addEventListener('error', () => {
+        if (item.abortController) {
+          item.abortController.signal.removeEventListener('abort', onAbort);
+        }
+        resolve({ type: 'error', status: 0, responseText: '', xhr });
+      });
+
+      xhr.addEventListener('abort', () => {
+        if (item.abortController) {
+          item.abortController.signal.removeEventListener('abort', onAbort);
+        }
+        resolve({ type: 'abort', status: 0, responseText: '', xhr });
+      });
+
+      // Reconstruct FormData on every attempt
+      const formData = new FormData();
+      formData.append('file', item.file, item.file.name);
+      xhr.send(formData);
+    });
+
+    // 1. User aborted
+    if (result.type === 'abort' || item.status === 'cancelled') {
+      state.activeUploadCount = Math.max(0, state.activeUploadCount - 1);
+      item.status = 'cancelled';
+      processFileUploadQueue();
+      renderFilesUploadTray();
+      return;
+    }
+
+    // 2. Success (2xx)
+    if (result.status >= 200 && result.status < 300) {
+      state.activeUploadCount = Math.max(0, state.activeUploadCount - 1);
       item.status = 'completed';
       item.percent = 100;
       showToast(tr('files.uploadSuccess', { name: item.file.name }, `Uploaded "${item.file.name}" successfully.`), 'success');
       processFileUploadQueue();
       renderFilesUploadTray();
-    } else if (xhr.status === 409 && !item.isOverwrite) {
-      // 409 Conflict: File exists. Prompt for overwrite confirmation (never auto-overwrite)
+      return;
+    }
+
+    // 3. 409 Conflict: File exists. Prompt for overwrite confirmation (never auto-overwrite, stop retrying)
+    if (result.xhr.status === 409 && !item.isOverwrite) {
+      state.activeUploadCount = Math.max(0, state.activeUploadCount - 1);
       item.status = 'paused_conflict';
       renderFilesUploadTray();
 
@@ -3949,7 +4075,6 @@ function uploadSingleFile(item) {
       const shouldOverwrite = await showConfirmDialog(confirmTitle, confirmMsg);
 
       if (shouldOverwrite) {
-        // Retrieve latest ETag from list entries
         let existingEtag = null;
         try {
           const listRes = await apiRequest(
@@ -3966,10 +4091,10 @@ function uploadSingleFile(item) {
         }
 
         if (existingEtag) {
-          // Retry single file with overwrite=true and If-Match and fresh idempotency key
           item.isOverwrite = true;
           item.overwriteEtag = existingEtag;
           item.idempotencyKey = generateUUID();
+          item.retryAttempt = 1;
           item.status = 'pending';
           item.percent = 0;
           processFileUploadQueue();
@@ -3980,49 +4105,42 @@ function uploadSingleFile(item) {
         }
       }
 
-      // User cancelled overwrite or ETag could not be resolved
       item.status = 'failed';
       showToast(tr('files.uploadCancelled', { name: item.file.name }, `Upload cancelled for "${item.file.name}".`), 'info');
       processFileUploadQueue();
       renderFilesUploadTray();
-    } else {
-      item.status = 'failed';
-      let errPayload = null;
-      try {
-        errPayload = JSON.parse(xhr.responseText);
-      } catch (parseErr) {
-        errPayload = null;
-      }
-      const safeMsg = getSafeErrorMessage(
-        { status: xhr.status, code: errPayload?.error?.code },
-        tr('files.uploadFailed', { name: item.file.name, error: `HTTP ${xhr.status}` }, `Failed to upload "${item.file.name}".`)
-      );
-      showToast(safeMsg, 'error');
-      processFileUploadQueue();
+      return;
+    }
+
+    // 4. Retry temporary errors
+    const lastStatus = result.status;
+    const lastResponseText = result.responseText;
+    if (!isLastAttempt && isRetriableUploadStatus(lastStatus)) {
+      item.status = 'retrying';
       renderFilesUploadTray();
+      const delayMs = UPLOAD_RETRY_DELAYS_MS[attempt - 1] || 5000;
+      try {
+        await uploadSleep(delayMs, item.abortController?.signal);
+        continue;
+      } catch {
+        state.activeUploadCount = Math.max(0, state.activeUploadCount - 1);
+        item.status = 'cancelled';
+        processFileUploadQueue();
+        renderFilesUploadTray();
+        return;
+      }
     }
-  });
 
-  xhr.addEventListener('error', () => {
+    // 5. Non-retriable or retries exhausted
     state.activeUploadCount = Math.max(0, state.activeUploadCount - 1);
-    if (item.status !== 'cancelled') {
-      item.status = 'failed';
-      showToast(t('error.network', null, 'Network connection failed.'), 'error');
-    }
+    item.status = 'failed';
+    const fallbackMsg = tr('files.uploadFailed', { name: item.file.name, error: `HTTP ${lastStatus}` }, `Failed to upload "${item.file.name}".`);
+    const errorMsg = getUploadDetailedErrorMessage(lastStatus, lastResponseText, fallbackMsg);
+    showToast(errorMsg, 'error');
     processFileUploadQueue();
     renderFilesUploadTray();
-  });
-
-  xhr.addEventListener('abort', () => {
-    state.activeUploadCount = Math.max(0, state.activeUploadCount - 1);
-    item.status = 'cancelled';
-    processFileUploadQueue();
-    renderFilesUploadTray();
-  });
-
-  const formData = new FormData();
-  formData.append('file', item.file, item.file.name);
-  xhr.send(formData);
+    return;
+  }
 }
 
 /**
@@ -18899,9 +19017,19 @@ function renderAttachmentTray() {
     const metaSpan = document.createElement('span');
     metaSpan.className = 'attachment-tray-meta';
     if (item.status === 'uploading') {
-      metaSpan.textContent = t('chat.uploadProgress', { percent: item.progress || 0 }, `Uploading ${item.progress || 0}%`);
+      if (item.retryAttempt && item.retryAttempt > 1) {
+        metaSpan.textContent = tr(
+          'chat.uploadRetrying',
+          { attempt: formatNumber(item.retryAttempt), percent: formatNumber(item.progress || 0) },
+          getLocale() === 'zh-CN'
+            ? `网络不稳，重试 ${item.retryAttempt}/3 (${item.progress || 0}%)`
+            : `Retrying ${item.retryAttempt}/3 (${item.progress || 0}%)`
+        );
+      } else {
+        metaSpan.textContent = t('chat.uploadProgress', { percent: item.progress || 0 }, `Uploading ${item.progress || 0}%`);
+      }
     } else if (item.status === 'error') {
-      metaSpan.textContent = t('chat.uploadFailed', null, 'Upload failed');
+      metaSpan.textContent = item.error || t('chat.uploadFailed', null, 'Upload failed');
     } else {
       metaSpan.textContent = formatBytes(item.size);
     }
@@ -19106,76 +19234,134 @@ async function processComposerUploadQueue() {
       try {
         await ensureUploadsDir(spaceId);
 
-        const formData = new FormData();
-        const uuidPrefix = generateUUID().slice(0, 8);
+        const csrf = state.csrfToken || (await fetchCsrfToken());
+        const idempotencyKey = item.idempotencyKey || generateUUID();
+        item.idempotencyKey = idempotencyKey;
+
+        const uuidPrefix = item.uuidPrefix || generateUUID().slice(0, 8);
+        item.uuidPrefix = uuidPrefix;
         const safeName = sanitizeClientFilename(item.file.name);
         const destFilename = `${uuidPrefix}-${safeName}`;
-
-        formData.append('file', item.file, destFilename);
-
         const uploadUrl = `/api/spaces/${encodeURIComponent(spaceId)}/files/upload?path=uploads`;
-        const csrf = state.csrfToken || (await fetchCsrfToken());
-        const idempotencyKey = generateUUID();
 
-        await new Promise((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open('POST', uploadUrl, true);
-          xhr.setRequestHeader('X-Enkeep-CSRF', csrf);
-          xhr.setRequestHeader('Idempotency-Key', idempotencyKey);
-          xhr.withCredentials = true;
+        let lastError = null;
 
-          if (item.abortController) {
-            item.abortController.signal.addEventListener('abort', () => {
-              xhr.abort();
-              reject(new Error('Upload aborted'));
-            });
+        for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
+          item.retryAttempt = attempt;
+          if (attempt > 1) {
+            renderAttachmentTray();
           }
 
-          xhr.upload.addEventListener('progress', (e) => {
-            if (e.lengthComputable && e.total > 0) {
-              item.progress = Math.min(Math.round((e.loaded / e.total) * 100), 99);
-              renderAttachmentTray();
-            }
-          });
+          try {
+            const uploadedFile = await new Promise((resolve, reject) => {
+              const xhr = new XMLHttpRequest();
+              item.xhr = xhr;
 
-          xhr.addEventListener('load', () => {
-            if (xhr.status === 200 || xhr.status === 201) {
-              try {
-                const res = JSON.parse(xhr.responseText);
-                if (res && res.data && Array.isArray(res.data.files) && res.data.files[0]) {
-                  const uploadedFile = res.data.files[0];
-                  item.status = 'ready';
-                  item.path = uploadedFile.path;
-                  item.etag = uploadedFile.etag;
-                  item.progress = 100;
-                  resolve(uploadedFile);
-                } else {
-                  reject(new Error('Malformed upload response'));
+              xhr.open('POST', uploadUrl, true);
+              xhr.setRequestHeader('X-Enkeep-CSRF', csrf);
+              xhr.setRequestHeader('Idempotency-Key', idempotencyKey);
+              xhr.withCredentials = true;
+
+              const onAbort = () => {
+                try { xhr.abort(); } catch {}
+                reject(new Error('Upload aborted'));
+              };
+
+              if (item.abortController) {
+                item.abortController.signal.addEventListener('abort', onAbort, { once: true });
+              }
+
+              xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable && e.total > 0) {
+                  item.progress = Math.min(Math.round((e.loaded / e.total) * 100), 99);
+                  renderAttachmentTray();
                 }
-              } catch (parseErr) {
-                reject(parseErr);
-              }
-            } else {
-              try {
-                const res = JSON.parse(xhr.responseText);
-                const msg = (res && res.error && res.error.message) || `Upload failed (${xhr.status})`;
-                reject(new Error(msg));
-              } catch {
-                reject(new Error(`Upload failed (${xhr.status})`));
-              }
-            }
-          });
+              });
 
-          xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
-          xhr.send(formData);
-        });
+              xhr.addEventListener('load', () => {
+                if (item.abortController) {
+                  item.abortController.signal.removeEventListener('abort', onAbort);
+                }
+                if (xhr.status === 200 || xhr.status === 201) {
+                  try {
+                    const res = JSON.parse(xhr.responseText);
+                    if (res && res.data && Array.isArray(res.data.files) && res.data.files[0]) {
+                      resolve(res.data.files[0]);
+                    } else {
+                      reject({ status: xhr.status, message: 'Malformed upload response' });
+                    }
+                  } catch (parseErr) {
+                    reject({ status: xhr.status, message: 'Malformed JSON response' });
+                  }
+                } else {
+                  let msg = `Upload failed (${xhr.status})`;
+                  try {
+                    const res = JSON.parse(xhr.responseText);
+                    if (res?.error?.message) msg = res.error.message;
+                  } catch {}
+                  reject({ status: xhr.status, message: msg });
+                }
+              });
+
+              xhr.addEventListener('error', () => {
+                if (item.abortController) {
+                  item.abortController.signal.removeEventListener('abort', onAbort);
+                }
+                reject({ status: 0, message: 'Network error during upload' });
+              });
+
+              xhr.addEventListener('abort', () => {
+                if (item.abortController) {
+                  item.abortController.signal.removeEventListener('abort', onAbort);
+                }
+                reject(new Error('Upload aborted'));
+              });
+
+              // Reconstruct FormData on every attempt
+              const formData = new FormData();
+              formData.append('file', item.file, destFilename);
+              xhr.send(formData);
+            });
+
+            // Upload succeeded
+            item.status = 'ready';
+            item.path = uploadedFile.path;
+            item.etag = uploadedFile.etag;
+            item.progress = 100;
+            item.retryAttempt = 1;
+            lastError = null;
+            break;
+          } catch (err) {
+            lastError = err;
+            if (item.abortController && item.abortController.signal.aborted) {
+              return;
+            }
+            const status = typeof err === 'object' && err !== null ? err.status : undefined;
+            const isRetriable = isRetriableUploadStatus(status ?? 0);
+            if (attempt === UPLOAD_MAX_ATTEMPTS || !isRetriable) {
+              break;
+            }
+            const delayMs = UPLOAD_RETRY_DELAYS_MS[attempt - 1] || 5000;
+            try {
+              await uploadSleep(delayMs, item.abortController?.signal);
+            } catch {
+              return;
+            }
+          }
+        }
+
+        if (lastError) {
+          throw lastError;
+        }
       } catch (err) {
         if (item.abortController && item.abortController.signal.aborted) {
           // If aborted by user, it's already removed
           return;
         }
         item.status = 'error';
-        item.error = err && err.message ? err.message : 'Upload failed';
+        const status = err?.status;
+        const msg = err?.message || 'Upload failed';
+        item.error = status ? `${msg} (HTTP ${status})` : msg;
         showToast(item.error, 'error');
       } finally {
         state.activeComposerUploadCount--;
@@ -21369,6 +21555,12 @@ if (typeof window !== 'undefined') {
   window.getLocalizedEnum = getLocalizedEnum;
   window.captureFormState = captureFormState;
   window.restoreFormState = restoreFormState;
+  window.isRetriableUploadStatus = isRetriableUploadStatus;
+  window.uploadSingleFile = uploadSingleFile;
+  window.processComposerUploadQueue = processComposerUploadQueue;
+  window.retryComposerUpload = retryComposerUpload;
+  window.UPLOAD_MAX_ATTEMPTS = UPLOAD_MAX_ATTEMPTS;
+  window.UPLOAD_RETRY_DELAYS_MS = UPLOAD_RETRY_DELAYS_MS;
 }
 
 // ----------------------------------------------------

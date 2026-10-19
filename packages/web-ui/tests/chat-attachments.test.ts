@@ -184,6 +184,7 @@ describe('Chat Attachments & Composer Workspace Picker Contract', () => {
       'chat.retryUpload',
       'chat.uploadFailed',
       'chat.uploadProgress',
+      'chat.uploadRetrying',
       'chat.uploadSuccess',
       'chat.uploading',
       'modal.filePickerEmpty',

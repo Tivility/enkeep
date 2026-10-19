@@ -194,6 +194,7 @@ describe('Files Workbench & Chat Pagination Unit & Security Tests', () => {
       'files.dragDropActive',
       'files.dragDropZone',
       'files.uploadProgress',
+      'files.uploadRetrying',
       'files.uploadSuccess',
       'files.uploadFailed',
       'files.uploadCancelled',
@@ -213,6 +214,325 @@ describe('Files Workbench & Chat Pagination Unit & Security Tests', () => {
         expect(key in zhCN, `Missing Simplified Chinese key "${key}"`).toBe(true);
         expect(en[key as keyof typeof en].trim().length).toBeGreaterThan(0);
         expect(zhCN[key as keyof typeof zhCN].trim().length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  describe('5. Upload Auto-Retry with Exponential Backoff & Idempotency', () => {
+    it('retries on status 0 / 408 / 502 / 503 / 504 and succeeds on subsequent attempt reusing Idempotency-Key', async () => {
+      // Mock FormData
+      class MockFormData {
+        entries: Array<[string, any, string?]> = [];
+        append(key: string, value: any, filename?: string) {
+          this.entries.push([key, value, filename]);
+        }
+      }
+
+      const instances: any[] = [];
+      class MockXHR {
+        headers: Record<string, string> = {};
+        status: number = 0;
+        responseText: string = '';
+        upload = {
+          listeners: {} as Record<string, Function[]>,
+          addEventListener(evt: string, fn: Function) {
+            (this.listeners[evt] = this.listeners[evt] || []).push(fn);
+          },
+        };
+        listeners: Record<string, Function[]> = {};
+        sentData: any = null;
+
+        constructor() {
+          instances.push(this);
+        }
+
+        open(_method: string, _url: string, _async: boolean) {}
+        setRequestHeader(k: string, v: string) {
+          this.headers[k] = v;
+        }
+        addEventListener(evt: string, fn: Function) {
+          (this.listeners[evt] = this.listeners[evt] || []).push(fn);
+        }
+        send(data: any) {
+          this.sentData = data;
+          setTimeout(() => {
+            if (instances.length === 1) {
+              // First attempt fails with 408
+              this.status = 408;
+              this.responseText = JSON.stringify({ error: { message: 'Request Timeout' } });
+              (this.listeners['load'] || []).forEach((fn) => fn());
+            } else {
+              // Second attempt succeeds with 201
+              this.status = 201;
+              this.responseText = JSON.stringify({ success: true, data: { files: [{ path: 'test.txt' }] } });
+              (this.listeners['load'] || []).forEach((fn) => fn());
+            }
+          }, 0);
+        }
+        abort() {}
+      }
+
+      const originalFormData = (globalThis as any).FormData;
+      const originalXHR = (globalThis as any).XMLHttpRequest;
+      (globalThis as any).FormData = MockFormData;
+      (globalThis as any).XMLHttpRequest = MockXHR;
+
+      try {
+        const item = {
+          spaceId: 'spc_00000000000000000000000000000001',
+          targetPath: '.',
+          file: { name: 'test.txt', size: 1024 },
+          idempotencyKey: 'idemp_key_fixed_synthetic_001',
+          status: 'pending',
+          percent: 0,
+          retryAttempt: 1,
+          abortController: new AbortController(),
+        };
+
+        const runner = new Function(
+          'item',
+          'UPLOAD_MAX_ATTEMPTS',
+          'UPLOAD_RETRY_DELAYS_MS',
+          'isRetriableUploadStatus',
+          'uploadSleep',
+          'getUploadDetailedErrorMessage',
+          'renderFilesUploadTray',
+          'processFileUploadQueue',
+          'showToast',
+          'tr',
+          't',
+          'getLocale',
+          'state',
+          `
+          let toastMsg = null;
+          let toastType = null;
+          showToast = (msg, type) => { toastMsg = msg; toastType = type; };
+          ${jsCode.slice(
+            jsCode.indexOf('async function uploadSingleFile('),
+            jsCode.indexOf('function enqueueFilesUpload(')
+          )}
+          return uploadSingleFile(item);
+        `
+        );
+
+        await runner(
+          item,
+          3,
+          [1, 1], // fast delays for unit test
+          (s: number) => [0, 408, 502, 503, 504].includes(s),
+          (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+          (s: number, r: string, f: string) => f,
+          () => {},
+          () => {},
+          () => {},
+          () => 'Uploaded successfully.',
+          () => 'Confirm',
+          () => 'en',
+          { csrfToken: 'fake_csrf', activeUploadCount: 1 }
+        );
+
+        expect(instances.length).toBe(2);
+        expect(instances[0].headers['Idempotency-Key']).toBe('idemp_key_fixed_synthetic_001');
+        expect(instances[1].headers['Idempotency-Key']).toBe('idemp_key_fixed_synthetic_001');
+        expect(instances[0].sentData).not.toBe(instances[1].sentData);
+        expect(item.status).toBe('completed');
+      } finally {
+        (globalThis as any).FormData = originalFormData;
+        (globalThis as any).XMLHttpRequest = originalXHR;
+      }
+    });
+
+    it('immediately fails without retrying on non-retriable error (413 Payload Too Large / 403 Forbidden)', async () => {
+      class MockFormData {
+        append() {}
+      }
+      const instances: any[] = [];
+      class MockXHR {
+        headers: Record<string, string> = {};
+        status: number = 0;
+        responseText: string = '';
+        upload = { addEventListener() {} };
+        listeners: Record<string, Function[]> = {};
+        constructor() {
+          instances.push(this);
+        }
+        open() {}
+        setRequestHeader(k: string, v: string) {
+          this.headers[k] = v;
+        }
+        addEventListener(evt: string, fn: Function) {
+          (this.listeners[evt] = this.listeners[evt] || []).push(fn);
+        }
+        send() {
+          setTimeout(() => {
+            this.status = 413;
+            this.responseText = JSON.stringify({ error: { message: 'Payload Too Large' } });
+            (this.listeners['load'] || []).forEach((fn) => fn());
+          }, 0);
+        }
+        abort() {}
+      }
+
+      const originalFormData = (globalThis as any).FormData;
+      const originalXHR = (globalThis as any).XMLHttpRequest;
+      (globalThis as any).FormData = MockFormData;
+      (globalThis as any).XMLHttpRequest = MockXHR;
+
+      try {
+        const item = {
+          spaceId: 'spc_00000000000000000000000000000001',
+          targetPath: '.',
+          file: { name: 'huge.iso', size: 999999999 },
+          idempotencyKey: 'idemp_key_fixed_synthetic_002',
+          status: 'pending',
+          percent: 0,
+          retryAttempt: 1,
+          abortController: new AbortController(),
+        };
+
+        let lastToast = '';
+        const runner = new Function(
+          'item',
+          'UPLOAD_MAX_ATTEMPTS',
+          'UPLOAD_RETRY_DELAYS_MS',
+          'isRetriableUploadStatus',
+          'uploadSleep',
+          'getUploadDetailedErrorMessage',
+          'renderFilesUploadTray',
+          'processFileUploadQueue',
+          'showToast',
+          'tr',
+          't',
+          'getLocale',
+          'state',
+          `
+          ${jsCode.slice(
+            jsCode.indexOf('async function uploadSingleFile('),
+            jsCode.indexOf('function enqueueFilesUpload(')
+          )}
+          return uploadSingleFile(item);
+        `
+        );
+
+        await runner(
+          item,
+          3,
+          [1, 1],
+          (s: number) => [0, 408, 502, 503, 504].includes(s),
+          () => Promise.resolve(),
+          (s: number, _r: string, f: string) => `Payload Too Large (HTTP ${s})`,
+          () => {},
+          () => {},
+          (msg: string) => { lastToast = msg; },
+          () => 'Failed',
+          () => 'Confirm',
+          () => 'en',
+          { csrfToken: 'fake_csrf', activeUploadCount: 1 }
+        );
+
+        expect(instances.length).toBe(1);
+        expect(item.status).toBe('failed');
+        expect(lastToast).toContain('HTTP 413');
+      } finally {
+        (globalThis as any).FormData = originalFormData;
+        (globalThis as any).XMLHttpRequest = originalXHR;
+      }
+    });
+
+    it('terminates and displays error when 3 attempts are exhausted on repeated temporary failures (502 / 504)', async () => {
+      class MockFormData {
+        append() {}
+      }
+      const instances: any[] = [];
+      class MockXHR {
+        headers: Record<string, string> = {};
+        status: number = 0;
+        responseText: string = '';
+        upload = { addEventListener() {} };
+        listeners: Record<string, Function[]> = {};
+        constructor() {
+          instances.push(this);
+        }
+        open() {}
+        setRequestHeader(k: string, v: string) {
+          this.headers[k] = v;
+        }
+        addEventListener(evt: string, fn: Function) {
+          (this.listeners[evt] = this.listeners[evt] || []).push(fn);
+        }
+        send() {
+          setTimeout(() => {
+            this.status = 504;
+            this.responseText = JSON.stringify({ error: { message: 'Gateway Timeout' } });
+            (this.listeners['load'] || []).forEach((fn) => fn());
+          }, 0);
+        }
+        abort() {}
+      }
+
+      const originalFormData = (globalThis as any).FormData;
+      const originalXHR = (globalThis as any).XMLHttpRequest;
+      (globalThis as any).FormData = MockFormData;
+      (globalThis as any).XMLHttpRequest = MockXHR;
+
+      try {
+        const item = {
+          spaceId: 'spc_00000000000000000000000000000001',
+          targetPath: '.',
+          file: { name: 'document.pdf', size: 2048 },
+          idempotencyKey: 'idemp_key_fixed_synthetic_003',
+          status: 'pending',
+          percent: 0,
+          retryAttempt: 1,
+          abortController: new AbortController(),
+        };
+
+        let lastToast = '';
+        const runner = new Function(
+          'item',
+          'UPLOAD_MAX_ATTEMPTS',
+          'UPLOAD_RETRY_DELAYS_MS',
+          'isRetriableUploadStatus',
+          'uploadSleep',
+          'getUploadDetailedErrorMessage',
+          'renderFilesUploadTray',
+          'processFileUploadQueue',
+          'showToast',
+          'tr',
+          't',
+          'getLocale',
+          'state',
+          `
+          ${jsCode.slice(
+            jsCode.indexOf('async function uploadSingleFile('),
+            jsCode.indexOf('function enqueueFilesUpload(')
+          )}
+          return uploadSingleFile(item);
+        `
+        );
+
+        await runner(
+          item,
+          3,
+          [1, 1],
+          (s: number) => [0, 408, 502, 503, 504].includes(s),
+          (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+          (s: number, _r: string, f: string) => `Gateway Timeout (HTTP ${s})`,
+          () => {},
+          () => {},
+          (msg: string) => { lastToast = msg; },
+          () => 'Failed',
+          () => 'Confirm',
+          () => 'en',
+          { csrfToken: 'fake_csrf', activeUploadCount: 1 }
+        );
+
+        expect(instances.length).toBe(3);
+        expect(item.status).toBe('failed');
+        expect(lastToast).toContain('HTTP 504');
+      } finally {
+        (globalThis as any).FormData = originalFormData;
+        (globalThis as any).XMLHttpRequest = originalXHR;
       }
     });
   });
