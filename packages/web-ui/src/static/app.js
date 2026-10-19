@@ -15408,6 +15408,161 @@ function formatToolName(toolName) {
   return cleanName;
 }
 
+function getProcessStepIcon(toolName) {
+  const lower = (toolName || '').toLowerCase();
+  if (['read', 'write', 'edit', 'read_file', 'write_file', 'edit_file'].includes(lower)) return '📄';
+  if (['bash', 'sh', 'shell', 'exec', 'command'].includes(lower)) return '💻';
+  if (['glob', 'grep', 'search', 'ripgrep'].includes(lower)) return '🔍';
+  if (['subagent', 'subagent_fork', 'workflow', 'create_task', 'agent', 'task'].includes(lower)) return '🤖';
+  if (['web_fetch', 'fetch', 'browser_open', 'browser_interact'].includes(lower)) return '🌐';
+  if (lower === 'thinking') return '💭';
+  return '🔧';
+}
+
+function formatProcessDuration(durationMs) {
+  if (typeof durationMs !== 'number' || durationMs <= 0) return '';
+  const totalSec = Math.round(durationMs / 1000);
+  if (totalSec < 60) return `${(durationMs / 1000).toFixed(totalSec < 5 ? 1 : 0)}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m${s}s`;
+}
+
+function createProcessCardElement(steps, mode, defaultOpen) {
+  const card = document.createElement('div');
+  card.className = `process-card ${mode} ${defaultOpen ? 'open' : ''}`;
+
+  const header = document.createElement('div');
+  header.className = 'process-card-header';
+  header.setAttribute('role', 'button');
+  header.setAttribute('tabindex', '0');
+
+  const headerLeft = document.createElement('div');
+  headerLeft.className = 'process-card-header-left';
+
+  const chevron = document.createElement('span');
+  chevron.className = 'process-card-chevron';
+  chevron.textContent = '▶';
+
+  const headerText = document.createElement('span');
+  headerText.className = 'process-card-header-text';
+
+  const stepCount = steps ? steps.length : 0;
+  let totalDurationMs = 0;
+  for (const st of steps || []) {
+    if (typeof st.durationMs === 'number') {
+      totalDurationMs += st.durationMs;
+    } else if (st.startedAt && st.endedAt) {
+      const s = new Date(st.startedAt).getTime();
+      const e = new Date(st.endedAt).getTime();
+      if (!Number.isNaN(s) && !Number.isNaN(e) && e >= s) {
+        totalDurationMs += (e - s);
+      }
+    }
+  }
+
+  const durationStr = formatProcessDuration(totalDurationMs);
+  const summaryPrefix = getLocale() === 'zh-CN' ? `${stepCount} 步` : `${stepCount} step${stepCount === 1 ? '' : 's'}`;
+  const summaryFull = durationStr ? `${summaryPrefix} · ${durationStr}` : summaryPrefix;
+
+  if (mode === 'live') {
+    const runningStep = (steps && steps.length > 0) ? steps[steps.length - 1] : null;
+    const runningName = runningStep ? formatToolName(runningStep.name) : '';
+    const runningSummary = runningStep?.summary ? ` (${runningStep.summary})` : '';
+    const spinner = document.createElement('span');
+    spinner.className = 'process-step-spinner';
+    headerLeft.appendChild(spinner);
+    headerText.textContent = runningStep
+      ? (getLocale() === 'zh-CN' ? `正在使用 ${runningName}${runningSummary}` : `Using ${runningName}${runningSummary}`)
+      : (getLocale() === 'zh-CN' ? '正在处理…' : 'Processing...');
+  } else {
+    headerLeft.appendChild(chevron);
+    headerText.textContent = summaryFull;
+  }
+
+  header.appendChild(headerLeft);
+
+  const toggleOpen = (ev) => {
+    ev.stopPropagation();
+    card.classList.toggle('open');
+  };
+  header.addEventListener('click', toggleOpen);
+  header.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      toggleOpen(ev);
+    }
+  });
+
+  card.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'process-card-body';
+
+  for (const st of steps || []) {
+    const row = document.createElement('div');
+    row.className = `process-step-row status-${st.status || 'running'}`;
+
+    const rowLeft = document.createElement('div');
+    rowLeft.className = 'process-step-left';
+
+    const icon = document.createElement('span');
+    icon.className = 'process-step-icon';
+    icon.textContent = getProcessStepIcon(st.name);
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'process-step-name';
+    nameEl.textContent = formatToolName(st.name);
+
+    rowLeft.appendChild(icon);
+    rowLeft.appendChild(nameEl);
+
+    if (st.summary) {
+      const summaryEl = document.createElement('span');
+      summaryEl.className = 'process-step-summary';
+      summaryEl.textContent = st.summary;
+      summaryEl.title = st.summary;
+      rowLeft.appendChild(summaryEl);
+    }
+
+    const rowRight = document.createElement('div');
+    rowRight.className = 'process-step-right';
+
+    if (st.facts) {
+      const factsEl = document.createElement('span');
+      factsEl.className = 'process-step-facts';
+      factsEl.textContent = st.facts;
+      rowRight.appendChild(factsEl);
+    }
+
+    if (st.status === 'running') {
+      const sp = document.createElement('span');
+      sp.className = 'process-step-spinner';
+      rowRight.appendChild(sp);
+    } else {
+      const dur = typeof st.durationMs === 'number' ? formatProcessDuration(st.durationMs) : '';
+      if (dur) {
+        const durEl = document.createElement('span');
+        durEl.className = 'process-step-duration';
+        durEl.textContent = dur;
+        rowRight.appendChild(durEl);
+      }
+      const statusBadge = document.createElement('span');
+      const isFailed = st.status === 'failed';
+      statusBadge.className = `badge badge-xs ${isFailed ? 'badge-danger' : 'badge-success'}`;
+      statusBadge.textContent = isFailed ? (getLocale() === 'zh-CN' ? '失败' : 'failed') : (getLocale() === 'zh-CN' ? '完成' : 'done');
+      rowRight.appendChild(statusBadge);
+    }
+
+    row.appendChild(rowLeft);
+    row.appendChild(rowRight);
+    body.appendChild(row);
+  }
+
+  card.appendChild(body);
+  return card;
+}
+
 // ----------------------------------------------------
 // Session Turn History Inspector (GET /api/sessions/:id/turns)
 // Contract fields only: status, startedAt, finishedAt
@@ -20409,6 +20564,40 @@ function renderMessages(preserveScroll = false) {
 
     card.appendChild(meta);
 
+    // If message is assistant with a turnId or cached steps, mount ProcessCard
+    if (msg.role === 'assistant') {
+      const turnId = msg.turnId;
+      const cachedSteps = turnId && state.turnStepsCache ? state.turnStepsCache.get(turnId) : null;
+      if (cachedSteps && cachedSteps.length > 0) {
+        const processCard = createProcessCardElement(cachedSteps, 'settled', false);
+        card.appendChild(processCard);
+      } else if (turnId && state.currentSessionId) {
+        // Create lazy placeholder ProcessCard
+        const processCard = createProcessCardElement([], 'settled', false);
+        processCard.classList.add('hidden'); // hidden until steps loaded
+        card.appendChild(processCard);
+
+        if (!state.loadingStepsTurnIds) state.loadingStepsTurnIds = new Set();
+        if (!state.loadingStepsTurnIds.has(turnId)) {
+          state.loadingStepsTurnIds.add(turnId);
+          apiRequest(`/api/sessions/${state.currentSessionId}/turns/${encodeURIComponent(turnId)}/steps`)
+            .then((res) => {
+              const steps = res && res.data && Array.isArray(res.data.steps) ? res.data.steps : [];
+              if (!state.turnStepsCache) state.turnStepsCache = new Map();
+              state.turnStepsCache.set(turnId, steps);
+              if (steps.length > 0 && processCard.parentNode) {
+                const newCard = createProcessCardElement(steps, 'settled', false);
+                processCard.parentNode.replaceChild(newCard, processCard);
+              }
+            })
+            .catch(() => {})
+            .finally(() => {
+              state.loadingStepsTurnIds.delete(turnId);
+            });
+        }
+      }
+    }
+
     // Render reply quote card if msg has replyReference
     if (msg.replyReference && msg.replyReference.messageId) {
       const quoteCard = document.createElement('div');
@@ -20662,6 +20851,12 @@ function renderMessages(preserveScroll = false) {
     }
 
     card.appendChild(meta);
+
+    if (stream.steps && Array.isArray(stream.steps) && stream.steps.length > 0) {
+      const liveProcessCard = createProcessCardElement(stream.steps, 'live', true);
+      card.appendChild(liveProcessCard);
+    }
+
     card.appendChild(content);
     container.appendChild(card);
   }
@@ -21188,6 +21383,11 @@ async function pollEvents(sessionId) {
                 state.messages.splice(insertIdx, 0, msg);
               }
               if (msg.role === 'assistant') {
+                if (state.streamingState && state.streamingState.steps && state.streamingState.steps.length > 0) {
+                  const targetTurnId = msg.turnId || `turn_from_stream_${msg.id}`;
+                  if (!state.turnStepsCache) state.turnStepsCache = new Map();
+                  state.turnStepsCache.set(targetTurnId, state.streamingState.steps);
+                }
                 state.streamingState = null;
               }
               hasChanges = true;
@@ -21262,20 +21462,87 @@ async function pollEvents(sessionId) {
           case 'tool_status': {
             const toolName = ev.toolName || (ev.payload && ev.payload.toolName) || 'tool';
             const status = ev.status || (ev.payload && ev.payload.status) || 'started';
+            const callId = ev.callId || (ev.payload && ev.payload.callId) || undefined;
+            const summary = ev.summary || (ev.payload && ev.payload.summary) || undefined;
+            const facts = ev.facts || (ev.payload && ev.payload.facts) || undefined;
+            const timestamp = ev.timestamp || new Date().toISOString();
+
             if (!state.streamingState) {
               state.streamingState = {
                 sessionId,
                 streamId: `msgstream_${Date.now()}`,
                 text: '',
                 accumulatedLength: 0,
-                createdAt: ev.timestamp || new Date().toISOString(),
+                createdAt: timestamp,
                 isThinking: false,
                 toolStatus: { toolName, status },
+                steps: [],
                 streamEnded: false,
                 cancelled: false,
               };
             } else {
               state.streamingState.toolStatus = { toolName, status };
+              if (!Array.isArray(state.streamingState.steps)) {
+                state.streamingState.steps = [];
+              }
+            }
+
+            const streamSteps = state.streamingState.steps;
+            const lowerName = toolName.toLowerCase();
+            const isSubagent = lowerName === 'subagent' || lowerName === 'subagent_fork' || lowerName === 'create_task' || lowerName === 'workflow';
+            const kind = isSubagent ? 'task' : 'tool';
+
+            if (status === 'started') {
+              streamSteps.push({
+                id: callId || `step_${streamSteps.length + 1}`,
+                kind,
+                name: toolName,
+                status: 'running',
+                startedAt: timestamp,
+                ...(summary ? { summary } : {}),
+              });
+            } else if (status === 'completed' || status === 'failed') {
+              let matched = null;
+              if (callId) {
+                for (let i = streamSteps.length - 1; i >= 0; i--) {
+                  if (streamSteps[i].id === callId) {
+                    matched = streamSteps[i];
+                    break;
+                  }
+                }
+              }
+              if (!matched) {
+                for (let i = streamSteps.length - 1; i >= 0; i--) {
+                  if (streamSteps[i].name === toolName && streamSteps[i].status === 'running') {
+                    matched = streamSteps[i];
+                    break;
+                  }
+                }
+              }
+
+              if (matched) {
+                matched.status = status;
+                matched.endedAt = timestamp;
+                if (facts && !matched.facts) matched.facts = facts;
+                if (summary && !matched.summary) matched.summary = summary;
+                const s = new Date(matched.startedAt).getTime();
+                const e = new Date(timestamp).getTime();
+                if (!Number.isNaN(s) && !Number.isNaN(e) && e >= s) {
+                  matched.durationMs = e - s;
+                }
+              } else {
+                streamSteps.push({
+                  id: callId || `step_${streamSteps.length + 1}`,
+                  kind,
+                  name: toolName,
+                  status,
+                  startedAt: timestamp,
+                  endedAt: timestamp,
+                  durationMs: 0,
+                  ...(summary ? { summary } : {}),
+                  ...(facts ? { facts } : {}),
+                });
+              }
             }
             hasChanges = true;
             break;

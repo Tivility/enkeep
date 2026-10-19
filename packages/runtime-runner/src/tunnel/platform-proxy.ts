@@ -2489,9 +2489,12 @@ export class PlatformProxyHandler implements StreamHandler {
             case 'tool_started': {
               eventType = 'tool_status';
               const rawName = p['toolName'] ?? p['name'];
+              const summary = typeof p['summary'] === 'string' ? p['summary'].slice(0, 120) : undefined;
               sanitizedPayload = {
                 toolName: typeof rawName === 'string' ? rawName.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 64) : 'tool',
                 status: 'started',
+                ...(typeof p['callId'] === 'string' ? { callId: p['callId'].slice(0, 64) } : {}),
+                ...(summary ? { summary } : {}),
               };
               break;
             }
@@ -2499,9 +2502,12 @@ export class PlatformProxyHandler implements StreamHandler {
               eventType = 'tool_status';
               const rawName = p['toolName'] ?? p['name'];
               const rawStatus = p['status'] === 'failed' ? 'failed' : 'completed';
+              const facts = typeof p['facts'] === 'string' ? p['facts'].slice(0, 60) : undefined;
               sanitizedPayload = {
                 toolName: typeof rawName === 'string' ? rawName.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 64) : 'tool',
                 status: rawStatus,
+                ...(typeof p['callId'] === 'string' ? { callId: p['callId'].slice(0, 64) } : {}),
+                ...(facts ? { facts } : {}),
               };
               break;
             }
@@ -2509,9 +2515,14 @@ export class PlatformProxyHandler implements StreamHandler {
               eventType = 'tool_status';
               const rawName = p['toolName'] ?? p['name'];
               const rawStatus = (p['status'] === 'started' || p['status'] === 'completed' || p['status'] === 'failed') ? p['status'] : 'started';
+              const summary = typeof p['summary'] === 'string' ? p['summary'].slice(0, 120) : undefined;
+              const facts = typeof p['facts'] === 'string' ? p['facts'].slice(0, 60) : undefined;
               sanitizedPayload = {
                 toolName: typeof rawName === 'string' ? rawName.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 64) : 'tool',
                 status: rawStatus,
+                ...(typeof p['callId'] === 'string' ? { callId: p['callId'].slice(0, 64) } : {}),
+                ...(summary ? { summary } : {}),
+                ...(facts ? { facts } : {}),
               };
               break;
             }

@@ -1089,6 +1089,16 @@ export class EventRelayService implements IEventRelayService {
           : undefined;
         streamState.activeToolName = toolName;
 
+        let summary: string | undefined;
+        if (typeof args === 'string') {
+          summary = args.slice(0, 120);
+        } else if (args && typeof args === 'object') {
+          const rawVal = args.file_path ?? args.path ?? args.cmd ?? args.command ??
+                         args.pattern ?? args.query ?? args.url ?? args.description ??
+                         args.prompt ?? args.name;
+          if (rawVal !== undefined) summary = String(rawVal).slice(0, 120);
+        }
+
         if (callId) {
           let toolMap = this.sessionToolCalls.get(sessionId);
           if (!toolMap) {
@@ -1111,6 +1121,9 @@ export class EventRelayService implements IEventRelayService {
         };
         if (callId) {
           payload.callId = callId;
+        }
+        if (summary) {
+          payload.summary = summary;
         }
 
         const frame: ContainerStreamingEventFrame = {
@@ -1187,12 +1200,30 @@ export class EventRelayService implements IEventRelayService {
           hasContentError
         );
 
+        let facts: string | undefined;
+        const lowerName = toolName.toLowerCase();
+        if (lowerName === 'bash' || lowerName === 'sh' || lowerName === 'exec') {
+          const rawErr = String(event.data.error || (event.data as any).isError || '');
+          const rawOutput = typeof (event.data as any).output === 'string'
+            ? (event.data as any).output
+            : typeof (event.data.message as any)?.content === 'string'
+              ? (event.data.message as any).content
+              : '';
+          const exitMatch = (rawErr + ' ' + rawOutput).match(/exit code:?\s*(\d+)/i);
+          if (exitMatch) {
+            facts = `exit ${exitMatch[1]}`;
+          }
+        }
+
         const payload: Record<string, unknown> = {
           toolName,
           status: hasError ? 'failed' : 'completed',
         };
         if (resolvedCallId) {
           payload.callId = resolvedCallId;
+        }
+        if (facts) {
+          payload.facts = facts.slice(0, 60);
         }
 
         const frame: ContainerStreamingEventFrame = {

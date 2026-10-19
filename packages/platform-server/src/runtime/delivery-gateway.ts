@@ -14,6 +14,7 @@ import {
   type RuntimeMountResolver,
   type ExtensionActivationPlan,
   type ExtensionPlanResolver,
+  type ProcessStepItem,
 } from '@enkeep/platform-core';
 import {
   DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
@@ -1548,6 +1549,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       content: replyText,
       status: 'delivered',
       createdAt: assistantCreatedAt,
+      turnId,
     };
 
     let inTx = false;
@@ -2590,6 +2592,123 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     });
   }
 
+  private collectTurnStepsJson(sessionId: string, turnId: string): string {
+    try {
+      const rows = this.db.prepare(`
+        SELECT type, payload, created_at
+        FROM web_events
+        WHERE session_id = ?
+          AND type = 'tool_status'
+          AND (
+            json_extract(payload, '$.turnId') = ?
+            OR json_extract(payload, '$.turn_id') = ?
+            OR (json_extract(payload, '$.turnId') IS NULL AND json_extract(payload, '$.turn_id') IS NULL)
+          )
+        ORDER BY rowid ASC
+        LIMIT 200
+      `).all(sessionId, turnId, turnId) as Array<{ type: string; payload: string; created_at: string }>;
+
+      const steps: ProcessStepItem[] = [];
+      const openStepsByCallId = new Map<string, ProcessStepItem>();
+      const openStepsByName = new Map<string, ProcessStepItem[]>();
+
+      for (const row of rows) {
+        let payload: any = {};
+        try {
+          payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+        } catch {
+          continue;
+        }
+
+        const toolName = typeof payload?.toolName === 'string' && payload.toolName ? payload.toolName : (payload?.name || 'tool');
+        const status = payload?.status;
+        const callId = typeof payload?.callId === 'string' && payload.callId ? payload.callId : undefined;
+        const summary = typeof payload?.summary === 'string' ? payload.summary.slice(0, 120) : undefined;
+        const facts = typeof payload?.facts === 'string' ? payload.facts.slice(0, 60) : undefined;
+        const createdAt = row.created_at || new Date().toISOString();
+
+        const lowerName = toolName.toLowerCase();
+        const isSubagent = lowerName === 'subagent' || lowerName === 'subagent_fork' || lowerName === 'create_task' || lowerName === 'workflow';
+        const kind = isSubagent ? 'task' : 'tool';
+
+        if (status === 'started') {
+          const stepId = callId || `step_${steps.length + 1}`;
+          const stepItem: ProcessStepItem = {
+            id: stepId,
+            kind,
+            name: toolName,
+            status: 'running',
+            startedAt: createdAt,
+            ...(summary ? { summary } : {}),
+          };
+          steps.push(stepItem);
+
+          if (callId) {
+            openStepsByCallId.set(callId, stepItem);
+          } else {
+            let list = openStepsByName.get(toolName);
+            if (!list) {
+              list = [];
+              openStepsByName.set(toolName, list);
+            }
+            list.push(stepItem);
+          }
+        } else if (status === 'completed' || status === 'failed') {
+          let matchedStep: ProcessStepItem | undefined;
+          if (callId && openStepsByCallId.has(callId)) {
+            matchedStep = openStepsByCallId.get(callId);
+            openStepsByCallId.delete(callId);
+          } else {
+            const list = openStepsByName.get(toolName);
+            if (list && list.length > 0) {
+              matchedStep = list.shift();
+            }
+          }
+
+          if (matchedStep) {
+            matchedStep.status = status;
+            matchedStep.endedAt = createdAt;
+            if (facts && !matchedStep.facts) matchedStep.facts = facts;
+            if (summary && !matchedStep.summary) matchedStep.summary = summary;
+            const startMs = new Date(matchedStep.startedAt).getTime();
+            const endMs = new Date(createdAt).getTime();
+            if (!Number.isNaN(startMs) && !Number.isNaN(endMs) && endMs >= startMs) {
+              matchedStep.durationMs = endMs - startMs;
+            }
+          } else {
+            // Standalone completed step without a started frame
+            const stepId = callId || `step_${steps.length + 1}`;
+            steps.push({
+              id: stepId,
+              kind,
+              name: toolName,
+              status,
+              startedAt: createdAt,
+              endedAt: createdAt,
+              durationMs: 0,
+              ...(summary ? { summary } : {}),
+              ...(facts ? { facts } : {}),
+            });
+          }
+        }
+      }
+
+      // Mark any remaining running steps as completed/settled
+      const nowIso = new Date().toISOString();
+      for (const step of steps) {
+        if (step.status === 'running') {
+          step.status = 'completed';
+          step.endedAt = nowIso;
+        }
+      }
+
+      return JSON.stringify(steps.slice(0, 100));
+    } catch (err) {
+      console.warn('[delivery-gateway] failed to collect turn steps:', err);
+      return '[]';
+    }
+  }
+
   async finalizeCompletedTurn(params: {
     userId: string;
     sessionId: string;
@@ -2675,12 +2794,13 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       }
 
       // 1b. CAS turn_runs from running (or queued on reconcile) -> completed
+      const stepsJson = this.collectTurnStepsJson(sessionId, turnId);
       const turnStmt = this.db.prepare(`
         UPDATE turn_runs
-        SET status = 'completed', finished_at = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = 'completed', finished_at = ?, steps_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status IN ('running', 'queued')
       `);
-      const turnRes = turnStmt.run(nowIso, turnId, userId);
+      const turnRes = turnStmt.run(nowIso, stepsJson, turnId, userId);
       if (safeChangesCount(turnRes.changes) === 0) {
         this.db.exec('ROLLBACK');
         inTx = false;
@@ -2713,7 +2833,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
       // 4. Insert assistant message into web_messages (idempotent: check if already exists for this turn)
       const existingMsg = this.db.prepare(`
-        SELECT id, content, status, created_at FROM web_messages
+        SELECT id, content, status, created_at, turn_id as turnId FROM web_messages
         WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
       `).get(sessionId, userId, turnId) as WebMessageRecord | undefined;
 
@@ -2740,6 +2860,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           content: executionResult.replyText,
           status: 'delivered',
           createdAt: nowIso,
+          turnId,
         };
 
         // 5. Insert assistant message event into web_events
@@ -2920,11 +3041,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         return;
       }
 
+      const stepsJson = this.collectTurnStepsJson(sessionId, turnId);
       this.db.prepare(`
         UPDATE turn_runs
-        SET status = 'interrupted', error = ?, finished_at = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = 'interrupted', error = ?, finished_at = ?, steps_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status IN ('queued', 'running')
-      `).run(reason, nowIso, turnId, userId);
+      `).run(reason, nowIso, stepsJson, turnId, userId);
 
       this.db.prepare(`
         UPDATE delivery_inbox
@@ -3131,11 +3253,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       inTx = true;
 
       // 1. Update turn_runs to failed
+      const stepsJson = this.collectTurnStepsJson(sessionId, turnId);
       this.db.prepare(`
         UPDATE turn_runs
-        SET status = 'failed', error = ?, finished_at = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = 'failed', error = ?, finished_at = ?, steps_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND user_id = ? AND status IN ('queued', 'running')
-      `).run(isTimeout ? 'TURN_TIMEOUT' : safeErrorMessage, nowIso, turnId, userId);
+      `).run(isTimeout ? 'TURN_TIMEOUT' : safeErrorMessage, nowIso, stepsJson, turnId, userId);
 
       // 2. Update delivery_inbox to failed
       this.db.prepare(`
@@ -3161,7 +3284,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       // 3c. If timeout or upstream transient, insert assistant system notice message into web_messages
       if ((isTimeout || isUpstreamTransient) && noticeContent) {
         const existingAssistantMsg = this.db.prepare(`
-          SELECT id, content, status, created_at FROM web_messages
+          SELECT id, content, status, created_at, turn_id as turnId FROM web_messages
           WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
         `).get(sessionId, userId, turnId) as WebMessageRecord | undefined;
 
@@ -3187,6 +3310,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             content: noticeContent,
             status: 'delivered',
             createdAt: nowIso,
+            turnId,
           };
 
           const eventPayload = JSON.stringify({ message: assistantMsgRecord });
@@ -3641,15 +3765,16 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         return false;
       }
 
+      const stepsJson = this.collectTurnStepsJson(sessionId, turnId);
       let inTx = false;
       this.db.exec('BEGIN IMMEDIATE');
       inTx = true;
       try {
         const turnRes = this.db.prepare(`
           UPDATE turn_runs
-          SET status = 'interrupted', error = 'Turn cancelled by user', finished_at = ?, updated_at = CURRENT_TIMESTAMP
+          SET status = 'interrupted', error = 'Turn cancelled by user', finished_at = ?, steps_json = ?, updated_at = CURRENT_TIMESTAMP
           WHERE turn_id = ? AND user_id = ? AND status = 'running'
-        `).run(nowIso, turnId, userId);
+        `).run(nowIso, stepsJson, turnId, userId);
 
         if (safeChangesCount(turnRes.changes) === 0) {
           this.db.exec('ROLLBACK');

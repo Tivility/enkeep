@@ -295,6 +295,7 @@ export function parseTurnRunRow(row: DbRow): TurnRun {
     finishedAt: getNullableString(row, 'finished_at'),
     error: getNullableString(row, 'error'),
     executionMode: (getNullableString(row, 'execution_mode') ?? 'container') as ExecutionMode,
+    stepsJson: getNullableString(row, 'steps_json') ?? undefined,
     createdAt: getString(row, 'created_at'),
     updatedAt: getString(row, 'updated_at'),
   };

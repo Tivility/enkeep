@@ -5962,3 +5962,152 @@ aside.workspace-sidebar.is-collapsed {
   border-color: var(--danger-border);
 }
 
+/* ==========================================================================
+   Process Card (Tool & Reasoning Steps)
+   ========================================================================== */
+.process-card {
+  margin: 0.35rem 0 0.65rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+  font-size: 0.8rem;
+  transition: border-color var(--transition-fast);
+}
+
+.process-card.live {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.process-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.4rem 0.65rem;
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+}
+
+.process-card-header:hover,
+.process-card-header:focus-visible {
+  background: var(--hover-overlay);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.process-card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.process-card-header-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.process-card-chevron {
+  display: inline-block;
+  font-size: 0.7rem;
+  transition: transform var(--transition-fast);
+  color: var(--text-muted);
+}
+
+.process-card.open .process-card-chevron {
+  transform: rotate(90deg);
+}
+
+.process-card-body {
+  display: none;
+  border-top: 1px solid var(--border-subtle);
+  padding: 0.4rem 0.65rem;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.process-card.open .process-card-body {
+  display: block;
+}
+
+.process-step-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.process-step-row:last-child {
+  border-bottom: none;
+}
+
+.process-step-left {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.process-step-icon {
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
+.process-step-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+.process-step-summary {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.process-step-right {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.process-step-duration {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.process-step-facts {
+  padding: 0.1rem 0.35rem;
+  border-radius: var(--radius-xs);
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+
+.process-step-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--accent-light);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+

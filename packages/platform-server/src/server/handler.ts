@@ -3110,6 +3110,38 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           return;
         }
 
+        // 6.1.5-steps /api/sessions/:sessionId/turns/:turnId/steps
+        const turnStepsMatch = subPath.match(/^\/turns\/([^\/]+)\/steps$/);
+        if (turnStepsMatch) {
+          if (method !== "GET") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          const turnId = turnStepsMatch[1];
+          const session = await platformApi.getSession(user.id, sessionId);
+          if (!session) {
+            throw new NotFoundError(`Session "${sessionId}" not found`);
+          }
+          const targetDb = db ?? (storage as any)?.db;
+          if (!targetDb) {
+            throw new PlatformError("Database unavailable", "INTERNAL_ERROR", 500);
+          }
+          const row = targetDb.prepare(`
+            SELECT steps_json FROM turn_runs
+            WHERE route_id = ? AND turn_id = ? AND user_id = ? LIMIT 1
+          `).get(sessionId, turnId, user.id) as { steps_json?: string } | undefined;
+
+          let steps: any[] = [];
+          if (row?.steps_json) {
+            try {
+              steps = JSON.parse(row.steps_json);
+            } catch {
+              steps = [];
+            }
+          }
+          sendJsonResponse(res, 200, createSuccessEnvelope({ turnId, steps }));
+          return;
+        }
+
         // 6.1.6 /api/sessions/:sessionId/turn/current
         if (subPath === "/turn/current") {
           if (method !== "GET") {
