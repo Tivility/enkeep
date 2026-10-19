@@ -233,7 +233,7 @@
                   <span id="session-status-badge" class="badge badge-active hidden" data-i18n="chat.statusActive">active</span>
                   <span id="session-generation-badge" class="badge badge-generation hidden">Gen 1</span>
                   <span id="session-turn-status-badge" class="badge badge-running hidden" data-i18n="chat.statusThinking">Thinking...</span>
-                  <span id="session-model-badge" class="badge badge-info hidden" title="Current effective model" data-i18n-title="models.kpiRouting">⚡ Model</span>
+                  <button id="session-model-badge" class="badge badge-info hidden" title="Current effective model" data-i18n-title="chat.modelTriggerTitle" aria-haspopup="dialog">⚡ Model</button>
                   <button id="btn-session-bg" class="badge badge-info hidden" title="Background tasks" data-i18n-title="tasks.bgHeaderTitle">0 Background</button>
                 </div>
                 <span id="current-session-meta" class="session-meta">Active Session: -</span>
@@ -712,6 +712,35 @@
         <div class="modal-actions">
           <button type="button" class="btn btn-secondary" data-close="modal-session-window" data-i18n="modal.cancel">Cancel</button>
           <button type="submit" id="btn-submit-session-window" class="btn btn-primary" data-i18n="common.save">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Session Model Picker Modal -->
+  <div id="modal-session-model" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="session-model-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="session-model-modal-title" data-i18n="chat.modelPickerTitle">Session Model &amp; Reasoning Effort</h3>
+        <button class="modal-close" data-close="modal-session-model" title="Close" data-i18n-title="modal.close">&times;</button>
+      </div>
+      <form id="form-session-model">
+        <div class="form-group">
+          <label data-i18n="chat.modelEffectiveLabel">Current Effective Model</label>
+          <div id="session-model-effective" class="text-sm font-semibold text-accent"></div>
+        </div>
+        <div class="form-group">
+          <label for="session-model-select" data-i18n="chat.modelSelectLabel">Model Selection</label>
+          <select id="session-model-select" class="form-select"></select>
+        </div>
+        <div class="form-group hidden" id="session-model-effort-group">
+          <label data-i18n="chat.effortSelectLabel">Reasoning Effort</label>
+          <div id="session-model-effort-buttons" class="effort-btn-group"></div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="btn-session-model-reset" class="btn btn-secondary btn-danger-hover mr-auto hidden" data-i18n="chat.btnResetOverride">Restore Default</button>
+          <button type="button" class="btn btn-secondary" data-close="modal-session-model" data-i18n="modal.cancel">Cancel</button>
+          <button type="submit" id="btn-submit-session-model" class="btn btn-primary" data-i18n="common.save">Save</button>
         </div>
       </form>
     </div>

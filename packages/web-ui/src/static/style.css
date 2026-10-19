@@ -5909,3 +5909,46 @@ aside.workspace-sidebar.is-collapsed {
   vertical-align: middle;
 }
 
+/* Session Model & Reasoning Effort Picker Modal */
+#session-model-badge {
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+#session-model-badge:hover {
+  filter: brightness(1.15);
+  border-color: var(--accent);
+}
+
+.effort-btn-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.25rem;
+}
+
+.effort-btn {
+  padding: 0.3rem 0.65rem;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-xs);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.effort-btn:hover {
+  background: var(--bg-card-hover);
+  color: var(--text-primary);
+  border-color: var(--accent-light);
+}
+
+.effort-btn.active {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+  color: var(--accent-light);
+  font-weight: 600;
+}
+
