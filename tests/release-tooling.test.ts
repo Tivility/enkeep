@@ -21,6 +21,9 @@ import {
   formatUtcTimestamp,
   findLatestPlistBackup,
   verifyContainers,
+  buildRestartPlatformCommands,
+  DEFAULT_PREFLIGHT_TIMEOUT_SECONDS,
+  DEFAULT_PREFLIGHT_INTERVAL_SECONDS,
 } from '../scripts/deploy-release.mjs';
 import { planPruneWorktrees, executePrune } from '../scripts/prune-release-worktrees.mjs';
 import * as fs from 'node:fs';
@@ -834,6 +837,33 @@ describe('Deploy Tooling Enhancements', () => {
           expect(() => verifyContainers(psOut, 'enkeep-test-', 'enkeep-runtime:target-img', true, 59999)).not.toThrow();
         });
       });
+    });
+  });
+
+  describe('Quiescence wait defaults and platform restart', () => {
+    it('waits up to 24 hours for quiescence by default', () => {
+      const config = resolveDeployConfig([]);
+      expect(DEFAULT_PREFLIGHT_TIMEOUT_SECONDS).toBe(86400);
+      expect(config.preflightTimeoutSeconds).toBe(DEFAULT_PREFLIGHT_TIMEOUT_SECONDS);
+      expect(config.preflightIntervalSeconds).toBe(DEFAULT_PREFLIGHT_INTERVAL_SECONDS);
+    });
+
+    it('restart-platform waits for quiescence before an in-place LaunchAgent restart', () => {
+      const { preflightCmd, restartCmd } = buildRestartPlatformCommands(
+        {
+          dataDir: '/tmp/enkeep-test/data',
+          port: 3900,
+          preflightDueMinutes: 10,
+          preflightTimeoutSeconds: 86400,
+          preflightIntervalSeconds: 120,
+          launchdLabel: 'com.example.enkeep',
+        },
+        '/tmp/enkeep-test/release/packages/demo-runner/dist/demo-runner.js'
+      );
+      expect(preflightCmd).toContain(' preflight ');
+      expect(preflightCmd).toContain('--wait');
+      expect(preflightCmd).toContain('--timeout-seconds 86400');
+      expect(restartCmd).toBe('launchctl kickstart -k gui/$(id -u)/com.example.enkeep');
     });
   });
 });
