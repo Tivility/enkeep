@@ -27,6 +27,7 @@ import type {
 } from '@enkeep/web-channel';
 import {
   buildNativeContextId,
+  expandMergeForwardContent,
   isCardActionEvent,
   messageMentionsBot,
   parseLarkCardAction,
@@ -612,6 +613,30 @@ export class LarkChannelGateway {
     fallbackNotice = resolved.fallbackNotice;
 
     // 6. Clean Text & Dispatch to Enkeep Agent via RuntimeGateway
+    if (parsed.msgType === 'merge_forward' && typeof this.transport.getMessage === 'function') {
+      try {
+        const fetched = await this.transport.getMessage(parsed.messageId);
+        if (fetched) {
+          const items = Array.isArray(fetched)
+            ? fetched
+            : (Array.isArray(fetched.items) ? fetched.items : (Array.isArray(fetched.data?.items) ? fetched.data.items : []));
+          if (items.length > 0) {
+            // Note: sub-message image download requires parent merge_forward's messageId
+            const forwardResult = expandMergeForwardContent(items, parsed.messageId);
+            parsed.text = forwardResult.text;
+            if (forwardResult.resources.length > 0) {
+              parsed.resources = [...(parsed.resources || []), ...forwardResult.resources];
+            }
+          }
+        }
+      } catch (getErr) {
+        // Fallback to placeholder without crashing
+        if (!parsed.text || parsed.text === rawEvent.event?.message?.content) {
+          parsed.text = '[合并转发消息]';
+        }
+      }
+    }
+
     const cleanedText = stripBotMentions(parsed.text, parsed.mentions, this.botOpenId);
     // Derive stable platform idempotency key from account + nativeEventId
     const platformIdempotencyKey = this.deriveIdempotencyKey(nativeEventId);
@@ -674,11 +699,12 @@ export class LarkChannelGateway {
           const batch = imageResources.slice(i, i + CONCURRENCY);
           const results = await Promise.allSettled(
             batch.map(async (res) => {
-              const dl = await this.transport.downloadImageResource!(parsed.messageId, res.key);
+              const targetMsgId = res.messageId || parsed.messageId;
+              const dl = await this.transport.downloadImageResource!(targetMsgId, res.key);
               if (!dl) {
                 throw new Error(`Resource not found for key ${res.key}`);
               }
-              return { ...dl, fileKey: res.key };
+              return { ...dl, fileKey: res.key, messageId: targetMsgId };
             })
           );
 
@@ -808,7 +834,7 @@ export class LarkChannelGateway {
               const ingested = await this.imageAttachmentIngestor.ingestImage({
                 userId: this.userId,
                 spaceId: binding.spaceId,
-                messageId: parsed.messageId,
+                messageId: (img as any).messageId || parsed.messageId,
                 fileKey: img.fileKey,
                 buffer: img.buffer,
                 contentType: img.mimeType,
@@ -954,7 +980,7 @@ export class LarkChannelGateway {
 
         try {
           downloadedFile = await this.transport.downloadFileResource(
-            parsed.messageId,
+            targetFile.messageId || parsed.messageId,
             targetFile.key,
             targetFile.size !== undefined ? { declaredSize: targetFile.size } : undefined
           );
@@ -1077,7 +1103,7 @@ export class LarkChannelGateway {
             const ingestedFile = await this.imageAttachmentIngestor.ingestFile({
               userId: this.userId,
               spaceId: binding.spaceId,
-              messageId: parsed.messageId,
+              messageId: targetFile.messageId || parsed.messageId,
               fileKey: targetFile.key,
               fileName: targetFile.name,
               buffer: downloadedFile.buffer,

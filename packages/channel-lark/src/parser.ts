@@ -281,6 +281,255 @@ export function sanitizeClaimedFileName(raw: string): string | undefined {
   return cleaned;
 }
 
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+export function sliceFeishuText(text: string, maxUnits: number): string {
+  if (text.length <= maxUnits) return text;
+  let end = Math.max(0, maxUnits);
+  if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1))) end--;
+  return text.slice(0, end);
+}
+
+function codePointLength(text: string): number {
+  let count = 0;
+  for (const _ of text) count++;
+  return count;
+}
+
+function truncationMarker(droppedChars: number): string {
+  return `\n[…卡片内容已截断 ${droppedChars} 字符]`;
+}
+
+function plainText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() || undefined;
+  if (!value || typeof value !== 'object') return undefined;
+  const object = value as Record<string, unknown>;
+  for (const key of ['content', 'text', 'title', 'plain_text']) {
+    const nested = object[key];
+    if (typeof nested === 'string' && nested.trim()) return nested.trim();
+  }
+  return undefined;
+}
+
+export interface InteractiveCardLimits {
+  maxCardNodes?: number;
+  maxTextChars?: number;
+  maxImageKeys?: number;
+}
+
+export const DEFAULT_INTERACTIVE_CARD_LIMITS: Required<InteractiveCardLimits> = {
+  maxCardNodes: 500,
+  maxTextChars: 20_000,
+  maxImageKeys: 10,
+};
+
+export function extractInteractiveCardContent(
+  rawContent: string,
+  limits: InteractiveCardLimits = DEFAULT_INTERACTIVE_CARD_LIMITS
+): { text: string; imageKeys: string[] } {
+  const maxCardNodes = limits.maxCardNodes ?? DEFAULT_INTERACTIVE_CARD_LIMITS.maxCardNodes;
+  const maxTextChars = limits.maxTextChars ?? DEFAULT_INTERACTIVE_CARD_LIMITS.maxTextChars;
+  const maxImageKeys = limits.maxImageKeys ?? DEFAULT_INTERACTIVE_CARD_LIMITS.maxImageKeys;
+
+  let root: any;
+  try {
+    root = JSON.parse(rawContent);
+  } catch {
+    return { text: typeof rawContent === 'string' && rawContent.trim() ? rawContent.trim() : '[飞书卡片消息]', imageKeys: [] };
+  }
+
+  if (typeof root === 'string') {
+    return { text: root.trim() || '[飞书卡片消息]', imageKeys: [] };
+  }
+  if (!root || typeof root !== 'object') {
+    return { text: '[飞书卡片消息]', imageKeys: [] };
+  }
+
+  const lines: string[] = [];
+  const imageKeys: string[] = [];
+  const seenObjects = new Set<object>();
+  let visited = 0;
+  let textChars = 0;
+  let droppedChars = 0;
+
+  const addLine = (value?: string) => {
+    const normalized = value?.replace(/\s+/g, ' ').trim();
+    if (!normalized || lines[lines.length - 1] === normalized) return;
+    if (textChars >= maxTextChars) {
+      droppedChars += codePointLength(normalized);
+      return;
+    }
+    const remaining = maxTextChars - textChars;
+    const clipped = sliceFeishuText(normalized, remaining);
+    if (clipped.length < normalized.length) {
+      droppedChars += codePointLength(normalized.slice(clipped.length));
+    }
+    if (lines[lines.length - 1] !== clipped) {
+      lines.push(clipped);
+      textChars += clipped.length + 1;
+    }
+  };
+
+  const visit = (node: unknown, depth: number) => {
+    if (node === null || node === undefined) return;
+    if (depth > 12 || visited >= maxCardNodes || textChars >= maxTextChars) return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    if (typeof node !== 'object') return;
+    if (seenObjects.has(node)) return;
+    seenObjects.add(node);
+    visited++;
+
+    const object = node as Record<string, unknown>;
+    const imgKey =
+      typeof object.image_key === 'string'
+        ? object.image_key
+        : typeof object.img_key === 'string'
+          ? object.img_key
+          : undefined;
+    if (imgKey && !imageKeys.includes(imgKey)) {
+      if (imageKeys.length < maxImageKeys) {
+        imageKeys.push(imgKey);
+        addLine('[图片]');
+      }
+    }
+
+    const tag = typeof object.tag === 'string' ? object.tag : undefined;
+    const label = plainText(object.text) ?? plainText(object.title);
+    const href =
+      typeof object.href === 'string'
+        ? object.href
+        : typeof object.url === 'string'
+          ? object.url
+          : typeof (object.multi_url as any)?.url === 'string'
+            ? (object.multi_url as any).url
+            : undefined;
+
+    if (tag === 'button' && label) {
+      addLine(`[按钮: ${label}]`);
+    } else if (tag === 'a' && label) {
+      addLine(href ? `[${label}](${href})` : label);
+    } else {
+      for (const key of ['title', 'text', 'content', 'plain_text']) {
+        const val = object[key];
+        if (typeof val === 'string' && tag !== 'img') addLine(val);
+      }
+    }
+
+    for (const val of Object.values(object)) {
+      if (val && typeof val === 'object') visit(val, depth + 1);
+    }
+  };
+
+  visit(root, 0);
+
+  let text = lines.join('\n').trim();
+  if (droppedChars > 0) {
+    const marker = truncationMarker(droppedChars);
+    text = `${sliceFeishuText(text, Math.max(0, maxTextChars - marker.length))}${marker}`;
+  }
+
+  return {
+    text: text || '[飞书卡片消息]',
+    imageKeys,
+  };
+}
+
+export function formatForwardMessageTime(createTime?: string | number): string {
+  if (!createTime) return '';
+  const num = typeof createTime === 'string' ? Number(createTime) : createTime;
+  if (!Number.isFinite(num) || num <= 0) return '';
+  // Lark create_time is epoch in milliseconds (13 digits) or seconds (10 digits)
+  const ms = num < 100_000_000_000 ? num * 1000 : num;
+  const date = new Date(ms);
+  if (isNaN(date.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const mins = pad(date.getMinutes());
+  return `${month}-${day} ${hours}:${mins}`;
+}
+
+export function expandMergeForwardContent(
+  items: any[],
+  parentMessageId?: string,
+  limits: { maxForwardItems?: number } = {}
+): { text: string; resources: LarkMessageResource[] } {
+  const maxItems = limits.maxForwardItems ?? 20;
+  const resources: LarkMessageResource[] = [];
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return { text: '[合并转发消息]', resources };
+  }
+
+  // Filter items:
+  // 1. Skip items whose msg_type === 'merge_forward' (e.g. parent message itself in im.v1.message.get)
+  // 2. If any item has upper_message_id, only keep items whose upper_message_id === parentMessageId
+  let candidates = items.filter((item) => (item.msg_type || item.message_type) !== 'merge_forward');
+  if (candidates.some((item) => Boolean(item.upper_message_id))) {
+    candidates = candidates.filter((item) => item.upper_message_id === parentMessageId);
+  }
+
+  if (candidates.length === 0) {
+    return { text: '[合并转发消息]', resources };
+  }
+
+  const bounded = candidates.slice(0, maxItems);
+  const lines: string[] = ['[合并转发]'];
+
+  for (const item of bounded) {
+    const rawSender =
+      typeof item.sender?.name === 'string'
+        ? item.sender.name.trim()
+        : typeof item.sender_name === 'string'
+          ? item.sender_name.trim()
+          : '';
+    const sender = rawSender;
+    const senderPart = sender ? `${sender} ` : '';
+
+    const timeRaw = item.create_time ?? item.createTime ?? item.timestamp;
+    const timeFormatted = formatForwardMessageTime(timeRaw);
+    const timePart = timeFormatted ? `${timeFormatted}: ` : (senderPart ? ': ' : '');
+
+    const header = senderPart || timePart ? `${senderPart}${timePart}`.trim() : '';
+
+    let subType = item.msg_type || item.message_type || 'text';
+    let subContent = item.body?.content ?? item.content ?? '';
+
+    // If item is deleted
+    if (item.deleted) {
+      lines.push(header ? `${header} [已撤回]` : '[已撤回]');
+      continue;
+    }
+
+    const subParsed = extractTextAndResources(subType, subContent);
+    // Sub-message images: use parent messageId if provided, else keep sub-message id
+    const imageOwnerMessageId = parentMessageId || item.message_id || item.messageId;
+    for (const res of subParsed.resources) {
+      if (res.type === 'image') {
+        resources.push({
+          ...res,
+          ...(imageOwnerMessageId ? { messageId: imageOwnerMessageId } : {}),
+        });
+      }
+    }
+
+    const contentText = subParsed.text.trim() || '[空消息]';
+    lines.push(header ? `${header} ${contentText}` : contentText);
+  }
+
+  if (candidates.length > maxItems) {
+    lines.push(`> ...（共 ${candidates.length} 条，仅展示前 ${maxItems} 条）`);
+  }
+
+  return { text: lines.join('\n'), resources };
+}
+
 export function extractTextAndResources(
   msgType: string,
   rawContent: string,
@@ -363,6 +612,120 @@ export function extractTextAndResources(
         return { text: `[文件: ${displayName}]`, resources };
       }
       return { text: '[文件]', resources };
+    }
+
+    if (msgType === 'interactive') {
+      const cardResult = extractInteractiveCardContent(rawContent);
+      for (const imgKey of cardResult.imageKeys) {
+        resources.push({
+          type: 'image',
+          key: imgKey,
+          name: `${imgKey}.jpg`,
+        });
+      }
+      return { text: cardResult.text, resources };
+    }
+
+    if (msgType === 'merge_forward') {
+      try {
+        const parsed = JSON.parse(rawContent);
+        const items = parsed.items || parsed.message_list || [];
+        if (Array.isArray(items) && items.length > 0) {
+          return expandMergeForwardContent(items);
+        }
+      } catch {}
+      return { text: '[合并转发消息]', resources };
+    }
+
+    if (msgType === 'audio') {
+      let durationStr = '';
+      try {
+        const parsed = JSON.parse(rawContent);
+        if (typeof parsed.duration === 'number' && parsed.duration > 0) {
+          durationStr = `: ${Math.round(parsed.duration / 1000)}s`;
+        }
+      } catch {}
+      return { text: `[语音消息${durationStr}]`, resources };
+    }
+
+    if (msgType === 'media') {
+      let fileName = '';
+      let fileKey = '';
+      try {
+        const parsed = JSON.parse(rawContent);
+        if (typeof parsed.file_key === 'string' && parsed.file_key) {
+          fileKey = parsed.file_key;
+        }
+        if (typeof parsed.file_name === 'string' && parsed.file_name) {
+          fileName = sanitizeClaimedFileName(parsed.file_name) || '';
+        }
+        const displayName = fileName || (fileKey ? `${fileKey}.mp4` : 'video.mp4');
+        if (fileKey) {
+          resources.push({
+            type: 'file',
+            key: fileKey,
+            name: displayName,
+          });
+        }
+      } catch {}
+      return { text: fileName ? `[视频: ${fileName}]` : '[视频消息]', resources };
+    }
+
+    if (msgType === 'sticker') {
+      let desc = '';
+      try {
+        const parsed = JSON.parse(rawContent);
+        desc = parsed.description || parsed.sticker_id || '';
+      } catch {}
+      return { text: desc ? `[表情包: ${desc}]` : '[表情包]', resources };
+    }
+
+    if (msgType === 'share_chat') {
+      let name = '';
+      try {
+        const parsed = JSON.parse(rawContent);
+        name = parsed.chat_name || parsed.chat_id || '';
+      } catch {}
+      return { text: name ? `[分享群聊: ${name}]` : '[分享群聊]', resources };
+    }
+
+    if (msgType === 'share_user') {
+      let name = '';
+      try {
+        const parsed = JSON.parse(rawContent);
+        name = parsed.user_name || parsed.user_id || '';
+      } catch {}
+      return { text: name ? `[分享名片: ${name}]` : '[分享名片]', resources };
+    }
+
+    if (msgType === 'location') {
+      let locText = '';
+      try {
+        const parsed = JSON.parse(rawContent);
+        const name = parsed.name || '';
+        const addr = parsed.address || '';
+        if (name && addr && name !== addr) {
+          locText = `${name} - ${addr}`;
+        } else {
+          locText = name || addr || '';
+        }
+      } catch {}
+      return { text: locText ? `[位置: ${locText}]` : '[位置]', resources };
+    }
+
+    if (msgType === 'system') {
+      let sysText = '';
+      try {
+        const parsed = JSON.parse(rawContent);
+        const body = parsed.body || parsed.content || parsed.template || '';
+        sysText = typeof body === 'string' ? body : JSON.stringify(body);
+        if (sysText.length > 200) {
+          sysText = sysText.slice(0, 200);
+        }
+      } catch {
+        sysText = typeof rawContent === 'string' ? rawContent.slice(0, 200) : '';
+      }
+      return { text: sysText ? `[系统消息: ${sysText}]` : '[系统消息]', resources };
     }
 
     return { text: rawContent, resources };

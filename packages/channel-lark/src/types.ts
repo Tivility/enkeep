@@ -344,6 +344,7 @@ export interface LarkTransport {
       activityTimeoutMs?: number;
     }
   ): Promise<{ buffer: Buffer; mimeType: string } | null>;
+  getMessage?(messageId: string): Promise<any | null>;
 }
 
 export interface LarkImageAttachmentIngestor {

@@ -926,6 +926,7 @@ export class FakeLarkTransport implements LarkTransport {
   private readonly _streamingCalls: FakeStreamingCallRecord[] = [];
   private readonly _mockImages = new Map<string, { buffer: Buffer; mimeType: string }>();
   private readonly _mockFiles = new Map<string, { buffer: Buffer; mimeType: string }>();
+  public readonly mockMessages = new Map<string, any>();
   public failNextSend = false;
   public failNextSendReason = 'Simulated network timeout';
   public failDownloadImage = false;
@@ -1089,6 +1090,16 @@ export class FakeLarkTransport implements LarkTransport {
       throw new Error('Unsupported image format or invalid image magic bytes');
     }
     return { buffer: found.buffer, mimeType: sniffed };
+  }
+
+  async getMessage(messageId: string): Promise<any | null> {
+    if (!this._connected) {
+      throw new Error('FakeLarkTransport is not connected');
+    }
+    if (this.mockMessages.has(messageId)) {
+      return this.mockMessages.get(messageId);
+    }
+    return null;
   }
 
   async sendReply(params: {
@@ -2289,6 +2300,39 @@ export class CredentialedLarkTransport implements LarkTransport {
       try {
         await fs.promises.unlink(tempFilePath);
       } catch {}
+    }
+  }
+
+  async getMessage(messageId: string): Promise<any | null> {
+    if (!this.apiClient) {
+      return null;
+    }
+    const messageApi = this.apiClient.im?.v1?.message || this.apiClient.im?.message;
+    if (!messageApi || typeof messageApi.get !== 'function') {
+      return null;
+    }
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const getPromise = messageApi.get({
+        path: { message_id: messageId },
+        params: { card_msg_content_type: 'user_card_content' },
+      });
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('im.message.get timed out after 3000ms'));
+        }, 3000);
+      });
+      const res = await Promise.race([getPromise, timeoutPromise]);
+      return res?.data?.items ?? (res as any)?.items ?? (res as any)?.data ?? res ?? null;
+    } catch (err) {
+      this.logger.warn('[lark-transport] getMessage failed', {
+        messageId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
