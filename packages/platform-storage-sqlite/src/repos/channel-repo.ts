@@ -306,7 +306,21 @@ export class SqliteTenantScopedChannelRepository implements TenantScopedChannelR
     const stmt = this.db.prepare(
       'SELECT * FROM channel_inbox WHERE user_id = ? AND account_id = ? AND native_event_id = ?'
     );
-    return queryOne(stmt, parseChannelInboxRow, this.userId, accountId, nativeEventId);
+    const direct = queryOne(stmt, parseChannelInboxRow, this.userId, accountId, nativeEventId);
+    if (direct) return direct;
+
+    // Fallback for rows stored before the key switched to message_id (legacy event_id keys).
+    // Bounded to recent rows: backfill never looks back more than 24h.
+    try {
+      const fallbackStmt = this.db.prepare(
+        "SELECT * FROM channel_inbox WHERE user_id = ? AND account_id = ? AND created_at >= datetime('now', '-2 days') AND (payload_json LIKE ? OR payload_json LIKE ?) ORDER BY created_at DESC LIMIT 1"
+      );
+      const match1 = `%"event_id":"${nativeEventId}"%`;
+      const match2 = `%"messageId":"${nativeEventId}"%`;
+      return queryOne(fallbackStmt, parseChannelInboxRow, this.userId, accountId, match1, match2);
+    } catch {
+      return null;
+    }
   }
 
   async createInboxItem(

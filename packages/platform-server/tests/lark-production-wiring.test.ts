@@ -953,7 +953,7 @@ describe('Production Lark Channel Wiring & Runtime End-to-End Acceptance', () =>
       const nativeEventId = 'evt_lark_quota_inbound_001';
       const inboundMsgId = 'om_quota_prompt_001';
       const promptText = 'Test Lark message under enforced quota mode';
-      const expectedIdempotencyKey = `idem_lark_${account.id}_${nativeEventId}`;
+      const expectedIdempotencyKey = `idem_lark_${account.id}_${inboundMsgId}`;
 
       await capturedEventDispatcher.invoke({
         schema: '2.0',

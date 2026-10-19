@@ -28,6 +28,8 @@ import {
   type ReconcileStreamingCardParams,
   type ILarkApiClient,
   type ILarkWSClient,
+  type LarkConnectionChangeStatus,
+  type LarkRestMessageItem,
 } from './types.js';
 import {
   optimizeMarkdownStyle,
@@ -921,6 +923,17 @@ export function formatCardUsageFooter(metadata?: CardFinalMetadata): string | nu
 export class FakeLarkTransport implements LarkTransport {
   private _connected = false;
   private readonly handlers = new Set<LarkEventHandler>();
+  private readonly connectionListeners = new Set<(status: LarkConnectionChangeStatus) => void>();
+  private wsConnectionGeneration = 0;
+  public mockChatMessages: LarkRestMessageItem[] = [];
+  public listChatMessagesHandler?: (params: {
+    containerId: string;
+    containerType?: 'chat';
+    startTimeSec?: number;
+    endTimeSec?: number;
+    pageSize?: number;
+    pageToken?: string;
+  }) => Promise<{ items: LarkRestMessageItem[]; hasMore: boolean; pageToken?: string }>;
   private readonly _sentReplies: SentReplyRecord[] = [];
   private readonly _addedReactions: FakeReactionRecord[] = [];
   private readonly _removedReactions: FakeRemovedReactionRecord[] = [];
@@ -961,10 +974,59 @@ export class FakeLarkTransport implements LarkTransport {
 
   async start(): Promise<void> {
     this._connected = true;
+    this.wsConnectionGeneration++;
+    this.notifyConnectionChange({ connected: true, generation: this.wsConnectionGeneration, reason: 'ready' });
   }
 
   async stop(): Promise<void> {
     this._connected = false;
+    this.wsConnectionGeneration++;
+    this.notifyConnectionChange({ connected: false, generation: this.wsConnectionGeneration, reason: 'stop' });
+  }
+
+  onConnectionChange(listener: (status: LarkConnectionChangeStatus) => void): void {
+    this.connectionListeners.add(listener);
+  }
+
+  removeConnectionChangeListener(listener: (status: LarkConnectionChangeStatus) => void): void {
+    this.connectionListeners.delete(listener);
+  }
+
+  private notifyConnectionChange(status: LarkConnectionChangeStatus): void {
+    for (const listener of this.connectionListeners) {
+      try {
+        listener(status);
+      } catch {}
+    }
+  }
+
+  async listChatMessages(params: {
+    containerId: string;
+    containerType?: 'chat';
+    startTimeSec?: number;
+    endTimeSec?: number;
+    pageSize?: number;
+    pageToken?: string;
+  }): Promise<{ items: LarkRestMessageItem[]; hasMore: boolean; pageToken?: string }> {
+    if (this.listChatMessagesHandler) {
+      return this.listChatMessagesHandler(params);
+    }
+    const filtered = this.mockChatMessages.filter((m) => {
+      if (m.chat_id !== params.containerId) return false;
+      if (params.startTimeSec && Number(m.create_time) / 1000 < params.startTimeSec) return false;
+      if (params.endTimeSec && Number(m.create_time) / 1000 > params.endTimeSec) return false;
+      return true;
+    });
+    const pageSize = params.pageSize ?? 50;
+    const startIndex = params.pageToken ? Number(params.pageToken) : 0;
+    const slice = filtered.slice(startIndex, startIndex + pageSize);
+    const nextIndex = startIndex + slice.length;
+    const hasMore = nextIndex < filtered.length;
+    return {
+      items: slice,
+      hasMore,
+      pageToken: hasMore ? String(nextIndex) : undefined,
+    };
   }
 
   onEvent(handler: LarkEventHandler): void {
@@ -1640,10 +1702,14 @@ export class FakeLarkTransport implements LarkTransport {
 
   simulateDisconnect(): void {
     this._connected = false;
+    this.wsConnectionGeneration++;
+    this.notifyConnectionChange({ connected: false, generation: this.wsConnectionGeneration, reason: 'disconnect' });
   }
 
   simulateReconnect(): void {
     this._connected = true;
+    this.wsConnectionGeneration++;
+    this.notifyConnectionChange({ connected: true, generation: this.wsConnectionGeneration, reason: 'reconnected' });
   }
 
   clearSentReplies(): void {
@@ -1698,6 +1764,9 @@ export class CredentialedLarkTransport implements LarkTransport {
   private wsRestartBackoffMs = WS_RESTART_MIN_BACKOFF_MS;
   private wsNextRestartAt = 0;
   private stopped = false;
+  private wsConnectionGeneration = 0;
+  private disconnectedAt: number | null = null;
+  private readonly connectionListeners = new Set<(status: LarkConnectionChangeStatus) => void>();
 
   constructor(options: LarkAccountConfig | CredentialedLarkTransportOptions) {
     if ('account' in options) {
@@ -1881,6 +1950,8 @@ export class CredentialedLarkTransport implements LarkTransport {
         }
         this._connected = true;
         this._connecting = false;
+        this.wsConnectionGeneration++;
+        this.notifyConnectionChange({ connected: true, generation: this.wsConnectionGeneration, reason: 'ready' });
       };
       const onErrorCallback = (_err: Error) => {
         if (this.wsClient !== client) return;
@@ -1890,11 +1961,15 @@ export class CredentialedLarkTransport implements LarkTransport {
         if (this.wsClient !== client) return;
         this._connected = false;
         this._connecting = true;
+        if (!this.disconnectedAt) this.disconnectedAt = Date.now();
       };
       const onReconnectedCallback = () => {
         if (this.wsClient !== client) return;
         this._connected = true;
         this._connecting = false;
+        this.wsConnectionGeneration++;
+        this.notifyConnectionChange({ connected: true, generation: this.wsConnectionGeneration, reason: 'reconnected' });
+        this.disconnectedAt = null;
       };
 
       const wsOptions = {
@@ -2011,6 +2086,8 @@ export class CredentialedLarkTransport implements LarkTransport {
     }
     this._connected = false;
     this._connecting = false;
+    this.wsConnectionGeneration++;
+    this.notifyConnectionChange({ connected: false, generation: this.wsConnectionGeneration, reason: 'stop' });
     if (this.wsClient) {
       try {
         if (typeof this.wsClient.close === 'function') {
@@ -2022,6 +2099,58 @@ export class CredentialedLarkTransport implements LarkTransport {
       this.wsClient = null;
     }
     this.apiClient = null;
+  }
+
+  onConnectionChange(listener: (status: LarkConnectionChangeStatus) => void): void {
+    this.connectionListeners.add(listener);
+  }
+
+  removeConnectionChangeListener(listener: (status: LarkConnectionChangeStatus) => void): void {
+    this.connectionListeners.delete(listener);
+  }
+
+  private notifyConnectionChange(status: LarkConnectionChangeStatus): void {
+    for (const listener of this.connectionListeners) {
+      try {
+        listener(status);
+      } catch {}
+    }
+  }
+
+  async listChatMessages(params: {
+    containerId: string;
+    containerType?: 'chat';
+    startTimeSec?: number;
+    endTimeSec?: number;
+    pageSize?: number;
+    pageToken?: string;
+  }): Promise<{ items: LarkRestMessageItem[]; hasMore: boolean; pageToken?: string }> {
+    if (!this.apiClient) {
+      throw new Error('Lark apiClient is not initialized');
+    }
+    const messageApi = this.apiClient.im?.v1?.message || this.apiClient.im?.message;
+    if (!messageApi || typeof messageApi.list !== 'function') {
+      throw new Error('Lark apiClient im.v1.message.list is not available');
+    }
+    const response = await messageApi.list({
+      params: {
+        container_id_type: params.containerType ?? 'chat',
+        container_id: params.containerId,
+        sort_type: 'ByCreateTimeAsc',
+        page_size: params.pageSize ?? 50,
+        ...(params.startTimeSec ? { start_time: String(params.startTimeSec) } : {}),
+        ...(params.endTimeSec ? { end_time: String(params.endTimeSec) } : {}),
+        ...(params.pageToken ? { page_token: params.pageToken } : {}),
+      },
+    });
+    if (response.code !== 0 && response.code !== undefined) {
+      throw new Error(`Failed to list chat messages: ${response.msg} (code: ${response.code})`);
+    }
+    return {
+      items: (response.data?.items as LarkRestMessageItem[]) || [],
+      hasMore: Boolean(response.data?.has_more),
+      pageToken: response.data?.page_token,
+    };
   }
 
   onEvent(handler: LarkEventHandler): void {
