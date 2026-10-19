@@ -371,6 +371,43 @@ export class ContinuationWatcher {
           detached: true,
           turnId: runningEvt.turnId,
           backgroundPanelManager: this.backgroundPanelManager,
+          onCardCreated: async ({ cardId, messageId }) => {
+            if (typeof this.channelRepo.upsertStreamingCard === 'function' && runningEvt.turnId) {
+              try {
+                await this.channelRepo.upsertStreamingCard({
+                  turnId: runningEvt.turnId,
+                  accountId: this.accountId,
+                  sessionId: this.sessionRouteId,
+                  nativeContextId: targetCardParams.chatId,
+                  chatId: targetCardParams.chatId,
+                  replyToMessageId: targetCardParams.replyToMessageId,
+                  rootId: targetCardParams.rootId,
+                  threadId: targetCardParams.threadId,
+                  cardId,
+                  messageId,
+                  status: 'streaming',
+                });
+              } catch (err) {
+                console.warn('[lark-cont] upsertStreamingCard onCardCreated failed', err);
+              }
+            }
+          },
+          onSnapshotFlush: async (text) => {
+            if (typeof this.channelRepo.upsertStreamingCard === 'function' && runningEvt.turnId) {
+              try {
+                await this.channelRepo.upsertStreamingCard({
+                  turnId: runningEvt.turnId,
+                  accountId: this.accountId,
+                  sessionId: this.sessionRouteId,
+                  nativeContextId: targetCardParams.chatId,
+                  chatId: targetCardParams.chatId,
+                  snapshotText: text,
+                });
+              } catch (err) {
+                console.warn('[lark-cont] upsertStreamingCard onSnapshotFlush failed', err);
+              }
+            }
+          },
           onFinalized: async (finalText: string, status: 'completed' | 'failed', messageId?: string) => {
             console.info('[lark-cont] tracker finalize result', {
               routeId: this.sessionRouteId,
@@ -432,6 +469,17 @@ export class ContinuationWatcher {
         payloadJson: JSON.stringify(payload),
         status: 'delivered',
       });
+
+      if (typeof this.channelRepo.findStreamingCardByTurn === 'function' && typeof this.channelRepo.finalizeStreamingCard === 'function') {
+        try {
+          const cardRecord = await this.channelRepo.findStreamingCardByTurn(this.accountId, outboxId);
+          if (cardRecord) {
+            await this.channelRepo.finalizeStreamingCard(cardRecord.id, status === 'completed' ? 'completed' : 'failed');
+          }
+        } catch (e) {
+          console.warn('[lark-cont] finalizeStreamingCard failed', e);
+        }
+      }
     } catch {
       // Best-effort outbox recording
     }

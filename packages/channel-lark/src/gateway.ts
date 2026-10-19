@@ -1363,6 +1363,43 @@ export class LarkChannelGateway {
           withThinkingPanel: hasThinking,
           withStatusBar: true,
           backgroundPanelManager: this.backgroundPanelManager,
+          onCardCreated: async ({ cardId, messageId }) => {
+            if (typeof this.channelRepo.upsertStreamingCard === 'function') {
+              try {
+                await this.channelRepo.upsertStreamingCard({
+                  turnId: dispatchResult.turnId,
+                  accountId: this.accountId,
+                  sessionId: route.id,
+                  nativeContextId: route.nativeContextId,
+                  chatId: parsed.chatId,
+                  replyToMessageId: parsed.messageId,
+                  rootId: parsed.rootId,
+                  threadId: parsed.threadId,
+                  cardId,
+                  messageId,
+                  status: 'streaming',
+                });
+              } catch (err) {
+                console.warn('[lark-stream] upsertStreamingCard onCardCreated failed', err);
+              }
+            }
+          },
+          onSnapshotFlush: async (text) => {
+            if (typeof this.channelRepo.upsertStreamingCard === 'function') {
+              try {
+                await this.channelRepo.upsertStreamingCard({
+                  turnId: dispatchResult.turnId,
+                  accountId: this.accountId,
+                  sessionId: route.id,
+                  nativeContextId: route.nativeContextId,
+                  chatId: parsed.chatId,
+                  snapshotText: text,
+                });
+              } catch (err) {
+                console.warn('[lark-stream] upsertStreamingCard onSnapshotFlush failed', err);
+              }
+            }
+          },
           cardParams: {
             chatId: parsed.chatId,
             replyToMessageId: parsed.messageId,
@@ -1885,6 +1922,17 @@ export class LarkChannelGateway {
         status: 'delivered',
       });
       // Skip deliverOutboxItem / sendReply for streaming cards
+
+      if (typeof this.channelRepo.findStreamingCardByTurn === 'function' && typeof this.channelRepo.finalizeStreamingCard === 'function') {
+        try {
+          const cardRecord = await this.channelRepo.findStreamingCardByTurn(this.accountId, params.turnId);
+          if (cardRecord) {
+            await this.channelRepo.finalizeStreamingCard(cardRecord.id, 'completed');
+          }
+        } catch (e) {
+          console.warn('[lark-stream] finalizeStreamingCard on completed failed', e);
+        }
+      }
     } else {
       console.warn('[lark-stream] gateway fallback to plain text reply', {
         code: 'FALLBACK_TO_PLAIN',
@@ -2279,6 +2327,17 @@ export class LarkChannelGateway {
         payloadJson: JSON.stringify(payload),
         status: 'delivered',
       });
+
+      if (typeof this.channelRepo.findStreamingCardByTurn === 'function' && typeof this.channelRepo.finalizeStreamingCard === 'function') {
+        try {
+          const cardRecord = await this.channelRepo.findStreamingCardByTurn(this.accountId, params.turnId);
+          if (cardRecord) {
+            await this.channelRepo.finalizeStreamingCard(cardRecord.id, 'failed', params.reason || params.code);
+          }
+        } catch (e) {
+          console.warn('[lark-stream] finalizeStreamingCard on failed failed', e);
+        }
+      }
 
       return outboxItem;
     }

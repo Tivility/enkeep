@@ -1615,6 +1615,38 @@ CREATE INDEX IF NOT EXISTS idx_runtime_target_version_updated_by ON runtime_targ
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_042_CHANNEL_STREAMING_CARDS_SQL = `
+-- Migration 42: Track active Feishu/Lark streaming cards for crash recovery
+CREATE TABLE IF NOT EXISTS channel_streaming_cards (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES channel_accounts(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES session_routes(id) ON DELETE CASCADE,
+  turn_id TEXT NOT NULL,
+  native_context_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  reply_to_message_id TEXT,
+  root_id TEXT,
+  thread_id TEXT,
+  card_id TEXT,
+  message_id TEXT,
+  version INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'streaming' CHECK(status IN ('creating', 'streaming', 'recovering', 'completed', 'aborted', 'failed')),
+  snapshot_text TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+  updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+  completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_streaming_cards_turn ON channel_streaming_cards(turn_id);
+CREATE INDEX IF NOT EXISTS idx_streaming_cards_session ON channel_streaming_cards(session_id);
+CREATE INDEX IF NOT EXISTS idx_streaming_cards_status ON channel_streaming_cards(status, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_streaming_cards_account_turn ON channel_streaming_cards(account_id, turn_id);
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

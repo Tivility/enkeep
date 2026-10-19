@@ -166,6 +166,9 @@ export class ChannelRuntimeManager {
     // 3. Scan for any completed turns that missed outbox delivery before startup
     await this.scanAndReconcileCommittedTurns();
 
+    // 3b. Reconcile orphan streaming cards across Lark accounts
+    await this.reconcileOrphanStreamingCardsOnStartup();
+
     // 4. Start background maintenance worker
     this.startWorker();
   }
@@ -842,6 +845,163 @@ export class ChannelRuntimeManager {
     } catch {
       // Ignore scan query errors if tables not ready
     }
+  }
+
+  /**
+   * Reconciles orphan streaming cards on startup (within last 24h).
+   */
+  async reconcileOrphanStreamingCardsOnStartup(): Promise<{
+    reconciled: number;
+    deferred: number;
+  }> {
+    if (!this.db || !this.isRunning || this.isDisposing) {
+      return { reconciled: 0, deferred: 0 };
+    }
+
+    let reconciled = 0;
+    let deferred = 0;
+
+    try {
+      // Query nonterminal streaming cards within the last 24 hours
+      const cards = this.db.prepare(`
+        SELECT c.*, sr.user_id, sr.space_id
+        FROM channel_streaming_cards c
+        JOIN session_routes sr ON sr.id = c.session_id
+        WHERE c.status IN ('creating', 'streaming', 'recovering')
+          AND datetime(c.created_at) >= datetime('now', '-24 hours')
+      `).all() as Array<{
+        id: string;
+        user_id: string;
+        account_id: string;
+        session_id: string;
+        turn_id: string;
+        native_context_id: string;
+        chat_id: string;
+        reply_to_message_id?: string | null;
+        root_id?: string | null;
+        thread_id?: string | null;
+        card_id?: string | null;
+        message_id?: string | null;
+        version: number;
+        status: string;
+        snapshot_text?: string | null;
+        created_at: string;
+      }>;
+
+      for (const card of cards) {
+        if (!this.isRunning || this.isDisposing) break;
+
+        let gateway = this.getActiveGateway(card.user_id, card.account_id);
+        if (!gateway) {
+          gateway = (await this.syncAccount(card.user_id, card.account_id)) ?? undefined;
+        }
+        if (!gateway || !gateway.transport || typeof (gateway.transport as any).reconcileInterruptedCard !== 'function') {
+          deferred++;
+          continue;
+        }
+
+        // CAS claim card recovery lock
+        const claimed = this.db.prepare(`
+          UPDATE channel_streaming_cards
+          SET status = 'recovering', updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND status IN ('creating', 'streaming', 'recovering')
+        `).run(card.id);
+        if (Number(claimed.changes) === 0) {
+          deferred++;
+          continue;
+        }
+
+        try {
+          // Check turn authoritative status and assistant text
+          const turnRow = this.db.prepare(`
+            SELECT status FROM turn_runs WHERE turn_id = ? AND user_id = ?
+          `).get(card.turn_id, card.user_id) as { status: string } | undefined;
+
+          // Check if there is already a persisted final Assistant message in web_messages
+          const assistantMsg = this.db.prepare(`
+            SELECT content FROM web_messages
+            WHERE session_id = ? AND user_id = ? AND role = 'assistant' AND turn_id = ?
+            ORDER BY created_at DESC LIMIT 1
+          `).get(card.session_id, card.user_id, card.turn_id) as { content: string } | undefined;
+
+          let finalBody = '';
+          let isCompleted = false;
+
+          if (assistantMsg && assistantMsg.content && assistantMsg.content.trim().length > 0) {
+            finalBody = assistantMsg.content.trim();
+            isCompleted = true;
+          } else if (turnRow?.status === 'queued') {
+            finalBody = (card.snapshot_text || '').trim();
+            isCompleted = false;
+          } else {
+            finalBody = (card.snapshot_text || '').trim();
+            isCompleted = false;
+          }
+
+          // Rewrite original card and close streaming_mode
+          await (gateway.transport as any).reconcileInterruptedCard({
+            chatId: card.chat_id,
+            cardId: card.card_id || undefined,
+            messageId: card.message_id || undefined,
+            version: card.version,
+            finalText: finalBody,
+            status: isCompleted ? 'completed' : 'aborted',
+            reasonBanner: isCompleted
+              ? undefined
+              : turnRow?.status === 'queued'
+                ? '服务重启，任务正在重新执行'
+                : finalBody
+                  ? undefined
+                  : '上次服务中断，本次任务未完成',
+          });
+
+          // Update card record to terminal status
+          this.db.prepare(`
+            UPDATE channel_streaming_cards
+            SET status = ?, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `).run(isCompleted ? 'completed' : 'aborted', card.id);
+
+          // If completed, ensure channel_outbox has delivered record to prevent re-delivery
+          if (isCompleted) {
+            const outboxId = gateway.deriveOutboxId(card.turn_id);
+            this.db.prepare(`
+              INSERT OR IGNORE INTO channel_outbox (
+                id, user_id, account_id, session_id, native_context_id, reply_to_native_id,
+                payload_json, status, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'delivered', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            `).run(
+              outboxId,
+              card.user_id,
+              card.account_id,
+              card.session_id,
+              card.native_context_id,
+              card.reply_to_message_id ?? null,
+              JSON.stringify({
+                text: finalBody,
+                format: 'markdown',
+                chatId: card.chat_id,
+                messageId: card.message_id,
+                turnId: card.turn_id,
+              })
+            );
+          }
+
+          reconciled++;
+        } catch (err) {
+          console.warn('[channel-runtime-manager] failed to reconcile orphan card', { cardId: card.id, err });
+          // Release claim back to streaming to allow future retry
+          this.db.prepare(`
+            UPDATE channel_streaming_cards SET status = 'streaming' WHERE id = ? AND status = 'recovering'
+          `).run(card.id);
+          deferred++;
+        }
+      }
+    } catch (err) {
+      console.warn('[channel-runtime-manager] reconcileOrphanStreamingCardsOnStartup error', err);
+    }
+
+    return { reconciled, deferred };
   }
 
   /**

@@ -99,6 +99,71 @@ describe('SqliteTenantScopedChannelRepository', () => {
       await repo.deleteBinding(binding.id);
       expect(await repo.findBindingById(binding.id)).toBeNull();
     });
+  });
+
+  describe('Streaming Cards', () => {
+    it('upserts streaming cards, tracks snapshot, claims for recovery and finalizes', async () => {
+      const account = await repo.createAccount({ type: 'lark' });
+
+      // Create initial route
+      db.prepare(`
+        INSERT INTO session_routes (id, user_id, space_id, channel, native_context_id, dsh_session_id)
+        VALUES ('ses_route_test_1', ?, ?, 'lark', 'oc_chat_test', 'dsh_ses_1')
+      `).run(userId, spaceId);
+
+      const turnId = 'turn_test_streaming_1';
+      const created = await repo.upsertStreamingCard({
+        turnId,
+        accountId: account.id,
+        sessionId: 'ses_route_test_1',
+        nativeContextId: 'oc_chat_test',
+        chatId: 'oc_chat_test',
+        replyToMessageId: 'om_reply_1',
+        cardId: 'crd_test_1',
+        messageId: 'om_card_msg_1',
+        version: 1,
+        status: 'streaming',
+        snapshotText: 'Hello world',
+      });
+
+      expect(created.id).toBeDefined();
+      expect(created.turnId).toBe(turnId);
+      expect(created.cardId).toBe('crd_test_1');
+      expect(created.messageId).toBe('om_card_msg_1');
+      expect(created.status).toBe('streaming');
+      expect(created.snapshotText).toBe('Hello world');
+
+      // Update snapshot
+      const updated = await repo.upsertStreamingCard({
+        turnId,
+        accountId: account.id,
+        sessionId: 'ses_route_test_1',
+        nativeContextId: 'oc_chat_test',
+        chatId: 'oc_chat_test',
+        snapshotText: 'Hello world expanded text',
+        version: 2,
+      });
+
+      expect(updated.id).toBe(created.id);
+      expect(updated.snapshotText).toBe('Hello world expanded text');
+      expect(updated.version).toBe(2);
+
+      // List nonterminal
+      const nonterminal = await repo.listNonterminalStreamingCards();
+      expect(nonterminal.some((c) => c.id === created.id)).toBe(true);
+
+      // Claim for recovery
+      const claimed = await repo.claimStreamingCardForRecovery(created.id);
+      expect(claimed?.status).toBe('recovering');
+
+      // Finalize
+      const finalized = await repo.finalizeStreamingCard(created.id, 'completed');
+      expect(finalized.status).toBe('completed');
+      expect(finalized.completedAt).toBeDefined();
+
+      const afterFinalize = await repo.listNonterminalStreamingCards();
+      expect(afterFinalize.some((c) => c.id === created.id)).toBe(false);
+    });
 
     it('setGroupActivationModeForAccountBindings updates group bindings and leaves p2p/other bindings untouched', async () => {
       const account = await repo.createAccount({ type: 'lark', groupActivationMode: 'mention' });
