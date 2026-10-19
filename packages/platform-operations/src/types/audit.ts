@@ -11,6 +11,7 @@ export type OperationAuditAction =
   | 'task_completed'
   | 'task_failed'
   | 'task_cancelled'
+  | 'task_deleted'
   | 'task_recovered'
   | 'quota_checked'
   | 'quota_reserved'

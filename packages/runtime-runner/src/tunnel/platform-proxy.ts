@@ -623,6 +623,10 @@ export class PlatformProxyHandler implements StreamHandler {
           await this.handleGetTask(taskMatch[1], stream);
           return;
         }
+        if (method === 'DELETE') {
+          await this.handleDeleteTask(taskMatch[1], req, stream);
+          return;
+        }
         this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
         return;
       }
@@ -1931,6 +1935,123 @@ export class PlatformProxyHandler implements StreamHandler {
 
     this.writeJsonResponse(stream, 503, {
       error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform Operations service is unavailable' },
+    });
+  }
+
+  /**
+   * Handles DELETE /api/manage/tasks/:id
+   */
+  private async handleDeleteTask(
+    rawTaskId: string,
+    _req: ParsedHttpRequest,
+    stream: Duplex
+  ): Promise<void> {
+    if (!this.platformUserId) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding' },
+      });
+      return;
+    }
+
+    let taskId: string;
+    try {
+      taskId = decodeURIComponent(rawTaskId);
+    } catch {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID encoding' },
+      });
+      return;
+    }
+
+    if (!TASK_ID_REGEX.test(taskId)) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID format' },
+      });
+      return;
+    }
+
+    if (this.operations) {
+      try {
+        const tenantOps = this.operations.forTenant(this.platformUserId);
+        const existing = await tenantOps.tasks.getTask(taskId);
+        if (!existing) {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: `Task "${taskId}" not found` },
+          });
+          return;
+        }
+        if (existing.status === 'running' || existing.status === 'claimed') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_CONFLICT', message: `Task "${taskId}" is running or claimed. Cancel it before deleting.` },
+          });
+          return;
+        }
+        await tenantOps.tasks.deleteTask(taskId);
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: { id: taskId, deleted: true, success: true },
+        });
+        return;
+      } catch (err: any) {
+        if (err instanceof TaskNotFoundError || err?.name === 'TaskNotFoundError' || err?.code === 'TASK_NOT_FOUND') {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: err.message || `Task "${taskId}" not found` },
+          });
+          return;
+        }
+        if (err instanceof TaskConflictError || err?.name === 'TaskConflictError' || err?.code === 'TASK_CONFLICT') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_CONFLICT', message: err.message || `Task "${taskId}" is running or claimed. Cancel it before deleting.` },
+          });
+          return;
+        }
+        const status = typeof err?.status === 'number' && err.status >= 400 && err.status <= 599 ? err.status : 500;
+        this.writeJsonResponse(stream, status, {
+          error: { code: err?.code || 'TASK_ERROR', message: err?.message || 'Task deletion failed' },
+        });
+        return;
+      }
+    }
+
+    if (this.db) {
+      try {
+        const existing = this.db.prepare(
+          'SELECT id, user_id, title, status FROM platform_tasks WHERE id = ? LIMIT 1'
+        ).get(taskId) as any;
+
+        if (!existing || existing.user_id !== this.platformUserId) {
+          this.writeJsonResponse(stream, 404, {
+            error: { code: 'TASK_NOT_FOUND', message: `Task "${taskId}" not found` },
+          });
+          return;
+        }
+
+        if (existing.status === 'running' || existing.status === 'claimed') {
+          this.writeJsonResponse(stream, 409, {
+            error: { code: 'TASK_CONFLICT', message: `Task "${taskId}" is running or claimed. Cancel it before deleting.` },
+          });
+          return;
+        }
+
+        this.db.prepare(
+          'DELETE FROM platform_tasks WHERE id = ? AND user_id = ?'
+        ).run(taskId, this.platformUserId);
+
+        this.writeJsonResponse(stream, 200, {
+          success: true,
+          data: { id: taskId, deleted: true, success: true },
+        });
+        return;
+      } catch (err: any) {
+        this.writeJsonResponse(stream, 500, {
+          error: { code: 'TASK_ERROR', message: err?.message || 'Task deletion failed' },
+        });
+        return;
+      }
+    }
+
+    this.writeJsonResponse(stream, 503, {
+      error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform operations service unavailable' },
     });
   }
 

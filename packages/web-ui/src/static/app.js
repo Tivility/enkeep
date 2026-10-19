@@ -192,6 +192,7 @@ const MANAGEMENT_LOCALES = {
     'tasks.btnSchedule': 'Schedule Task',
     'tasks.btnRunNow': 'Run Now',
     'tasks.btnCancel': 'Cancel',
+    'tasks.btnDelete': 'Delete',
     'tasks.emptyTitle': 'No Task Records',
     'tasks.emptyDesc': 'No task records were returned for this account.',
     'tasks.noActiveSessions': 'No active container sessions found',
@@ -734,6 +735,7 @@ const MANAGEMENT_LOCALES = {
     'tasks.btnSchedule': '提交调度任务',
     'tasks.btnRunNow': '立即执行',
     'tasks.btnCancel': '取消任务',
+    'tasks.btnDelete': '删除',
     'tasks.emptyTitle': '暂无任务记录',
     'tasks.emptyDesc': '当前账户暂无任何任务记录。',
     'tasks.noActiveSessions': '未找到活跃容器会话',
@@ -6325,6 +6327,40 @@ async function renderTasksView(container) {
       });
     });
     tdActions.appendChild(cancelBtn);
+
+    // 5. Delete Button
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'btn btn-outline-danger btn-xs';
+    deleteBtn.textContent = tr('tasks.btnDelete', null, 'Delete');
+    const isRunning = taskStatus === 'running' || taskStatus === 'claimed';
+    deleteBtn.disabled = isRunning;
+    if (isRunning) {
+      deleteBtn.title = getLocale() === 'zh-CN'
+        ? '任务正在执行中，无法直接删除'
+        : 'Task is currently running and cannot be deleted';
+    }
+    deleteBtn.addEventListener('click', () => {
+      const modalTitle = getLocale() === 'zh-CN' ? '删除定时任务' : 'Delete Scheduled Task';
+      const modalMsg = getLocale() === 'zh-CN'
+        ? `确定要彻底删除定时任务 "${t.title || '定时任务'}" 吗？此操作不可撤销，且将清除所有运行历史。`
+        : `Are you sure you want to permanently delete task "${t.title || 'Scheduled Task'}"? This action cannot be undone.`;
+
+      showConfirmation(modalTitle, modalMsg, async () => {
+        deleteBtn.disabled = true;
+        try {
+          await apiRequest(`/api/manage/tasks/${t.id}`, {
+            method: 'DELETE',
+          });
+          showToast(getLocale() === 'zh-CN' ? '任务已彻底删除' : 'Task deleted successfully', 'success');
+          renderManagementView('tasks');
+        } catch (err) {
+          showToast(getSafeErrorMessage(err, 'Failed to delete task.'), 'error');
+          deleteBtn.disabled = false;
+        }
+      });
+    });
+    tdActions.appendChild(deleteBtn);
 
     trRow.appendChild(tdActions);
     tbody.appendChild(trRow);

@@ -64,6 +64,11 @@ export function createManagementOperationsAdapter(
       return tenantOps.tasks.updateTask(taskId, input);
     },
 
+    async deleteTask(userId: string, taskId: string): Promise<{ success: boolean; id: string }> {
+      const tenantOps = operationsService.forTenant(userId);
+      return tenantOps.tasks.deleteTask(taskId);
+    },
+
     async getTask(userId: string, taskId: string): Promise<SafeTask | null> {
       const tenantOps = operationsService.forTenant(userId);
       return tenantOps.tasks.getTask(taskId);
