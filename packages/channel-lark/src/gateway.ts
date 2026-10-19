@@ -70,6 +70,21 @@ import {
 export const LARK_ONIT_REACTION = 'OnIt';
 export const LARK_QUEUE_REACTION = 'OneSecond';
 export const LARK_STEER_TRIGGER_REACTION = 'Fire'; // Can be configured / changed if another emoji is preferred
+export const COALESCE_WINDOW_MS = 3000;
+
+interface PendingMediaEntry {
+  envelope: InboundEnvelope;
+  platformIdempotencyKey: string;
+  inboxItem: ChannelInboxItem;
+  route: SessionRoute;
+  parsed: any;
+  rawEvent: any;
+  nativeEventId: string;
+  nativeContextId: string;
+  timer: any;
+  resolve: (value: { claimed: boolean; claimedByEnvelope?: InboundEnvelope }) => void;
+  dispatchedPromise?: Promise<InboundHandlingResult>;
+}
 
 export interface LarkChannelGatewayOptions {
   account: ChannelAccount | LarkAccountConfig;
@@ -87,6 +102,7 @@ export interface LarkChannelGatewayOptions {
   noCotChats?: string[];
   withThinkingPanel?: boolean;
   senderNameResolver?: FeishuSenderNameResolver;
+  coalesceWindowMs?: number;
   isOperatorAllowed?: (params: {
     operatorId: string;
     chatId?: string;
@@ -160,6 +176,8 @@ export class LarkChannelGateway {
   readonly backgroundPanelManager: LarkBackgroundPanelManager;
   readonly senderNameResolver: FeishuSenderNameResolver;
   private readonly configuredWithThinkingPanel?: boolean;
+  private readonly coalesceWindowMs: number;
+  private readonly pendingMedia = new Map<string, PendingMediaEntry>();
   private readonly isOperatorAllowedCallback?: (params: {
     operatorId: string;
     chatId?: string;
@@ -180,6 +198,7 @@ export class LarkChannelGateway {
     this.groupActivationMode = options.groupActivationMode;
     this.streamEventSource = options.streamEventSource;
     this.configuredWithThinkingPanel = options.withThinkingPanel;
+    this.coalesceWindowMs = options.coalesceWindowMs ?? COALESCE_WINDOW_MS;
     this.isOperatorAllowedCallback = options.isOperatorAllowed;
     this.cotManager = new LarkCotManager({
       enabled: options.enableCot ?? false,
@@ -421,6 +440,23 @@ export class LarkChannelGateway {
     })();
 
     this.pendingReactions.set(idempotencyKey, { messageId, emojiType, reactionIdPromise });
+  }
+
+  /**
+   * Removes an in-flight receipt reaction if recorded.
+   */
+  private removeReceiptReaction(idempotencyKey: string): void {
+    const pending = this.pendingReactions.get(idempotencyKey);
+    if (pending) {
+      this.pendingReactions.delete(idempotencyKey);
+      pending.reactionIdPromise
+        .then((rxId) => {
+          if (rxId) {
+            this.transport.removeReaction(pending.messageId, rxId).catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
   }
 
   /**
@@ -1416,6 +1452,141 @@ export class LarkChannelGateway {
       },
       // Do NOT pass native message ID into replyToMessageId because Platform expects internal web_messages.id
     };
+
+    // 7. Check for pending media coalescence
+    const isCommand = envelope.content.trim().startsWith('/');
+    const coalesceKey = parsed.senderId ? `${nativeContextId}:${parsed.senderId}` : undefined;
+
+    let effectiveEnvelope = envelope;
+
+    if (!isCommand && coalesceKey && this.pendingMedia.has(coalesceKey)) {
+      const pending = this.pendingMedia.get(coalesceKey)!;
+      clearTimeout(pending.timer);
+      this.pendingMedia.delete(coalesceKey);
+
+      // Merge media attachments before current text attachments
+      let mergedAttachments = effectiveEnvelope.attachments;
+      if (pending.envelope.attachments && pending.envelope.attachments.length > 0) {
+        mergedAttachments = [
+          ...pending.envelope.attachments,
+          ...(effectiveEnvelope.attachments || []),
+        ];
+      }
+
+      // If media was merge_forward, prepend its expanded text before current text
+      let mergedContent = effectiveEnvelope.content;
+      if (pending.parsed.msgType === 'merge_forward' && pending.envelope.content) {
+        mergedContent = `${pending.envelope.content}\n${effectiveEnvelope.content}`;
+      }
+
+      effectiveEnvelope = {
+        ...effectiveEnvelope,
+        content: mergedContent,
+        ...(mergedAttachments && mergedAttachments.length > 0 ? { attachments: mergedAttachments } : {}),
+      };
+
+      // Resolve pending media as claimed
+      pending.resolve({ claimed: true, claimedByEnvelope: effectiveEnvelope });
+    }
+
+    // If current message is media-only without text, register to pendingMedia and wait COALESCE_WINDOW_MS
+    const isMediaOnly = this.isMediaOnlyMessage(parsed, cleanedText);
+    if (!isCommand && coalesceKey && isMediaOnly) {
+      let mediaResolver!: (value: { claimed: boolean; claimedByEnvelope?: InboundEnvelope }) => void;
+      const mediaPromise = new Promise<{ claimed: boolean; claimedByEnvelope?: InboundEnvelope }>((res) => {
+        mediaResolver = res;
+      });
+
+      const timer = setTimeout(() => {
+        if (this.pendingMedia.get(coalesceKey) === entry) {
+          this.pendingMedia.delete(coalesceKey);
+        }
+        mediaResolver({ claimed: false });
+      }, this.coalesceWindowMs);
+
+      const entry: PendingMediaEntry = {
+        envelope: effectiveEnvelope,
+        platformIdempotencyKey,
+        inboxItem,
+        route,
+        parsed,
+        rawEvent,
+        nativeEventId,
+        nativeContextId,
+        timer,
+        resolve: mediaResolver,
+      };
+
+      this.pendingMedia.set(coalesceKey, entry);
+
+      const waitResult = await mediaPromise;
+      if (waitResult.claimed) {
+        inboxItem = await this.channelRepo.updateInboxStatus(inboxItem.id, 'delivered');
+        this.removeReceiptReaction(platformIdempotencyKey);
+        return {
+          handled: true,
+          inboxItem,
+          sessionRouteId: route.id,
+        };
+      }
+    }
+
+    return await this.dispatchInboundEnvelope({
+      envelope: effectiveEnvelope,
+      platformIdempotencyKey,
+      inboxItem,
+      route,
+      parsed,
+      rawEvent,
+      nativeEventId,
+      nativeContextId,
+    });
+  }
+
+  private isMediaOnlyMessage(parsed: any, cleanedText: string): boolean {
+    const isMediaMsgType =
+      parsed.msgType === 'image' ||
+      parsed.msgType === 'file' ||
+      parsed.msgType === 'media' ||
+      parsed.msgType === 'merge_forward';
+
+    if (!isMediaMsgType) {
+      return false;
+    }
+
+    const trimmed = (cleanedText || '').trim();
+    if (!trimmed) {
+      return true;
+    }
+
+    if (parsed.msgType === 'merge_forward') {
+      return true;
+    }
+
+    const placeholderRegex = /^\[(图片|文件(:.*)?|合并转发(消息)?)\]$/;
+    return placeholderRegex.test(trimmed);
+  }
+
+  private async dispatchInboundEnvelope(params: {
+    envelope: InboundEnvelope;
+    platformIdempotencyKey: string;
+    inboxItem: ChannelInboxItem;
+    route: SessionRoute;
+    parsed: any;
+    rawEvent: any;
+    nativeEventId: string;
+    nativeContextId: string;
+  }): Promise<InboundHandlingResult> {
+    const {
+      envelope,
+      platformIdempotencyKey,
+      route,
+      parsed,
+      rawEvent,
+      nativeEventId,
+      nativeContextId,
+    } = params;
+    let inboxItem = params.inboxItem;
 
     let turnId: string = platformIdempotencyKey;
     const isStopCommand = /^\/stop(?:\s|$)/i.test(envelope.content.trim());
@@ -3002,6 +3173,11 @@ export class LarkChannelGateway {
       watcher.stop();
     }
     this.continuationWatchers.clear();
+    for (const [key, entry] of this.pendingMedia.entries()) {
+      clearTimeout(entry.timer);
+      this.pendingMedia.delete(key);
+      entry.resolve({ claimed: false });
+    }
     if (this.transport) {
       await this.transport.stop();
     }
