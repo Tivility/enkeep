@@ -270,7 +270,7 @@ describe('Runtime Idle Auto-Upgrade & Target Version Governance', () => {
   });
 
   describe('3. RuntimeAutoUpgrader Lifecycle & Safety', () => {
-    it('outdated and idle meeting threshold -> pauses dispatch, stops runtime, resumes dispatch, and redrives', async () => {
+    it('outdated and idle meeting threshold -> pauses dispatch, stops runtime, resumes dispatch without the startup redrive', async () => {
       const paused: string[] = [];
       const resumed: string[] = [];
       let redriveCalled = 0;
@@ -314,7 +314,9 @@ describe('Runtime Idle Auto-Upgrade & Target Version Governance', () => {
       expect(paused).toContain('user-bob');
       expect(stoppedUser).toBe('user-bob');
       expect(resumed).toContain('user-bob');
-      expect(redriveCalled).toBe(1);
+      // redriveHeld() is the startup recovery pass: it interrupts every turn holding an active
+      // lease, including other users' running turns, so the upgrader must never call it.
+      expect(redriveCalled).toBe(0);
     });
 
     it('idle below threshold does not perform upgrade', async () => {

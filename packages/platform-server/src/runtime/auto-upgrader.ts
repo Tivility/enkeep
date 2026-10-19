@@ -70,7 +70,6 @@ export class RuntimeAutoUpgrader {
     if (this.currentlyPausedUserId && this.deliveryGateway) {
       try {
         this.deliveryGateway.resumeUserDispatch(this.currentlyPausedUserId);
-        this.deliveryGateway.redriveHeld().catch(() => {});
       } catch {}
       this.currentlyPausedUserId = undefined;
     }
@@ -152,7 +151,6 @@ export class RuntimeAutoUpgrader {
           // Busy! Abort and resume dispatch
           if (this.deliveryGateway) {
             this.deliveryGateway.resumeUserDispatch(targetUserId);
-            await this.deliveryGateway.redriveHeld();
             this.currentlyPausedUserId = undefined;
           }
           this.lastIdleTimestamps.delete(targetUserId);
@@ -171,10 +169,11 @@ export class RuntimeAutoUpgrader {
           await this.managementProvider.stopRuntime(targetUserId, candidateToUpgrade.mode);
         }
 
-        // Step 4: Resume dispatch & redrive held
+        // Step 4: Resume dispatch. resumeUserDispatch wakes the scheduler for the held messages.
+        // Never call redriveHeld() here: it is the startup recovery pass and interrupts every
+        // turn holding an active lease, including turns other users have running right now.
         if (this.deliveryGateway) {
           this.deliveryGateway.resumeUserDispatch(targetUserId);
-          await this.deliveryGateway.redriveHeld();
           this.currentlyPausedUserId = undefined;
         }
 
@@ -185,7 +184,6 @@ export class RuntimeAutoUpgrader {
         if (this.deliveryGateway) {
           try {
             this.deliveryGateway.resumeUserDispatch(targetUserId);
-            await this.deliveryGateway.redriveHeld();
           } catch {}
           this.currentlyPausedUserId = undefined;
         }
