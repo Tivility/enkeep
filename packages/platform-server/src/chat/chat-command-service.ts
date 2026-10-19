@@ -11,7 +11,7 @@ import {
 import type { ModelSelectionService } from '../models/model-selection-service.js';
 import type { BackgroundTask } from '../runtime/delivery-gateway.js';
 
-export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention' | 'bg' | 'background' | 'unknown';
+export type ChatCommandType = 'model' | 'effort' | 'help' | 'status' | 'new' | 'stop' | 'compact' | 'sw' | 'spawn' | 'where' | 'bind' | 'unbind' | 'newws' | 'list' | 'ws' | 'session' | 'ses' | 'mention' | 'require_mention' | 'bg' | 'background' | 'steer' | 'unknown';
 
 export interface ParsedChatCommand {
   command: ChatCommandType;
@@ -52,6 +52,7 @@ export const HELP_USAGE = `Available commands:
   /session window [<tokens>|default] - 查看或设置当前会话上下文窗口上限
 
 运行与控制指令:
+  /steer [<消息>] - 插队纠偏当前任务（无参数提升排队消息；有参数有任务则插队，无任务则普通发送）
   /status - 查看当前工作区、会话、模型与排队状态
   /bg - 查看当前会话后台任务 (别名: /bg stop <短ID> 停止任务)
   /stop - 取消正在运行或排队的轮次
@@ -291,7 +292,7 @@ export function parseChatCommand(
   }
 
   const trimmed = content.trim();
-  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention|bg|background)(?:[\s\t\r\n]+([\s\S]*))?$/i);
+  const match = trimmed.match(/^\/(model|effort|help|status|new|reset|clear|stop|compact|sw|spawn|where|bind|unbind|newws|new-workspace|list|ls|ws|session|ses|mention|require_mention|bg|background|steer)(?:[\s\t\r\n]+([\s\S]*))?$/i);
   if (!match) {
     if (options?.allowUnknown) {
       const unknown = parseUnknownChatCommand(trimmed);
@@ -353,6 +354,17 @@ export function parseChatCommand(
       subcommand: 'unknown',
       action: 'unknown',
       arg: rest,
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === 'steer') {
+    return {
+      command: 'steer',
+      type: 'steer',
+      subcommand: rest ? 'steer' : 'promote',
+      action: rest ? 'steer' : 'promote',
+      arg: rest || undefined,
       raw: trimmed,
     };
   }
@@ -970,6 +982,20 @@ export interface ChatCommandServiceOptions {
       sessionId: string,
       taskId: string
     ) => Promise<{ stopped: boolean }>;
+    steerTurn?: (
+      userId: string,
+      sessionId: string,
+      req: { clientRequestId: string; expectedTurnId: string; content: string }
+    ) => Promise<{ messageId: string; ok: boolean }>;
+    promoteQueuedToSteer?: (
+      userId: string,
+      sessionId: string,
+      sel: { turnIds: string[] } | { all: true; senderId?: string }
+    ) => Promise<{
+      status: 'steered' | 'nothing_running' | 'nothing_queued' | 'requeued';
+      count: number;
+      runningTurnId?: string;
+    }>;
   };
   db?: DatabaseSync;
   checkChatAdmin?: (params: {
@@ -986,6 +1012,7 @@ export interface ChatCommandChannelContext {
   accountId?: string;
   nativeContextId?: string;
   chatId?: string;
+  parentId?: string | null;
   senderId?: string | null;
   chatType?: string | null;
   fallbackNotice?: string | null;
@@ -1164,7 +1191,7 @@ export class ChatCommandService {
     content: string;
     idempotencyKey?: string;
     channelContext?: ChatCommandChannelContext;
-  }): Promise<{ replyText: string }> {
+  }): Promise<{ replyText: string; isSteerExecuted?: boolean; fallbackToOrdinary?: boolean }> {
     try {
       const parsed = parseChatCommand(params.content, { allowUnknown: true });
       if (!parsed) {
@@ -1196,7 +1223,7 @@ export class ChatCommandService {
         }
       }
 
-      let result: { replyText: string };
+      let result: { replyText: string; isSteerExecuted?: boolean; fallbackToOrdinary?: boolean };
       switch (parsed.command) {
         case 'help':
           result = { replyText: HELP_USAGE };
@@ -1206,6 +1233,9 @@ export class ChatCommandService {
           break;
         case 'stop':
           result = await this.executeStopCommand(params, parsed);
+          break;
+        case 'steer':
+          result = await this.executeSteerCommand(params, parsed);
           break;
         case 'new':
           result = await this.executeNewCommand(params, parsed);
@@ -2940,6 +2970,101 @@ export class ChatCommandService {
       return { replyText: 'cancelled' };
     }
     return { replyText: 'nothing running' };
+  }
+
+  private async executeSteerCommand(
+    params: {
+      userId: string;
+      sessionId: string;
+      spaceId: string;
+      idempotencyKey?: string;
+      channelContext?: ChatCommandChannelContext;
+    },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string; isSteerExecuted?: boolean; fallbackToOrdinary?: boolean }> {
+    const { userId, sessionId } = params;
+    const steerContent = parsed.arg?.trim() || '';
+
+    // Branch 1: /steer <消息>
+    if (steerContent) {
+      if (this.db) {
+        const runningTurn = this.db.prepare(`
+          SELECT turn_id, space_id FROM turn_runs
+          WHERE user_id = ? AND route_id = ? AND status = 'running'
+          LIMIT 1
+        `).get(userId, sessionId) as { turn_id: string; space_id: string } | undefined;
+
+        if (!runningTurn) {
+          return { replyText: '', fallbackToOrdinary: true };
+        }
+
+        if (this.gateway?.steerTurn) {
+          try {
+            await this.gateway.steerTurn(userId, sessionId, {
+              clientRequestId: params.idempotencyKey || randomUUID(),
+              expectedTurnId: runningTurn.turn_id,
+              content: steerContent,
+            });
+            return {
+              replyText: '已插入当前任务',
+              isSteerExecuted: true,
+            };
+          } catch (err: any) {
+            return { replyText: '', fallbackToOrdinary: true };
+          }
+        }
+      }
+      return { replyText: '当前网关不支持插队纠偏。' };
+    }
+
+    // Branch 2: /steer without arguments (or with quote reply)
+    if (!this.gateway?.promoteQueuedToSteer) {
+      return { replyText: '当前网关不支持排队消息提升。' };
+    }
+
+    let sel: { turnIds: string[] } | { all: true; senderId?: string } = { all: true };
+
+    const parentId = params.channelContext?.parentId;
+    if (parentId && this.db) {
+      try {
+        const originRow = this.db.prepare(`
+          SELECT turn_id FROM channel_turn_origins
+          WHERE reply_to_message_id = ? AND user_id = ? AND session_id = ?
+          LIMIT 1
+        `).get(parentId, userId, sessionId) as { turn_id: string } | undefined;
+
+        if (originRow?.turn_id) {
+          sel = { turnIds: [originRow.turn_id] };
+        }
+      } catch {}
+    }
+
+    if (!('turnIds' in sel)) {
+      const isGroup = params.channelContext?.chatType === 'group';
+      const senderId = params.channelContext?.senderId;
+      if (isGroup && senderId) {
+        sel = { all: true, senderId };
+      } else {
+        sel = { all: true };
+      }
+    }
+
+    const promoteRes = await this.gateway.promoteQueuedToSteer(userId, sessionId, sel);
+
+    if (promoteRes.status === 'nothing_running') {
+      return { replyText: '当前没有运行中的任务，消息会正常处理' };
+    }
+    if (promoteRes.status === 'nothing_queued') {
+      return { replyText: '没有排队中的消息' };
+    }
+    if (promoteRes.status === 'steered') {
+      return { replyText: `已插入当前任务（${promoteRes.count} 条）`, isSteerExecuted: true };
+    }
+    if (promoteRes.status === 'requeued') {
+      return { replyText: '任务已结束，消息已重新排队等待处理' };
+    }
+
+    return { replyText: '' };
   }
 
   private async executeNewCommand(

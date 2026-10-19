@@ -635,6 +635,55 @@ describe('Lark Channel Closed-Loop Communication', () => {
       expect(mentionsBot).toBe(true);
     });
 
+    it('marks a queued message with OneSecond and switches it back to OnIt once /steer promotes it', async () => {
+      const qTransport = new FakeLarkTransport();
+      await qTransport.start();
+      let queuedTurns: Array<{ turnId: string; createdAt: string; contentSnippet: string }> = [];
+      const mockRuntime: any = {
+        dispatchInbound: vi.fn().mockImplementation(async (env: any) => {
+          if (/^\/steer/.test(env.content.trim())) {
+            queuedTurns = [];
+            return { turnId: 'turn_steer_cmd_001', executionMode: 'command' };
+          }
+          queuedTurns = [{ turnId: 'turn_queued_001', createdAt: new Date().toISOString(), contentSnippet: 'x' }];
+          return { turnId: 'turn_queued_001', executionMode: 'runtime', queuePosition: 1 };
+        }),
+        getCurrentTurnStatus: vi.fn().mockResolvedValue({ status: 'running', turnId: 'turn_running_001' }),
+        listQueuedTurns: vi.fn().mockImplementation(async () => queuedTurns),
+      };
+      const qGateway = new LarkChannelGateway({
+        account: { id: gateway.accountId, userId, appId: 'cli_test_queue_01', botOpenId, groupActivationMode: 'always' },
+        transport: qTransport,
+        channelRepo,
+        sessionRouteRepo,
+        spaceRepo,
+        runtimeGateway: mockRuntime,
+      });
+      const chatId = 'oc_queue_chat_1';
+      await channelRepo.createBinding({ accountId: gateway.accountId, spaceId, nativeContextId: chatId, activationMode: 'always' });
+      const makeEvent = (eventId: string, messageId: string, text: string) => ({
+        header: { event_id: eventId, event_type: 'im.message.receive_v1', create_time: '1700000000000' },
+        event: {
+          sender: { sender_id: { open_id: 'ou_developer_1' } },
+          message: { message_id: messageId, chat_id: chatId, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }), create_time: '1700000000000' },
+        },
+      });
+      const settle = () => new Promise((r) => setTimeout(r, 30));
+
+      await qGateway.handleInboundEvent(makeEvent('evt_queue_001', 'om_queue_msg_001', 'second question'));
+      await settle();
+      const forMsg = () => qTransport.addedReactions.filter((r: any) => r.messageId === 'om_queue_msg_001').map((r: any) => r.emojiType);
+      expect(forMsg()).toEqual(['OnIt', 'OneSecond']);
+      const onItId = qTransport.addedReactions.find((r: any) => r.messageId === 'om_queue_msg_001' && r.emojiType === 'OnIt')!.reactionId;
+      expect(qTransport.removedReactions.map((r: any) => r.reactionId)).toContain(onItId);
+
+      await qGateway.handleInboundEvent(makeEvent('evt_queue_002', 'om_queue_msg_002', '/steer'));
+      await settle();
+      expect(forMsg()).toEqual(['OnIt', 'OneSecond', 'OnIt']);
+      const oneSecondId = qTransport.addedReactions.find((r: any) => r.messageId === 'om_queue_msg_001' && r.emojiType === 'OneSecond')!.reactionId;
+      expect(qTransport.removedReactions.map((r: any) => r.reactionId)).toContain(oneSecondId);
+    });
+
     it('processes inbound merge_forward event, enriches sub-messages via getMessage, and reparents image attachment', async () => {
       const forwardTransport = new FakeLarkTransport();
       await forwardTransport.start();

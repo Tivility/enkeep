@@ -517,4 +517,227 @@ describe('D-03 & D-04: Platform Steer and Queue Cancel/List Gateway and Routes',
       expect(cancelAgainJson.error.code).toBe('NOT_IN_QUEUE');
     });
   });
+
+  describe('06-A: promoteQueuedToSteer Gateway Unit Tests', () => {
+    it('promotes 2 queued turns into single steerTurn call, cancelling queued turns without creating new turn', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      // Running turn
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_active_1', 'turn_active_1', 'sp1', 'ses1', 'u1', 'container', 'running', '2026-10-18T10:00:00.000Z', '2026-10-18T10:00:00.000Z')
+      `).run();
+
+      // Two queued turns
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_q_1', 'turn_q_1', 'sp1', 'ses1', 'u1', 'container', 'queued', '2026-10-18T10:01:00.000Z', '2026-10-18T10:01:00.000Z')
+      `).run();
+      db.prepare(`
+        INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at)
+        VALUES ('msg_q_1', 'ses1', 'u1', 'user', 'First queued message', 'delivered', 'u1:web:ses1', 'turn_q_1', NULL, '2026-10-18T10:01:00.000Z')
+      `).run();
+      db.prepare(`
+        INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+        VALUES ('inbox_q_1', 'u1', 'ses1', 'msg_q_1', 'deliv_q_1', '{"content":"First queued message"}', 'held', 'turn_q_1', '2026-10-18T10:01:00.000Z', '2026-10-18T10:01:00.000Z')
+      `).run();
+
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_q_2', 'turn_q_2', 'sp1', 'ses1', 'u1', 'container', 'queued', '2026-10-18T10:02:00.000Z', '2026-10-18T10:02:00.000Z')
+      `).run();
+      db.prepare(`
+        INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at)
+        VALUES ('msg_q_2', 'ses1', 'u1', 'user', 'Second queued message', 'delivered', 'u1:web:ses1', 'turn_q_2', NULL, '2026-10-18T10:02:00.000Z')
+      `).run();
+      db.prepare(`
+        INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+        VALUES ('inbox_q_2', 'u1', 'ses1', 'msg_q_2', 'deliv_q_2', '{"content":"Second queued message"}', 'held', 'turn_q_2', '2026-10-18T10:02:00.000Z', '2026-10-18T10:02:00.000Z')
+      `).run();
+
+      const steerMock = vi.fn().mockResolvedValue({ ok: true });
+      const executor = {
+        execute: vi.fn(),
+        cancel: vi.fn(),
+        steerTurn: steerMock,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+      });
+
+      const res = await gateway.promoteQueuedToSteer('u1', 'ses1', { all: true });
+      expect(res.status).toBe('steered');
+      expect(res.count).toBe(2);
+      expect(res.runningTurnId).toBe('turn_active_1');
+
+      // steerTurn was called exactly once with merged messages (timestamp prefix because count > 1)
+      expect(steerMock).toHaveBeenCalledTimes(1);
+      const callArg = steerMock.mock.calls[0][0];
+      expect(callArg.expectedTurnId).toBe('turn_active_1');
+      expect(callArg.message).toContain('First queued message');
+      expect(callArg.message).toContain('Second queued message');
+
+      // Both queued turns are cancelled with error 'promoted to steer'
+      const t1 = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_q_1') as any;
+      const t2 = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_q_2') as any;
+      expect(t1.status).toBe('interrupted');
+      expect(t1.error).toBe('promoted to steer');
+      expect(t2.status).toBe('interrupted');
+      expect(t2.error).toBe('promoted to steer');
+
+      // Original web_messages metadata updated with isSteer and attachedTurnId
+      const msg1 = db.prepare('SELECT metadata FROM web_messages WHERE id = ?').get('msg_q_1') as any;
+      const meta1 = JSON.parse(msg1.metadata);
+      expect(meta1.isSteer).toBe(true);
+      expect(meta1.attachedTurnId).toBe('turn_active_1');
+    });
+
+    it('requeues via dispatchInbound when steerTurn is rejected (turn not running)', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      // Running turn in DB
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_active_2', 'turn_active_2', 'sp1', 'ses1', 'u1', 'container', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run();
+
+      // Queued turn
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_q_3', 'turn_q_3', 'sp1', 'ses1', 'u1', 'container', 'queued', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run();
+      db.prepare(`
+        INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at)
+        VALUES ('msg_q_3', 'ses1', 'u1', 'user', 'Queued message for fallback', 'delivered', 'u1:web:ses1', 'turn_q_3', NULL, CURRENT_TIMESTAMP)
+      `).run();
+      db.prepare(`
+        INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+        VALUES ('inbox_q_3', 'u1', 'ses1', 'msg_q_3', 'deliv_q_3', '{"content":"Queued message for fallback"}', 'held', 'turn_q_3', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run();
+
+      // Executor rejects with TURN_NOT_RUNNING (e.g. race condition where turn finished)
+      const steerMock = vi.fn().mockResolvedValue({
+        ok: false,
+        error: { code: 'TURN_NOT_RUNNING', message: 'Turn active_2 is not running' },
+      });
+      const executor = {
+        execute: vi.fn(),
+        cancel: vi.fn(),
+        steerTurn: steerMock,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+      });
+
+      const res = await gateway.promoteQueuedToSteer('u1', 'ses1', { turnIds: ['turn_q_3'] });
+      expect(res.status).toBe('requeued');
+      expect(res.count).toBe(1);
+
+      // Verify original queued turn was cancelled
+      const oldTurn = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_q_3') as any;
+      expect(oldTurn.status).toBe('interrupted');
+      expect(oldTurn.error).toBe('promoted to steer');
+
+      // Verify a new queued turn was dispatched into turn_runs
+      const newQueuedTurns = db.prepare(`
+        SELECT turn_id, status FROM turn_runs WHERE route_id = 'ses1' AND status = 'queued'
+      `).all() as any[];
+      expect(newQueuedTurns.length).toBe(1);
+      expect(newQueuedTurns[0].turn_id).not.toBe('turn_q_3');
+    });
+
+    it('requeues and preserves channelContext when steerTurn throws generic error', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      // Seed channel account for lark
+      db.prepare(`
+        INSERT INTO channel_accounts (id, user_id, type, status, credential_ref)
+        VALUES ('acc_test_01', 'u1', 'lark', 'active', '{}')
+      `).run();
+
+      // Running turn in DB
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_active_boom', 'turn_active_boom', 'sp1', 'ses1', 'u1', 'container', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run();
+
+      const channelCtx = {
+        channel: 'lark',
+        accountId: 'acc_test_01',
+        chatId: 'oc_test_chat_01',
+        nativeContextId: 'oc_test_chat_01',
+        nativeEventId: 'evt_test_event_01',
+        senderId: 'ou_test_user_01',
+      };
+
+      // Queued turn with channelContext in delivery_inbox payload
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_q_boom', 'turn_q_boom', 'sp1', 'ses1', 'u1', 'container', 'queued', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run();
+      db.prepare(`
+        INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, metadata, created_at)
+        VALUES ('msg_q_boom', 'ses1', 'u1', 'user', 'Queued message for generic error', 'delivered', 'u1:web:ses1', 'turn_q_boom', NULL, CURRENT_TIMESTAMP)
+      `).run();
+      db.prepare(`
+        INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+        VALUES ('inbox_q_boom', 'u1', 'ses1', 'msg_q_boom', 'deliv_q_boom', ?, 'held', 'turn_q_boom', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(JSON.stringify({ content: 'Queued message for generic error', channelContext: channelCtx }));
+
+      // Executor steerTurn throws generic Error('boom')
+      const steerMock = vi.fn().mockRejectedValue(new Error('boom'));
+      const executor = {
+        execute: vi.fn(),
+        cancel: vi.fn(),
+        steerTurn: steerMock,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        storage,
+        messageStore,
+        db,
+        quotaMode: 'disabled',
+        executor,
+        profileResolver,
+      });
+
+      const res = await gateway.promoteQueuedToSteer('u1', 'ses1', { turnIds: ['turn_q_boom'] });
+      expect(res.status).toBe('requeued');
+      expect(res.count).toBe(1);
+
+      // Verify original queued turn was cancelled
+      const oldTurn = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_q_boom') as any;
+      expect(oldTurn.status).toBe('interrupted');
+      expect(oldTurn.error).toBe('promoted to steer');
+
+      // Verify a new turn exists (status queued or running)
+      const newTurns = db.prepare(`
+        SELECT turn_id, status FROM turn_runs WHERE route_id = 'ses1' AND status IN ('queued', 'running') AND turn_id != 'turn_active_boom'
+      `).all() as any[];
+      expect(newTurns.length).toBe(1);
+      const newTurnId = newTurns[0].turn_id;
+      expect(newTurnId).not.toBe('turn_q_boom');
+
+      // Verify delivery_inbox payload for the new turn retained channelContext
+      const newInbox = db.prepare(`
+        SELECT payload FROM delivery_inbox WHERE turn_id = ?
+      `).get(newTurnId) as any;
+      expect(newInbox).toBeDefined();
+      expect(newInbox.payload).toBeDefined();
+      const parsedPayload = JSON.parse(newInbox.payload);
+      expect(parsedPayload.channelContext).toEqual(channelCtx);
+    });
+  });
 });
