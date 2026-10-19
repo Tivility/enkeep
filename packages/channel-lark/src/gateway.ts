@@ -57,13 +57,12 @@ import {
 } from './sender-name.js';
 
 /**
- * Standard Feishu Reaction emoji types:
- * - OnIt: "收到/在处理" (Feishu built-in emoji_type 'OnIt')
- * - SANDGLASS: "排队中/沙漏" (Feishu built-in emoji_type 'SANDGLASS')
- * Source: Lark Open Platform reaction emojis documentation and HappyClaw reference.
+ * Lark built-in reaction emoji types:
+ * - OnIt: the message is being handled.
+ * - OneSecond: the message is queued behind a running turn.
  */
 export const LARK_ONIT_REACTION = 'OnIt';
-export const LARK_QUEUE_REACTION = 'SANDGLASS';
+export const LARK_QUEUE_REACTION = 'OneSecond';
 
 export interface LarkChannelGatewayOptions {
   account: ChannelAccount | LarkAccountConfig;
@@ -135,6 +134,8 @@ export class LarkChannelGateway {
       reactionIdPromise: Promise<string | undefined>;
     }
   >();
+  // routeId -> (queued turnId -> idempotency key) for messages showing the queued reaction
+  private readonly queuedReactionTurns = new Map<string, Map<string, string>>();
   private readonly ackedNativeEvents = new Set<string>();
   private readonly activeTrackers = new Map<string, StreamingReplyTracker>();
   private readonly lastInboundTargets = new Map<string, ContinuationTarget>();
@@ -396,31 +397,49 @@ export class LarkChannelGateway {
   }
 
   /**
-   * Switches an existing pending reaction to target emojiType (e.g. from SANDGLASS to OnIt).
+   * Switches an existing pending reaction to targetEmoji (e.g. queued -> OnIt).
+   * The new reaction is added first; the old one is removed only once the new one exists.
    */
   private async switchReaction(idempotencyKey: string, targetEmoji: string): Promise<void> {
     const pending = this.pendingReactions.get(idempotencyKey);
     if (!pending || pending.emojiType === targetEmoji) return;
-
     try {
-      const oldReactionId = await pending.reactionIdPromise;
-      if (oldReactionId) {
-        await this.transport.removeReaction(pending.messageId, oldReactionId).catch(() => {});
-      }
-      const newPromise = (async () => {
-        try {
-          const res = await this.transport.addReaction(pending.messageId, targetEmoji);
-          return res?.reactionId;
-        } catch {
-          return undefined;
-        }
-      })();
+      const res = await this.transport.addReaction(pending.messageId, targetEmoji);
+      const newReactionId = res?.reactionId;
+      if (!newReactionId) return;
+      const oldReactionId = await pending.reactionIdPromise.catch(() => undefined);
       this.pendingReactions.set(idempotencyKey, {
         messageId: pending.messageId,
         emojiType: targetEmoji,
-        reactionIdPromise: newPromise,
+        reactionIdPromise: Promise.resolve(newReactionId),
       });
+      if (oldReactionId) {
+        await this.transport.removeReaction(pending.messageId, oldReactionId).catch(() => {});
+      }
     } catch {}
+  }
+
+  /**
+   * After a /steer command, queued messages whose turns left the queue without running were
+   * promoted into the running turn: switch their queued reaction back to OnIt.
+   */
+  private async refreshPromotedReactions(routeId: string): Promise<void> {
+    const entries = this.queuedReactionTurns.get(routeId);
+    if (!entries || entries.size === 0) return;
+    if (typeof this.runtimeGateway.listQueuedTurns !== 'function') return;
+    let stillQueued: Set<string>;
+    try {
+      const queued = await this.runtimeGateway.listQueuedTurns(this.userId, routeId);
+      stillQueued = new Set(queued.map((q) => q.turnId));
+    } catch {
+      return;
+    }
+    for (const [turnId, idemKey] of [...entries]) {
+      if (stillQueued.has(turnId)) continue;
+      entries.delete(turnId);
+      await this.switchReaction(idemKey, LARK_ONIT_REACTION);
+    }
+    if (entries.size === 0) this.queuedReactionTurns.delete(routeId);
   }
 
   private markEventAcked(nativeEventId: string): void {
@@ -1399,10 +1418,19 @@ export class LarkChannelGateway {
           hasRunning = currentStatus?.status === 'running';
         } catch {}
 
-        if (hasRunning) {
-          // Switch initial OnIt reaction to SANDGLASS (queued)
+        if (hasRunning && dispatchResult.turnId) {
+          let entries = this.queuedReactionTurns.get(route.id);
+          if (!entries) {
+            entries = new Map();
+            this.queuedReactionTurns.set(route.id, entries);
+          }
+          entries.set(dispatchResult.turnId, platformIdempotencyKey);
           this.switchReaction(platformIdempotencyKey, LARK_QUEUE_REACTION).catch(() => {});
         }
+      }
+
+      if (dispatchResult.executionMode === 'command' && /^\/steer(?:\s|$)/i.test(envelope.content.trim())) {
+        this.refreshPromotedReactions(route.id).catch(() => {});
       }
 
       if (dispatchResult.executionMode !== 'command' && this.streamEventSource && typeof this.transport.createStreamingCard === 'function') {
@@ -1463,6 +1491,7 @@ export class LarkChannelGateway {
           },
           onRunning: () => {
             // When turn actually starts running, switch reaction to OnIt
+            if (dispatchResult.turnId) this.queuedReactionTurns.get(route.id)?.delete(dispatchResult.turnId);
             this.switchReaction(platformIdempotencyKey, LARK_ONIT_REACTION).catch(() => {});
           },
           cardParams: {
