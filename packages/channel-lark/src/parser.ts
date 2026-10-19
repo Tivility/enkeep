@@ -938,8 +938,9 @@ export function normalizeRestMessageToParsed(
   if (!item || !item.message_id || item.deleted) {
     return null;
   }
-  // Bot's own messages must not be ingested as inbound user messages
-  if (item.sender?.sender_type === 'app') {
+  // Only real user messages are replayed: system notices (member joins, group changes, ...)
+  // and app/bot messages must never start a turn.
+  if (item.msg_type === 'system' || item.sender?.sender_type !== 'user') {
     return null;
   }
   if (context.botOpenId && item.sender?.id === context.botOpenId) {
