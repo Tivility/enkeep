@@ -341,7 +341,7 @@ describe('D-03 & D-04: Platform Steer and Queue Cancel/List Gateway and Routes',
     });
   });
 
-  describe('HTTP Route Integration (POST /steer, GET /queue, POST /queue/:turnId/cancel)', () => {
+  describe('HTTP Route Integration (POST /steer, GET /queue, POST /queue/:turnId/cancel, POST /queue/steer)', () => {
     let server: PlatformServer;
     let baseUrl: string;
     let csrfToken = 'test-steer-queue-csrf-token-32-chars!!';
@@ -515,6 +515,62 @@ describe('D-03 & D-04: Platform Steer and Queue Cancel/List Gateway and Routes',
       expect(cancelAgainRes.status).toBe(409);
       const cancelAgainJson = await cancelAgainRes.json();
       expect(cancelAgainJson.error.code).toBe('NOT_IN_QUEUE');
+    });
+
+    it('06-B: POST /api/sessions/:sessionId/queue/steer delegates to promoteQueuedToSteer', async () => {
+      const aliceUser = (await server.storage.users.list()).find((u) => u.username === 'alice');
+      const userId = aliceUser!.id;
+
+      // Clean up any lingering running turn on ses1 from prior tests
+      db.prepare(`DELETE FROM turn_runs WHERE user_id = ? AND route_id = 'ses1'`).run(userId);
+      db.prepare(`DELETE FROM delivery_inbox WHERE user_id = ? AND route_id = 'ses1'`).run(userId);
+
+      // Running turn
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_http_run', 'turn_http_run', 'sp1', 'ses1', ?, 'container', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(userId);
+
+      // Queued turn
+      db.prepare(`
+        INSERT INTO turn_runs (id, turn_id, space_id, route_id, user_id, execution_mode, status, created_at, updated_at)
+        VALUES ('run_http_q', 'turn_http_q', 'sp1', 'ses1', ?, 'container', 'queued', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(userId);
+      db.prepare(`
+        INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, created_at)
+        VALUES ('msg_http_q', 'ses1', ?, 'user', 'Promoted HTTP queued prompt', 'delivered', ?, 'turn_http_q', CURRENT_TIMESTAMP)
+      `).run(userId, `${userId}:web:ses1`);
+      db.prepare(`
+        INSERT INTO delivery_inbox (id, user_id, route_id, message_id, delivery_id, payload, status, turn_id, created_at, updated_at)
+        VALUES ('inbox_http_q', ?, 'ses1', 'msg_http_q', 'deliv_http_q', '{"content":"Promoted HTTP queued prompt"}', 'held', 'turn_http_q', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(userId);
+
+      // 1. Promote specific turnId
+      const steerRes = await fetch(`${baseUrl}/api/sessions/ses1/queue/steer`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ turnIds: ['turn_http_q'] }),
+      });
+      expect(steerRes.status).toBe(200);
+      const steerJson = await steerRes.json();
+      expect(steerJson.data.status).toBe('steered');
+      expect(steerJson.data.count).toBe(1);
+
+      // Verify the queued turn was marked interrupted with error 'promoted to steer'
+      const qRow = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get('turn_http_q') as any;
+      expect(qRow.status).toBe('interrupted');
+      expect(qRow.error).toBe('promoted to steer');
+
+      // 2. Calling with no queued turns left returns nothing_queued
+      const steerEmptyRes = await fetch(`${baseUrl}/api/sessions/ses1/queue/steer`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({}),
+      });
+      expect(steerEmptyRes.status).toBe(200);
+      const steerEmptyJson = await steerEmptyRes.json();
+      expect(steerEmptyJson.data.status).toBe('nothing_queued');
+      expect(steerEmptyJson.data.count).toBe(0);
     });
   });
 

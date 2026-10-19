@@ -4974,10 +4974,38 @@ aside.workspace-sidebar.is-collapsed {
 .composer-queue-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 0.4rem;
   font-size: 0.75rem;
   font-weight: 600;
   color: var(--text-muted);
+}
+
+.composer-queue-header-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.composer-queue-steer-all {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  color: var(--warning-text);
+  font-size: 0.72rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.composer-queue-steer-all:hover:not(:disabled) {
+  background: var(--warning);
+  color: var(--text-inverse);
+}
+
+.composer-queue-steer-all:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .composer-queue-list {
@@ -5012,6 +5040,35 @@ aside.workspace-sidebar.is-collapsed {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.composer-queue-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.composer-queue-item-steer {
+  background: transparent;
+  border: 1px solid var(--warning-border);
+  color: var(--warning-text);
+  cursor: pointer;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.72rem;
+  border-radius: var(--radius-xs);
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.composer-queue-item-steer:hover:not(:disabled) {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.composer-queue-item-steer:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .composer-queue-item-cancel {
