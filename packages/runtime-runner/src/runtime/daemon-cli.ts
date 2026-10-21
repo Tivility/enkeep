@@ -66,6 +66,21 @@ export function redirectConsoleToStderr(): () => void {
   };
 }
 
+/**
+ * The daemon is spawned detached so it survives a platform restart, but its stdio pipes
+ * belong to the platform process that spawned it. Once that process exits, the next write
+ * to stdout/stderr raises EPIPE; unhandled, that error kills the daemon in the middle of
+ * the first turn it accepts after the restart. Swallow write errors on these streams: the
+ * daemon keeps serving over its socket and only loses log output nobody can read.
+ */
+export function guardStdioAgainstBrokenPipe(
+  streams: NodeJS.WritableStream[] = [process.stdout, process.stderr]
+): void {
+  for (const stream of streams) {
+    stream.on('error', () => {});
+  }
+}
+
 export function resolveDaemonBootConfig(): {
   userId: string;
   dshHome: string;
@@ -132,6 +147,7 @@ export function resolveDaemonBootConfig(): {
 export async function runDaemonServer(): Promise<void> {
   // Isolate stdout for NDJSON only: redirect console logs to stderr
   redirectConsoleToStderr();
+  guardStdioAgainstBrokenPipe();
 
   const config = resolveDaemonBootConfig();
   const daemon = new RuntimeDaemon(config);
