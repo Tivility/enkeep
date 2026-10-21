@@ -81,6 +81,20 @@ export function guardStdioAgainstBrokenPipe(
   }
 }
 
+/**
+ * Removes the daemon's socket file only if it is still the one this daemon bound. A newer daemon
+ * for the same user may have replaced it; deleting that file would make the newer daemon
+ * unreachable while it keeps running.
+ */
+export function removeOwnSocket(socketPath: string, ownIno: number | undefined): void {
+  try {
+    if (ownIno === undefined) return;
+    if (fs.statSync(socketPath).ino === ownIno) {
+      fs.unlinkSync(socketPath);
+    }
+  } catch {}
+}
+
 export function resolveDaemonBootConfig(): {
   userId: string;
   dshHome: string;
@@ -218,9 +232,13 @@ export async function runDaemonServer(): Promise<void> {
     socket.on('error', cleanup);
   });
 
+  let ownSocketIno: number | undefined;
   server.listen(socketPath, () => {
     try {
       fs.chmodSync(socketPath, 0o600);
+    } catch {}
+    try {
+      ownSocketIno = fs.statSync(socketPath).ino;
     } catch {}
     process.stderr.write(`[RuntimeDaemon] Unix domain socket listening at ${socketPath} (mode 0600)\n`);
   });
@@ -271,11 +289,7 @@ export async function runDaemonServer(): Promise<void> {
           s.destroy();
         } catch {}
       }
-      try {
-        if (fs.existsSync(socketPath)) {
-          fs.unlinkSync(socketPath);
-        }
-      } catch {}
+      removeOwnSocket(socketPath, ownSocketIno);
       await daemon.shutdown(5000);
     } catch {}
     process.exit(0);
