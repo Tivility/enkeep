@@ -1422,6 +1422,7 @@ export class FakeLarkTransport implements LarkTransport {
       config: {
         update_multi: true,
         streaming_mode: true,
+        width_mode: 'fill',
       },
       header: {
         title: {
@@ -1544,6 +1545,7 @@ export class FakeLarkTransport implements LarkTransport {
 
       return {
         schema: '2.0',
+        config: { width_mode: 'fill' },
         header:
           lastStatus === 'completed'
             ? {
@@ -1699,6 +1701,7 @@ export class FakeLarkTransport implements LarkTransport {
     });
     const cardJson = {
       schema: '2.0',
+      config: { width_mode: 'fill' },
       header: isCompleted
         ? { title: { tag: 'plain_text', content: params.title ?? '已完成' }, template: 'violet' }
         : { title: { tag: 'plain_text', content: params.title ? `${params.title} (已中断)` : '已中断' }, template: 'orange' },
@@ -3388,6 +3391,7 @@ export class CredentialedLarkTransport implements LarkTransport {
         config: {
           update_multi: true,
           streaming_mode: true,
+          width_mode: 'fill',
         },
         header: {
           title: {
@@ -3789,6 +3793,7 @@ export class CredentialedLarkTransport implements LarkTransport {
 
         return {
           schema: '2.0',
+          config: { width_mode: 'fill' },
           header:
             lastStatus === 'completed'
               ? {
@@ -4034,6 +4039,7 @@ export class CredentialedLarkTransport implements LarkTransport {
     });
     const cardJson = {
       schema: '2.0',
+      config: { width_mode: 'fill' },
       header: isCompleted
         ? { title: { tag: 'plain_text', content: params.title ?? '已完成' }, template: 'violet' }
         : { title: { tag: 'plain_text', content: params.title ? `${params.title} (已中断)` : '已中断' }, template: 'orange' },

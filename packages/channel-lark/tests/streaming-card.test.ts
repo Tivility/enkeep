@@ -1073,34 +1073,13 @@ All criteria met.
       expect(elements[0].content).toContain('##### Task Summary');
       expect(elements[0].content).toContain('Here is the performance report:');
 
-      // Element 1: Native Schema 2.0 Table
-      expect(elements[1].tag).toBe('table');
-      expect(elements[1].row_height).toBe('low');
-      expect(elements[1].header_style.bold).toBe(true);
-      expect(elements[1].header_style.background_style).toBe('grey');
-      expect(elements[1].columns).toHaveLength(4);
-      expect(elements[1].columns[0]).toEqual({
-        name: 'c0',
-        display_name: 'Metric',
-        data_type: 'lark_md',
-        width: 'auto',
-        align: 'left',
-      });
-      expect(elements[1].columns[1].align).toBe('center');
-      expect(elements[1].columns[2].align).toBe('right');
-      expect(elements[1].rows).toHaveLength(2);
-      expect(elements[1].rows[0]).toEqual({
-        c0: 'Latency',
-        c1: '100ms',
-        c2: '45ms',
-        c3: 'Optimal',
-      });
-      expect(elements[1].rows[1]).toEqual({
-        c0: 'Error Rate',
-        c1: '< 0.1%',
-        c2: '0.00%',
-        c3: 'Zero errors',
-      });
+      // Element 1: the table stays GFM Markdown so Lark wraps cell text
+      expect(elements[1].tag).toBe('markdown');
+      expect(elements[1].content).toContain('| Metric |');
+      expect(elements[1].content).toContain('| Error Rate | < 0.1% | 0.00% | Zero errors |');
+
+      // The card fills the chat width instead of Lark's default fixed width
+      expect(finalCard.config?.width_mode).toBe('fill');
 
       // Element 2: Markdown
       expect(elements[2].tag).toBe('markdown');
@@ -1155,10 +1134,9 @@ All criteria met.
       // 1: Divider hr
       expect(elements[1].tag).toBe('hr');
 
-      // 2: C5 Native table
-      expect(elements[2].tag).toBe('table');
-      expect(elements[2].columns).toHaveLength(2);
-      expect(elements[2].rows).toHaveLength(2);
+      // 2: C5 table kept as Markdown
+      expect(elements[2].tag).toBe('markdown');
+      expect(elements[2].content).toContain('|');
 
       // 3: C2 Usage footer
       expect(elements[3].tag).toBe('markdown');
@@ -1166,7 +1144,7 @@ All criteria met.
       expect(elements[3].content).toContain('🤖 deepseek-chat · ⏱ 1.5s · 💡 50 tokens');
     });
 
-    it('FakeLarkTransport: finalize generates native table element in recorded card', async () => {
+    it('FakeLarkTransport: finalize keeps the table as markdown in recorded card', async () => {
       const transport = new FakeLarkTransport();
       await transport.start();
 
@@ -1189,9 +1167,9 @@ All criteria met.
 
       const elements = finalizeCall?.card.body.elements;
       expect(elements.length).toBe(1);
-      expect(elements[0].tag).toBe('table');
-      expect(elements[0].columns[0].display_name).toBe('Key');
-      expect(elements[0].rows[0]).toEqual({ c0: 'A', c1: '1' });
+      expect(elements[0].tag).toBe('markdown');
+      expect(elements[0].content).toContain('| Key | Value |');
+      expect(elements[0].content).toContain('| A | 1 |');
     });
   });
 });

@@ -403,6 +403,9 @@ export function parseMarkdownTable(input: string[] | string): LarkCardTableEleme
   };
 }
 
+/** Lark rejects a card with more than five tables (and more than four per markdown element). */
+export const CARD_MAX_TABLES = 5;
+
 export interface MarkdownToCardElementsOptions {
   maxChunkLen?: number;
   emptyFallback?: string;
@@ -410,7 +413,7 @@ export interface MarkdownToCardElementsOptions {
 
 /**
  * Transforms Markdown content into a sequence of Feishu Schema 2.0 CardKit body elements.
- * GFM pipe tables are parsed into native `table` containers with adaptive columns and lark_md cells.
+ * GFM pipe tables stay Markdown, one table per element, so Lark wraps their cells.
  * Non-table text is safely chunked (at code block / paragraph boundaries) into `markdown` elements.
  * The original sequential ordering between text, code blocks, and tables is preserved.
  */
@@ -435,6 +438,7 @@ export function markdownToCardElements(
 
   const elements: LarkCardBodyElement[] = [];
   let lastTextIndex = 0;
+  let tableCount = 0;
 
   let inCodeBlock = false;
   let codeFence = '';
@@ -500,16 +504,16 @@ export function markdownToCardElements(
             tableEnd++;
           }
 
-          const tableLines = lines.slice(i, tableEnd);
-          const tableElement = parseMarkdownTable(tableLines);
-          if (tableElement) {
-            elements.push(tableElement);
-          } else {
-            // Fallback: emit as markdown if table parsing failed
-            const rawTable = tableLines.join('\n');
-            const optimized = optimizeMarkdownStyle(rawTable);
-            elements.push({ tag: 'markdown', content: optimized });
-          }
+          // Keep tables as GFM Markdown (one table per markdown element) so Lark wraps
+          // cell text. The native `table` component truncates cells to a single line.
+          // Lark rejects a whole card holding more than five tables, so later tables
+          // are shown as preformatted text instead.
+          const rawTable = lines.slice(i, tableEnd).join('\n');
+          tableCount++;
+          elements.push({
+            tag: 'markdown',
+            content: tableCount <= CARD_MAX_TABLES ? rawTable : '```\n' + rawTable + '\n```',
+          });
 
           lastTextIndex = tableEnd;
           i = tableEnd;

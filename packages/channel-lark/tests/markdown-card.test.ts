@@ -201,15 +201,22 @@ describe('Fix C5: Markdown Table to Lark Schema 2.0 Native Table Element', () =>
       expect((elements[0] as LarkCardMarkdownElement).content).toContain('#### Overview');
     });
 
-    it('returns table element when markdown contains only a table', () => {
+    it('keeps a table as its own markdown element so Lark wraps cell text', () => {
       const text = '| Feature | Support |\n| --- | --- |\n| Table | Supported |';
       const elements = markdownToCardElements(text);
 
-      expect(elements).toHaveLength(1);
-      expect(elements[0].tag).toBe('table');
-      const tableEl = elements[0] as LarkCardTableElement;
-      expect(tableEl.columns).toHaveLength(2);
-      expect(tableEl.rows).toHaveLength(1);
+      expect(elements).toEqual([{ tag: 'markdown', content: text }]);
+    });
+
+    it('shows tables beyond the per-card limit as preformatted text', () => {
+      const table = (n: number) => `| T${n} | V |\n| --- | --- |\n| a | b |`;
+      const doc = [1, 2, 3, 4, 5, 6].map(table).join('\n\n');
+      const elements = markdownToCardElements(doc) as LarkCardMarkdownElement[];
+
+      expect(elements).toHaveLength(6);
+      expect(elements.every((e) => e.tag === 'markdown')).toBe(true);
+      expect(elements[4].content).toBe(table(5));
+      expect(elements[5].content).toBe('```\n' + table(6) + '\n```');
     });
 
     it('preserves exact sequential ordering across mixed text, tables, and code blocks', () => {
@@ -257,20 +264,19 @@ Final closing remarks.
       expect(md0.content).toContain('```typescript\ninterface Config');
       expect(md0.content).toContain('Below is the comparison matrix:');
 
-      expect(elements[1].tag).toBe('table');
-      const tbl1 = elements[1] as LarkCardTableElement;
-      expect(tbl1.columns.map((c) => c.display_name)).toEqual(['Metric', 'Target', 'Actual']);
-      expect(tbl1.rows).toHaveLength(2);
+      expect(elements[1].tag).toBe('markdown');
+      const tbl1 = elements[1] as LarkCardMarkdownElement;
+      expect(tbl1.content.startsWith('| Metric | Target | Actual |')).toBe(true);
+      expect(tbl1.content).toContain('| Error Rate | < 0.1% | 0.02% |');
 
       expect(elements[2].tag).toBe('markdown');
       const md2 = elements[2] as LarkCardMarkdownElement;
       expect(md2.content).toContain('##### Next Steps');
       expect(md2.content).toContain('1. Deploy to staging');
 
-      expect(elements[3].tag).toBe('table');
-      const tbl3 = elements[3] as LarkCardTableElement;
-      expect(tbl3.columns.map((c) => c.display_name)).toEqual(['Action', 'Owner']);
-      expect(tbl3.rows).toHaveLength(1);
+      expect(elements[3].tag).toBe('markdown');
+      const tbl3 = elements[3] as LarkCardMarkdownElement;
+      expect(tbl3.content).toBe('| Action | Owner |\n| --- | --- |\n| Staging rollout | @dev |');
 
       expect(elements[4].tag).toBe('markdown');
       const md4 = elements[4] as LarkCardMarkdownElement;
@@ -303,10 +309,7 @@ And outside is the actual table:
       expect(mdEl.content).toContain('```markdown');
       expect(mdEl.content).toContain('| Fake | Col |');
 
-      expect(elements[1].tag).toBe('table');
-      const tblEl = elements[1] as LarkCardTableElement;
-      expect(tblEl.columns.map((c) => c.display_name)).toEqual(['Real', 'Col']);
-      expect(tblEl.rows).toEqual([{ c0: '1', c1: '2' }]);
+      expect(elements[1]).toEqual({ tag: 'markdown', content: '| Real | Col |\n| --- | --- |\n| 1 | 2 |' });
     });
 
     it('chunks long non-table text blocks safely at maxChunkLen', () => {
@@ -318,11 +321,11 @@ And outside is the actual table:
 
       // Paragraph A (~2500) -> Element 0 (markdown)
       // Paragraph B (~2500) -> Element 1 (markdown)
-      // Table -> Element 2 (table)
+      // Table -> Element 2 (markdown, kept whole)
       expect(elements).toHaveLength(3);
       expect(elements[0].tag).toBe('markdown');
       expect(elements[1].tag).toBe('markdown');
-      expect(elements[2].tag).toBe('table');
+      expect(elements[2]).toEqual({ tag: 'markdown', content: table });
     });
 
     it('honors emptyFallback option when text is empty', () => {
