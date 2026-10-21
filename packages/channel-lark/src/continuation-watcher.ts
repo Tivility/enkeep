@@ -414,7 +414,7 @@ export class ContinuationWatcher {
               status,
               messageId,
             });
-            await this.recordOutboxDelivery(finalText, status, messageId, outboxId, targetCardParams);
+            await this.recordOutboxDelivery(finalText, status, messageId, outboxId, targetCardParams, runningEvt.turnId);
             if (!this.isStopped) {
               void this.pollTick();
             }
@@ -445,7 +445,8 @@ export class ContinuationWatcher {
     status: 'completed' | 'failed',
     messageId: string | undefined,
     outboxId: string,
-    targetOverride?: ContinuationTarget
+    targetOverride?: ContinuationTarget,
+    cardTurnId?: string
   ): Promise<void> {
     try {
       const target = targetOverride ?? this.replyTarget;
@@ -472,7 +473,10 @@ export class ContinuationWatcher {
 
       if (typeof this.channelRepo.findStreamingCardByTurn === 'function' && typeof this.channelRepo.finalizeStreamingCard === 'function') {
         try {
-          const cardRecord = await this.channelRepo.findStreamingCardByTurn(this.accountId, outboxId);
+          // The card is registered under the continuation turn id (onCardCreated), not the outbox id.
+          const cardRecord = cardTurnId
+            ? await this.channelRepo.findStreamingCardByTurn(this.accountId, cardTurnId)
+            : null;
           if (cardRecord) {
             await this.channelRepo.finalizeStreamingCard(cardRecord.id, status === 'completed' ? 'completed' : 'failed');
           }

@@ -363,6 +363,7 @@ export class StreamingReplyTracker {
   private inFlightTick: Promise<void> | null = null;
   private finalizedResult: { handled: boolean; messageId?: string; degraded?: boolean } | null = null;
   private seenOwnRunning = false;
+  private ownRunningTurnId: string | undefined;
   private readonly onRunning?: () => void;
 
   private readonly backgroundPanelManager?: LarkBackgroundPanelManager;
@@ -572,11 +573,22 @@ export class StreamingReplyTracker {
 
     for (const evt of events) {
       if (evt.type === 'turn_status' && evt.status === 'running') {
+        const evtTurnId = (evt as { turnId?: string }).turnId;
         if (this.seenOwnRunning) {
-          // Do not consume or advance cursor past a subsequent turn's running event
-          break;
+          // A repeated running event for the turn we already follow (the relay can emit one twice)
+          // is skipped. Only another turn's running event ends this tracker's window; stopping on a
+          // duplicate left the cursor parked on it forever and the card never finalized.
+          const ownTurnId = this.turnId ?? this.ownRunningTurnId;
+          if (!evtTurnId || !ownTurnId || evtTurnId !== ownTurnId) {
+            break;
+          }
+          if (evt.rowId > this.cursor) {
+            this.cursor = evt.rowId;
+          }
+          continue;
         }
         this.seenOwnRunning = true;
+        this.ownRunningTurnId = evtTurnId;
         try {
           this.onRunning?.();
         } catch {}

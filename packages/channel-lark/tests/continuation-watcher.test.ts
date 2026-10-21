@@ -108,6 +108,59 @@ describe('ContinuationWatcher', () => {
     watcher.stop();
   });
 
+  it('finalizes despite a duplicated running event and marks its registered card completed', async () => {
+    const transport = new FakeLarkTransport();
+    await transport.start();
+
+    const routeId = 'session_route_cont_dup';
+    const chatId = 'oc_test_chat_cont_dup';
+    const turnId = 'turn_auto_test_dup_0001';
+    const events: any[] = [
+      // The relay occasionally writes the same running event twice
+      { rowId: 20, type: 'turn_status', status: 'running', turnId, originTurnId: 'turn_origin_test_0001' },
+      { rowId: 21, type: 'turn_status', status: 'running', turnId, originTurnId: 'turn_origin_test_0001' },
+      { rowId: 22, type: 'assistant_delta', delta: 'Week done.', streamId: 'msgstream_dup_1', turnId },
+      { rowId: 23, type: 'assistant_stream_end', streamId: 'msgstream_dup_1', turnId },
+      { rowId: 24, type: 'turn_status', status: 'completed', turnId },
+    ];
+    const fakeSource: StreamEventSource = {
+      listAssistantEvents: vi.fn().mockImplementation(async (_rId, afterRowId) => events.filter((e) => e.rowId > afterRowId)),
+      resolveTurnOrigin: vi.fn().mockResolvedValue({ chatId, replyToMessageId: 'om_test_origin_0001' }),
+    };
+    const mockChannelRepo: any = {
+      createOutboxItem: vi.fn().mockImplementation(async (item) => item),
+      upsertStreamingCard: vi.fn().mockResolvedValue(undefined),
+      findStreamingCardByTurn: vi.fn().mockImplementation(async (_acc, tid) => (tid === turnId ? { id: 'strc_test_dup' } : null)),
+      finalizeStreamingCard: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const watcher = new ContinuationWatcher({
+      sessionRouteId: routeId,
+      accountId: 'acc_lark_1',
+      userId: 'usr_1',
+      nativeContextId: chatId,
+      streamEventSource: fakeSource,
+      transport,
+      channelRepo: mockChannelRepo,
+      replyTarget: { chatId },
+      initialCursor: 19,
+      hasActiveInboundTracker: () => false,
+      pollIntervalMs: 100,
+      inactivityTimeoutMs: 15 * 60 * 1000,
+    });
+
+    watcher.start();
+    for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(100);
+
+    const finalizeCall = transport.streamingCalls.find((c) => c.type === 'finalize');
+    expect(finalizeCall?.status).toBe('completed');
+    expect(finalizeCall?.content).toBe('Week done.');
+    expect(mockChannelRepo.findStreamingCardByTurn).toHaveBeenCalledWith('acc_lark_1', turnId);
+    expect(mockChannelRepo.finalizeStreamingCard).toHaveBeenCalledWith('strc_test_dup', 'completed');
+
+    watcher.stop();
+  });
+
   it('a running turn already tracked by an inbound tracker does not spawn a second card', async () => {
     const transport = new FakeLarkTransport();
     await transport.start();
