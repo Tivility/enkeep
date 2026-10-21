@@ -974,6 +974,7 @@ export class WeChatRuntimeManager {
              AND json_extract(co.payload_json, '$.turnId') = wm.turn_id
         WHERE wm.role = 'assistant' AND wm.status = 'delivered'
           AND wm.created_at < datetime('now', '-15 seconds')
+          AND wm.created_at >= datetime('now', '-1 day')
           AND co.id IS NULL
           AND (ir.idempotency_key LIKE 'idem_wechat_%' OR sr.channel = 'wechat')
       `).all() as Array<{
