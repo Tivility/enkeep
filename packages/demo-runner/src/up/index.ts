@@ -3230,9 +3230,16 @@ fs.appendFileSync(p, corruptData);
               allErrors.push(new Error(`Failed to teardown container for user "${h.userId}": ${err instanceof Error ? err.message : String(err)}`));
             }
           }
+        }
+
+        // Host daemons are stopped even when containers are retained across a platform restart:
+        // their LLM and platform proxy servers live in this process and die with it, and the next
+        // platform cannot verify this process's signed metadata. A retained daemon could no longer
+        // reach the model, and the next platform would start a second daemon on the same socket.
+        if (!isCrash) {
           for (const h of new Set(hostRuntimeHandles.values())) {
             try {
-              await h.teardown(removeVols);
+              await h.teardown(retainContainers ? false : removeVols);
             } catch (err: unknown) {
               allErrors.push(new Error(`Failed to teardown host runtime for user "${h.userId}": ${err instanceof Error ? err.message : String(err)}`));
             }
