@@ -4865,7 +4865,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             if (r.payload) {
               try {
                 const parsed = JSON.parse(r.payload);
-                if (parsed?.channelContext?.senderId === sel.senderId) return true;
+                // Rows queued before channelContext was stored carry no sender: include them.
+                if (!parsed?.channelContext) return true;
+                if (parsed.channelContext.senderId === sel.senderId) return true;
               } catch {}
             }
             return false;
@@ -4982,7 +4984,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       turnContent = turnContent || '';
       if (cand.payload) {
         try {
-          const ctx = JSON.parse(cand.payload)?.channelContext;
+          const parsedPayload = JSON.parse(cand.payload);
+          const ctx = parsedPayload?.channelContext ?? parsedPayload;
           const senderName = typeof ctx?.senderName === 'string' ? ctx.senderName.trim() : '';
           if (senderName && typeof ctx?.chatType === 'string' && ctx.chatType !== 'p2p') {
             turnContent = `[发送者: ${senderName}] ${turnContent}`;

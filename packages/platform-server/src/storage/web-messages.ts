@@ -986,6 +986,9 @@ export class SqliteWebMessageStore {
         timestamp,
         senderName: params.channelContext?.senderName ?? null,
         chatType: params.channelContext?.chatType ?? null,
+        // Kept so queued IM messages can later be promoted per sender (/steer), merged per
+        // chat, and re-queued with their reply target.
+        ...(params.channelContext ? { channelContext: params.channelContext } : {}),
       });
 
       // 2a. Insert placeholder into idempotency_records
