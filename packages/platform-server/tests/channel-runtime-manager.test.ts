@@ -457,6 +457,47 @@ describe('ChannelRuntimeManager - Proactive Scheduled Deliveries & Web Isolation
       expect(outboxRows.some((o) => o.status === 'delivered')).toBe(true);
     });
 
+    it('1b. Completed autonomous continuation turn (no turn_runs, no web_messages): closes as completed with the streamed text', async () => {
+      const turnId = 'turn_auto_test_reconcile_0001';
+      const sessionRouteId = 'ses_reconcile_auto_001';
+
+      db.prepare(`
+        INSERT INTO session_routes (id, user_id, space_id, channel, native_context_id, dsh_session_id)
+        VALUES (?, ?, ?, 'lark', ?, 'dsh_ses_rec_auto')
+      `).run(sessionRouteId, userId, spaceId, chatId);
+
+      db.prepare(`
+        INSERT INTO channel_streaming_cards (
+          id, user_id, account_id, session_id, turn_id, native_context_id, chat_id,
+          card_id, message_id, version, status, snapshot_text, created_at, updated_at
+        ) VALUES (
+          'strc_rec_auto', ?, ?, ?, ?, ?, ?,
+          'crd_orphan_auto', 'om_orphan_auto', 1, 'streaming', 'Step one', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+      `).run(userId, accountId, sessionRouteId, turnId, chatId, chatId);
+
+      const insertEvent = db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      `);
+      insertEvent.run('evt_auto_1', sessionRouteId, userId, 'turn_status', JSON.stringify({ status: 'running', turnId }));
+      insertEvent.run('evt_auto_2', sessionRouteId, userId, 'assistant_delta', JSON.stringify({ turnId, streamId: 's1', delta: 'Step one ' }));
+      insertEvent.run('evt_auto_3', sessionRouteId, userId, 'assistant_delta', JSON.stringify({ turnId, streamId: 's1', delta: 'done.' }));
+      insertEvent.run('evt_auto_4', sessionRouteId, userId, 'assistant_delta', JSON.stringify({ turnId, streamId: 's2', delta: 'Final summary.' }));
+      insertEvent.run('evt_auto_5', sessionRouteId, userId, 'turn_status', JSON.stringify({ status: 'completed', turnId }));
+
+      const res = await runtimeManager.reconcileOrphanStreamingCardsOnStartup();
+      expect(res.reconciled).toBe(1);
+
+      const recCall = transport.streamingCalls.find((c) => c.type === 'reconcile');
+      expect(recCall?.status).toBe('completed');
+      expect(recCall?.content).toBe('Step one done.\n\nFinal summary.');
+      expect(recCall?.card.header.template).toBe('violet');
+
+      const cardRow = db.prepare('SELECT status FROM channel_streaming_cards WHERE id = ?').get('strc_rec_auto') as any;
+      expect(cardRow.status).toBe('completed');
+    });
+
     it('2. Aborted/failed turn: preserves snapshot text without misleading banner, empty text shows interrupted notice', async () => {
       const turnIdWithSnapshot = 'turn_test_reconcile_aborted_snap';
       const sessionRouteId1 = 'ses_reconcile_002';

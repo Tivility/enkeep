@@ -848,6 +848,42 @@ export class ChannelRuntimeManager {
   }
 
   /**
+   * Returns the streamed reply text of a turn whose last turn_status event is `completed`,
+   * or null when the event stream holds no completed status for it.
+   */
+  private readCompletedTurnTextFromEvents(sessionId: string, userId: string, turnId: string): string | null {
+    const db = this.db;
+    if (!db) return null;
+    const terminal = db.prepare(`
+      SELECT json_extract(payload, '$.status') AS status FROM web_events
+      WHERE session_id = ? AND user_id = ? AND type = 'turn_status'
+        AND json_extract(payload, '$.turnId') = ?
+        AND json_extract(payload, '$.status') IN ('completed', 'failed', 'interrupted', 'cancelled', 'stopped')
+      ORDER BY rowid DESC LIMIT 1
+    `).get(sessionId, userId, turnId) as { status?: string } | undefined;
+    if (terminal?.status !== 'completed') return null;
+
+    const deltas = db.prepare(`
+      SELECT json_extract(payload, '$.streamId') AS streamId, json_extract(payload, '$.delta') AS delta
+      FROM web_events
+      WHERE session_id = ? AND user_id = ? AND type = 'assistant_delta' AND json_extract(payload, '$.turnId') = ?
+      ORDER BY rowid ASC
+    `).all(sessionId, userId, turnId) as Array<{ streamId?: string | null; delta?: string | null }>;
+    const parts: string[] = [];
+    let currentStream: string | null | undefined;
+    for (const row of deltas) {
+      if (typeof row.delta !== 'string') continue;
+      if (parts.length === 0 || row.streamId !== currentStream) {
+        parts.push(row.delta);
+        currentStream = row.streamId;
+      } else {
+        parts[parts.length - 1] += row.delta;
+      }
+    }
+    return parts.map((p) => p.trim()).filter(Boolean).join('\n\n');
+  }
+
+  /**
    * Reconciles orphan streaming cards on startup (within last 24h).
    */
   async reconcileOrphanStreamingCardsOnStartup(): Promise<{
@@ -927,8 +963,18 @@ export class ChannelRuntimeManager {
           let finalBody = '';
           let isCompleted = false;
 
+          // Autonomous continuation turns have neither a turn_runs row nor a web_messages reply;
+          // their outcome lives only in the session's event stream.
+          let streamedCompletedText: string | null = null;
+          if (!turnRow && !(assistantMsg?.content && assistantMsg.content.trim().length > 0)) {
+            streamedCompletedText = this.readCompletedTurnTextFromEvents(card.session_id, card.user_id, card.turn_id);
+          }
+
           if (assistantMsg && assistantMsg.content && assistantMsg.content.trim().length > 0) {
             finalBody = assistantMsg.content.trim();
+            isCompleted = true;
+          } else if (streamedCompletedText !== null) {
+            finalBody = streamedCompletedText || (card.snapshot_text || '').trim();
             isCompleted = true;
           } else if (turnRow?.status === 'queued') {
             finalBody = (card.snapshot_text || '').trim();
