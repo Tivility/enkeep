@@ -19250,6 +19250,12 @@ function renderMarkdownToElement(container, markdownText) {
       paraLines.push(lines[i]);
       i++;
     }
+    if (paraLines.length === 0) {
+      // A line that looked like a table start but did not parse as a table matches none of the
+      // branches above; consume it as plain text so the loop always advances.
+      paraLines.push(lines[i]);
+      i++;
+    }
     const p = document.createElement('p');
     renderInlineMarkdown(p, paraLines.join('\n'));
     container.appendChild(p);
