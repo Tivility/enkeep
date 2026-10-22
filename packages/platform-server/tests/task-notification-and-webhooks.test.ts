@@ -612,4 +612,71 @@ describe('Task Notification & Webhook Subsystem (SSRF Defense, HMAC & Retries)',
       expect(retryJson.data.id).toBe(deliveryId);
     });
   });
+  describe('6. Failure notifications on the task route (GET/PUT /api/manage/tasks/:taskId/notifications/failure)', () => {
+    const headers = () => ({
+      'Content-Type': 'application/json',
+      'X-Enkeep-CSRF': csrfToken,
+      Origin: baseUrl,
+      Cookie: aliceCookie,
+    });
+
+    it('is on by default, can be disabled per task, and the task_route subscription cannot be created or deleted directly', async () => {
+      const getRes = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/failure`, { headers: headers() });
+      expect(getRes.status).toBe(200);
+      const getJson = await getRes.json();
+      expect(getJson.data.enabled).toBe(true);
+      expect(getJson.data.events).toEqual(['failed', 'timeout']);
+      expect(getJson.data.route).toEqual({ kind: 'in_app', sessionId: null });
+
+      const putRes = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/failure`, {
+        method: 'PUT',
+        headers: headers(),
+        body: JSON.stringify({ enabled: false }),
+      });
+      expect(putRes.status).toBe(200);
+      const putJson = await putRes.json();
+      expect(putJson.data.enabled).toBe(false);
+      expect(putJson.data.subscriptionId).toBe(getJson.data.subscriptionId);
+
+      const listRes = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/subscriptions`, { headers: headers() });
+      const listJson = await listRes.json();
+      const routeSubs = listJson.data.filter((s: any) => s.channel === 'task_route');
+      expect(routeSubs).toHaveLength(1);
+      expect(routeSubs[0].enabled).toBe(false);
+
+      const badPut = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/failure`, {
+        method: 'PUT',
+        headers: headers(),
+        body: JSON.stringify({ enabled: 'no' }),
+      });
+      expect(badPut.status).toBe(400);
+
+      const createRes = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/subscriptions`, {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ channel: 'task_route' }),
+      });
+      expect(createRes.status).toBe(400);
+
+      const delRes = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/subscriptions/${routeSubs[0].id}`, {
+        method: 'DELETE',
+        headers: headers(),
+      });
+      expect(delRes.status).toBe(400);
+
+      const patchRes = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/subscriptions/${routeSubs[0].id}`, {
+        method: 'PATCH',
+        headers: headers(),
+        body: JSON.stringify({ enabled: true, events: ['completed'] }),
+      });
+      expect(patchRes.status).toBe(400);
+    });
+
+    it('returns 404 for another user\'s task', async () => {
+      const res = await fetch(`${baseUrl}/api/manage/tasks/${taskId}/notifications/failure`, {
+        headers: { ...headers(), Cookie: adminCookie },
+      });
+      expect(res.status).toBe(404);
+    });
+  });
 });

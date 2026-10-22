@@ -498,21 +498,22 @@ describe('Task Payload Contract (agent_prompt) & Due Date Hardening', () => {
       expect(validDelivery.spaceFolder).toBe('flow-test0007-81f2');
       expect(validDelivery.delivery?.channel).toBe('lark');
 
-      // Rejects conflicting silent=true and delivery
-      expect(() =>
-        validateAgentPromptPayload({
-          type: 'agent_prompt',
-          prompt: 'Conflicting prompt',
-          sessionId: validSessionId,
-          sessionPolicy: 'existing_session',
-          silent: true,
-          delivery: {
-            channel: 'lark',
-            accountId: 'acc_synth_test_1',
-            nativeContextId: 'oc_synth_chat_1',
-          },
-        })
-      ).toThrow(/cannot specify both silent=true and a delivery target/i);
+      // silent=true with a delivery is allowed: silent only hides success output,
+      // failure notifications still go to the delivery target
+      const silentWithDelivery = validateAgentPromptPayload({
+        type: 'agent_prompt',
+        prompt: 'Silent prompt with failure route',
+        sessionId: validSessionId,
+        sessionPolicy: 'existing_session',
+        silent: true,
+        delivery: {
+          channel: 'lark',
+          accountId: 'acc_synth_test_1',
+          nativeContextId: 'oc_synth_chat_1',
+        },
+      });
+      expect(silentWithDelivery.silent).toBe(true);
+      expect(silentWithDelivery.delivery?.nativeContextId).toBe('oc_synth_chat_1');
 
       // Rejects non-boolean silent
       expect(() =>
