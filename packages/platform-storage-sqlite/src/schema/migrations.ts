@@ -1661,6 +1661,78 @@ ALTER TABLE channel_bindings ADD COLUMN busy_mode TEXT NOT NULL DEFAULT 'queue' 
 PRAGMA foreign_key_check;
 `;
 
+export const MIGRATION_045_TASK_ROUTE_NOTIFICATIONS_SQL = `
+-- Migration 45: allow the 'task_route' notification channel (a task's own delivery route).
+-- SQLite cannot alter a CHECK constraint, so both tables are rebuilt. The new deliveries table
+-- references the new subscriptions table from the start, so dropping the old tables never
+-- cascades into rows that were copied over. RENAME rewrites the foreign key reference.
+CREATE TABLE task_notification_subscriptions_v45 (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES platform_tasks(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL CHECK(channel IN ('in_app', 'webhook', 'task_route')),
+  destination TEXT,
+  secret_hash TEXT,
+  secret_ciphertext TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+  events TEXT NOT NULL DEFAULT '["completed", "failed", "cancelled", "timeout"]',
+  created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+  updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+INSERT INTO task_notification_subscriptions_v45 (
+  id, task_id, user_id, channel, destination, secret_hash, secret_ciphertext, enabled, events, created_at, updated_at
+)
+SELECT id, task_id, user_id, channel, destination, secret_hash, secret_ciphertext, enabled, events, created_at, updated_at
+FROM task_notification_subscriptions;
+
+CREATE TABLE task_notification_deliveries_v45 (
+  id TEXT PRIMARY KEY,
+  subscription_id TEXT NOT NULL REFERENCES task_notification_subscriptions_v45(id) ON DELETE CASCADE,
+  task_id TEXT NOT NULL REFERENCES platform_tasks(id) ON DELETE CASCADE,
+  run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL CHECK(channel IN ('in_app', 'webhook', 'task_route')),
+  event TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'delivered', 'failed', 'dead_letter')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
+  next_retry_at TEXT,
+  last_error TEXT,
+  payload_json TEXT NOT NULL,
+  response_status INTEGER,
+  response_time_ms INTEGER,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+  updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+INSERT INTO task_notification_deliveries_v45 (
+  id, subscription_id, task_id, run_id, user_id, channel, event, status, attempts, max_attempts,
+  next_retry_at, last_error, payload_json, response_status, response_time_ms, idempotency_key, created_at, updated_at
+)
+SELECT id, subscription_id, task_id, run_id, user_id, channel, event, status, attempts, max_attempts,
+  next_retry_at, last_error, payload_json, response_status, response_time_ms, idempotency_key, created_at, updated_at
+FROM task_notification_deliveries;
+
+DROP TABLE task_notification_deliveries;
+DROP TABLE task_notification_subscriptions;
+
+ALTER TABLE task_notification_subscriptions_v45 RENAME TO task_notification_subscriptions;
+ALTER TABLE task_notification_deliveries_v45 RENAME TO task_notification_deliveries;
+
+CREATE INDEX IF NOT EXISTS idx_task_notif_sub_task ON task_notification_subscriptions(task_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_task_notif_sub_user ON task_notification_subscriptions(user_id, channel);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_notif_sub_task_route ON task_notification_subscriptions(task_id) WHERE channel = 'task_route';
+
+CREATE INDEX IF NOT EXISTS idx_task_notif_deliv_status_retry ON task_notification_deliveries(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_task_notif_deliv_task_created ON task_notification_deliveries(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_notif_deliv_user ON task_notification_deliveries(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_notif_deliv_run_channel ON task_notification_deliveries(run_id, channel);
+
+PRAGMA foreign_key_check;
+`;
+
 export const BUILTIN_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,

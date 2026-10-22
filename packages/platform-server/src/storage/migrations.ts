@@ -57,6 +57,7 @@ import {
   MIGRATION_042_CHANNEL_STREAMING_CARDS_SQL,
   MIGRATION_043_TURN_RUNS_STEPS_SQL,
   MIGRATION_044_CHANNEL_BINDING_BUSY_MODE_SQL,
+  MIGRATION_045_TASK_ROUTE_NOTIFICATIONS_SQL,
 } from '@enkeep/platform-storage-sqlite';
 
 export {
@@ -111,6 +112,7 @@ export {
   MIGRATION_042_CHANNEL_STREAMING_CARDS_SQL,
   MIGRATION_043_TURN_RUNS_STEPS_SQL,
   MIGRATION_044_CHANNEL_BINDING_BUSY_MODE_SQL,
+  MIGRATION_045_TASK_ROUTE_NOTIFICATIONS_SQL,
 };
 
 function isSqliteBusyOrLocked(err: unknown): boolean {
@@ -366,6 +368,12 @@ export const ALL_PLATFORM_MIGRATIONS: MigrationDefinition[] = [
     name: '044_channel_binding_busy_mode',
     upSql: MIGRATION_044_CHANNEL_BINDING_BUSY_MODE_SQL,
     checksum: computeChecksum(MIGRATION_044_CHANNEL_BINDING_BUSY_MODE_SQL),
+  },
+  {
+    version: 45,
+    name: '045_task_route_notifications',
+    upSql: MIGRATION_045_TASK_ROUTE_NOTIFICATIONS_SQL,
+    checksum: computeChecksum(MIGRATION_045_TASK_ROUTE_NOTIFICATIONS_SQL),
   },
 ];
 

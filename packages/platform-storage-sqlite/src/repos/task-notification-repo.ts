@@ -205,6 +205,50 @@ export class SqliteTaskNotificationRepository {
     };
   }
 
+  /**
+   * Returns the task_route subscription of a task, or null when it was never materialized.
+   */
+  async getTaskRouteSubscription(taskId: string, userId: string): Promise<TaskNotificationSubscription | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM task_notification_subscriptions
+      WHERE task_id = ? AND user_id = ? AND channel = 'task_route'
+      LIMIT 1
+    `).get(taskId, userId) as unknown as DbSubscriptionRow | undefined;
+    return row ? parseSubscriptionRow(row) : null;
+  }
+
+  /**
+   * Materializes the implicit task_route subscription (failed/timeout, enabled) of a task.
+   * Idempotent: the partial unique index keeps one task_route row per task.
+   * Returns null when the task does not exist for this user.
+   */
+  async ensureTaskRouteSubscription(
+    taskId: string,
+    userId: string,
+    defaults: { events: TaskNotificationEventType[]; enabled: boolean }
+  ): Promise<TaskNotificationSubscription | null> {
+    const owned = this.db.prepare(
+      'SELECT id FROM platform_tasks WHERE id = ? AND user_id = ? LIMIT 1'
+    ).get(taskId, userId);
+    if (!owned) return null;
+
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT OR IGNORE INTO task_notification_subscriptions (
+        id, task_id, user_id, channel, destination, secret_hash, secret_ciphertext, enabled, events, created_at, updated_at
+      ) VALUES (?, ?, ?, 'task_route', NULL, NULL, NULL, ?, ?, ?, ?)
+    `).run(
+      `sub_${randomUUID().replace(/-/g, '')}`,
+      taskId,
+      userId,
+      defaults.enabled ? 1 : 0,
+      JSON.stringify(defaults.events),
+      now,
+      now
+    );
+    return this.getTaskRouteSubscription(taskId, userId);
+  }
+
   async getSubscription(id: string, userId: string): Promise<TaskNotificationSubscription | null> {
     const row = this.db.prepare(`
       SELECT * FROM task_notification_subscriptions WHERE id = ? AND user_id = ?
@@ -361,6 +405,53 @@ export class SqliteTaskNotificationRepository {
       createdAt: now,
       updatedAt: now,
     };
+  }
+
+  /**
+   * Inserts a delivery unless one with the same idempotency key exists.
+   * Returns the stored row and whether this call created it.
+   */
+  async createDeliveryIfAbsent(input: CreateDeliveryInput): Promise<{ created: boolean; delivery: TaskNotificationDelivery | null }> {
+    const id = input.id || `del_${randomUUID().replace(/-/g, '')}`;
+    const now = new Date().toISOString();
+    const res = this.db.prepare(`
+      INSERT OR IGNORE INTO task_notification_deliveries (
+        id, subscription_id, task_id, run_id, user_id, channel, event, status,
+        attempts, max_attempts, next_retry_at, last_error, payload_json, idempotency_key, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      input.subscriptionId,
+      input.taskId,
+      input.runId ?? null,
+      input.userId,
+      input.channel,
+      input.event,
+      input.status || 'pending',
+      input.attempts ?? 0,
+      input.maxAttempts ?? 5,
+      input.nextRetryAt ?? null,
+      input.lastError ?? null,
+      JSON.stringify(input.payload),
+      input.idempotencyKey,
+      now,
+      now
+    );
+    const created = Number((res as any)?.changes ?? 0) > 0;
+    const row = this.db.prepare(`
+      SELECT * FROM task_notification_deliveries WHERE idempotency_key = ?
+    `).get(input.idempotencyKey) as unknown as DbDeliveryRow | undefined;
+    return { created, delivery: row ? parseDeliveryRow(row) : null };
+  }
+
+  /**
+   * Returns true when a delivery with this idempotency key already exists.
+   */
+  async hasDeliveryWithKey(idempotencyKey: string): Promise<boolean> {
+    const row = this.db.prepare(
+      'SELECT 1 AS present FROM task_notification_deliveries WHERE idempotency_key = ? LIMIT 1'
+    ).get(idempotencyKey);
+    return Boolean(row);
   }
 
   async getDelivery(id: string, userId: string): Promise<TaskNotificationDelivery | null> {
