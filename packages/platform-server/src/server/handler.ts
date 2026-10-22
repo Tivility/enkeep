@@ -231,6 +231,8 @@ const ALLOWED_UPDATE_SUBSCRIPTION_KEYS = new Set(["destination", "secret", "even
 const ALLOWED_TEST_WEBHOOK_KEYS = new Set(["url", "secret"]);
 const VALID_NOTIFICATION_CHANNELS = new Set(["in_app", "webhook"]);
 const VALID_NOTIFICATION_EVENTS = new Set(["completed", "failed", "cancelled", "timeout", "started"]);
+const TASK_ROUTE_NOTIFICATION_EVENTS = new Set(["failed", "timeout"]);
+const ALLOWED_FAILURE_NOTIFICATION_KEYS = new Set(["enabled"]);
 
 const VALID_TASK_PRIORITIES = new Set(["low", "medium", "high", "urgent"]);
 const VALID_TASK_STATUSES = new Set(["pending", "claimed", "running", "completed", "failed", "cancelled"]);
@@ -4904,6 +4906,44 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
               return;
             }
 
+            // Task Notifications: failure notices on the task's own route (task_route, on by default)
+            if (action === "/notifications/failure") {
+              if (method !== "GET" && method !== "PUT") {
+                throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+              }
+              let setting;
+              if (method === "PUT") {
+                validateCsrf(req, { csrfToken });
+                const body = await parseJsonBody(req, maxBodyBytes);
+                const unknownKeys = getUnknownKeys(body, ALLOWED_FAILURE_NOTIFICATION_KEYS);
+                if (unknownKeys.length > 0) {
+                  throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
+                }
+                if (typeof body.enabled !== "boolean") {
+                  throw new ValidationError('Field "enabled" must be a boolean');
+                }
+                setting = await taskNotificationService.setFailureNotificationEnabled(taskId, user.id, body.enabled);
+              } else {
+                setting = await taskNotificationService.getFailureNotificationSetting(taskId, user.id);
+              }
+              if (!setting) {
+                throw new NotFoundError(`Task "${taskId}" not found`);
+              }
+              const route = taskNotificationService.resolveFailureRoute(taskId, user.id);
+              sendJsonResponse(res, 200, createSuccessEnvelope({
+                taskId,
+                enabled: setting.enabled,
+                events: setting.events,
+                subscriptionId: setting.id,
+                route: route
+                  ? route.kind === "im"
+                    ? { kind: "im", source: route.source, channel: route.channel, accountId: route.accountId, nativeContextId: route.nativeContextId }
+                    : { kind: "in_app", sessionId: route.sessionId }
+                  : null,
+              }));
+              return;
+            }
+
             // Task Notifications: Subscriptions
             if (action === "/notifications/subscriptions") {
               if (method === "GET") {
@@ -4920,6 +4960,11 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
                   throw new ValidationError(`Unexpected field "${unknownKeys[0]}"`);
                 }
 
+                if (body.channel === "task_route") {
+                  throw new ValidationError(
+                    'The "task_route" subscription exists implicitly for every task; use PUT /notifications/failure to enable or disable it'
+                  );
+                }
                 if (!body.channel || typeof body.channel !== "string" || !VALID_NOTIFICATION_CHANNELS.has(body.channel)) {
                   throw new ValidationError('Field "channel" must be either "in_app" or "webhook"');
                 }
@@ -5015,6 +5060,16 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
 
                 const enabled = body.enabled !== undefined ? Boolean(body.enabled) : undefined;
 
+                const existingSub = await taskNotificationService.getSubscription(subId, user.id);
+                if (existingSub?.channel === "task_route") {
+                  if (destination !== undefined || secret !== undefined) {
+                    throw new ValidationError('The "task_route" subscription has no destination or secret');
+                  }
+                  if (events && (events.length === 0 || events.some((ev) => !TASK_ROUTE_NOTIFICATION_EVENTS.has(ev)))) {
+                    throw new ValidationError('The "task_route" subscription only supports the "failed" and "timeout" events');
+                  }
+                }
+
                 try {
                   const updated = await taskNotificationService.updateSubscription({
                     id: subId,
@@ -5039,6 +5094,10 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
 
               if (method === "DELETE") {
                 validateCsrf(req, { csrfToken });
+                const existingSub = await taskNotificationService.getSubscription(subId, user.id);
+                if (existingSub?.channel === "task_route") {
+                  throw new ValidationError('The "task_route" subscription cannot be deleted; disable it with PUT /notifications/failure');
+                }
                 const deleted = await taskNotificationService.deleteSubscription(subId, user.id);
                 if (!deleted) {
                   throw new NotFoundError(`Subscription "${subId}" not found`);

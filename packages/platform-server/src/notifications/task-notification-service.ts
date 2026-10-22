@@ -9,6 +9,8 @@
  * 5. Safe webhook payload construction: NO prompt or model text, URL secrets redacted.
  * 6. At-least-once delivery worker with exponential backoff & dead-letter queue.
  * 7. Test webhook verification endpoint.
+ * 8. task_route channel: failure / timeout / missed-run notices on the task's own route
+ *    (payload.delivery → IM chat bound to the anchor session → in-app message), one per run.
  *
  * @module @enkeep/platform-server/notifications
  */
@@ -41,6 +43,45 @@ import {
   computeSecretHash,
   CredentialDecryptionError,
 } from './credential-cipher.js';
+import {
+  TASK_ROUTE_EVENTS,
+  DEFAULT_MISSED_RUN_THRESHOLD_MS,
+  DEFAULT_FAILURE_LOOKBACK_MS,
+  buildMissedRunMessage,
+  buildRunFailureMessage,
+  computeScanFloor,
+  findMissedRuns,
+  findUnnotifiedFailedRuns,
+  loadRun,
+  loadTaskContext,
+  missedRouteKey,
+  resolveTaskRouteTarget,
+  runRouteKey,
+  type TaskRouteTarget,
+} from './task-failure-notifier.js';
+
+/**
+ * Sends a proactive IM message for the task_route channel (lark / wechat).
+ * Must be idempotent per outboxId.
+ */
+export type TaskRouteSender = (params: {
+  userId: string;
+  channel: 'lark' | 'wechat';
+  accountId: string;
+  chatId: string;
+  text: string;
+  title?: string;
+  sessionId?: string;
+  outboxId: string;
+}) => Promise<{ success: boolean; messageId?: string; error?: string } | void>;
+
+export interface TaskRouteReconcileResult {
+  failedRuns: number;
+  missedRuns: number;
+  retried: number;
+}
+
+const FAILED_RUN_STATUSES = new Set(['failed', 'timeout', 'lease_lost']);
 
 export interface TaskNotificationServiceOptions {
   db: DatabaseSync;
@@ -49,6 +90,12 @@ export interface TaskNotificationServiceOptions {
   deliveryTimeoutMs?: number;
   cipher?: CredentialCipherPort;
   cipherKey?: string | Buffer;
+  /** IM sender of the task_route channel; can also be set later with setTaskRouteSender(). */
+  taskRouteSender?: TaskRouteSender;
+  /** A pending task whose due time is older than this without any run is reported (default 30 min). */
+  missedRunThresholdMs?: number;
+  /** Failed runs older than this are never reported by the reconciler (default 24h). */
+  failureLookbackMs?: number;
 }
 
 const BACKOFF_INTERVALS_MS = [
@@ -87,6 +134,10 @@ export class TaskNotificationService {
   private readonly cipher: CredentialCipherPort | null;
   private workerTimer: NodeJS.Timeout | null = null;
   private isProcessing = false;
+  private taskRouteSender: TaskRouteSender | null;
+  private readonly missedRunThresholdMs: number;
+  private readonly failureLookbackMs: number;
+  private readonly inFlightDeliveries = new Set<string>();
 
   constructor(options: TaskNotificationServiceOptions) {
     this.db = options.db;
@@ -94,6 +145,9 @@ export class TaskNotificationService {
     this.securityOptions = options.securityOptions ?? {};
     this.maxDeliveryAttempts = options.maxDeliveryAttempts ?? 5;
     this.deliveryTimeoutMs = options.deliveryTimeoutMs ?? 5000;
+    this.taskRouteSender = options.taskRouteSender ?? null;
+    this.missedRunThresholdMs = options.missedRunThresholdMs ?? DEFAULT_MISSED_RUN_THRESHOLD_MS;
+    this.failureLookbackMs = options.failureLookbackMs ?? DEFAULT_FAILURE_LOOKBACK_MS;
 
     if (options.cipher) {
       this.cipher = options.cipher;
@@ -106,7 +160,14 @@ export class TaskNotificationService {
 
   // --- Subscription Management ---
 
+  setTaskRouteSender(sender: TaskRouteSender | null): void {
+    this.taskRouteSender = sender;
+  }
+
   async createSubscription(input: CreateTaskNotificationSubscriptionInput): Promise<TaskNotificationSubscription> {
+    if (input.channel === 'task_route') {
+      throw new Error('task_route subscription is implicit per task; use the failure notification settings instead');
+    }
     if (input.channel === 'webhook') {
       if (!input.destination) {
         throw new Error('Webhook subscription requires destination URL');
@@ -179,7 +240,315 @@ export class TaskNotificationService {
   }
 
   async deleteSubscription(id: string, userId: string): Promise<boolean> {
+    const existing = await this.repo.getSubscription(id, userId);
+    if (existing?.channel === 'task_route') {
+      throw new Error('task_route subscription cannot be deleted; disable it instead');
+    }
     return this.repo.deleteSubscription(id, userId);
+  }
+
+  // --- task_route: failure notifications on the task's own route ---
+
+  /**
+   * Returns the failure-notification setting of a task (materializing the implicit
+   * task_route subscription), or null when the task does not belong to the user.
+   */
+  async getFailureNotificationSetting(taskId: string, userId: string): Promise<TaskNotificationSubscription | null> {
+    return this.repo.ensureTaskRouteSubscription(taskId, userId, { events: TASK_ROUTE_EVENTS, enabled: true });
+  }
+
+  /**
+   * Enables or disables failure notifications of one task.
+   */
+  async setFailureNotificationEnabled(
+    taskId: string,
+    userId: string,
+    enabled: boolean
+  ): Promise<TaskNotificationSubscription | null> {
+    const sub = await this.getFailureNotificationSetting(taskId, userId);
+    if (!sub) return null;
+    if (sub.enabled === enabled) return sub;
+    return this.repo.updateSubscription({ id: sub.id, userId, enabled });
+  }
+
+  /**
+   * Describes where failure notifications of a task would go right now.
+   */
+  resolveFailureRoute(taskId: string, userId: string): TaskRouteTarget | null {
+    const task = loadTaskContext(this.db, taskId, userId);
+    return task ? resolveTaskRouteTarget(this.db, task) : null;
+  }
+
+  /**
+   * Creates (at most once per run) and dispatches the task_route notice of a failed run.
+   * Returns null when the run is not a failure, the task is gone, or the notice is disabled.
+   */
+  async notifyRunFailure(userId: string, runId: string, options: { dispatch?: 'async' | 'await' } = {}): Promise<TaskNotificationDelivery | null> {
+    const run = loadRun(this.db, runId, userId);
+    if (!run || !FAILED_RUN_STATUSES.has(run.status)) return null;
+    if (await this.repo.hasDeliveryWithKey(runRouteKey(run.id))) return null;
+
+    const task = loadTaskContext(this.db, run.taskId, userId);
+    if (!task) return null;
+    const sub = await this.getFailureNotificationSetting(task.id, userId);
+    if (!sub || !sub.enabled) return null;
+
+    const message = buildRunFailureMessage(task, run);
+    if (!sub.events.includes(message.event)) return null;
+
+    return this.createTaskRouteDelivery({
+      subscriptionId: sub.id,
+      taskId: task.id,
+      runId: run.id,
+      userId,
+      event: message.event,
+      idempotencyKey: runRouteKey(run.id),
+      kind: 'run_failure',
+      target: resolveTaskRouteTarget(this.db, task),
+      message,
+      dispatch: options.dispatch ?? 'async',
+    });
+  }
+
+  /**
+   * Creates (at most once per task and due time) and dispatches a missed-run notice.
+   */
+  async notifyMissedRun(
+    userId: string,
+    taskId: string,
+    dueAt: string,
+    now = new Date(),
+    options: { dispatch?: 'async' | 'await' } = {}
+  ): Promise<TaskNotificationDelivery | null> {
+    const key = missedRouteKey(taskId, dueAt);
+    if (await this.repo.hasDeliveryWithKey(key)) return null;
+    const task = loadTaskContext(this.db, taskId, userId);
+    if (!task) return null;
+    const sub = await this.getFailureNotificationSetting(task.id, userId);
+    if (!sub || !sub.enabled) return null;
+    const message = buildMissedRunMessage(task, dueAt, now);
+    if (!sub.events.includes(message.event)) return null;
+
+    return this.createTaskRouteDelivery({
+      subscriptionId: sub.id,
+      taskId: task.id,
+      runId: null,
+      userId,
+      event: message.event,
+      idempotencyKey: key,
+      kind: 'missed_run',
+      target: resolveTaskRouteTarget(this.db, task),
+      message,
+      dispatch: options.dispatch ?? 'async',
+      extra: { dueAt },
+    });
+  }
+
+  /**
+   * Scheduler maintenance pass: reports failed runs that have no notice yet (lease expiry,
+   * timeouts, restarts and anything the fast path missed) and runs that never started.
+   */
+  async reconcileTaskRoute(now = new Date(), options: { dispatch?: 'async' | 'await' } = {}): Promise<TaskRouteReconcileResult> {
+    const floor = computeScanFloor(this.db, now, this.failureLookbackMs);
+    const dispatch = options.dispatch ?? 'await';
+    let failedRuns = 0;
+    let missedRuns = 0;
+
+    for (const run of findUnnotifiedFailedRuns(this.db, floor)) {
+      try {
+        if (await this.notifyRunFailure(run.userId, run.id, { dispatch })) failedRuns++;
+      } catch {
+        // One broken task must not block the others
+      }
+    }
+
+    for (const missed of findMissedRuns(this.db, now, this.missedRunThresholdMs, floor)) {
+      try {
+        if (await this.notifyMissedRun(missed.userId, missed.taskId, missed.dueAt, now, { dispatch })) missedRuns++;
+      } catch {
+        // Continue with the next task
+      }
+    }
+
+    const retried = await this.processPendingDeliveries('task_route');
+    return { failedRuns, missedRuns, retried };
+  }
+
+  private async createTaskRouteDelivery(input: {
+    subscriptionId: string;
+    taskId: string;
+    runId: string | null;
+    userId: string;
+    event: TaskNotificationEventType;
+    idempotencyKey: string;
+    kind: 'run_failure' | 'missed_run';
+    target: TaskRouteTarget;
+    message: { title: string; text: string };
+    dispatch: 'async' | 'await';
+    extra?: Record<string, unknown>;
+  }): Promise<TaskNotificationDelivery | null> {
+    const { created, delivery } = await this.repo.createDeliveryIfAbsent({
+      subscriptionId: input.subscriptionId,
+      taskId: input.taskId,
+      runId: input.runId,
+      userId: input.userId,
+      channel: 'task_route',
+      event: input.event,
+      status: 'pending',
+      maxAttempts: this.maxDeliveryAttempts,
+      idempotencyKey: input.idempotencyKey,
+      payload: {
+        kind: input.kind,
+        event: `task.${input.event}`,
+        taskId: input.taskId,
+        runId: input.runId,
+        target: input.target,
+        title: input.message.title,
+        text: input.message.text,
+        ...(input.extra ?? {}),
+      },
+    });
+    if (!created || !delivery) return null;
+
+    if (input.dispatch === 'await') {
+      await this.runDeliveryExclusive(delivery);
+      return (await this.repo.getDelivery(delivery.id, input.userId)) ?? delivery;
+    }
+    setImmediate(() => {
+      void this.runDeliveryExclusive(delivery).catch(() => {});
+    });
+    return delivery;
+  }
+
+  /** Runs one delivery attempt unless the same delivery is already in flight in this process. */
+  private async runDeliveryExclusive(delivery: TaskNotificationDelivery): Promise<void> {
+    if (this.inFlightDeliveries.has(delivery.id)) return;
+    this.inFlightDeliveries.add(delivery.id);
+    try {
+      await this.executeDeliveryAttempt(delivery);
+    } finally {
+      this.inFlightDeliveries.delete(delivery.id);
+    }
+  }
+
+  private async executeTaskRouteAttempt(
+    delivery: TaskNotificationDelivery
+  ): Promise<{ success: boolean; statusCode?: number; error?: string; responseTimeMs?: number }> {
+    const payload = delivery.payload as Record<string, unknown>;
+    const target = payload.target as TaskRouteTarget | undefined;
+    const text = typeof payload.text === 'string' ? payload.text : '';
+    const title = typeof payload.title === 'string' ? payload.title : undefined;
+    const startTime = Date.now();
+
+    if (!target || !text) {
+      await this.repo.updateDeliveryStatus(delivery.id, {
+        status: 'dead_letter',
+        attempts: delivery.attempts + 1,
+        lastError: 'INVALID_TASK_ROUTE_PAYLOAD',
+      });
+      return { success: false, error: 'INVALID_TASK_ROUTE_PAYLOAD' };
+    }
+
+    if (target.kind === 'in_app') {
+      const written = this.writeInAppNotice(delivery, target.sessionId, text);
+      await this.repo.updateDeliveryStatus(delivery.id, written
+        ? { status: 'delivered', attempts: delivery.attempts + 1, responseStatus: 200, responseTimeMs: Date.now() - startTime, lastError: null }
+        : { status: 'dead_letter', attempts: delivery.attempts + 1, lastError: 'NO_ROUTE_AVAILABLE', nextRetryAt: null });
+      return written ? { success: true, statusCode: 200 } : { success: false, error: 'NO_ROUTE_AVAILABLE' };
+    }
+
+    let errStr: string | null = null;
+    if (!this.taskRouteSender) {
+      errStr = 'IM_SENDER_UNAVAILABLE';
+    } else {
+      try {
+        const chatId = target.nativeContextId.includes(':')
+          ? target.nativeContextId.split(':')[0]
+          : target.nativeContextId;
+        const result = await this.taskRouteSender({
+          userId: delivery.userId,
+          channel: target.channel,
+          accountId: target.accountId,
+          chatId,
+          text,
+          title,
+          sessionId: target.sessionId ?? undefined,
+          outboxId: `out_tfn_${delivery.id.replace(/[^a-zA-Z0-9_]/g, '')}`,
+        });
+        if (result && result.success === false) {
+          errStr = result.error ? `IM_SEND_FAILED: ${result.error}` : 'IM_SEND_FAILED';
+        }
+      } catch (err: unknown) {
+        errStr = `IM_SEND_FAILED: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
+    const responseTimeMs = Date.now() - startTime;
+    if (!errStr) {
+      await this.repo.updateDeliveryStatus(delivery.id, {
+        status: 'delivered',
+        attempts: delivery.attempts + 1,
+        responseStatus: 200,
+        responseTimeMs,
+        lastError: null,
+      });
+      return { success: true, statusCode: 200, responseTimeMs };
+    }
+
+    const truncated = errStr.length > 500 ? errStr.slice(0, 500) : errStr;
+    await this.handleDeliveryFailure(delivery, truncated, undefined, responseTimeMs);
+    if (delivery.attempts + 1 >= delivery.maxAttempts) {
+      // IM route exhausted: leave the notice in the anchor session so it is not lost silently
+      this.writeInAppNotice(delivery, target.sessionId, `${text}\n\n（飞书/微信推送多次失败，改为在此会话提醒：${truncated}）`);
+    }
+    return { success: false, error: truncated, responseTimeMs };
+  }
+
+  /** Writes the notice as an assistant message of the anchor web session (idempotent per delivery). */
+  private writeInAppNotice(delivery: TaskNotificationDelivery, sessionId: string | null, text: string): boolean {
+    if (!sessionId) return false;
+    try {
+      const route = this.db.prepare(
+        'SELECT space_id FROM session_routes WHERE id = ? AND user_id = ? LIMIT 1'
+      ).get(sessionId, delivery.userId) as { space_id?: string } | undefined;
+      if (!route) return false;
+
+      const messageId = `msg_tfn_${delivery.id.replace(/[^a-zA-Z0-9_]/g, '')}`;
+      const exists = this.db.prepare('SELECT 1 AS present FROM web_messages WHERE id = ?').get(messageId);
+      if (exists) return true;
+
+      const nowIso = new Date().toISOString();
+      const content = text.length > 4000 ? text.slice(0, 4000) : text;
+      const routeKey = `${delivery.userId}:web:${route.space_id ?? ''}:${sessionId}`;
+      this.db.prepare(`
+        INSERT INTO web_messages (
+          id, session_id, user_id, role, content, status, route_key, turn_id, created_at
+        ) VALUES (?, ?, ?, 'assistant', ?, 'delivered', ?, NULL, ?)
+      `).run(messageId, sessionId, delivery.userId, content, routeKey, nowIso);
+      this.db.prepare(`
+        INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
+        VALUES (?, ?, ?, 'message', ?, ?)
+      `).run(
+        `evt_${randomUUID().replace(/-/g, '')}`,
+        sessionId,
+        delivery.userId,
+        JSON.stringify({
+          message: {
+            id: messageId,
+            sessionId,
+            userId: delivery.userId,
+            role: 'assistant',
+            content,
+            status: 'delivered',
+            createdAt: nowIso,
+          },
+        }),
+        nowIso
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // --- Event Handling & Webhook Dispatch ---
@@ -211,12 +580,24 @@ export class TaskNotificationService {
       error?: string | null;
     } | null;
   }): Promise<TaskNotificationDelivery[]> {
-    const subscriptions = await this.repo.findSubscriptionsForEvent(options.taskId, options.event);
-    if (subscriptions.length === 0) {
-      return [];
+    const deliveries: TaskNotificationDelivery[] = [];
+
+    // task_route: failure notices are on by default (implicit subscription), one per run
+    if ((options.event === 'failed' || options.event === 'timeout') && options.run?.id) {
+      try {
+        const routeDelivery = await this.notifyRunFailure(options.userId, options.run.id);
+        if (routeDelivery) deliveries.push(routeDelivery);
+      } catch {
+        // The scheduler maintenance pass retries unnotified failures
+      }
     }
 
-    const deliveries: TaskNotificationDelivery[] = [];
+    const subscriptions = (await this.repo.findSubscriptionsForEvent(options.taskId, options.event))
+      .filter((sub) => sub.channel !== 'task_route');
+    if (subscriptions.length === 0) {
+      return deliveries;
+    }
+
     const eventId = `evt_${randomUUID().replace(/-/g, '')}`;
     const timestamp = new Date().toISOString();
 
@@ -293,6 +674,9 @@ export class TaskNotificationService {
     delivery: TaskNotificationDelivery,
     subscription?: TaskNotificationSubscription | null
   ): Promise<{ success: boolean; statusCode?: number; error?: string; responseTimeMs?: number }> {
+    if (delivery.channel === 'task_route') {
+      return this.executeTaskRouteAttempt(delivery);
+    }
     const sub = subscription || (await this.repo.getSubscription(delivery.subscriptionId, delivery.userId));
     if (!sub || !sub.destination) {
       const errStr = 'Subscription or destination URL not found';
@@ -580,7 +964,13 @@ export class TaskNotificationService {
 
     const updated = await this.repo.getDelivery(deliveryId, userId);
     if (updated) {
-      this.dispatchDeliveryAsync(updated, (await this.repo.getSubscription(updated.subscriptionId, userId))!);
+      if (updated.channel === 'task_route') {
+        setImmediate(() => {
+          void this.runDeliveryExclusive(updated).catch(() => {});
+        });
+      } else {
+        this.dispatchDeliveryAsync(updated, (await this.repo.getSubscription(updated.subscriptionId, userId))!);
+      }
     }
     return updated;
   }
@@ -609,13 +999,15 @@ export class TaskNotificationService {
     }
   }
 
-  async processPendingDeliveries(): Promise<number> {
-    const pending = await this.repo.findPendingDeliveries(new Date().toISOString(), 20);
+  async processPendingDeliveries(channel?: TaskNotificationChannel): Promise<number> {
+    const pending = (await this.repo.findPendingDeliveries(new Date().toISOString(), 20))
+      .filter((item) => !channel || item.channel === channel);
     let processed = 0;
 
     for (const item of pending) {
+      if (this.inFlightDeliveries.has(item.id)) continue;
       try {
-        await this.executeDeliveryAttempt(item);
+        await this.runDeliveryExclusive(item);
         processed++;
       } catch (_itemErr: unknown) {
         // executeDeliveryAttempt handles delivery failure persistence
