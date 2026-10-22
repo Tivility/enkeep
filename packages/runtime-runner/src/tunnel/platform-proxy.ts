@@ -588,7 +588,8 @@ export class PlatformProxyHandler implements StreamHandler {
       return;
     }
 
-    // 5. Tasks: POST /api/manage/tasks, GET /api/manage/tasks, PUT /api/manage/tasks/:id, GET /api/manage/tasks/:id, POST /api/manage/tasks/:id/cancel
+    // 5. Tasks: POST /api/manage/tasks, GET /api/manage/tasks, PUT /api/manage/tasks/:id, GET /api/manage/tasks/:id, POST /api/manage/tasks/:id/cancel,
+    //    GET/PUT /api/manage/tasks/:id/notifications/failure
     if (pathname === '/api/manage/tasks') {
       if (method === 'POST') {
         await this.handleCreateTask(req, stream);
@@ -603,6 +604,16 @@ export class PlatformProxyHandler implements StreamHandler {
     }
 
     if (pathname.startsWith('/api/manage/tasks/')) {
+      const failureNotifyMatch = pathname.match(/^\/api\/manage\/tasks\/([^/]+)\/notifications\/failure\/?$/);
+      if (failureNotifyMatch) {
+        if (method !== 'GET' && method !== 'PUT') {
+          this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
+          return;
+        }
+        await this.handleTaskFailureNotification(failureNotifyMatch[1], method, req, stream);
+        return;
+      }
+
       const cancelMatch = pathname.match(/^\/api\/manage\/tasks\/([^/]+)\/cancel\/?$/);
       if (cancelMatch) {
         if (method !== 'POST') {
@@ -1825,6 +1836,105 @@ export class PlatformProxyHandler implements StreamHandler {
   /**
    * Handles POST /api/manage/tasks/:id/cancel
    */
+  /**
+   * GET/PUT /api/manage/tasks/:id/notifications/failure
+   * Failure notices of a task go to the task's own route by default (task_route subscription,
+   * events failed/timeout). PUT {"enabled": false} turns them off for this task only.
+   */
+  private async handleTaskFailureNotification(
+    rawTaskId: string,
+    method: string,
+    req: ParsedHttpRequest,
+    stream: Duplex
+  ): Promise<void> {
+    if (!this.platformUserId || !this.db) {
+      this.writeJsonResponse(stream, 503, {
+        error: { code: 'OPERATIONS_UNAVAILABLE', message: 'Platform proxy requires authoritative platformUserId binding and database' },
+      });
+      return;
+    }
+
+    let taskId: string;
+    try {
+      taskId = decodeURIComponent(rawTaskId);
+    } catch {
+      this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID encoding' } });
+      return;
+    }
+    if (!TASK_ID_REGEX.test(taskId)) {
+      this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid task ID format' } });
+      return;
+    }
+
+    let enabled: boolean | undefined;
+    if (method === 'PUT') {
+      if (req.body.length > this.maxBodyBytes) {
+        this.writeJsonResponse(stream, 413, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } });
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(req.body.toString('utf8'));
+      } catch {
+        this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid JSON body' } });
+        return;
+      }
+      if (!isRecord(parsed)) {
+        this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'Request body must be an object' } });
+        return;
+      }
+      const unknownKey = Object.keys(parsed).find((k) => k !== 'enabled');
+      if (unknownKey) {
+        this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: `Unexpected field "${unknownKey}"` } });
+        return;
+      }
+      if (typeof parsed.enabled !== 'boolean') {
+        this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'Field "enabled" must be a boolean' } });
+        return;
+      }
+      enabled = parsed.enabled;
+    }
+
+    try {
+      const owned = this.db.prepare('SELECT id FROM platform_tasks WHERE id = ? AND user_id = ? LIMIT 1').get(taskId, this.platformUserId);
+      if (!owned) {
+        this.writeJsonResponse(stream, 404, { error: { code: 'TASK_NOT_FOUND', message: `Task "${taskId}" not found` } });
+        return;
+      }
+      const now = new Date().toISOString();
+      this.db.prepare(`
+        INSERT OR IGNORE INTO task_notification_subscriptions (
+          id, task_id, user_id, channel, destination, secret_hash, secret_ciphertext, enabled, events, created_at, updated_at
+        ) VALUES (?, ?, ?, 'task_route', NULL, NULL, NULL, 1, ?, ?, ?)
+      `).run(`sub_${randomUUID().replace(/-/g, '')}`, taskId, this.platformUserId, JSON.stringify(['failed', 'timeout']), now, now);
+      if (enabled !== undefined) {
+        this.db.prepare(`
+          UPDATE task_notification_subscriptions SET enabled = ?, updated_at = ?
+          WHERE task_id = ? AND user_id = ? AND channel = 'task_route'
+        `).run(enabled ? 1 : 0, now, taskId, this.platformUserId);
+      }
+      const row = this.db.prepare(`
+        SELECT id, enabled, events FROM task_notification_subscriptions
+        WHERE task_id = ? AND user_id = ? AND channel = 'task_route' LIMIT 1
+      `).get(taskId, this.platformUserId) as { id: string; enabled: number; events: string } | undefined;
+      if (!row) {
+        throw new Error('task_route subscription unavailable');
+      }
+      let events: unknown = ['failed', 'timeout'];
+      try {
+        events = JSON.parse(row.events);
+      } catch {}
+      this.writeJsonResponse(stream, 200, {
+        success: true,
+        data: { taskId, enabled: Number(row.enabled) === 1, events, subscriptionId: row.id },
+      });
+    } catch (err: unknown) {
+      this.writeJsonResponse(stream, 500, {
+        error: { code: 'INTERNAL_ERROR', message: err instanceof Error ? err.message : 'Failed to update failure notification setting' },
+      });
+    }
+  }
+
   private async handleCancelTask(rawTaskId: string, _req: ParsedHttpRequest, stream: Duplex): Promise<void> {
     if (!this.platformUserId) {
       this.writeJsonResponse(stream, 503, {

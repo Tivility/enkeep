@@ -25,6 +25,7 @@ import type { TenantScopedTaskRepository } from '../ports/task-port.js';
 import type { TenantScopedQuotaLedgerRepository } from '../ports/quota-ledger-port.js';
 import { TaskOperationService } from '../services/task-operation-service.js';
 import { QuotaOperationService } from '../services/quota-operation-service.js';
+import { resolveTaskOriginDelivery } from './task-delivery-route.js';
 import {
   TaskLeaseExpiredError,
   TaskAlreadyClaimedError,
@@ -86,6 +87,7 @@ export type TaskWorkerStage =
   | 'heartbeat'
   | 'polling_tick'
   | 'recovery'
+  | 'maintenance'
   | 'callback';
 
 export type TaskWorkerOriginatingStage =
@@ -142,6 +144,14 @@ export interface TaskWorkerOptions {
   recoverOnStart?: boolean;
   systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   onError?: TaskWorkerErrorHandler;
+  /**
+   * Periodic maintenance hook of the scheduler (e.g. failure / missed-run notifications).
+   * Runs on its own timer inside this worker so a long-running task does not block it.
+   * Errors are swallowed and reported through onError with stage 'maintenance'.
+   */
+  maintenance?: () => Promise<unknown> | unknown;
+  /** Interval of the maintenance hook (default 60s). */
+  maintenanceIntervalMs?: number;
   channelRuntimeManager?: any;
   wechatRuntimeManager?: any;
   db?: any;
@@ -220,6 +230,10 @@ export class AgentPromptTaskWorker {
   private readonly recoverOnStart: boolean;
   private readonly systemRecovery?: () => Promise<{ recoveredTasks: number; expiredReservations?: number }>;
   private readonly onErrorCallback?: TaskWorkerErrorHandler;
+  private readonly maintenanceHook?: () => Promise<unknown> | unknown;
+  private readonly maintenanceIntervalMs: number;
+  private maintenanceTimer: NodeJS.Timeout | null = null;
+  private maintenanceRunning = false;
   public channelRuntimeManager?: any;
   public wechatRuntimeManager?: any;
   private readonly db?: any;
@@ -251,6 +265,8 @@ export class AgentPromptTaskWorker {
     this.recoverOnStart = options.recoverOnStart ?? true;
     this.systemRecovery = options.systemRecovery;
     this.onErrorCallback = options.onError;
+    this.maintenanceHook = options.maintenance;
+    this.maintenanceIntervalMs = options.maintenanceIntervalMs ?? 60_000;
     this.channelRuntimeManager = options.channelRuntimeManager;
     this.wechatRuntimeManager = options.wechatRuntimeManager;
     this.db = options.db;
@@ -310,6 +326,48 @@ export class AgentPromptTaskWorker {
 
     // 2. Start polling loop
     this.scheduleNextPoll();
+
+    // 3. Start maintenance timer (independent of task execution, same process)
+    this.startMaintenance();
+  }
+
+  /**
+   * Runs the maintenance hook once (no-op when not configured or already running).
+   */
+  async runMaintenance(): Promise<void> {
+    if (!this.maintenanceHook || this.maintenanceRunning) {
+      return;
+    }
+    this.maintenanceRunning = true;
+    try {
+      await this.maintenanceHook();
+    } catch (err: unknown) {
+      if (this.onErrorCallback) {
+        try {
+          await this.onErrorCallback(
+            err instanceof Error ? err : new Error('Task worker maintenance failed'),
+            { stage: 'maintenance' }
+          );
+        } catch {
+          // Callback errors are contained
+        }
+      }
+    } finally {
+      this.maintenanceRunning = false;
+    }
+  }
+
+  private startMaintenance(): void {
+    if (!this.maintenanceHook || this.maintenanceTimer) {
+      return;
+    }
+    this.maintenanceTimer = setInterval(() => {
+      if (this._status !== 'running') {
+        return;
+      }
+      void this.runMaintenance();
+    }, this.maintenanceIntervalMs);
+    this.maintenanceTimer.unref?.();
   }
 
   /**
@@ -327,6 +385,11 @@ export class AgentPromptTaskWorker {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
+    }
+
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
     }
 
     if (options?.abortInFlight && this.activeAbortController) {
@@ -2086,167 +2149,6 @@ export class AgentPromptTaskWorker {
     tenantId: string,
     payload: AgentPromptTaskPayload
   ): TaskDeliveryTarget | undefined {
-    if (!this.db || !payload.sessionId) {
-      return undefined;
-    }
-
-    try {
-      // 1. Query origin session route
-      let routeRow: {
-        space_id?: string;
-        channel?: string;
-        account_id?: string;
-        native_context_id?: string;
-      } | undefined;
-
-      try {
-        routeRow = this.db.prepare(`
-          SELECT space_id, channel, account_id, native_context_id
-          FROM session_routes
-          WHERE id = ? AND user_id = ?
-          LIMIT 1
-        `).get(payload.sessionId, tenantId) as typeof routeRow;
-      } catch {}
-
-      // If task payload specified spaceId and routeRow exists with a different spaceId: fail closed
-      if (payload.spaceId && routeRow?.space_id && payload.spaceId !== routeRow.space_id) {
-        return undefined;
-      }
-
-      const resolvedSpaceId = payload.spaceId || routeRow?.space_id;
-
-      // 1a. If origin session itself has a direct channel binding (lark or wechat)
-      if (
-        routeRow &&
-        (routeRow.channel === 'lark' || routeRow.channel === 'wechat') &&
-        routeRow.account_id &&
-        routeRow.native_context_id
-      ) {
-        // If channel_accounts table is present, verify account is active
-        try {
-          const accountRow = this.db.prepare(`
-            SELECT id, status, type FROM channel_accounts
-            WHERE id = ? AND user_id = ?
-            LIMIT 1
-          `).get(routeRow.account_id, tenantId) as { id?: string; status?: string; type?: string } | undefined;
-          if (accountRow && accountRow.status !== 'active') {
-            return undefined;
-          }
-        } catch {}
-
-        // If channel_bindings table is present, verify binding exists and matches space
-        try {
-          const baseContext = routeRow.native_context_id.includes(':')
-            ? routeRow.native_context_id.split(':')[0]
-            : routeRow.native_context_id;
-          const bindingRow = this.db.prepare(`
-            SELECT id, space_id FROM channel_bindings
-            WHERE user_id = ? AND account_id = ? AND (native_context_id = ? OR native_context_id = ?)
-            LIMIT 1
-          `).get(tenantId, routeRow.account_id, routeRow.native_context_id, baseContext) as { id?: string; space_id?: string } | undefined;
-
-          if (bindingRow && resolvedSpaceId && bindingRow.space_id !== resolvedSpaceId) {
-            return undefined;
-          }
-        } catch {}
-
-        return {
-          channel: routeRow.channel,
-          accountId: routeRow.account_id,
-          nativeContextId: routeRow.native_context_id,
-        };
-      }
-
-      // 2. Fall back to origin space channel binding (when session is web or has no channel route)
-      if (!resolvedSpaceId) {
-        return undefined;
-      }
-
-      let candidateBindings: Array<{
-        account_id: string;
-        native_context_id: string;
-      }> = [];
-
-      try {
-        candidateBindings = this.db.prepare(`
-          SELECT account_id, native_context_id
-          FROM channel_bindings
-          WHERE user_id = ? AND space_id = ?
-        `).all(tenantId, resolvedSpaceId) as typeof candidateBindings;
-      } catch {}
-
-      if (!candidateBindings || candidateBindings.length === 0) {
-        return undefined;
-      }
-
-      const validTargets: Array<{
-        channel: 'lark' | 'wechat';
-        accountId: string;
-        nativeContextId: string;
-      }> = [];
-
-      for (const b of candidateBindings) {
-        if (!b.account_id || !b.native_context_id) continue;
-
-        let channelType: 'lark' | 'wechat' | undefined;
-        try {
-          const accRow = this.db.prepare(`
-            SELECT type, status FROM channel_accounts
-            WHERE id = ? AND user_id = ?
-            LIMIT 1
-          `).get(b.account_id, tenantId) as { type?: string; status?: string } | undefined;
-          if (accRow) {
-            if (accRow.status !== 'active') continue;
-            if (accRow.type === 'lark' || accRow.type === 'wechat') {
-              channelType = accRow.type;
-            } else {
-              continue;
-            }
-          }
-        } catch {}
-
-        if (!channelType) {
-          if (b.account_id.includes('lark') || b.account_id.startsWith('acc_hpc_') || b.account_id.startsWith('acc_lark_')) {
-            channelType = 'lark';
-          } else if (b.account_id.includes('wechat')) {
-            channelType = 'wechat';
-          }
-        }
-
-        if (channelType) {
-          validTargets.push({
-            channel: channelType,
-            accountId: b.account_id,
-            nativeContextId: b.native_context_id,
-          });
-        }
-      }
-
-      if (validTargets.length === 0) {
-        return undefined;
-      }
-
-      // Check if candidate bindings point to multiple different chats: never guess a different chat!
-      const uniqueChatKeys = new Set(
-        validTargets.map((t) => {
-          const base = t.nativeContextId.includes(':') ? t.nativeContextId.split(':')[0] : t.nativeContextId;
-          return `${t.channel}:${t.accountId}:${base}`;
-        })
-      );
-
-      if (uniqueChatKeys.size > 1) {
-        console.warn(`[agent-prompt-task] Multiple candidate channel bindings found for space "${resolvedSpaceId}"; falling back to web only without guessing:`, {
-          tenantId,
-          spaceId: resolvedSpaceId,
-          candidateCount: uniqueChatKeys.size,
-        });
-        return undefined;
-      }
-
-      return validTargets[0];
-    } catch (err) {
-      console.warn('[agent-prompt-task] Error during fallback delivery resolution:', err);
-      return undefined;
-    }
+    return resolveTaskOriginDelivery(this.db, tenantId, payload);
   }
 }

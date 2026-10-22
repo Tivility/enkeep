@@ -433,3 +433,68 @@ describe('PlatformProxyHandler Task Management (cancel / list / get) Tests', () 
     });
   });
 });
+
+describe('PlatformProxyHandler task failure notification setting (GET/PUT /api/manage/tasks/:id/notifications/failure)', () => {
+  let db: DatabaseSync;
+  let handler: PlatformProxyHandler;
+
+  beforeEach(() => {
+    db = createTestDatabase();
+    db.exec(`
+      CREATE TABLE task_notification_subscriptions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        destination TEXT,
+        secret_hash TEXT,
+        secret_ciphertext TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        events TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_task_notif_sub_task_route ON task_notification_subscriptions(task_id) WHERE channel = 'task_route';
+    `);
+    handler = createPlatformProxyHandler({ db, platformUserId: ALICE_ID });
+  });
+
+  afterEach(() => {
+    try {
+      db.close();
+    } catch {}
+  });
+
+  it('defaults to enabled and turns off for one task only', async () => {
+    const getRes = await sendRequest(handler, 'GET', `/api/manage/tasks/${TASK_ALICE_1}/notifications/failure`);
+    expect(getRes.statusCode).toBe(200);
+    expect(getRes.body.data).toMatchObject({ taskId: TASK_ALICE_1, enabled: true, events: ['failed', 'timeout'] });
+
+    const putRes = await sendRequest(handler, 'PUT', `/api/manage/tasks/${TASK_ALICE_1}/notifications/failure`, { enabled: false });
+    expect(putRes.statusCode).toBe(200);
+    expect(putRes.body.data.enabled).toBe(false);
+    expect(putRes.body.data.subscriptionId).toBe(getRes.body.data.subscriptionId);
+
+    const other = await sendRequest(handler, 'GET', `/api/manage/tasks/${TASK_ALICE_2}/notifications/failure`);
+    expect(other.body.data.enabled).toBe(true);
+
+    const rows = db.prepare(`SELECT task_id, enabled FROM task_notification_subscriptions WHERE channel = 'task_route' ORDER BY task_id`).all() as any[];
+    expect(rows).toEqual([
+      { task_id: TASK_ALICE_1, enabled: 0 },
+      { task_id: TASK_ALICE_2, enabled: 1 },
+    ]);
+  });
+
+  it('validates the body, method and tenant', async () => {
+    const bad = await sendRequest(handler, 'PUT', `/api/manage/tasks/${TASK_ALICE_1}/notifications/failure`, { enabled: 'off' });
+    expect(bad.statusCode).toBe(400);
+    const extra = await sendRequest(handler, 'PUT', `/api/manage/tasks/${TASK_ALICE_1}/notifications/failure`, { enabled: true, channel: 'x' });
+    expect(extra.statusCode).toBe(400);
+    const post = await sendRequest(handler, 'POST', `/api/manage/tasks/${TASK_ALICE_1}/notifications/failure`, { enabled: true });
+    expect(post.statusCode).toBe(405);
+    const bob = await sendRequest(handler, 'GET', `/api/manage/tasks/${TASK_BOB}/notifications/failure`);
+    expect(bob.statusCode).toBe(404);
+    const count = db.prepare(`SELECT COUNT(*) AS c FROM task_notification_subscriptions`).get() as any;
+    expect(count.c).toBe(0);
+  });
+});

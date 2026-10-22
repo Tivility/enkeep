@@ -148,7 +148,7 @@ describe('Script Task Payload & Result Contract (D6 / F-16)', () => {
       expect(valid.timeoutMs).toBe(300000);
     });
 
-    it('validates delivery target and silent conflict', () => {
+    it('validates delivery target and allows silent with a delivery (failure route)', () => {
       const validDelivery = {
         channel: 'lark',
         accountId: 'acc_123',
@@ -163,15 +163,15 @@ describe('Script Task Payload & Result Contract (D6 / F-16)', () => {
       });
       expect(res.delivery).toEqual(validDelivery);
 
-      expect(() =>
-        validateScriptTaskPayload({
-          type: 'script',
-          command: 'echo 1',
-          spaceId: validSpaceId,
-          delivery: validDelivery,
-          silent: true,
-        })
-      ).toThrow(ValidationError);
+      const silent = validateScriptTaskPayload({
+        type: 'script',
+        command: 'echo 1',
+        spaceId: validSpaceId,
+        delivery: validDelivery,
+        silent: true,
+      });
+      expect(silent.silent).toBe(true);
+      expect(silent.delivery).toEqual(validDelivery);
     });
   });
 

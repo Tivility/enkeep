@@ -5449,12 +5449,66 @@ async function showTaskRunsModal(taskId, taskTitle) {
     tabBody.replaceChildren(createSkeletonLoader());
 
     try {
-      const [subsRes, delivRes] = await Promise.allSettled([
+      const [failureRes, subsRes, delivRes] = await Promise.allSettled([
+        apiRequest(`/api/manage/tasks/${taskId}/notifications/failure`),
         apiRequest(`/api/manage/tasks/${taskId}/notifications/subscriptions`),
         apiRequest(`/api/manage/tasks/${taskId}/notifications/deliveries`),
       ]);
 
       tabBody.replaceChildren();
+
+      // Failure notifications on the task's own route (on by default, per-task opt-out)
+      const failureSetting = failureRes.status === 'fulfilled' && failureRes.value ? failureRes.value.data : null;
+      if (failureSetting) {
+        const failureSection = document.createElement('div');
+        failureSection.className = 'management-section mb-3';
+        const fHead = document.createElement('div');
+        fHead.className = 'section-header';
+        const h3Failure = document.createElement('h3');
+        h3Failure.textContent = t('notifications.failureTitle', null, 'Failure notifications');
+        fHead.appendChild(h3Failure);
+        failureSection.appendChild(fHead);
+
+        const fPanel = document.createElement('div');
+        fPanel.className = 'card-panel mb-2';
+        const fDesc = document.createElement('p');
+        fDesc.className = 'text-muted';
+        fDesc.textContent = t(
+          'notifications.failureDesc',
+          null,
+          'When a run fails, times out, or does not start on time, a notice is sent to the task delivery target, else the chat bound to its session, else the session itself. Silent tasks are notified too.'
+        );
+        fPanel.appendChild(fDesc);
+
+        const fRow = document.createElement('div');
+        fRow.className = 'file-actions-cell';
+        fRow.appendChild(createBadgeElement(
+          failureSetting.enabled ? t('notifications.failureOn', null, 'On') : t('notifications.failureOff', null, 'Off'),
+          failureSetting.enabled ? 'success' : 'muted'
+        ));
+        const btnFailureToggle = document.createElement('button');
+        btnFailureToggle.type = 'button';
+        btnFailureToggle.className = 'btn btn-secondary btn-xs';
+        btnFailureToggle.textContent = failureSetting.enabled ? 'Disable' : 'Enable';
+        btnFailureToggle.addEventListener('click', async () => {
+          try {
+            btnFailureToggle.disabled = true;
+            await apiRequest(`/api/manage/tasks/${taskId}/notifications/failure`, {
+              method: 'PUT',
+              body: { enabled: !failureSetting.enabled },
+            });
+            await renderWebhooksTab();
+          } catch (err) {
+            showToast(getSafeErrorMessage(err, 'Failed to update failure notifications.'), 'error');
+          } finally {
+            btnFailureToggle.disabled = false;
+          }
+        });
+        fRow.appendChild(btnFailureToggle);
+        fPanel.appendChild(fRow);
+        failureSection.appendChild(fPanel);
+        tabBody.appendChild(failureSection);
+      }
 
       // Subscriptions Management Section
       const subsSection = document.createElement('div');
@@ -5656,7 +5710,9 @@ async function showTaskRunsModal(taskId, taskTitle) {
 
       // Subscriptions Table
       const rawSubs = subsRes.status === 'fulfilled' && subsRes.value ? subsRes.value.data : [];
-      const subs = Array.isArray(rawSubs) ? rawSubs : (rawSubs && Array.isArray(rawSubs.items) ? rawSubs.items : []);
+      // The task_route subscription is managed by the failure notification switch above
+      const subs = (Array.isArray(rawSubs) ? rawSubs : (rawSubs && Array.isArray(rawSubs.items) ? rawSubs.items : []))
+        .filter((s) => s && s.channel !== 'task_route');
 
       if (subs.length > 0) {
         const subTableContainer = document.createElement('div');

@@ -61,6 +61,11 @@ export interface PlatformServerTaskWorkerOptions {
   defaultExecutionBudgetMs?: number;
   operationsStorage?: SqlitePlatformOperationsStorage;
   taskNotificationService?: TaskNotificationService;
+  /**
+   * Interval of the scheduler maintenance pass that reports failed / timed-out / missed runs on
+   * the task's own route (only when taskNotificationService is set). Default 60s.
+   */
+  failureNotificationIntervalMs?: number;
   channelRuntimeManager?: any;
   wechatRuntimeManager?: any;
   prepareTaskInput?: TaskWorkerOptions['prepareTaskInput'];
@@ -102,9 +107,11 @@ export function createPlatformServerTaskWorker(
     }
 
     const notifService = options.taskNotificationService;
-    const proxiedTasks: typeof origTasks = {
-      ...origTasks,
-      async complete(id, claimantId, result, runId, tokenUsage) {
+    // Delegate through the prototype chain: the tenant repository is a class instance, so an
+    // object spread would drop its prototype methods (claimNext, heartbeat, ...).
+    const proxiedTasks: typeof origTasks = Object.create(origTasks);
+    Object.assign(proxiedTasks, {
+      async complete(id: string, claimantId: string, result: any, runId?: string, tokenUsage?: any) {
         const completedTask = await origTasks.complete(id, claimantId, result, runId, tokenUsage);
         try {
           await notifService.notifyTaskEvent({
@@ -131,7 +138,7 @@ export function createPlatformServerTaskWorker(
         } catch {}
         return completedTask;
       },
-      async fail(id, claimantId, error, retryable, runId, errorCode) {
+      async fail(id: string, claimantId: string, error: string, retryable?: boolean, runId?: string, errorCode?: string) {
         const failedTask = await origTasks.fail(id, claimantId, error, retryable, runId, errorCode);
         try {
           await notifService.notifyTaskEvent({
@@ -157,7 +164,7 @@ export function createPlatformServerTaskWorker(
         } catch {}
         return failedTask;
       },
-    };
+    } as Partial<typeof origTasks>);
 
     return {
       tasks: proxiedTasks,
@@ -253,6 +260,10 @@ export function createPlatformServerTaskWorker(
     heartbeatIntervalMs: options.heartbeatIntervalMs,
     defaultExecutionBudgetMs: options.defaultExecutionBudgetMs ?? DEFAULT_TASK_EXECUTION_BUDGET_MS,
     systemRecovery: () => operationsStorage.recoverAfterRestart(),
+    maintenance: options.taskNotificationService
+      ? () => options.taskNotificationService!.reconcileTaskRoute()
+      : undefined,
+    maintenanceIntervalMs: options.failureNotificationIntervalMs,
     channelRuntimeManager: options.channelRuntimeManager,
     wechatRuntimeManager: options.wechatRuntimeManager,
     prepareTaskInput: taskPreparerHook,

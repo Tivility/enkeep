@@ -32,3 +32,5 @@ export {
   computeNextRun,
   type ScheduleCalculationParams,
 } from './schedule-calculator.js';
+
+export { resolveTaskOriginDelivery } from './task-delivery-route.js';

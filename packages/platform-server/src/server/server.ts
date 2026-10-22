@@ -1054,6 +1054,7 @@ export class PlatformServer {
           runId: options.runId,
           workerId: options.workerId,
           defaultExecutionBudgetMs: options.defaultExecutionBudgetMs,
+          taskNotificationService: this.taskNotificationService,
           channelRuntimeManager: options.channelRuntimeManager ?? this.channelRuntimeManager,
           wechatRuntimeManager: options.wechatRuntimeManager ?? this.wechatRuntimeManager,
           prepareTaskInput: taskPreparerHook,
@@ -1071,6 +1072,25 @@ export class PlatformServer {
     if (this.taskWorker) {
       this.taskWorker.channelRuntimeManager = this.channelRuntimeManager;
       this.taskWorker.wechatRuntimeManager = this.wechatRuntimeManager;
+    }
+
+    // task_route failure notifications go out through the same IM runtimes as task results
+    if (typeof this.taskNotificationService.setTaskRouteSender === 'function') {
+      this.taskNotificationService.setTaskRouteSender(async (params) => {
+        const manager = params.channel === 'wechat' ? this.wechatRuntimeManager : this.channelRuntimeManager;
+        if (!manager || typeof (manager as any).sendProactiveMessage !== 'function') {
+          throw new Error(`${params.channel} runtime is not available`);
+        }
+        return (manager as any).sendProactiveMessage({
+          userId: params.userId,
+          accountId: params.accountId,
+          chatId: params.chatId,
+          text: params.text,
+          title: params.title,
+          sessionId: params.sessionId,
+          outboxId: params.outboxId,
+        });
+      });
     }
 
     // Inject outbound file channel adapter into operations service

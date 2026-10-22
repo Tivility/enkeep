@@ -1,4 +1,12 @@
-export type TaskNotificationChannel = 'in_app' | 'webhook';
+/**
+ * Notification channels.
+ * - in_app: recorded only (visible through the deliveries API).
+ * - webhook: signed HTTP POST to a user supplied URL.
+ * - task_route: the task's own delivery route (payload.delivery, else the IM chat bound to the
+ *   anchor session, else an in-app message in the anchor session). Every task has one implicit
+ *   task_route subscription for failed/timeout events; it is materialized on first use.
+ */
+export type TaskNotificationChannel = 'in_app' | 'webhook' | 'task_route';
 
 export type TaskNotificationEventType =
   | 'completed'

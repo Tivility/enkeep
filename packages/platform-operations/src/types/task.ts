@@ -373,9 +373,8 @@ export function validateAgentPromptPayload(payload: unknown): AgentPromptTaskPay
 
   let delivery: TaskDeliveryTarget | undefined;
   if (obj.delivery !== undefined && obj.delivery !== null) {
-    if (silent === true) {
-      throw new ValidationError('Task payload cannot specify both silent=true and a delivery target');
-    }
+    // silent=true with a delivery target is allowed: silent only suppresses the normal output of a
+    // successful run, while failure notifications still go to the delivery target.
     if (typeof obj.delivery !== 'object' || Array.isArray(obj.delivery)) {
       throw new ValidationError('Task payload delivery must be an object');
     }
@@ -467,9 +466,8 @@ export function validateScriptTaskPayload(payload: unknown): ScriptTaskPayload {
 
   let delivery: TaskDeliveryTarget | undefined;
   if (obj.delivery !== undefined && obj.delivery !== null) {
-    if (silent === true) {
-      throw new ValidationError('Task payload cannot specify both silent=true and a delivery target');
-    }
+    // silent=true with a delivery target is allowed: silent only suppresses the normal output of a
+    // successful run, while failure notifications still go to the delivery target.
     if (typeof obj.delivery !== 'object' || Array.isArray(obj.delivery)) {
       throw new ValidationError('Task payload delivery must be an object');
     }
