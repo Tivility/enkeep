@@ -581,22 +581,8 @@ export class TaskNotificationService {
     } | null;
   }): Promise<TaskNotificationDelivery[]> {
     const deliveries: TaskNotificationDelivery[] = [];
-
-    // task_route: failure notices are on by default (implicit subscription), one per run
-    if ((options.event === 'failed' || options.event === 'timeout') && options.run?.id) {
-      try {
-        const routeDelivery = await this.notifyRunFailure(options.userId, options.run.id);
-        if (routeDelivery) deliveries.push(routeDelivery);
-      } catch {
-        // The scheduler maintenance pass retries unnotified failures
-      }
-    }
-
     const subscriptions = (await this.repo.findSubscriptionsForEvent(options.taskId, options.event))
       .filter((sub) => sub.channel !== 'task_route');
-    if (subscriptions.length === 0) {
-      return deliveries;
-    }
 
     const eventId = `evt_${randomUUID().replace(/-/g, '')}`;
     const timestamp = new Date().toISOString();
@@ -661,6 +647,17 @@ export class TaskNotificationService {
           responseStatus: 200,
           responseTimeMs: 0,
         });
+      }
+    }
+
+    // task_route: failure notices are on by default (implicit subscription), one per run.
+    // Appended after explicit subscriptions so existing callers keep their ordering.
+    if ((options.event === 'failed' || options.event === 'timeout') && options.run?.id) {
+      try {
+        const routeDelivery = await this.notifyRunFailure(options.userId, options.run.id);
+        if (routeDelivery) deliveries.push(routeDelivery);
+      } catch {
+        // The scheduler maintenance pass retries unnotified failures
       }
     }
 
