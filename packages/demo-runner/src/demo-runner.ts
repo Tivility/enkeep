@@ -684,7 +684,8 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         } else {
           console.log(formatMigrationReport(result.reports, dryRun));
         }
-        if (!result.ok) process.exit(1);
+        // 1: error/busy, 2: divergent copies need an operator decision (also in --dry-run)
+        if (result.exitCode !== 0) process.exit(result.exitCode);
         break;
       }
 

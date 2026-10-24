@@ -491,6 +491,19 @@ export type UserMigrationOutcome =
   | 'already_mounted'
   | 'error';
 
+/**
+ * Process exit code of `user-assets-migrate`:
+ * - 0: every user converged, was already converged/mounted, or had nothing to migrate;
+ * - 1: a user failed or was busy (retry later);
+ * - 2: a user's copies diverge from the host copy and need an operator decision.
+ * Applies to `--dry-run` too, so scripts can gate on it.
+ */
+export function migrationExitCode(reports: readonly { readonly outcome: UserMigrationOutcome }[]): 0 | 1 | 2 {
+  if (reports.some((r) => r.outcome === 'error' || r.outcome === 'busy')) return 1;
+  if (reports.some((r) => r.outcome === 'divergent')) return 2;
+  return 0;
+}
+
 export interface UserMigrationReport {
   readonly runtimeIdentity: string;
   readonly volumeName: string;

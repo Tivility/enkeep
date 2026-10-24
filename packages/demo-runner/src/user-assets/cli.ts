@@ -16,6 +16,7 @@ import { deriveRuntimeIdentity } from '../utils/runtime-identity.js';
 import { queryContainerActivity } from '../preflight/index.js';
 import {
   CONTAINER_MIGRATION_SCRIPT,
+  migrationExitCode,
   runUserAssetMigration,
   type MigrationUser,
   type UserAssetMigrationDeps,
@@ -146,6 +147,7 @@ export function createDockerMigrationDeps(pathOptions: { repoRoot?: string; data
 
 export async function runUserAssetMigrateCli(options: UserAssetMigrateCliOptions): Promise<{
   ok: boolean;
+  exitCode: 0 | 1 | 2;
   dryRun: boolean;
   reports: UserMigrationReport[];
 }> {
@@ -158,6 +160,6 @@ export async function runUserAssetMigrateCli(options: UserAssetMigrateCliOptions
     archiveDivergent: options.archiveDivergent,
     deps: createDockerMigrationDeps({ repoRoot: paths.repoRoot, dataRoot: paths.dataRoot }),
   });
-  const ok = reports.every((r) => r.outcome !== 'error' && r.outcome !== 'busy');
-  return { ok, dryRun: options.dryRun, reports };
+  const exitCode = migrationExitCode(reports);
+  return { ok: exitCode === 0, exitCode, dryRun: options.dryRun, reports };
 }

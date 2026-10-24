@@ -147,6 +147,9 @@ For every active platform user with a container, the command:
 Properties:
 
 - `--dry-run` only reads and reports.
+- Exit status: `0` all users converged / already converged / nothing to do; `1` a user failed
+  or was busy (retry later); `2` a user's copies are divergent and need an operator decision.
+  The same codes apply with `--dry-run`, so scripts can gate on them.
 - Idempotent: a user whose marker matches the current volume id is reported as
   `already_converged`; a container that already has the mounts is `already_mounted`, and the
   marker is backfilled for it (except with `--dry-run`).
