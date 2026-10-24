@@ -148,6 +148,112 @@ describe('user assets: desired mounts for container runtimes', () => {
     expect(handle.userAssets?.reason).toBe('migrated');
   });
 
+  /**
+   * Fake Docker state for one user: start/rebuild create a container whose inspect output carries
+   * the spec's mounts; a later start with that container running reconnects to it.
+   */
+  function adapterWithFakeDocker() {
+    vi.spyOn(runtimeRunner, 'loadDshDeploymentConfig').mockReturnValue(null as any);
+    const client = new SafeDockerClient();
+    vi.spyOn(client, 'isDockerAvailable').mockResolvedValue(true);
+    const state: { running: any; calls: string[]; markerAtCreate: any[] } = { running: null, calls: [], markerAtCreate: [] };
+    vi.spyOn(client, 'inspectContainer').mockImplementation(async () => state.running);
+    const adapter = new DockerRuntimeContainerAdapter(client);
+    const internal = (adapter as any).adapter;
+    const orig = internal.createDefaultUserSpec.bind(internal);
+    const specs: any[] = [];
+    vi.spyOn(internal, 'createDefaultUserSpec').mockImplementation((opts: any) => {
+      const spec = orig(opts);
+      specs.push(spec);
+      return spec;
+    });
+    const handleFor = (spec: any, actual: any[], pending: boolean) => ({
+      userId: spec.userId,
+      runId: spec.runId,
+      containerId: CONTAINER_ID,
+      userAssetMounts: actual,
+      userAssetMountsPending: pending,
+      teardown: vi.fn(async () => {
+        state.running = null;
+      }),
+    });
+    const create = (kind: string) => async (spec: any) => {
+      state.calls.push(kind);
+      state.markerAtCreate.push(readMigrationMarker(dataRoot, spec.volume.volumeName));
+      state.running = {
+        id: CONTAINER_ID,
+        state: 'running',
+        image: spec.image,
+        networkMode: spec.networkMode,
+        labels: spec.labels,
+        mounts: [
+          { type: 'volume', name: spec.volume.volumeName, source: '', destination: '/home/dsh', rw: true },
+          ...(spec.userAssetMounts ?? []).map((m: any) => ({ type: 'bind', source: m.sourcePath, destination: m.targetPath, rw: false })),
+        ],
+      };
+      return handleFor(spec, spec.userAssetMounts ?? [], false);
+    };
+    vi.spyOn(internal, 'startRuntime').mockImplementation(create('create'));
+    vi.spyOn(internal, 'startRuntimeWithOwnedVolume').mockImplementation(create('rebuild'));
+    vi.spyOn(internal, 'connectRuntime').mockImplementation(async (spec: any) => {
+      state.calls.push('reconnect');
+      const actual = runtimeRunner.readContainerUserAssetMounts(state.running);
+      return handleFor(spec, actual, !runtimeRunner.userAssetMountKindsEqual(actual, spec.userAssetMounts));
+    });
+    return { adapter, specs, state };
+  }
+
+  it('new volume: mounts survive a restart (reconnect) and a rebuild; the marker is written before the container is created', async () => {
+    const identity = 'alice_1a2b3c4d';
+    const volumeName = `enkeep-demo-dsh-${identity}`;
+    const { adapter, specs, state } = adapterWithFakeDocker();
+    const start = () => adapter.startUserRuntime({ userId: identity, username: 'alice', repoRoot: tempRepo.repoRoot });
+    const kinds = (spec: any) => (spec.userAssetMounts ?? []).map((m: any) => m.kind);
+
+    // 1st start: brand-new volume
+    const first = await start();
+    const firstSpec = specs[specs.length - 1];
+    expect(kinds(firstSpec)).toEqual(['memory', 'skills']);
+    expect(first.userAssets?.reason).toBe('new_volume');
+    expect(state.markerAtCreate[0]).toMatchObject({ status: 'converged', origin: 'new_volume', volumeId: firstSpec.volume.volumeId });
+    const volumeId = firstSpec.volume.volumeId;
+
+    // 2nd start of the same user (platform restart): reconnects to the running container
+    const second = await start();
+    expect(state.calls).toEqual(['create', 'reconnect']);
+    expect(kinds(specs[specs.length - 1])).toEqual(['memory', 'skills']);
+    expect(second.userAssets?.reason).toBe('migrated');
+    expect(second.rawHandle?.userAssetMounts?.map((m) => m.kind)).toEqual(['memory', 'skills']);
+    expect(second.rawHandle?.userAssetMountsPending).toBe(false);
+    expect(specs[specs.length - 1].environment.ENKEEP_USER_MEMORY_WRITE).toBe('platform');
+
+    // Rebuild (AutoUpgrader: container removed, volume kept), then the next request starts it again
+    await second.rawHandle!.teardown(false);
+    const third = await start();
+    expect(state.calls).toEqual(['create', 'reconnect', 'rebuild']);
+    const thirdSpec = specs[specs.length - 1];
+    expect(thirdSpec.volume.volumeId).toBe(volumeId);
+    expect(kinds(thirdSpec)).toEqual(['memory', 'skills']);
+    expect(thirdSpec.environment.ENKEEP_USER_MEMORY_WRITE).toBe('platform');
+    expect(third.userAssets?.reason).toBe('migrated');
+    expect(readMigrationMarker(dataRoot, volumeName)).toMatchObject({ status: 'converged', volumeId });
+  });
+
+  it('a running container that already has the mounts but no marker gets one, and keeps its mounts', async () => {
+    const identity = 'alice_1a2b3c4d';
+    const volumeName = `enkeep-demo-dsh-${identity}`;
+    const { adapter, specs, state } = adapterWithFakeDocker();
+    const start = () => adapter.startUserRuntime({ userId: identity, username: 'alice', repoRoot: tempRepo.repoRoot });
+    await start();
+    // Simulate a container created before markers were written for new volumes
+    rmSync(migrationMarkerPath(dataRoot, volumeName));
+    const again = await start();
+    expect(state.calls).toEqual(['create', 'reconnect']);
+    expect(readMigrationMarker(dataRoot, volumeName)).toMatchObject({ status: 'converged', origin: 'observed_mounted' });
+    expect(specs[specs.length - 1].userAssetMounts.map((m: any) => m.kind)).toEqual(['memory', 'skills']);
+    expect(again.rawHandle?.userAssetMountsPending).toBe(false);
+  });
+
   it('kill switch ENKEEP_USER_ASSET_MOUNTS=0 disables mounts', () => {
     const d = resolveDesiredUserAssets({
       dataRoot,
@@ -348,9 +454,17 @@ describe('user assets: user-assets-migrate', () => {
     expect((await run(false))[0].outcome).toBe('busy');
     idle = true;
     mountedKinds = ['memory'];
-    expect((await run(false))[0].outcome).toBe('already_mounted');
+    // dry-run reports it and writes nothing
+    expect((await run(true))[0].outcome).toBe('already_mounted');
+    expect(readMigrationMarker(dataRoot, user.volumeName)).toBeNull();
+    const [mounted] = await run(false);
+    expect(mounted.outcome).toBe('already_mounted');
     expect(scriptCalls).toEqual([]);
     expect(existsSync(join(containerHome, '.dsh', 'memory'))).toBe(true);
+    // The volume is served from the host copy: the marker is backfilled so no rebuild drops the mounts
+    expect(mounted.markerPath).toBe(migrationMarkerPath(dataRoot, user.volumeName));
+    expect(readMigrationMarker(dataRoot, user.volumeName)).toMatchObject({ status: 'converged', origin: 'already_mounted', volumeId: VOLUME_ID });
+    expect((await run(false))[0].outcome).toBe('already_converged');
   });
 
   it('treats symlinks in the container copy as divergent and the script refuses unsafe moves', async () => {

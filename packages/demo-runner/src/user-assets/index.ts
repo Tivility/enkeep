@@ -46,13 +46,29 @@ export function hostDshHomeForUsername(dataRoot: string, username: string | null
   return join(normalize(dataRoot), 'host-runtimes', username, '.dsh');
 }
 
+/**
+ * How a volume came to be served from the host copy:
+ * - `migration`: `user-assets-migrate` converged the volume's own copies;
+ * - `new_volume`: the volume was created with the mounts (it never had its own copy);
+ * - `observed_mounted`: the platform found a running container of this volume already mounted;
+ * - `already_mounted`: `user-assets-migrate` found the container already mounted.
+ */
+export type UserAssetMarkerOrigin = 'migration' | 'new_volume' | 'observed_mounted' | 'already_mounted';
+
 export interface UserAssetMigrationMarker {
   readonly version: number;
-  readonly status: 'converged';
+  /**
+   * `converged`: mounts are enabled for this volume (every start, restart, upgrade and rebuild).
+   * `suspended`: the kill switch rebuilt the container without mounts; the volume keeps local
+   * copies again, so re-enabling requires running `user-assets-migrate` first.
+   */
+  readonly status: 'converged' | 'suspended';
+  readonly origin?: UserAssetMarkerOrigin;
   readonly volumeName: string;
   readonly volumeId: string;
   readonly runtimeIdentity: string;
   readonly migratedAt: string;
+  readonly suspendedAt?: string;
   readonly archiveDir: string | null;
   readonly assets: Readonly<Record<string, AssetComparisonStatus>>;
   readonly divergentArchived: readonly string[];
@@ -65,6 +81,9 @@ export function migrationMarkerPath(dataRoot: string, volumeName: string): strin
   return join(dataRoot, USER_ASSET_MIGRATIONS_DIR, `${volumeName}.json`);
 }
 
+/**
+ * Reads the converged marker for a volume. Returns null when absent, malformed, or suspended.
+ */
 export function readMigrationMarker(dataRoot: string, volumeName: string): UserAssetMigrationMarker | null {
   const p = migrationMarkerPath(dataRoot, volumeName);
   try {
@@ -95,6 +114,56 @@ export function writeMigrationMarker(dataRoot: string, marker: UserAssetMigratio
   writeFileSync(tmp, JSON.stringify(marker, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
   renameSync(tmp, p);
   return p;
+}
+
+/**
+ * Persists the decision that a volume is served from the host copy. Must run as soon as mounts
+ * are decided for a volume (before the container is created) so that no later restart,
+ * upgrade or rebuild drops the mounts. No-op when a converged marker for the same volume id
+ * already exists. Returns the marker path.
+ */
+export function recordUserAssetMountsEnabled(
+  dataRoot: string,
+  input: {
+    readonly volumeName: string;
+    readonly volumeId: string;
+    readonly runtimeIdentity: string;
+    readonly origin: UserAssetMarkerOrigin;
+    readonly now?: Date;
+  }
+): string {
+  const existing = readMigrationMarker(dataRoot, input.volumeName);
+  if (existing && existing.volumeId === input.volumeId) {
+    return migrationMarkerPath(dataRoot, input.volumeName);
+  }
+  if (!VOLUME_ID_REGEX.test(input.volumeId)) {
+    throw new Error('Invalid volume id for user asset migration marker');
+  }
+  return writeMigrationMarker(dataRoot, {
+    version: USER_ASSET_MIGRATION_MARKER_VERSION,
+    status: 'converged',
+    origin: input.origin,
+    volumeName: input.volumeName,
+    volumeId: input.volumeId,
+    runtimeIdentity: input.runtimeIdentity,
+    migratedAt: (input.now ?? new Date()).toISOString(),
+    archiveDir: null,
+    assets: {},
+    divergentArchived: [],
+  });
+}
+
+/**
+ * Kill switch: the container of this volume is being rebuilt without mounts, so the volume
+ * gets local copies again. Marks the converged marker as suspended (kept for audit) so that
+ * turning mounts back on goes through `user-assets-migrate` instead of silently hiding what
+ * was written locally meanwhile. Returns true when a marker was suspended.
+ */
+export function suspendMigrationMarker(dataRoot: string, volumeName: string, volumeId: string, now: Date = new Date()): boolean {
+  const existing = readMigrationMarker(dataRoot, volumeName);
+  if (!existing || existing.volumeId !== volumeId) return false;
+  writeMigrationMarker(dataRoot, { ...existing, status: 'suspended', suspendedAt: now.toISOString() });
+  return true;
 }
 
 export type DesiredUserAssetReason =
@@ -486,8 +555,21 @@ export async function runUserAssetMigration(options: UserAssetMigrationOptions):
         continue;
       }
       if (info.userAssetMountKinds.length > 0) {
-        // Assets are already mounted over the volume paths; the old copies are not reachable.
-        reports.push({ ...base, outcome: 'already_mounted', comparisons: [], archived: [] });
+        // Assets are already mounted over the volume paths, so the volume is served from the
+        // host copy (and the old copies are not reachable). Record that, so no later rebuild
+        // drops the mounts.
+        if (options.dryRun) {
+          reports.push({ ...base, outcome: 'already_mounted', comparisons: [], archived: [] });
+          continue;
+        }
+        const markerPath = recordUserAssetMountsEnabled(options.dataRoot, {
+          volumeName: user.volumeName,
+          volumeId: info.volumeId,
+          runtimeIdentity: user.runtimeIdentity,
+          origin: 'already_mounted',
+          now: now(),
+        });
+        reports.push({ ...base, outcome: 'already_mounted', comparisons: [], archived: [], markerPath });
         continue;
       }
       if (!info.running) {
@@ -554,6 +636,7 @@ export async function runUserAssetMigration(options: UserAssetMigrationOptions):
       const markerPath = writeMigrationMarker(options.dataRoot, {
         version: USER_ASSET_MIGRATION_MARKER_VERSION,
         status: 'converged',
+        origin: 'migration',
         volumeName: user.volumeName,
         volumeId: info.volumeId,
         runtimeIdentity: user.runtimeIdentity,

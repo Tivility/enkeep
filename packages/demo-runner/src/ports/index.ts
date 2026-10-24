@@ -40,6 +40,8 @@ import {
   createInContainerProvidersSpec,
   createLlmProxyHandler,
   HostRuntimeAdapter,
+  readContainerUserAssetMounts,
+  userAssetMountsEnabled,
   type HostRuntimeSpec,
   type ActiveRuntimeHandle,
   type SessionSeedReceipt,
@@ -77,7 +79,14 @@ import {
   validateResourceSuffix,
   getDemoPathConfig,
 } from '../config.js';
-import { hostDshHomeForUsername, resolveDesiredUserAssets, type DesiredUserAssetReason } from '../user-assets/index.js';
+import {
+  hostDshHomeForUsername,
+  recordUserAssetMountsEnabled,
+  resolveDesiredUserAssets,
+  suspendMigrationMarker,
+  type DesiredUserAssetReason,
+  type DesiredUserAssets,
+} from '../user-assets/index.js';
 
 export const MAX_TURN_PROMPT_BYTES = 64 * 1024; // 65,536 bytes (64KiB)
 export const MAX_TURN_PROMPT_LENGTH = MAX_TURN_PROMPT_BYTES;
@@ -908,13 +917,37 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
 
     // User-level assets: single host copy mounted read-only. Enabled for new volumes, and for
     // existing volumes only after the one-time convergence (`user-assets-migrate`) recorded a marker.
-    const desiredUserAssets = resolveDesiredUserAssets({
+    // Once a volume is served from the host copy, a marker is persisted immediately so that every
+    // later restart, upgrade or rebuild keeps the mounts (only the kill switch removes them).
+    const hostDshHome = hostDshHomeForUsername(paths.dataRoot, options.username);
+    const mountsEnabledByEnv = userAssetMountsEnabled(process.env);
+    if (mountsEnabledByEnv && hostDshHome && isExistingContainerReconnect && existingContainer) {
+      // A running container of this volume already has the mounts: the volume is served from the
+      // host copy. Record it so the reconnect keeps (and a rebuild recreates) the mounts.
+      let observed: readonly { kind: string }[] = [];
+      try {
+        observed = readContainerUserAssetMounts(existingContainer);
+      } catch {
+        observed = []; // read-write asset bind: connectRuntime fails closed on it below
+      }
+      if (observed.length > 0) {
+        this.persistUserAssetMarker(paths.dataRoot, expectedVolumeName, selectedVolumeId, options.userId, 'observed_mounted');
+      }
+    }
+    let desiredUserAssets: DesiredUserAssets = resolveDesiredUserAssets({
       dataRoot: paths.dataRoot,
-      hostDshHome: hostDshHomeForUsername(paths.dataRoot, options.username),
+      hostDshHome,
       volumeName: expectedVolumeName,
       volumeId: selectedVolumeId,
       isNewVolume: !existingVolMeta && !isExistingContainerReconnect,
     });
+    if (desiredUserAssets.reason === 'new_volume' && desiredUserAssets.mounts.length > 0) {
+      const persisted = this.persistUserAssetMarker(paths.dataRoot, expectedVolumeName, selectedVolumeId, options.userId, 'new_volume');
+      if (!persisted) {
+        // Without a durable marker a later rebuild would drop the mounts; keep the old layout.
+        desiredUserAssets = { enabled: false, reason: 'migration_pending', hostDshHome: desiredUserAssets.hostDshHome, mounts: [] };
+      }
+    }
 
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
@@ -977,6 +1010,10 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       }
 
       if (!activeHandle && isOwnedVolumeResume) {
+        if (!mountsEnabledByEnv) {
+          // Kill switch: this volume gets a container without mounts (local copies again).
+          this.suspendUserAssetMarker(paths.dataRoot, spec.volume.volumeName, spec.volume.volumeId);
+        }
         try {
           activeHandle = await this.adapter.startRuntimeWithOwnedVolume(spec, timeoutMs);
         } catch (ownedErr: unknown) {
@@ -1002,6 +1039,12 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
           spec.labels[VOLUME_ID_LABEL_KEY] = freshVolId;
         }
         activeHandle = await this.adapter.startRuntime(spec, timeoutMs);
+      }
+
+      // A container that actually runs with user asset mounts means the volume is served from the
+      // host copy (covers a fresh volume replacing a vanished one). Never let a rebuild drop them.
+      if (mountsEnabledByEnv && (activeHandle.userAssetMounts?.length ?? 0) > 0) {
+        this.persistUserAssetMarker(paths.dataRoot, spec.volume.volumeName, spec.volume.volumeId, options.userId, 'observed_mounted');
       }
 
       // Save signed volume metadata
@@ -1103,6 +1146,40 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       };
     }
     return userHandle;
+  }
+
+  /** Persists the "served from the host copy" marker for a volume; false if it could not be written. */
+  private persistUserAssetMarker(
+    dataRoot: string,
+    volumeName: string,
+    volumeId: string,
+    runtimeIdentity: string,
+    origin: 'new_volume' | 'observed_mounted'
+  ): boolean {
+    try {
+      recordUserAssetMountsEnabled(dataRoot, { volumeName, volumeId, runtimeIdentity, origin });
+      return true;
+    } catch (err: unknown) {
+      console.warn('[user-assets] failed to persist the user asset mount marker', {
+        volumeName,
+        origin,
+        error: err instanceof Error ? err.message : 'unknown error',
+      });
+      return false;
+    }
+  }
+
+  private suspendUserAssetMarker(dataRoot: string, volumeName: string, volumeId: string): void {
+    try {
+      if (suspendMigrationMarker(dataRoot, volumeName, volumeId)) {
+        console.info('[user-assets] kill switch: container rebuilt without user asset mounts; marker suspended', { volumeName });
+      }
+    } catch (err: unknown) {
+      console.warn('[user-assets] failed to suspend the user asset mount marker', {
+        volumeName,
+        error: err instanceof Error ? err.message : 'unknown error',
+      });
+    }
   }
 
   /**
