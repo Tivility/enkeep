@@ -133,6 +133,7 @@ import {
 import type { RuntimeMountSpec, ResolvedRuntimeMount } from '../spec/types.js';
 import { computeMountHash, computeExtraRootsHash, validateExtraReadableRoots } from '../spec/mount-security.js';
 import { computeExtensionPlanHash } from '../spec/extension-plan-security.js';
+import { CONTAINER_DSH_HOME, removeUnmountedUserAssetPlaceholders } from '../spec/user-assets.js';
 import {
   type ExtensionActivationPlan,
   validateExtensionActivationPlan,
@@ -1193,6 +1194,19 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     root: sessionsDir,
     compression: 'none', // Raw JSONL for transparent auditability
   });
+  // A container started without user asset mounts (kill switch / rollback) may still carry the
+  // empty root-owned mountpoints Docker created while the mounts were on. Remove them before
+  // memory is touched so the container user can create its own global memory again.
+  if (dshHome === CONTAINER_DSH_HOME) {
+    try {
+      const cleanup = removeUnmountedUserAssetPlaceholders(dshHome);
+      if (cleanup.removed.length > 0) {
+        ctx.logger?.info?.(`[user-assets] removed empty root-owned mountpoint placeholders: ${cleanup.removed.join(', ')}`);
+      }
+    } catch (err: unknown) {
+      ctx.logger?.warn?.(`[user-assets] placeholder cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   // Container runtimes with host-backed global memory (read-only mount) forward global writes
   // to the platform; host runtimes keep writing their own DSH home directly.
   await ctx.plugin(MemoryService, {

@@ -27,6 +27,9 @@ import {
   isReadableByContainerUser,
   userAssetMountKindsEqual,
   readContainerUserAssetMounts,
+  removeUnmountedUserAssetPlaceholders,
+  readProcessMountPoints,
+  CONTAINER_DSH_HOME,
   USER_ASSET_CONTAINER_TARGETS,
   USER_MEMORY_WRITE_ENV_KEY,
   type RuntimeUserAssetMount,
@@ -624,5 +627,90 @@ describe('user assets: container memory_write -> platform client -> proxy -> hos
 
     await tool.execute({ content: 'line', mode: 'append', path: 'topics/t.md' });
     expect(fs.readFileSync(path.join(hostHome, 'memory', 'topics', 't.md'), 'utf8')).toBe('line');
+  });
+});
+
+describe('user assets: kill switch / rollback leaves no root-owned placeholders in the way', () => {
+  let tmp: string;
+  let dshHome: string;
+  const me = typeof process.getuid === 'function' ? process.getuid() : 0;
+
+  beforeEach(() => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-ua-placeholders-')));
+    dshHome = path.join(tmp, '.dsh');
+    fs.mkdirSync(dshHome, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('removes empty mountpoint placeholders (memory/, skills/ dirs and empty AGENTS.md) owned by the placeholder owner', () => {
+    fs.mkdirSync(path.join(dshHome, 'memory'));
+    fs.mkdirSync(path.join(dshHome, 'skills'));
+    fs.writeFileSync(path.join(dshHome, 'AGENTS.md'), '');
+    const r = removeUnmountedUserAssetPlaceholders(dshHome, { placeholderUid: me, isMountPoint: () => false });
+    expect(r.removed).toEqual(['memory', 'skills', 'agents_md']);
+    expect(fs.existsSync(path.join(dshHome, 'memory'))).toBe(false);
+    expect(fs.existsSync(path.join(dshHome, 'skills'))).toBe(false);
+    expect(fs.existsSync(path.join(dshHome, 'AGENTS.md'))).toBe(false);
+  });
+
+  it('keeps anything with data, mounted paths and entries owned by someone else', () => {
+    fs.mkdirSync(path.join(dshHome, 'memory'));
+    fs.writeFileSync(path.join(dshHome, 'memory', 'global.md'), 'data');
+    fs.mkdirSync(path.join(dshHome, 'skills'));
+    fs.writeFileSync(path.join(dshHome, 'AGENTS.md'), 'instructions');
+    const r = removeUnmountedUserAssetPlaceholders(dshHome, {
+      placeholderUid: me,
+      isMountPoint: (p) => p === path.join(dshHome, 'skills'),
+    });
+    expect(r.removed).toEqual([]);
+    expect(r.kept).toEqual([
+      { kind: 'memory', reason: 'not_empty' },
+      { kind: 'skills', reason: 'mounted' },
+      { kind: 'agents_md', reason: 'not_empty' },
+    ]);
+    // Default placeholder owner is root: the container user's own empty dirs are kept
+    fs.rmSync(path.join(dshHome, 'memory'), { recursive: true });
+    fs.mkdirSync(path.join(dshHome, 'memory'));
+    if (me !== 0) {
+      const d = removeUnmountedUserAssetPlaceholders(dshHome, { isMountPoint: () => false });
+      expect(d.removed).toEqual([]);
+      expect(d.kept.find((k) => k.kind === 'memory')?.reason).toBe('not_placeholder_owner');
+    }
+    // A wrong entry type is never removed
+    fs.rmdirSync(path.join(dshHome, 'memory'));
+    fs.writeFileSync(path.join(dshHome, 'memory'), '');
+    const w = removeUnmountedUserAssetPlaceholders(dshHome, { placeholderUid: me, isMountPoint: () => false });
+    expect(w.kept.find((k) => k.kind === 'memory')?.reason).toBe('wrong_type');
+    expect(fs.existsSync(path.join(dshHome, 'memory'))).toBe(true);
+  });
+
+  it('reads mount points from mountinfo (octal escapes decoded)', () => {
+    const info = path.join(tmp, 'mountinfo');
+    fs.writeFileSync(
+      info,
+      [
+        '36 35 98:0 / /home/dsh rw,relatime - ext4 /dev/vda1 rw',
+        '40 36 0:50 /alice/.dsh/memory /home/dsh/.dsh/memory ro,relatime - virtiofs mac ro',
+        '41 36 0:50 /x /home/dsh/with\\040space ro - virtiofs mac ro',
+      ].join('\n')
+    );
+    const points = readProcessMountPoints(info)!;
+    expect(points.has('/home/dsh/.dsh/memory')).toBe(true);
+    expect(points.has('/home/dsh/with space')).toBe(true);
+    expect(points.has('/home/dsh/.dsh/skills')).toBe(false);
+    expect(readProcessMountPoints(path.join(tmp, 'missing'))).toBeUndefined();
+  });
+
+  it('the runtime boot only cleans placeholders for the container DSH home', () => {
+    expect(CONTAINER_DSH_HOME).toBe('/home/dsh/.dsh');
+    const boot = fs.readFileSync(path.join(__dirname, '..', 'src', 'runtime', 'dsh-boot.ts'), 'utf8');
+    const cleanupAt = boot.indexOf('removeUnmountedUserAssetPlaceholders(dshHome)');
+    const memoryAt = boot.indexOf('await ctx.plugin(MemoryService');
+    expect(cleanupAt).toBeGreaterThan(0);
+    expect(cleanupAt).toBeLessThan(memoryAt);
+    expect(boot).toContain('if (dshHome === CONTAINER_DSH_HOME)');
   });
 });

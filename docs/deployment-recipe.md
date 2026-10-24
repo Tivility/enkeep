@@ -97,7 +97,7 @@ node packages/demo-runner/dist/demo-runner.js user-assets-migrate --data-dir <da
 node packages/demo-runner/dist/demo-runner.js user-assets-migrate --data-dir <data-root>
 ```
 
-报告为 `divergent` 的用户不会被修改：先按报告列出的相对路径把需要的内容合入宿主副本后重跑；或确认容器副本可丢弃后加 `--archive-divergent`（仅归档，不覆盖宿主）。收敛后容器在空闲时由自动升级路径重建（卷数据保留），重建后生效。应急关闭：`ENKEEP_USER_ASSET_MOUNTS=0`。
+报告为 `divergent` 的用户不会被修改：先按报告列出的相对路径把需要的内容合入宿主副本后重跑；或确认容器副本可丢弃后加 `--archive-divergent`（仅归档，不覆盖宿主）。收敛后容器在空闲时由自动升级路径重建（卷数据保留），重建后生效。应急关闭：平台进程设 `ENKEEP_USER_ASSET_MOUNTS=0` 并重启平台；仍带挂载的容器在重建前继续经平台写宿主副本，空闲重建后改回卷内副本（启动时清理 Docker 留下的 root 空占位，标记置为 `suspended`），重新开启需对该卷再跑一次 `user-assets-migrate`。详见 `docs/user-assets.md`。
 
 ### 3.6 清理旧发布工作树
 

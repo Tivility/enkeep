@@ -198,7 +198,10 @@ export function resolveDesiredUserAssets(input: {
   readonly hostPlatform?: NodeJS.Platform;
 }): DesiredUserAssets {
   if (!userAssetMountsEnabled(input.env ?? process.env)) {
-    return { enabled: false, reason: 'disabled_by_env', mounts: [] };
+    // Kill switch: no mounts for containers created from now on. The host DSH home is still
+    // reported so that a container that still runs with the mounts keeps its platform write
+    // route (bound from its ACTUAL mounts) until it is rebuilt without them.
+    return { enabled: false, reason: 'disabled_by_env', hostDshHome: input.hostDshHome, mounts: [] };
   }
   if (!input.hostDshHome) {
     return { enabled: false, reason: 'no_host_home', mounts: [] };
@@ -409,6 +412,11 @@ export function compareAsset(
   }
   if (container.truncated || host.truncated) {
     return { ...base, status: 'divergent', onlyInContainer: [{ path: '(manifest truncated)', size: 0 }], onlyOnHost: [], differing: [] };
+  }
+  if (asset === 'agents_md' && container.type === 'file' && container.entries.length === 1 && container.entries[0].size === 0) {
+    // An empty AGENTS.md carries no instructions (and is what Docker leaves behind as the
+    // mountpoint of a single-file bind): nothing to preserve.
+    return { ...base, status: 'absent', ...empty };
   }
   const c = fileMap(container);
   const h = fileMap(host);
@@ -705,6 +713,22 @@ export function hostUserAssetsForHandle(handle: {
   const enabled = assets.reason === 'new_volume' || assets.reason === 'migrated';
   if (!mountedNow && !enabled) return undefined;
   return { hostDshHome: assets.hostDshHome, spacesDir: join(assets.hostDshHome, '..', 'spaces') };
+}
+
+/**
+ * Host memory root the platform binds to a container runtime's write route
+ * (`POST /api/user-assets/memory/write`). Decided from the mounts the container ACTUALLY has,
+ * not from the desired ones: a container that still runs with the memory mount keeps a working
+ * write route even after the kill switch, until it is rebuilt without the mount.
+ */
+export function hostMemoryRootForBinding(handle: {
+  readonly userAssets?: { readonly hostDshHome: string };
+  readonly rawHandle?: { readonly userAssetMounts?: readonly { kind: string; sourcePath?: string }[] };
+}): string | undefined {
+  if (!handle.userAssets) return undefined;
+  const mounted = handle.rawHandle?.userAssetMounts ?? [];
+  if (!mounted.some((m) => m.kind === 'memory')) return undefined;
+  return join(handle.userAssets.hostDshHome, 'memory');
 }
 
 export function isPathInside(child: string, parent: string): boolean {

@@ -24,7 +24,9 @@ import {
   CONTAINER_MIGRATION_SCRIPT,
   DEFAULT_GLOBAL_MEMORY_SKELETON,
   formatMigrationReport,
+  compareAsset,
   hostDshHomeForUsername,
+  hostMemoryRootForBinding,
   hostUserAssetsForHandle,
   migrationMarkerPath,
   readMigrationMarker,
@@ -252,6 +254,62 @@ describe('user assets: desired mounts for container runtimes', () => {
     expect(readMigrationMarker(dataRoot, volumeName)).toMatchObject({ status: 'converged', origin: 'observed_mounted' });
     expect(specs[specs.length - 1].userAssetMounts.map((m: any) => m.kind)).toEqual(['memory', 'skills']);
     expect(again.rawHandle?.userAssetMountsPending).toBe(false);
+  });
+
+  it('kill switch round trip: write route kept until rebuild, rebuild drops mounts and suspends the marker', async () => {
+    const identity = 'alice_1a2b3c4d';
+    const volumeName = `enkeep-demo-dsh-${identity}`;
+    const home = join(dataRoot, 'host-runtimes', 'alice', '.dsh');
+    const { adapter, specs, state } = adapterWithFakeDocker();
+    const start = () => adapter.startUserRuntime({ userId: identity, username: 'alice', repoRoot: tempRepo.repoRoot });
+
+    const on = await start();
+    expect(hostMemoryRootForBinding(on)).toBe(join(home, 'memory'));
+
+    // Switch off. The running container still has the mounts: it keeps its platform write route
+    // and admin AGENTS.md edits still go to the host copy, and it is flagged for an idle rebuild.
+    process.env.ENKEEP_USER_ASSET_MOUNTS = '0';
+    const stillMounted = await start();
+    expect(state.calls).toEqual(['create', 'reconnect']);
+    expect(specs[specs.length - 1].userAssetMounts).toBeUndefined();
+    expect(stillMounted.userAssets?.reason).toBe('disabled_by_env');
+    expect(stillMounted.rawHandle?.userAssetMountsPending).toBe(true);
+    expect(hostMemoryRootForBinding(stillMounted)).toBe(join(home, 'memory'));
+    expect(hostUserAssetsForHandle(stillMounted)?.hostDshHome).toBe(home);
+    // Marker untouched while the mounted container keeps running
+    expect(readMigrationMarker(dataRoot, volumeName)?.status).toBe('converged');
+
+    // Idle rebuild: container without mounts, no platform write mode, route no longer bound
+    await stillMounted.rawHandle!.teardown(false);
+    const rolledBack = await start();
+    expect(state.calls).toEqual(['create', 'reconnect', 'rebuild']);
+    const rbSpec = specs[specs.length - 1];
+    expect(rbSpec.userAssetMounts).toBeUndefined();
+    expect(rbSpec.environment.ENKEEP_USER_MEMORY_WRITE).toBeUndefined();
+    expect(hostMemoryRootForBinding(rolledBack)).toBeUndefined();
+    expect(hostUserAssetsForHandle(rolledBack)).toBeUndefined();
+    // The volume holds local copies again: marker suspended, not deleted
+    expect(readMigrationMarker(dataRoot, volumeName)).toBeNull();
+    const raw = JSON.parse(readFileSync(migrationMarkerPath(dataRoot, volumeName), 'utf8'));
+    expect(raw).toMatchObject({ status: 'suspended', origin: 'new_volume' });
+    expect(typeof raw.suspendedAt).toBe('string');
+
+    // Turning the switch back on does not silently shadow what was written locally meanwhile:
+    // the volume needs user-assets-migrate again.
+    delete process.env.ENKEEP_USER_ASSET_MOUNTS;
+    await rolledBack.rawHandle!.teardown(false);
+    const back = await start();
+    expect(specs[specs.length - 1].userAssetMounts).toBeUndefined();
+    expect(back.userAssets?.reason).toBe('migration_pending');
+  });
+
+  it('an empty container AGENTS.md (single-file mountpoint leftover) is not data', () => {
+    const empty = { exists: true, type: 'file' as const, entries: [{ path: '', type: 'file' as const, size: 0, sha256: sha('') }], truncated: false };
+    const host = { exists: true, type: 'file' as const, entries: [{ path: '', type: 'file' as const, size: 3, sha256: sha('abc') }], truncated: false };
+    expect(compareAsset('agents_md', empty, host).status).toBe('absent');
+    expect(compareAsset('agents_md', empty, { exists: false, entries: [], truncated: false }).status).toBe('absent');
+    const nonEmpty = { ...empty, entries: [{ path: '', type: 'file' as const, size: 1, sha256: sha('x') }] };
+    expect(compareAsset('agents_md', nonEmpty, host).status).toBe('divergent');
   });
 
   it('kill switch ENKEEP_USER_ASSET_MOUNTS=0 disables mounts', () => {

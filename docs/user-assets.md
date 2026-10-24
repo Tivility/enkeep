@@ -75,16 +75,47 @@ such a write so it picks up the new file.
 Mounts are fixed when a container is created, so existing containers keep their current mounts
 until they are rebuilt.
 
-- **New volume** (first container for a user): mounts are enabled immediately.
+- **New volume** (first container for a user): mounts are enabled immediately, and the marker
+  (`<data-root>/user-assets-migrations/<volume>.json`, `origin: new_volume`) is written
+  **before** the container is created. If the marker cannot be written, the container is created
+  without mounts — a volume is never served from the host copy without a durable record.
 - **Existing volume**: mounts are enabled only after the one-time convergence below has written a
-  marker for that exact volume id (`<data-root>/user-assets-migrations/<volume>.json`). Until
-  then the container keeps using its own copy (`migration_pending`).
+  marker for that exact volume id. Until then the container keeps using its own copy
+  (`migration_pending`).
+- Once a volume has a converged marker, every later start, platform restart, image upgrade and
+  rebuild of that volume gets the mounts again. A running container found with the mounts but
+  without a marker (`observed_mounted`) gets one on reconnect.
 - When the desired mounts differ from what a running container has, the runtime is reported as
   outdated and the existing auto-upgrader rebuilds it **only when it has been idle** (no active
   or queued turns, jobs or subagents). Rebuild stops and removes the container; the volume and
   all its data are kept.
-- Kill switch: `ENKEEP_USER_ASSET_MOUNTS=0` disables the mounts (containers are rebuilt back to
-  the volume-only layout on the same idle path).
+- Kill switch: see "Rolling back" below.
+
+### Rolling back: `ENKEEP_USER_ASSET_MOUNTS=0`
+
+Set the variable on the platform process and restart the platform. Containers are not stopped
+by this; they move back to the volume-only layout on the same idle rebuild path:
+
+1. **Until the rebuild**, a container that still runs with the mounts keeps working as before:
+   the platform binds the write route from the mounts the container *actually* has, so global
+   `memory_write` still reaches the host copy, and admin edits of the global `AGENTS.md` still go
+   to the host copy. The container is reported outdated (`userAssetMountsPending`).
+2. **At the rebuild** (idle only, volume kept), the new container gets no mounts and no
+   `ENKEEP_USER_MEMORY_WRITE`, and the marker is changed to `status: suspended` (kept for audit).
+3. **At daemon boot** in the new container, the empty placeholders Docker created in the volume
+   for the bind mountpoints (`.dsh/memory/`, `.dsh/skills/` as `root:root` empty directories,
+   `.dsh/AGENTS.md` as an empty `root:root` file) are removed, so uid 1000 can create and write
+   its own global memory again. Only entries that are not mount points, are owned by root, and
+   are empty are removed; anything else is left alone.
+4. The container now uses its own copy in the volume. It does **not** contain what was written
+   to the host copy while the mounts were on; copy that content into the volume if needed.
+
+If a container still runs with `ENKEEP_USER_MEMORY_WRITE=platform` but the platform no longer
+serves its route (for example a manual container change), `memory_write` fails with a clear
+`HTTP 404 ... read-only until the runtime is rebuilt` error and writes nothing.
+
+Turning mounts back on for a suspended volume requires running `user-assets-migrate` again
+(the volume may hold new local content); new volumes are enabled directly as usual.
 
 ## 4. One-time convergence: `user-assets-migrate`
 
@@ -117,7 +148,10 @@ Properties:
 
 - `--dry-run` only reads and reports.
 - Idempotent: a user whose marker matches the current volume id is reported as
-  `already_converged`; a container that already has the mounts is `already_mounted`.
+  `already_converged`; a container that already has the mounts is `already_mounted`, and the
+  marker is backfilled for it (except with `--dry-run`).
+- An empty container `AGENTS.md` (the leftover mountpoint of a single-file bind) counts as
+  `absent`, not divergent.
 - `--user <username>` (repeatable) restricts the run; `--json` prints machine-readable reports.
 - The script that runs inside the container only reads or moves the four whitelisted paths
   into `.enkeep-archive/`, as the runtime user.

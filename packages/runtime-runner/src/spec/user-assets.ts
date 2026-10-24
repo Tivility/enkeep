@@ -347,6 +347,116 @@ export function userAssetKindForTarget(destination: string): UserAssetKind | und
   return undefined;
 }
 
+/** DSH home inside the runtime container (`DSH_HOME`). */
+export const CONTAINER_DSH_HOME = '/home/dsh/.dsh';
+
+export type PlaceholderKeepReason = 'mounted' | 'not_placeholder_owner' | 'not_empty' | 'wrong_type' | 'remove_failed';
+
+export interface UserAssetPlaceholderCleanup {
+  readonly removed: readonly UserAssetKind[];
+  readonly kept: ReadonlyArray<{ kind: UserAssetKind; reason: PlaceholderKeepReason }>;
+}
+
+export interface UserAssetPlaceholderCleanupOptions {
+  /** Owner of the placeholders Docker creates for nested bind mountpoints (default 0 = root). */
+  readonly placeholderUid?: number;
+  /** Mount point test (default: /proc/self/mountinfo, falling back to a device-id comparison). */
+  readonly isMountPoint?: (absPath: string) => boolean;
+}
+
+function decodeMountInfoPath(raw: string): string {
+  return raw.replace(/\\([0-7]{3})/g, (_m, oct: string) => String.fromCharCode(parseInt(oct, 8)));
+}
+
+/** Mount points of the current process (Linux); undefined when /proc is not available. */
+export function readProcessMountPoints(mountInfoPath = '/proc/self/mountinfo'): Set<string> | undefined {
+  let text: string;
+  try {
+    text = fs.readFileSync(mountInfoPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+  const points = new Set<string>();
+  for (const line of text.split('\n')) {
+    const fields = line.split(' ');
+    if (fields.length > 4 && fields[4]) points.add(decodeMountInfoPath(fields[4]));
+  }
+  return points;
+}
+
+function defaultIsMountPoint(): (absPath: string) => boolean {
+  const points = readProcessMountPoints();
+  if (points) return (p) => points.has(p);
+  return (p) => {
+    try {
+      return fs.lstatSync(p).dev !== fs.lstatSync(path.dirname(p)).dev;
+    } catch {
+      return false;
+    }
+  };
+}
+
+/**
+ * Removes the empty, root-owned placeholders Docker left in the volume for user asset bind
+ * mounts (`.dsh/memory`, `.dsh/skills` directories and the `.dsh/AGENTS.md` file) when the
+ * container runs WITHOUT those mounts (kill switch / rollback). Without this the container user
+ * (uid 1000) cannot create global memory there (EACCES). Runs inside the container as uid 1000:
+ * removing an entry needs write access to `.dsh` (owned by 1000), not to the entry itself.
+ *
+ * Only removes an entry that is not a mount point, is owned by the placeholder owner, and is an
+ * empty directory (memory/skills) or an empty regular file (AGENTS.md). Anything else is kept.
+ */
+export function removeUnmountedUserAssetPlaceholders(
+  dshHome: string,
+  options: UserAssetPlaceholderCleanupOptions = {}
+): UserAssetPlaceholderCleanup {
+  const placeholderUid = options.placeholderUid ?? 0;
+  const isMountPoint = options.isMountPoint ?? defaultIsMountPoint();
+  const removed: UserAssetKind[] = [];
+  const kept: Array<{ kind: UserAssetKind; reason: PlaceholderKeepReason }> = [];
+  for (const kind of USER_ASSET_KINDS) {
+    const p = path.join(dshHome, USER_ASSET_HOST_NAMES[kind]);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      continue; // absent: nothing to do
+    }
+    if (isMountPoint(p)) {
+      kept.push({ kind, reason: 'mounted' });
+      continue;
+    }
+    if (st.uid !== placeholderUid) {
+      kept.push({ kind, reason: 'not_placeholder_owner' });
+      continue;
+    }
+    const wantDir = USER_ASSET_ENTRY_TYPES[kind] === 'directory';
+    if (wantDir ? !st.isDirectory() : !st.isFile()) {
+      kept.push({ kind, reason: 'wrong_type' });
+      continue;
+    }
+    try {
+      if (wantDir) {
+        if (fs.readdirSync(p).length > 0) {
+          kept.push({ kind, reason: 'not_empty' });
+          continue;
+        }
+        fs.rmdirSync(p);
+      } else {
+        if (st.size !== 0) {
+          kept.push({ kind, reason: 'not_empty' });
+          continue;
+        }
+        fs.unlinkSync(p);
+      }
+      removed.push(kind);
+    } catch {
+      kept.push({ kind, reason: 'remove_failed' });
+    }
+  }
+  return { removed, kept };
+}
+
 /**
  * Host directory of global memory for a set of mounts (undefined if memory is not mounted).
  */

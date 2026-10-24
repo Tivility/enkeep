@@ -120,6 +120,18 @@ describe('global memory: platform write mode', () => {
     expect(fs.readFileSync(path.join(dshHome, 'memory', 'global.md'), 'utf8')).toBe('host copy');
   });
 
+  it('a 404 (route no longer bound: kill switch before the rebuild) is a clear read-only error, nothing written', async () => {
+    const tool = createMemoryWriteTool({
+      dshHome,
+      globalMemoryWrite: 'platform',
+      getClient: () => client(() => {
+        throw new FakeHttpError(404, { error: { code: 'NOT_FOUND', message: 'Not Found' } });
+      }),
+    });
+    await expect(tool.execute({ content: 'x' })).rejects.toThrow(/HTTP 404.*read-only until the runtime is rebuilt/s);
+    expect(fs.readFileSync(path.join(dshHome, 'memory', 'global.md'), 'utf8')).toBe('host copy');
+  });
+
   it('rejects traversal before any platform call', async () => {
     const tool = createMemoryWriteTool({ dshHome, globalMemoryWrite: 'platform', getClient: () => client(() => ({})) });
     await expect(tool.execute({ content: 'x', path: '../../escape.md' })).rejects.toThrow();

@@ -365,6 +365,15 @@ export function createMemoryWriteTool(options: MemoryWriteToolOptions): ToolDefi
           if (status === 409) {
             throw new MemoryWriteConflictError(detail ?? 'Memory write conflict: expectedEtag does not match current etag');
           }
+          if (status === 404) {
+            // The platform no longer serves this runtime's host memory (user asset mounts were
+            // turned off, or the mount does not match the user's host copy). The runtime is
+            // rebuilt when idle; until then global memory is read-only here.
+            throw new Error(
+              'Global memory write unavailable (HTTP 404): the platform no longer accepts host memory writes for this runtime. ' +
+              'Global memory is read-only until the runtime is rebuilt (automatic when idle); nothing was written.'
+            );
+          }
           throw new Error(`Global memory write rejected by platform${status ? ` (HTTP ${status})` : ''}${detail ? `: ${detail}` : ''}`);
         }
         const payload = (res.data ?? res.body) as Partial<MemoryWriteResult> | undefined;

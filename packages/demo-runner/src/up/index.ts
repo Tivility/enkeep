@@ -92,7 +92,7 @@ import {
   FileOpError,
   type SessionSeedReceipt,
 } from '@enkeep/runtime-runner';
-import { hostUserAssetsForHandle } from '../user-assets/index.js';
+import { hostMemoryRootForBinding, hostUserAssetsForHandle } from '../user-assets/index.js';
 import {
   getDemoPathConfig,
   findRepoRoot,
@@ -1955,10 +1955,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
 
   // 6d. Helper to bind full platform proxy & events stream handlers to runtime tunnel
   function memoryRootForBinding(handle: UserRuntimeHandle): string | undefined {
-    if (!handle.userAssets) return undefined;
-    const mounted = handle.rawHandle?.userAssetMounts ?? [];
-    if (!mounted.some((m) => m.kind === 'memory')) return undefined;
-    return join(handle.userAssets.hostDshHome, 'memory');
+    return hostMemoryRootForBinding(handle);
   }
 
   async function bindRuntimeServices(handle: UserRuntimeHandle, platformUserId: string): Promise<void> {
