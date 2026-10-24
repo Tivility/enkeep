@@ -23,7 +23,9 @@ import {
   MemoryWriteConflictError,
   MemoryPathError,
   PLATFORM_MEMORY_WRITE_ROUTE,
+  MemoryService,
 } from '../src/index.js';
+import { Context } from '@deepseek-ai/cordis';
 
 function etagOf(content: string): string {
   return `"${crypto.createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16)}"`;
@@ -162,12 +164,27 @@ describe('global memory: platform write mode', () => {
     expect(JSON.stringify(res)).toContain('host copy');
   });
 
-  it('ensureGlobalMemorySkeleton tolerates a read-only memory directory', () => {
+  it('ensureGlobalMemorySkeleton tolerates a read-only memory directory only for the read-only mount', () => {
     fs.rmSync(path.join(dshHome, 'memory', 'global.md'));
     fs.chmodSync(path.join(dshHome, 'memory'), 0o500);
     if (typeof process.getuid === 'function' && process.getuid() === 0) return; // root ignores modes
-    expect(() => ensureGlobalMemorySkeleton(dshHome)).not.toThrow();
+    expect(() => ensureGlobalMemorySkeleton(dshHome, { readOnlyMount: true })).not.toThrow();
     expect(fs.existsSync(path.join(dshHome, 'memory', 'global.md'))).toBe(false);
+    // Host runtimes (and containers with a local copy): a permission error is reported
+    expect(() => ensureGlobalMemorySkeleton(dshHome)).toThrow(/EACCES|EPERM/);
+    expect(() => ensureGlobalMemorySkeleton(dshHome, { readOnlyMount: false })).toThrow(/EACCES|EPERM/);
+  });
+
+  it('MemoryService: only platform write mode (read-only mount) skips the skeleton on a read-only directory', () => {
+    fs.rmSync(path.join(dshHome, 'memory', 'global.md'));
+    fs.chmodSync(path.join(dshHome, 'memory'), 0o500);
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const platform = new MemoryService(new Context(), { globalMemoryWrite: 'platform' });
+    expect(() => platform.ensureSkeleton(dshHome)).not.toThrow();
+    expect(platform.assembleSection({ dshHome }).snapshot.globalMemory?.content ?? '').toBe('');
+    const host = new MemoryService(new Context(), {});
+    expect(() => host.ensureSkeleton(dshHome)).toThrow(/EACCES|EPERM/);
+    expect(() => host.assembleSection({ dshHome })).toThrow(/EACCES|EPERM/);
   });
 });
 

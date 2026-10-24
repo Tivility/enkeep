@@ -85,7 +85,10 @@ export function truncateUtf8Bytes(text: string, maxBytes: number): { text: strin
 /**
  * Ensures the global memory skeleton file exists under dshHome.
  */
-export function ensureGlobalMemorySkeleton(dshHome: string): string {
+export function ensureGlobalMemorySkeleton(
+  dshHome: string,
+  options: { readonly readOnlyMount?: boolean } = {}
+): string {
   const memoryDir = path.join(dshHome, 'memory');
   const globalPath = path.join(memoryDir, 'global.md');
   try {
@@ -97,10 +100,12 @@ export function ensureGlobalMemorySkeleton(dshHome: string): string {
       fs.writeFileSync(globalPath, defaultSkeleton, { encoding: 'utf-8', mode: 0o600 });
     }
   } catch (err: unknown) {
-    // Container runtimes see the host copy through a read-only mount; the skeleton is the
-    // platform's job there. Reading an absent global.md yields empty memory.
+    // Only a container whose global memory is the host copy mounted read-only
+    // (globalMemoryWrite: 'platform') may skip the skeleton: it is the platform's job there and
+    // reading an absent global.md yields empty memory. Everywhere else (host runtimes, containers
+    // with a local copy) a permission error is a real fault and is reported.
     const code = (err as { code?: string })?.code;
-    if (code !== 'EROFS' && code !== 'EACCES' && code !== 'EPERM') {
+    if (!options.readOnlyMount || (code !== 'EROFS' && code !== 'EACCES' && code !== 'EPERM')) {
       throw err;
     }
   }
@@ -113,14 +118,15 @@ export function ensureGlobalMemorySkeleton(dshHome: string): string {
 export function loadGlobalMemorySnapshot(
   dshHome: string,
   maxBytes = DEFAULT_MAX_GLOBAL_MEMORY_BYTES,
-  customGlobalPath?: string
+  customGlobalPath?: string,
+  readOnlyMount = false
 ): { content: string; hash: string; etag: string; size: number; truncated: boolean; rawPath: string } {
   const globalPath = customGlobalPath && path.isAbsolute(customGlobalPath)
     ? customGlobalPath
     : path.join(dshHome, 'memory', 'global.md');
 
   if (!fs.existsSync(globalPath)) {
-    ensureGlobalMemorySkeleton(dshHome);
+    ensureGlobalMemorySkeleton(dshHome, { readOnlyMount });
   }
 
   let rawContent = '';
@@ -160,6 +166,7 @@ export function assembleMemoryPromptSection(options: AssembleMemoryOptions): {
     maxGlobalBytes = DEFAULT_MAX_GLOBAL_MEMORY_BYTES,
     injectGlobalMemory = 'always',
     memoryPlan,
+    globalMemoryReadOnlyMount = false,
   } = options;
 
   const effectiveInjectMode = memoryPlan?.injectGlobalMemory ?? injectGlobalMemory;
@@ -169,7 +176,7 @@ export function assembleMemoryPromptSection(options: AssembleMemoryOptions): {
   let globalSanitizedText = '';
 
   if (effectiveInjectMode !== 'never') {
-    const loaded = loadGlobalMemorySnapshot(dshHome, effectiveMaxBytes, memoryPlan?.globalMemoryPath);
+    const loaded = loadGlobalMemorySnapshot(dshHome, effectiveMaxBytes, memoryPlan?.globalMemoryPath, globalMemoryReadOnlyMount);
     globalMemorySnapshot = {
       path: 'global.md',
       content: loaded.content,

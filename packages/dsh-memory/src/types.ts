@@ -112,6 +112,8 @@ export interface AssembleMemoryOptions {
   readonly injectGlobalMemory?: MemoryInjectionMode;
   readonly maxGlobalBytes?: number;
   readonly memoryPlan?: MemoryPlan | null;
+  /** Global memory is the host copy mounted read-only (globalMemoryWrite: 'platform'). */
+  readonly globalMemoryReadOnlyMount?: boolean;
 }
 
 /**

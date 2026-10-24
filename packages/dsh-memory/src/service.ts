@@ -43,7 +43,12 @@ export class MemoryService extends Service {
    * Ensures the global memory skeleton exists under dshHome.
    */
   ensureSkeleton(dshHome: string): string {
-    return ensureGlobalMemorySkeleton(dshHome);
+    return ensureGlobalMemorySkeleton(dshHome, { readOnlyMount: this.isGlobalMemoryReadOnlyMount() });
+  }
+
+  /** Global memory is the host copy mounted read-only (container runtimes with platform writes). */
+  private isGlobalMemoryReadOnlyMount(): boolean {
+    return this.config.globalMemoryWrite === 'platform';
   }
 
   /**
@@ -55,7 +60,10 @@ export class MemoryService extends Service {
     revision: string;
     snapshot: MemorySnapshot;
   } {
-    return assembleMemoryPromptSection(options);
+    return assembleMemoryPromptSection({
+      ...options,
+      globalMemoryReadOnlyMount: options.globalMemoryReadOnlyMount ?? this.isGlobalMemoryReadOnlyMount(),
+    });
   }
 
   /**
@@ -76,7 +84,8 @@ export class MemoryService extends Service {
     const { dshHome, spacePath, spaceId, userId, memoryPlan, maxGlobalBytes, injectGlobalMemory } = options;
 
     // 1. Ensure skeleton on disk
-    ensureGlobalMemorySkeleton(dshHome);
+    const globalMemoryReadOnlyMount = this.isGlobalMemoryReadOnlyMount();
+    ensureGlobalMemorySkeleton(dshHome, { readOnlyMount: globalMemoryReadOnlyMount });
 
     // 2. Assemble prompt section and snapshot
     const assembled = assembleMemoryPromptSection({
@@ -87,6 +96,7 @@ export class MemoryService extends Service {
       maxGlobalBytes: maxGlobalBytes ?? this.config.defaultMaxGlobalBytes,
       injectGlobalMemory: injectGlobalMemory ?? this.config.injectGlobalMemory,
       memoryPlan,
+      globalMemoryReadOnlyMount,
     });
 
     const disposers: Array<() => void> = [];
