@@ -87,8 +87,12 @@ import {
   loadDshDeploymentConfig,
   validateMountSourcePath,
   isProcessAlive,
+  executeInstructionsRead,
+  executeInstructionsWrite,
+  FileOpError,
   type SessionSeedReceipt,
 } from '@enkeep/runtime-runner';
+import { hostUserAssetsForHandle } from '../user-assets/index.js';
 import {
   getDemoPathConfig,
   findRepoRoot,
@@ -734,6 +738,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       const targetVer = getEffectiveTargetRuntimeVersion();
       const userHandle = await containerAdapter.startUserRuntime({
         userId: runtimeIdentity,
+        username: u.username,
         image: targetVer.image,
         repoRoot,
         dataRoot: options.dataRoot,
@@ -926,6 +931,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
 
         const handle = await containerAdapter.startUserRuntime({
           userId: runtimeIdentity,
+          username: userRecord.username,
           image: targetVer.image,
           repoRoot,
           dataRoot: options.dataRoot,
@@ -1660,6 +1666,17 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         ? hostRuntimeHandles.get(userId)!
         : await resolveUserHandle(userId);
 
+      const hostAssets = hostRuntimeHandles.has(userId) ? undefined : hostUserAssetsForHandle(userHandle);
+      if (hostAssets) {
+        // Single copy: the user's AGENTS.md lives in the host DSH home (mounted read-only).
+        try {
+          const r = executeInstructionsRead({ target: 'global' }, { dshHome: hostAssets.hostDshHome, spacesDir: hostAssets.spacesDir });
+          return { content: r.content, etag: r.etag, size: r.size, mtimeMs: r.mtimeMs, exists: r.exists };
+        } catch (err: unknown) {
+          throw mapFileOpError({ code: err instanceof FileOpError ? err.code : 'READ_FAILED' });
+        }
+      }
+
       const rawHandle = userHandle.rawHandle ?? userHandle;
       if (rawHandle && typeof rawHandle.instructionsRead === 'function') {
         const rawRes = await rawHandle.instructionsRead({ target: 'global' });
@@ -1690,6 +1707,25 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       const userHandle = hostRuntimeHandles.has(userId)
         ? hostRuntimeHandles.get(userId)!
         : await resolveUserHandle(userId);
+
+      const hostAssets = hostRuntimeHandles.has(userId) ? undefined : hostUserAssetsForHandle(userHandle);
+      if (hostAssets) {
+        let w: { etag: string; size: number; mtimeMs: number };
+        try {
+          w = executeInstructionsWrite(
+            { target: 'global', content, expectedEtag: options?.expectedEtag, requireAbsent: options?.requireAbsent },
+            { dshHome: hostAssets.hostDshHome, spacesDir: hostAssets.spacesDir }
+          );
+        } catch (err: unknown) {
+          throw mapFileOpError({ code: err instanceof FileOpError ? err.code : 'WRITE_FAILED' });
+        }
+        // AGENTS.md is a single-file bind mount pinned to the old inode (the write is an atomic
+        // rename), or was not mounted yet. Rebuild the container when idle to pick it up.
+        if (userHandle.rawHandle) {
+          userHandle.rawHandle.userAssetMountsPending = true;
+        }
+        return { etag: w.etag, size: w.size, mtimeMs: w.mtimeMs };
+      }
 
       const rawHandle = userHandle.rawHandle ?? userHandle;
       if (rawHandle && typeof rawHandle.instructionsWrite === 'function') {
@@ -1839,6 +1875,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                 const targetVer = getEffectiveTargetRuntimeVersion();
                 const newHandle = await containerAdapter.startUserRuntime({
                   userId: runtimeIdentity,
+                  username: userRecord.username,
                   image: targetVer.image,
                   repoRoot,
                   dataRoot: options.dataRoot,
@@ -1917,6 +1954,13 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
   let platformServer: PlatformServer | undefined;
 
   // 6d. Helper to bind full platform proxy & events stream handlers to runtime tunnel
+  function memoryRootForBinding(handle: UserRuntimeHandle): string | undefined {
+    if (!handle.userAssets) return undefined;
+    const mounted = handle.rawHandle?.userAssetMounts ?? [];
+    if (!mounted.some((m) => m.kind === 'memory')) return undefined;
+    return join(handle.userAssets.hostDshHome, 'memory');
+  }
+
   async function bindRuntimeServices(handle: UserRuntimeHandle, platformUserId: string): Promise<void> {
     const rawHandle = handle.rawHandle;
     if (!rawHandle) return;
@@ -1943,6 +1987,9 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       mcpService: mcpManager,
       fileProvider: demoFileProvider as any,
       onAutonomousTurnCompleted,
+      // Container runtimes whose global memory is the host copy (read-only mount): the
+      // platform writes it. The memory root comes from the platform's user record.
+      ...(memoryRootForBinding(handle) ? { userAssets: { memoryRoot: memoryRootForBinding(handle)! } } : {}),
     });
     const eventsHandler = createEventsStreamHandler({
       platformUserId,
@@ -2102,7 +2149,10 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           }
         }
 
-        const isOutdated = Boolean(targetVer.image && (!currentImage || currentImage !== targetVer.image));
+        // A container whose read-only user asset mounts differ from the desired ones is rebuilt
+        // through the same idle-only path as an image upgrade (container replaced, volume kept).
+        const userAssetMountsPending = handle.rawHandle?.userAssetMountsPending === true;
+        const isOutdated = Boolean(targetVer.image && (!currentImage || currentImage !== targetVer.image)) || userAssetMountsPending;
         let isIdle = false;
         let pendingReason: string = isOutdated ? 'activity_unavailable' : 'up_to_date';
 
@@ -2433,6 +2483,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
             const targetVer = getEffectiveTargetRuntimeVersion();
             const newHandle = await containerAdapter.startUserRuntime({
               userId: runtimeIdentity,
+              username: userRecord.username,
               image: targetVer.image,
               repoRoot,
               dataRoot: options.dataRoot,
@@ -3091,6 +3142,7 @@ fs.appendFileSync(p, corruptData);
         const targetVer = getEffectiveTargetRuntimeVersion();
         const startOpts = {
           userId: runtimeIdentity,
+          username: userRecord.username,
           image: targetVer.image,
           repoRoot,
           dataRoot: options.dataRoot,

@@ -87,13 +87,22 @@ export function truncateUtf8Bytes(text: string, maxBytes: number): { text: strin
  */
 export function ensureGlobalMemorySkeleton(dshHome: string): string {
   const memoryDir = path.join(dshHome, 'memory');
-  if (!fs.existsSync(memoryDir)) {
-    fs.mkdirSync(memoryDir, { recursive: true, mode: 0o700 });
-  }
   const globalPath = path.join(memoryDir, 'global.md');
-  if (!fs.existsSync(globalPath)) {
-    const defaultSkeleton = '# Global Memory\n\nThis is your long-term memory across all spaces and sessions.\n';
-    fs.writeFileSync(globalPath, defaultSkeleton, { encoding: 'utf-8', mode: 0o600 });
+  try {
+    if (!fs.existsSync(memoryDir)) {
+      fs.mkdirSync(memoryDir, { recursive: true, mode: 0o700 });
+    }
+    if (!fs.existsSync(globalPath)) {
+      const defaultSkeleton = '# Global Memory\n\nThis is your long-term memory across all spaces and sessions.\n';
+      fs.writeFileSync(globalPath, defaultSkeleton, { encoding: 'utf-8', mode: 0o600 });
+    }
+  } catch (err: unknown) {
+    // Container runtimes see the host copy through a read-only mount; the skeleton is the
+    // platform's job there. Reading an absent global.md yields empty memory.
+    const code = (err as { code?: string })?.code;
+    if (code !== 'EROFS' && code !== 'EACCES' && code !== 'EPERM') {
+      throw err;
+    }
   }
   return globalPath;
 }

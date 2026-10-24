@@ -109,7 +109,14 @@ export class MemoryService extends Service {
 
     const searchTool = createMemorySearchTool({ dshHome, spacePath, getClient });
     const readTool = createMemoryReadTool({ dshHome, spacePath, getClient });
-    const writeTool = createMemoryWriteTool({ dshHome, spacePath, spaceId, userId, getClient });
+    const writeTool = createMemoryWriteTool({
+      dshHome,
+      spacePath,
+      spaceId,
+      userId,
+      getClient,
+      globalMemoryWrite: this.config.globalMemoryWrite ?? 'local',
+    });
 
     const toolsToRegister: ToolDefinition[] = [searchTool, readTool, writeTool];
     const registeredToolNames = toolsToRegister.map(t => t.name);

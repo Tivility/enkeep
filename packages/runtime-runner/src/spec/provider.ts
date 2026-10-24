@@ -7,7 +7,7 @@
  * @module @enkeep/runtime-runner/spec/provider
  */
 
-import type { RuntimeContainerSpec } from './types.js';
+import type { RuntimeContainerSpec, RuntimeUserAssetMount } from './types.js';
 import type { HostRuntimeSpec } from '../host/types.js';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type {
@@ -98,6 +98,14 @@ export interface ActiveRuntimeHandle {
   readonly volumeId: string;
   /** Whether this handle newly created the runtime (true) or reconnected to an existing one (false) */
   readonly isCreated: boolean;
+  /** Read-only user asset mounts the running container actually has (container mode only) */
+  readonly userAssetMounts?: readonly RuntimeUserAssetMount[];
+  /**
+   * True when the running container's user asset mounts differ from the desired ones (or a
+   * host-side asset change needs a fresh mount). The platform rebuilds such a container when
+   * the user's runtime is idle; the volume is kept.
+   */
+  userAssetMountsPending?: boolean;
   /** Host runtime PID if running in host mode */
   readonly pid?: number;
   /** Active tunnel host instance, if started */

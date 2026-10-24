@@ -45,7 +45,8 @@ import {
 import type { RuntimeContainerSpec, RunContainerResult, RuntimeNetworkMode } from '../spec/types.js';
 import type { ExecCliRequest, ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type { FileOperationResult, FileListEntry, FileOpType } from '../runtime/file-ops.js';
-import type { RuntimeMountSpec } from '../spec/types.js';
+import type { RuntimeMountSpec, RuntimeUserAssetMount } from '../spec/types.js';
+import { userAssetKindForTarget } from '../spec/user-assets.js';
 import type { PluginReadinessStatus } from '../transport/types.js';
 
 const execFileAsync = promisify(execFile);
@@ -99,6 +100,8 @@ export interface OwnershipExpectation {
   containerPath: string;
   /** Controlled host mounts */
   mounts?: readonly RuntimeMountSpec[];
+  /** Read-only user asset mounts (host DSH home -> /home/dsh/.dsh/<asset>) */
+  userAssetMounts?: readonly RuntimeUserAssetMount[];
   /** Container network isolation mode ('none' | 'bridge', default 'none') */
   networkMode?: RuntimeNetworkMode;
 }
@@ -1252,6 +1255,14 @@ export class SafeDockerClient {
       }
     }
 
+    // Read-only user asset mounts. `--mount` (not `-v`) so a missing source fails instead of
+    // Docker silently creating a host directory in its place.
+    if (Array.isArray(spec.userAssetMounts)) {
+      for (const asset of spec.userAssetMounts) {
+        args.push('--mount', `type=bind,source=${asset.sourcePath},target=${asset.targetPath},readonly`);
+      }
+    }
+
     // Mandatory and user labels (including runId and volumeId)
     for (const [k, v] of Object.entries(spec.labels)) {
       args.push('--label', `${k}=${v}`);
@@ -1366,6 +1377,7 @@ export class SafeDockerClient {
       volumeId: spec.volume.volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      userAssetMounts: spec.userAssetMounts,
       networkMode: spec.networkMode,
     };
 
@@ -1482,6 +1494,7 @@ export class SafeDockerClient {
       volumeId: spec.volume.volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      userAssetMounts: spec.userAssetMounts,
       networkMode: spec.networkMode,
     };
 
@@ -1679,7 +1692,8 @@ export class SafeDockerClient {
     }
 
     const expectedControlledMounts = expectation.mounts ?? [];
-    if (expectedControlledMounts.length === 0) {
+    const expectedUserAssetMounts = expectation.userAssetMounts ?? [];
+    if (expectedControlledMounts.length === 0 && expectedUserAssetMounts.length === 0) {
       if (info.mounts.length !== 1) {
         throw new DockerOwnershipError('Container must have exactly ONE volume mount');
       }
@@ -1705,10 +1719,10 @@ export class SafeDockerClient {
         throw new DockerOwnershipError('Container volume mount source cannot be empty');
       }
     } else {
-      const totalExpected = 1 + expectedControlledMounts.length;
+      const totalExpected = 1 + expectedControlledMounts.length + expectedUserAssetMounts.length;
       if (info.mounts.length !== totalExpected) {
         throw new DockerOwnershipError(
-          `Container must have exactly ${totalExpected} mounts (1 volume + ${expectedControlledMounts.length} controlled bind mounts), got ${info.mounts.length}`
+          `Container must have exactly ${totalExpected} mounts (1 volume + ${expectedControlledMounts.length} controlled bind mounts + ${expectedUserAssetMounts.length} user asset mounts), got ${info.mounts.length}`
         );
       }
 
@@ -1732,10 +1746,11 @@ export class SafeDockerClient {
       }
 
       const bindMounts = info.mounts.filter((m) => m.type === 'bind');
-      if (bindMounts.length !== expectedControlledMounts.length) {
+      if (bindMounts.length !== expectedControlledMounts.length + expectedUserAssetMounts.length) {
         throw new DockerOwnershipError('Container bind mount count mismatch with expectation');
       }
 
+      const seenUserAssetKinds = new Set<string>();
       for (const bind of bindMounts) {
         const dest = bind.destination;
         if (
@@ -1747,6 +1762,21 @@ export class SafeDockerClient {
           dest.startsWith('/root')
         ) {
           throw new DockerOwnershipError(`Forbidden bind mount destination: "${dest}"`);
+        }
+        const assetKind = userAssetKindForTarget(dest);
+        if (assetKind) {
+          const expectedAsset = expectedUserAssetMounts.find((m) => m.kind === assetKind);
+          if (!expectedAsset) {
+            throw new DockerOwnershipError(`Unexpected user asset bind mount at "${dest}"`);
+          }
+          if (seenUserAssetKinds.has(assetKind)) {
+            throw new DockerOwnershipError(`Duplicate user asset bind mount at "${dest}"`);
+          }
+          seenUserAssetKinds.add(assetKind);
+          if (bind.rw !== false) {
+            throw new DockerOwnershipError(`User asset bind mount "${dest}" must be read-only`);
+          }
+          continue;
         }
         if (!dest.startsWith('/home/dsh/mounts/')) {
           throw new DockerOwnershipError(
@@ -1764,6 +1794,9 @@ export class SafeDockerClient {
             `Bind mount "${mountId}" mode mismatch: expected rw=${expectedRw}, got rw=${bind.rw}`
           );
         }
+      }
+      if (seenUserAssetKinds.size !== expectedUserAssetMounts.length) {
+        throw new DockerOwnershipError('Container user asset bind mounts do not match expectation');
       }
     }
 

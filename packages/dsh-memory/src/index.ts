@@ -33,6 +33,7 @@ export type Config = MemoryPluginConfig;
 export const Config: Schema<Config> = Schema.object({
   defaultMaxGlobalBytes: Schema.natural().default(20_480).description('Default maximum global memory bytes to inject (20 KiB)'),
   injectGlobalMemory: Schema.union(['always', 'never', 'auto'] as const).default('always').description('Global memory injection mode'),
+  globalMemoryWrite: Schema.union(['local', 'platform'] as const).default('local').description('Where global-scope memory writes go: local file, or the platform (host-backed read-only mount)'),
 });
 
 /**

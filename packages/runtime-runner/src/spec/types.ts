@@ -39,6 +39,26 @@ export interface ResolvedRuntimeMount {
   readonly ino?: number;
 }
 
+/**
+ * User-level asset kinds that live only on the host (authoritative single copy) and are
+ * bind-mounted read-only into the user's container at fixed paths under `/home/dsh/.dsh/`.
+ */
+export type UserAssetKind = 'memory' | 'skills' | 'agents_md';
+
+/**
+ * Read-only bind mount of one user-level asset from the host DSH home into the container.
+ */
+export interface RuntimeUserAssetMount {
+  /** Asset kind; determines the fixed container target path */
+  readonly kind: UserAssetKind;
+  /** Absolute host path (`<host-dsh-home>/memory`, `<host-dsh-home>/skills` or `<host-dsh-home>/AGENTS.md`) */
+  readonly sourcePath: string;
+  /** Fixed container path (`/home/dsh/.dsh/memory`, `/home/dsh/.dsh/skills` or `/home/dsh/.dsh/AGENTS.md`) */
+  readonly targetPath: string;
+  /** Always true: the container never writes user-level assets directly */
+  readonly readOnly: true;
+}
+
 export interface RuntimeBindMountSpec {
   /** Host source path */
   sourcePath: string;
@@ -76,6 +96,8 @@ export interface RuntimeContainerSpec {
   volume: RuntimeVolumeSpec;
   /** Controlled host mounts */
   mounts?: RuntimeMountSpec[];
+  /** Read-only user-level asset mounts (host DSH home -> /home/dsh/.dsh/<asset>) */
+  userAssetMounts?: RuntimeUserAssetMount[];
   /** Legacy bind mounts field (strictly forbidden if non-empty unless valid controlled mounts) */
   bindMounts?: RuntimeBindMountSpec[];
   /** Container network isolation mode (strictly 'none') */

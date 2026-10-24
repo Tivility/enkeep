@@ -12,6 +12,8 @@ import { launchDemoSystem } from './up/index.js';
 import { downDemo } from './down/index.js';
 import { runDemoTestSuite } from './test/index.js';
 import { runPreflight } from './preflight/index.js';
+import { runUserAssetMigrateCli } from './user-assets/cli.js';
+import { formatMigrationReport } from './user-assets/index.js';
 import { listSignedProcesses, listSignedContainers } from './utils/crypto-meta.js';
 import { validateSafePort } from './utils/probes.js';
 import {
@@ -49,6 +51,9 @@ COMMANDS:
   status     Show current status of demo services, processes, and containers
   preflight  Verify platform and all host/container runtimes quiescence before deploy or stop
   bind-lark  Explicitly bind a Lark chatId to the dedicated test space
+  user-assets-migrate
+             One-time convergence of user-level assets (memory/skills/AGENTS.md) to the single
+             host copy before container mounts are enabled. Idempotent; never modifies the host copy
   help       Display this help message
 
 OPTIONS:
@@ -65,6 +70,9 @@ OPTIONS:
   --json                      Output results as JSON (errors omit stack trace)
   --remove-vols               Remove demo Docker volumes on teardown
   --repo-root                 Explicit repository root path (default: auto-detected)
+  --dry-run                   user-assets-migrate: compare and report only, change nothing
+  --archive-divergent         user-assets-migrate: also archive divergent container copies (operator decision)
+  --user <username>           user-assets-migrate: restrict to this platform user (repeatable)
   --help, -h                  Show help
 `);
 }
@@ -648,6 +656,35 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
           console.log(`  Containers: ${result.containers.length} active`);
           console.log(`  Ports:      ${result.activePortBindings.join(', ') || 'none'}\n`);
         }
+        break;
+      }
+
+      case 'user-assets-migrate': {
+        const usernames: string[] = [];
+        for (let i = 0; i < args.length; i++) {
+          if (args[i] === '--user') {
+            const next = args[i + 1];
+            if (next === undefined || next.startsWith('-')) {
+              throw new Error('Safety Violation: --user requires a username.');
+            }
+            usernames.push(next);
+          }
+        }
+        const dryRun = args.includes('--dry-run');
+        const result = await runUserAssetMigrateCli({
+          repoRoot,
+          dataDir: parseDataDir(args, process.env),
+          resourceSuffix: parseResourceSuffix(args),
+          dryRun,
+          archiveDivergent: args.includes('--archive-divergent'),
+          usernames,
+        });
+        if (isJson) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(formatMigrationReport(result.reports, dryRun));
+        }
+        if (!result.ok) process.exit(1);
         break;
       }
 

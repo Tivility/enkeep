@@ -91,6 +91,7 @@ Before starting demo components (such as in `demo:up`), preflight checks verify:
   - User ownership label `enkeep.user=<userId>`.
   - Exact run identifier label `enkeep.run-id=<runId>`.
   - Full 64-character container ID verification.
+  - Bind mounts must be exactly the expected set: controlled mounts at `/home/dsh/mounts/<id>` and, when enabled, the user's read-only asset mounts at `/home/dsh/.dsh/{memory,skills,AGENTS.md}` (any writable or unexpected asset bind fails ownership). See [user-assets.md](./user-assets.md).
   - Live Docker inspection verifies metadata matches actual container state before issuing stop or remove commands.
 - **Volume Ownership & Teardown**:
   - Volumes follow pattern `^enkeep-demo-dsh-[a-zA-Z0-9][a-zA-Z0-9_-]{0,60}$` (e.g. `enkeep-demo-dsh-alice[-<suffix>]`).

@@ -8,4 +8,5 @@ export * from './types.js';
 export * from './validator.js';
 export * from './provider.js';
 export * from './mount-security.js';
+export * from './user-assets.js';
 export * from './extension-plan-security.js';

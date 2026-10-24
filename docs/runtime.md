@@ -86,6 +86,11 @@ Enkeep provisions isolated, non-root Docker runtime containers for individual te
    - **Zero Host Home Exposure**: Host `$HOME` / `/root` directories are rejected by bind mount validators.
    - **Forbidden Path Safeguard**: Bind mounts containing `happyclaw/data`, `messages.db`, or system states are blocked.
 
+8. **Single Copy of User-Level Assets** (see [user-assets.md](./user-assets.md)):
+   - Global memory, skills and `AGENTS.md` live once, in the user's host DSH home (`<data-root>/host-runtimes/<username>/.dsh`).
+   - Containers get them as read-only `--mount` binds at `/home/dsh/.dsh/{memory,skills,AGENTS.md}`; no other host path is mounted.
+   - Container `memory_write` with global scope is forwarded through the tunnel (`POST /api/user-assets/memory/write`); the platform writes the host copy with the tunnel-bound identity and the same etag semantics. Space memory is unchanged.
+
 ---
 
 ## 3. Platform <-> Runtime Transport Analysis
@@ -176,6 +181,6 @@ The Enkeep runtime sandbox enforces clear, fail-closed boundaries:
 - **No Real Credentials**: No external model provider credentials, tokens, or API keys are accepted, stored, or transmitted.
 - **No Arbitrary / Dynamic Imports**: Offline data migration is strictly restricted to verified repository fixtures (`packages/import-happyclaw/fixtures/source/db/messages.db`). Dynamic live imports and external production DB access are disallowed.
 - **No Host Execution**: User code, tool commands, and agent turns run exclusively inside zero-network Docker containers, never on the host.
-- **No Arbitrary Host Mounts**: User containers never mount `/var/run/docker.sock`, host `$HOME`, `~/.dsh`, `/etc`, or arbitrary host directories (`additional_mounts`).
+- **No Arbitrary Host Mounts**: User containers never mount `/var/run/docker.sock`, host `$HOME`, `~/.dsh`, `/etc`, or arbitrary host directories (`additional_mounts`). The only host paths besides controlled mounts are the user's own `memory/`, `skills/` and `AGENTS.md` from the platform-managed host DSH home, read-only.
 - **No External MCP / Arbitrary Plugins**: No Stdio/SSE Model Context Protocol servers or unvetted external Cordis plugins.
 - **No Host Git / Shell Skills**: No host-level git automation or host-executing shell skill plugins.
