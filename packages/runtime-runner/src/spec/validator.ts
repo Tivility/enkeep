@@ -15,6 +15,7 @@ import type {
   SpecValidationResult,
 } from './types.js';
 import { validateMountSpec } from './mount-security.js';
+import { validateUserAssetMounts, USER_MEMORY_WRITE_ENV_KEY, USER_MEMORY_WRITE_ENV_PLATFORM } from './user-assets.js';
 
 export const DEMO_CONTAINER_PREFIX = 'enkeep-demo-';
 export const DEMO_VOLUME_PREFIX = 'enkeep-demo-dsh-';
@@ -124,6 +125,7 @@ export const ALLOWED_SPEC_KEYS = new Set([
   'workingDir',
   'volume',
   'mounts',
+  'userAssetMounts',
   'bindMounts',
   'networkMode',
   'labels',
@@ -158,6 +160,7 @@ export const ALLOWED_ENV_KEYS = new Set([
   'ENKEEP_LLM_BASE_URL',
   'ENKEEP_LLM_PROVIDERS',
   'IN_CONTAINER_PLACEHOLDER',
+  USER_MEMORY_WRITE_ENV_KEY,
 ]);
 
 /**
@@ -275,6 +278,9 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
     }
   }
 
+  // 9b. Read-only user asset mounts (host DSH home -> fixed /home/dsh/.dsh/<asset> targets)
+  errors.push(...validateUserAssetMounts(rawSpec.userAssetMounts));
+
   const bindMounts = rawSpec.bindMounts;
   if (bindMounts !== undefined) {
     if (!Array.isArray(bindMounts) || bindMounts.length > 0) {
@@ -335,6 +341,13 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
     }
     if (environment.DSH_HOME !== '/home/dsh/.dsh' && environment.DSH_HOME !== '/home/dsh') {
       errors.push('environment.DSH_HOME must be "/home/dsh/.dsh" or "/home/dsh"');
+    }
+    if (USER_MEMORY_WRITE_ENV_KEY in environment && environment[USER_MEMORY_WRITE_ENV_KEY] !== undefined) {
+      const memoryMounted = Array.isArray(rawSpec.userAssetMounts)
+        && rawSpec.userAssetMounts.some((m) => isRecord(m) && m.kind === 'memory');
+      if (environment[USER_MEMORY_WRITE_ENV_KEY] !== USER_MEMORY_WRITE_ENV_PLATFORM || !memoryMounted) {
+        errors.push(`environment.${USER_MEMORY_WRITE_ENV_KEY} must be "${USER_MEMORY_WRITE_ENV_PLATFORM}" and requires a memory user asset mount`);
+      }
     }
     if (environment.DSH_SPACES !== '/home/dsh/spaces') {
       errors.push('environment.DSH_SPACES must be "/home/dsh/spaces"');
