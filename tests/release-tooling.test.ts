@@ -384,9 +384,8 @@ describe('Deploy Tooling Enhancements', () => {
         });
       });
 
-      it('classifies runtime-runner, dsh-*, and docker/ changes as runtime', () => {
+      it('classifies in-runtime-only dsh-* and docker/ changes as runtime', () => {
         const changes = [
-          'packages/runtime-runner/src/host/adapter.ts',
           'packages/dsh-settings/src/index.ts',
           'docker/Dockerfile.runtime',
         ];
@@ -396,6 +395,16 @@ describe('Deploy Tooling Enhancements', () => {
           runtime: true,
           platform: false,
         });
+      });
+
+      it('also restarts the platform for runtime packages the platform process loads', () => {
+        for (const p of [
+          'packages/runtime-runner/src/host/security.ts',
+          'packages/runtime-runner/src/runtime/daemon-cli.ts',
+          'packages/dsh-tool-cli/src/index.ts',
+        ]) {
+          expect(classifyChanges([p])).toEqual({ frontend: false, runtime: true, platform: true });
+        }
       });
 
       it('classifies server, channel, and demo-runner changes as platform', () => {

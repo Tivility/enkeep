@@ -42,6 +42,9 @@ export const DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 24 * 60 * 60;
 /** Default interval between quiescence checks while waiting. */
 export const DEFAULT_PREFLIGHT_INTERVAL_SECONDS = 120;
 
+/** Runtime packages that the platform process imports too (see demo-runner and platform-server imports). */
+export const PLATFORM_LOADED_RUNTIME_PACKAGES = ['runtime-runner', 'dsh-enkeep-bundle', 'dsh-external-interaction', 'dsh-tool-cli'];
+
 export function classifyChanges(paths, options = {}) {
   const result = {
     frontend: false,
@@ -70,6 +73,12 @@ export function classifyChanges(paths, options = {}) {
       p.startsWith('docker/')
     ) {
       result.runtime = true;
+      // These packages are also loaded by the platform process (host daemon spawning and its
+      // environment, Docker adapter, transports, tool/bundle wiring). A runtime-only rollout
+      // would leave the platform on the old code, so they need a platform restart as well.
+      if (PLATFORM_LOADED_RUNTIME_PACKAGES.some((pkg) => p.startsWith(`packages/${pkg}/`))) {
+        result.platform = true;
+      }
       continue;
     }
 
