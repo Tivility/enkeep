@@ -38,7 +38,7 @@ import {
   USER_MEMORY_WRITE_ENV_KEY,
   USER_MEMORY_WRITE_ENV_PLATFORM,
   userAssetKindForTarget,
-  userAssetMountKindsEqual,
+  userAssetMountsEqual,
 } from '../spec/user-assets.js';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
@@ -107,7 +107,8 @@ export interface UserSpecOptions {
 
 /**
  * Reads the user asset bind mounts a container actually has from `docker inspect` output.
- * Bind sources may be rewritten by VM file sharing, so only the kind is authoritative.
+ * `sourcePath` is the source Docker reports; compare it with `normalizeBindSourceForCompare`
+ * (VM-based engines may rewrite it).
  */
 export function readContainerUserAssetMounts(info: DockerContainerInfo): RuntimeUserAssetMount[] {
   const result: RuntimeUserAssetMount[] = [];
@@ -831,10 +832,11 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
     }
 
     // User asset mounts are fixed at `docker run`. If the existing container's mounts differ from
-    // the desired ones, keep serving with what it actually has and flag it for an idle rebuild.
+    // the desired ones (kind, or host source path after normalization — e.g. the user's host DSH
+    // home moved), keep serving with what it actually has and flag it for an idle rebuild.
     const actualUserAssetMounts = readContainerUserAssetMounts(info);
     let userAssetMountsPending = false;
-    if (!userAssetMountKindsEqual(actualUserAssetMounts, spec.userAssetMounts)) {
+    if (!userAssetMountsEqual(actualUserAssetMounts, spec.userAssetMounts)) {
       expectation.userAssetMounts = actualUserAssetMounts;
       userAssetMountsPending = true;
     }

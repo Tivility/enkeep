@@ -303,6 +303,16 @@ describe('user assets: desired mounts for container runtimes', () => {
     expect(back.userAssets?.reason).toBe('migration_pending');
   });
 
+  it('write route is bound only when the memory mount source is the user\'s host copy', () => {
+    const hostDshHome = '/srv/data/host-runtimes/alice/.dsh';
+    const mk = (sourcePath: string) => ({ userAssets: { hostDshHome }, rawHandle: { userAssetMounts: [{ kind: 'memory', sourcePath }] } });
+    expect(hostMemoryRootForBinding(mk('/srv/data/host-runtimes/alice/.dsh/memory'))).toBe('/srv/data/host-runtimes/alice/.dsh/memory');
+    expect(hostMemoryRootForBinding(mk('/host_mnt/srv/data/host-runtimes/alice/.dsh/memory/'))).toBe('/srv/data/host-runtimes/alice/.dsh/memory');
+    // container reads another directory (e.g. username changed): no route until the rebuild
+    expect(hostMemoryRootForBinding(mk('/srv/data/host-runtimes/old-alice/.dsh/memory'))).toBeUndefined();
+    expect(hostMemoryRootForBinding({ userAssets: { hostDshHome }, rawHandle: { userAssetMounts: [{ kind: 'skills', sourcePath: '/x' }] } })).toBeUndefined();
+  });
+
   it('an empty container AGENTS.md (single-file mountpoint leftover) is not data', () => {
     const empty = { exists: true, type: 'file' as const, entries: [{ path: '', type: 'file' as const, size: 0, sha256: sha('') }], truncated: false };
     const host = { exists: true, type: 'file' as const, entries: [{ path: '', type: 'file' as const, size: 3, sha256: sha('abc') }], truncated: false };

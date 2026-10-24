@@ -46,7 +46,7 @@ import type { RuntimeContainerSpec, RunContainerResult, RuntimeNetworkMode } fro
 import type { ExecCliRequest, ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type { FileOperationResult, FileListEntry, FileOpType } from '../runtime/file-ops.js';
 import type { RuntimeMountSpec, RuntimeUserAssetMount } from '../spec/types.js';
-import { userAssetKindForTarget } from '../spec/user-assets.js';
+import { bindSourceMatches, userAssetKindForTarget } from '../spec/user-assets.js';
 import type { PluginReadinessStatus } from '../transport/types.js';
 
 const execFileAsync = promisify(execFile);
@@ -1775,6 +1775,9 @@ export class SafeDockerClient {
           seenUserAssetKinds.add(assetKind);
           if (bind.rw !== false) {
             throw new DockerOwnershipError(`User asset bind mount "${dest}" must be read-only`);
+          }
+          if (!bindSourceMatches(bind.source, expectedAsset.sourcePath)) {
+            throw new DockerOwnershipError(`User asset bind mount "${dest}" source does not match the expected host path`);
           }
           continue;
         }

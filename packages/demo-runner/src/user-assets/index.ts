@@ -20,6 +20,7 @@ import {
 } from 'node:fs';
 import { join, isAbsolute, normalize, relative, sep } from 'node:path';
 import {
+  bindSourceMatches,
   resolveUserAssetMounts,
   userAssetMountsEnabled,
   type RuntimeUserAssetMount,
@@ -739,9 +740,13 @@ export function hostMemoryRootForBinding(handle: {
   readonly rawHandle?: { readonly userAssetMounts?: readonly { kind: string; sourcePath?: string }[] };
 }): string | undefined {
   if (!handle.userAssets) return undefined;
-  const mounted = handle.rawHandle?.userAssetMounts ?? [];
-  if (!mounted.some((m) => m.kind === 'memory')) return undefined;
-  return join(handle.userAssets.hostDshHome, 'memory');
+  const memory = (handle.rawHandle?.userAssetMounts ?? []).find((m) => m.kind === 'memory');
+  if (!memory) return undefined;
+  const root = join(handle.userAssets.hostDshHome, 'memory');
+  // The container must read the same directory the platform would write. A mount of another
+  // host path (e.g. the user's host DSH home moved) gets no route (404) until it is rebuilt.
+  if (typeof memory.sourcePath === 'string' && !bindSourceMatches(memory.sourcePath, root)) return undefined;
+  return root;
 }
 
 export function isPathInside(child: string, parent: string): boolean {

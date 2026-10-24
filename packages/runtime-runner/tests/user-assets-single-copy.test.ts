@@ -29,6 +29,9 @@ import {
   readContainerUserAssetMounts,
   removeUnmountedUserAssetPlaceholders,
   readProcessMountPoints,
+  normalizeBindSourceForCompare,
+  bindSourceMatches,
+  userAssetMountsEqual,
   CONTAINER_DSH_HOME,
   USER_ASSET_CONTAINER_TARGETS,
   USER_MEMORY_WRITE_ENV_KEY,
@@ -337,6 +340,14 @@ describe('user assets: docker run arguments and ownership', () => {
     const wrongTarget = [{ destination: '/home/dsh/.dsh', source: home, rw: false }];
     expect(() => client.assertContainerOwnership(containerInfo(spec, wrongTarget), expectation(spec, mounts.slice(0, 1)))).toThrow(DockerOwnershipError);
 
+    // The bind source must be the expected host path (after VM-rewrite normalization)
+    const moved = roBinds.map((b, i) => (i === 0 ? { ...b, source: path.join(tmp, 'host-runtimes', 'old-name', '.dsh', 'memory') } : b));
+    expect(() => client.assertContainerOwnership(containerInfo(spec, moved), expectation(spec, mounts))).toThrow(/source does not match/);
+    const rewritten = roBinds.map((b) => ({ ...b, source: `/host_mnt${b.source}/` }));
+    expect(() => client.assertContainerOwnership(containerInfo(spec, rewritten), expectation(spec, mounts))).not.toThrow();
+    const emptySource = roBinds.map((b, i) => (i === 0 ? { ...b, source: '' } : b));
+    expect(() => client.assertContainerOwnership(containerInfo(spec, emptySource), expectation(spec, mounts))).toThrow(/source does not match/);
+
     // No assets expected and none present: unchanged single-volume rule
     const plain = adapter.createDefaultUserSpec({ userId: 'alice', runId: spec.runId, volumeId: spec.volume.volumeId });
     expect(() => client.assertContainerOwnership(containerInfo(plain, []), expectation(plain, undefined))).not.toThrow();
@@ -398,6 +409,13 @@ describe('user assets: docker run arguments and ownership', () => {
       const handle = await connectWith(assetMounts(home, ['memory', 'skills']), []);
       expect(handle.userAssetMountsPending).toBe(true);
       expect(handle.userAssetMounts).toEqual([]);
+    });
+
+    it('flags a container whose asset mounts come from another host path (e.g. host DSH home moved)', async () => {
+      const oldHome = path.join(tmp, 'host-runtimes', 'old-name', '.dsh');
+      const handle = await connectWith(assetMounts(home, ['memory', 'skills']), assetMounts(oldHome, ['memory', 'skills']));
+      expect(handle.userAssetMountsPending).toBe(true);
+      expect(handle.userAssetMounts?.map((m) => m.sourcePath)).toEqual([path.join(oldHome, 'memory'), path.join(oldHome, 'skills')]);
     });
 
     it('does not flag a container whose mounts already match', async () => {
@@ -641,6 +659,24 @@ describe('user assets: container memory_write -> platform client -> proxy -> hos
 
     await tool.execute({ content: 'line', mode: 'append', path: 'topics/t.md' });
     expect(fs.readFileSync(path.join(hostHome, 'memory', 'topics', 't.md'), 'utf8')).toBe('line');
+  });
+});
+
+describe('user assets: bind source normalization', () => {
+  it('folds known VM rewrites and nothing else', () => {
+    expect(normalizeBindSourceForCompare('/data/host-runtimes/alice/.dsh/memory/')).toBe('/data/host-runtimes/alice/.dsh/memory');
+    expect(normalizeBindSourceForCompare('/host_mnt/Users/a/.dsh/memory')).toBe('/Users/a/.dsh/memory');
+    expect(normalizeBindSourceForCompare('/private/tmp/x/.dsh/memory')).toBe('/tmp/x/.dsh/memory');
+    expect(normalizeBindSourceForCompare('/private/var/folders/x')).toBe('/var/folders/x');
+    expect(normalizeBindSourceForCompare('/private/etc/x')).toBe('/private/etc/x');
+    expect(normalizeBindSourceForCompare('/a/./b/../c')).toBe('/a/c');
+    expect(bindSourceMatches('/host_mnt/private/tmp/h/.dsh/memory', '/tmp/h/.dsh/memory')).toBe(true);
+    expect(bindSourceMatches('/srv/other/.dsh/memory', '/srv/alice/.dsh/memory')).toBe(false);
+    expect(bindSourceMatches(undefined, '/srv/alice/.dsh/memory')).toBe(false);
+    expect(userAssetMountsEqual(
+      [{ kind: 'memory', sourcePath: '/host_mnt/srv/a/.dsh/memory', targetPath: '/home/dsh/.dsh/memory', readOnly: true }],
+      [{ kind: 'memory', sourcePath: '/srv/a/.dsh/memory', targetPath: '/home/dsh/.dsh/memory', readOnly: true }]
+    )).toBe(true);
   });
 });
 

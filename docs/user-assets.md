@@ -33,8 +33,15 @@ because nothing synchronized them.
 - The spec validator only accepts asset mounts that are read-only, target one of the three fixed
   paths, come from absolute normalized host paths whose basename matches the asset, share one
   host DSH home, and are outside protected system roots. Generic `bindMounts` remain forbidden.
-  Container ownership checks expect exactly the asset mounts in the spec and require them to be
-  read-only.
+  Container ownership checks expect exactly the asset mounts in the spec, require them to be
+  read-only, and require each bind `Source` reported by `docker inspect` to be the expected host
+  path. Sources are compared after normalization (trailing slash, `.`/`..`, and the known VM
+  rewrites `/host_mnt/<path>` and `/private/{tmp,var}` -> `/{tmp,var}`); OrbStack and native Linux
+  report the host path unchanged (verified on OrbStack).
+- On reconnect, a container whose asset mounts come from another host path (for example the
+  user's host DSH home moved after a username change) is served with its actual mounts and
+  flagged for an idle rebuild. Until then its global memory write route is not bound (`404`), so
+  the platform never writes a directory the container does not read.
 
 ## 2. How a container writes global memory
 

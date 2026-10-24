@@ -319,9 +319,33 @@ export function userAssetMountsEqual(
   a: readonly RuntimeUserAssetMount[] | undefined,
   b: readonly RuntimeUserAssetMount[] | undefined
 ): boolean {
-  const left = [...(a ?? [])].map((m) => `${m.kind}\0${m.sourcePath}`).sort();
-  const right = [...(b ?? [])].map((m) => `${m.kind}\0${m.sourcePath}`).sort();
+  const left = [...(a ?? [])].map((m) => `${m.kind}\0${normalizeBindSourceForCompare(m.sourcePath)}`).sort();
+  const right = [...(b ?? [])].map((m) => `${m.kind}\0${normalizeBindSourceForCompare(m.sourcePath)}`).sort();
   return left.length === right.length && left.every((v, i) => v === right[i]);
+}
+
+/**
+ * Normalizes a bind mount source for comparing the host path in a spec with the `Source` that
+ * `docker inspect` reports. Native Linux Docker and OrbStack report the host path unchanged;
+ * VM-based engines may rewrite it, so these known forms are folded:
+ * - Docker Desktop for Mac (older file sharing): `/host_mnt/<host path>`;
+ * - macOS firmlinks resolved by the engine: `/private/{tmp,var}/...` -> `/{tmp,var}/...`.
+ * Anything else is compared as a normalized POSIX path (trailing slashes removed).
+ */
+export function normalizeBindSourceForCompare(source: string): string {
+  if (typeof source !== 'string' || source.length === 0) return '';
+  let p = path.posix.normalize(source);
+  if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+  if (p.startsWith('/host_mnt/')) p = p.slice('/host_mnt'.length);
+  const priv = /^\/private\/(tmp|var)(\/|$)/.exec(p);
+  if (priv) p = p.slice('/private'.length);
+  return p;
+}
+
+/** Whether a bind source reported by Docker is the expected host path (after normalization). */
+export function bindSourceMatches(reported: string | undefined, expected: string): boolean {
+  if (typeof reported !== 'string' || reported.length === 0) return false;
+  return normalizeBindSourceForCompare(reported) === normalizeBindSourceForCompare(expected);
 }
 
 /**
