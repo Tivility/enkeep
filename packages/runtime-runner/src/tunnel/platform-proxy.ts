@@ -58,6 +58,14 @@ import type {
 } from '@enkeep/platform-core';
 import { parseHttp1RequestFromStream, type ParsedHttpRequest } from './llm-proxy.js';
 import {
+  applyMemoryWriteAtRoot,
+  MemoryWriteConflictError,
+  MemoryPathError,
+  MAX_WRITE_BYTES as MAX_MEMORY_WRITE_BYTES,
+  PLATFORM_MEMORY_WRITE_ROUTE,
+} from '@enkeep/dsh-memory';
+import path from 'node:path';
+import {
   DescendantResolver,
   type DescendantRouteRecord,
   type RegisterDescendantOptions,
@@ -156,6 +164,17 @@ export interface PlatformProxyBaseOptions {
   onAutonomousTurnCompleted?: AutonomousTurnCompletedCallback;
 }
 
+/**
+ * Host-side user assets bound to one container runtime by the platform.
+ * The memory root is derived by the platform from its own user record, never from the container.
+ */
+export interface PlatformProxyUserAssetsBinding {
+  /** Absolute host path of the user's global memory directory (`<host-dsh-home>/memory`) */
+  readonly memoryRoot: string;
+  /** Optional observer invoked after a successful host memory write (path is relative to memoryRoot) */
+  readonly onMemoryWritten?: (event: { path: string; bytesWritten: number; etag: string }) => void;
+}
+
 export interface PlatformProxyBoundOptions extends PlatformProxyBaseOptions {
   /** Authoritative platform user identifier (canonical UUID in platform DB) */
   platformUserId: string;
@@ -171,6 +190,11 @@ export interface PlatformProxyBoundOptions extends PlatformProxyBaseOptions {
   fileProvider?: PlatformProxyFileProvider;
   /** Optional MCP service / gateway port */
   mcpService?: PlatformProxyMcpService;
+  /**
+   * Host-backed user assets for a container runtime. When set, the container's global
+   * memory_write is executed here against the single host copy. Absent for host runtimes.
+   */
+  userAssets?: PlatformProxyUserAssetsBinding;
 }
 
 export interface PlatformProxyUnboundOptions extends PlatformProxyBaseOptions {
@@ -181,6 +205,7 @@ export interface PlatformProxyUnboundOptions extends PlatformProxyBaseOptions {
   browserService?: undefined;
   fileProvider?: undefined;
   mcpService?: undefined;
+  userAssets?: undefined;
 }
 
 export type PlatformProxyOptions = PlatformProxyBoundOptions | PlatformProxyUnboundOptions;
@@ -222,6 +247,7 @@ export class PlatformProxyHandler implements StreamHandler {
   private readonly browserService?: BrowserService;
   private readonly fileProvider?: PlatformProxyFileProvider;
   private readonly mcpService?: PlatformProxyMcpService;
+  private readonly userAssets?: PlatformProxyUserAssetsBinding;
   private readonly descendantResolver: DescendantResolver;
   private readonly unmappedSessionWarnMap = new Map<string, number>();
   private readonly onAutonomousTurnCompleted?: AutonomousTurnCompletedCallback;
@@ -230,7 +256,7 @@ export class PlatformProxyHandler implements StreamHandler {
 
   constructor(options: PlatformProxyOptions = {}) {
     this.onAutonomousTurnCompleted = options.onAutonomousTurnCompleted;
-    if (options.db || options.storage || options.operations || options.browserService || options.fileProvider || options.mcpService) {
+    if (options.db || options.storage || options.operations || options.browserService || options.fileProvider || options.mcpService || options.userAssets) {
       if (
         options.platformUserId === undefined ||
         options.platformUserId === null ||
@@ -293,6 +319,13 @@ export class PlatformProxyHandler implements StreamHandler {
     this.browserService = options.browserService;
     this.fileProvider = options.fileProvider;
     this.mcpService = options.mcpService;
+    if (options.userAssets !== undefined) {
+      const root = options.userAssets.memoryRoot;
+      if (typeof root !== 'string' || !path.isAbsolute(root) || path.normalize(root) !== root || root.endsWith(path.sep)) {
+        throw new Error('FAIL-CLOSED: userAssets.memoryRoot must be an absolute normalized host path');
+      }
+      this.userAssets = options.userAssets;
+    }
     this.descendantResolver = options.descendantResolver ?? new DescendantResolver();
     this.maxBodyBytes = options.maxBodyBytes ?? MAX_PLATFORM_BODY_BYTES;
     this.maxFileSizeBytes = options.maxFileSizeBytes ?? MAX_FILE_BODY_BYTES;
@@ -559,6 +592,20 @@ export class PlatformProxyHandler implements StreamHandler {
         },
         capabilities: verifiedCapabilities,
       });
+      return;
+    }
+
+    // 1b. User-level global memory write (container runtimes with host-backed memory only)
+    if (pathname === PLATFORM_MEMORY_WRITE_ROUTE) {
+      if (!this.userAssets || !this.platformUserId) {
+        this.writeJsonResponse(stream, 404, { error: { code: 'NOT_FOUND', message: 'Not Found' } });
+        return;
+      }
+      if (method !== 'POST') {
+        this.writeJsonResponse(stream, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Method Not Allowed' } });
+        return;
+      }
+      this.handleUserMemoryWrite(req, stream);
       return;
     }
 
@@ -1231,6 +1278,114 @@ export class PlatformProxyHandler implements StreamHandler {
   /**
    * Handles POST /api/manage/tasks
    */
+  /**
+   * Writes the user's single host copy of global memory on behalf of the container.
+   *
+   * - Identity: the memory root was bound by the platform for this tunnel; the body must not
+   *   carry any identity or location field (userId, spaceId, dshHome, ...).
+   * - Path: relative to the memory root only; absolute paths, `..` segments, NUL bytes and
+   *   symlinks anywhere below the root are rejected.
+   * - Concurrency: expectedEtag is checked against the host copy; mismatch is 409. The
+   *   read-compare-write runs synchronously in the platform process.
+   */
+  private handleUserMemoryWrite(req: ParsedHttpRequest, stream: Duplex): void {
+    const binding = this.userAssets!;
+    const maxBytes = MAX_MEMORY_WRITE_BYTES + 64 * 1024;
+    if (req.body.length > maxBytes) {
+      this.writeJsonResponse(stream, 413, {
+        error: { code: 'PAYLOAD_TOO_LARGE', message: `Memory write payload exceeds maximum limit of ${maxBytes} bytes` },
+      });
+      return;
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(req.body.toString('utf8'));
+      if (!isRecord(parsed)) {
+        this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'Request body must be an object' } });
+        return;
+      }
+      body = parsed;
+    } catch (_parseErr: unknown) {
+      this.writeJsonResponse(stream, 400, { error: { code: 'INVALID_JSON', message: 'Request body must be valid JSON' } });
+      return;
+    }
+
+    const allowed = new Set(['scope', 'path', 'content', 'mode', 'expectedEtag']);
+    for (const key of Object.keys(body)) {
+      if (!allowed.has(key)) {
+        this.writeJsonResponse(stream, 400, {
+          error: { code: 'FORBIDDEN_FIELD', message: `Field "${key}" is not accepted; identity and location come from the platform` },
+        });
+        return;
+      }
+    }
+    if (body.scope !== undefined && body.scope !== 'global') {
+      this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'Only global scope is written by the platform' } });
+      return;
+    }
+    if (typeof body.content !== 'string') {
+      this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'content must be a string' } });
+      return;
+    }
+    if (body.mode !== undefined && body.mode !== 'overwrite' && body.mode !== 'append') {
+      this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'mode must be "overwrite" or "append"' } });
+      return;
+    }
+    if (body.expectedEtag !== undefined && (typeof body.expectedEtag !== 'string' || body.expectedEtag.length > 256)) {
+      this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: 'expectedEtag must be a string' } });
+      return;
+    }
+    const relPath = body.path === undefined ? 'global.md' : body.path;
+    if (
+      typeof relPath !== 'string' ||
+      relPath.length === 0 ||
+      relPath.length > 512 ||
+      relPath.includes('\0') ||
+      relPath.includes('\\') ||
+      path.posix.isAbsolute(relPath) ||
+      relPath.split('/').some((seg) => seg === '..' || seg === '.')
+    ) {
+      this.writeJsonResponse(stream, 400, { error: { code: 'PATH_REJECTED', message: 'Memory path must be a plain relative path inside the memory root' } });
+      return;
+    }
+
+    try {
+      const result = applyMemoryWriteAtRoot(
+        binding.memoryRoot,
+        'global',
+        {
+          path: relPath,
+          content: body.content,
+          mode: body.mode as 'overwrite' | 'append' | undefined,
+          expectedEtag: body.expectedEtag as string | undefined,
+        },
+        { rejectSymlinks: true }
+      );
+      const { targetPath: _targetPath, ...publicResult } = result;
+      try {
+        binding.onMemoryWritten?.({ path: result.path, bytesWritten: result.bytesWritten, etag: result.etag });
+      } catch (_observerErr: unknown) {
+        // Observer failures never affect the write result
+      }
+      this.writeJsonResponse(stream, 200, publicResult);
+    } catch (err: unknown) {
+      if (err instanceof MemoryWriteConflictError) {
+        this.writeJsonResponse(stream, 409, { error: { code: 'MEMORY_WRITE_CONFLICT', message: err.message } });
+        return;
+      }
+      if (err instanceof MemoryPathError || (err instanceof Error && err.message.startsWith('Security violation'))) {
+        this.writeJsonResponse(stream, 400, { error: { code: 'PATH_REJECTED', message: 'Memory path is not allowed' } });
+        return;
+      }
+      if (err instanceof TypeError) {
+        this.writeJsonResponse(stream, 400, { error: { code: 'VALIDATION_ERROR', message: err.message } });
+        return;
+      }
+      this.writeJsonResponse(stream, 500, { error: { code: 'MEMORY_WRITE_FAILED', message: 'Host memory write failed' } });
+    }
+  }
+
   private async handleCreateTask(req: ParsedHttpRequest, stream: Duplex): Promise<void> {
     if (!this.platformUserId) {
       this.writeJsonResponse(stream, 503, {

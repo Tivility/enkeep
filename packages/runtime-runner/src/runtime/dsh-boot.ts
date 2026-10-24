@@ -1193,7 +1193,11 @@ export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Pr
     root: sessionsDir,
     compression: 'none', // Raw JSONL for transparent auditability
   });
-  await ctx.plugin(MemoryService);
+  // Container runtimes with host-backed global memory (read-only mount) forward global writes
+  // to the platform; host runtimes keep writing their own DSH home directly.
+  await ctx.plugin(MemoryService, {
+    globalMemoryWrite: process.env.ENKEEP_USER_MEMORY_WRITE === 'platform' ? 'platform' : 'local',
+  });
   await ctx.plugin(WorkspaceAttachmentStore, {
     dshHome,
     spacesDir,
