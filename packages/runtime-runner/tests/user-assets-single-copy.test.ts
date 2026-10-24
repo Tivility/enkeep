@@ -488,6 +488,20 @@ describe('user assets: platform proxy writes the single host copy', () => {
     expect(written).toEqual([{ path: 'global.md', bytesWritten: 18, etag: etagOf('# Memory\nfact one\n') }]);
   });
 
+  it('keeps the host file mode across writes so the container user can still read it', async () => {
+    const g = path.join(memoryRoot, 'global.md');
+    fs.chmodSync(memoryRoot, 0o755);
+    fs.writeFileSync(g, 'shared');
+    fs.chmodSync(g, 0o644);
+    const r = await send(handler, 'POST', ROUTE, { content: 'more', mode: 'append' });
+    expect(r.statusCode).toBe(200);
+    expect(fs.statSync(g).mode & 0o777).toBe(0o644);
+    const t = await send(handler, 'POST', ROUTE, { path: 'topics/new.md', content: 'x' });
+    expect(t.statusCode).toBe(200);
+    expect(fs.statSync(path.join(memoryRoot, 'topics')).mode & 0o777).toBe(0o755);
+    expect(fs.statSync(path.join(memoryRoot, 'topics', 'new.md')).mode & 0o777).toBe(0o644);
+  });
+
   it('defaults to global.md, supports append and nested topic files', async () => {
     fs.writeFileSync(path.join(memoryRoot, 'global.md'), 'a');
     const r1 = await send(handler, 'POST', ROUTE, { content: 'b', mode: 'append' });

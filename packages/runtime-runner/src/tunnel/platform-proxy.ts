@@ -1360,7 +1360,7 @@ export class PlatformProxyHandler implements StreamHandler {
           mode: body.mode as 'overwrite' | 'append' | undefined,
           expectedEtag: body.expectedEtag as string | undefined,
         },
-        { rejectSymlinks: true }
+        { rejectSymlinks: true, preservePermissions: true }
       );
       const { targetPath: _targetPath, ...publicResult } = result;
       try {

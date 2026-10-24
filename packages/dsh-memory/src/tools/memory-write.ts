@@ -45,21 +45,78 @@ export interface MemoryWriteToolOptions {
 /**
  * Performs an atomic file write using temp file and rename.
  */
-export function atomicWriteFileSync(targetPath: string, content: string): void {
+export function atomicWriteFileSync(
+  targetPath: string,
+  content: string,
+  options: { readonly preservePermissions?: boolean } = {}
+): void {
   const dir = path.dirname(targetPath);
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (options.preservePermissions) {
+      mkdirInheritingPermissions(dir);
+    } else {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
   }
 
   const tempPath = path.join(dir, `.tmp_mem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
   try {
     fs.writeFileSync(tempPath, content, { encoding: 'utf-8', mode: 0o600 });
+    if (options.preservePermissions) {
+      applyPermissionsForReplacement(tempPath, targetPath, dir);
+    }
     fs.renameSync(tempPath, targetPath);
   } catch (err) {
     try {
       if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
     } catch {}
     throw err;
+  }
+}
+
+/**
+ * Gives a temp file the permissions its replacement target should have, so an atomic replace
+ * does not change who can read the file:
+ * - existing target: same mode bits, and (best effort) same owner/group;
+ * - new file: 0600 plus the read bits the parent directory grants to group/others, and
+ *   (best effort) the parent directory's owner/group.
+ * Ownership changes need privileges; when the platform runs as the owner they are no-ops.
+ */
+function applyPermissionsForReplacement(tempPath: string, targetPath: string, dir: string): void {
+  let ref: fs.Stats;
+  let mode: number;
+  try {
+    ref = fs.statSync(targetPath);
+    mode = ref.mode & 0o777;
+  } catch (err: unknown) {
+    if ((err as { code?: string })?.code !== 'ENOENT') throw err;
+    ref = fs.statSync(dir);
+    mode = 0o600 | (ref.mode & 0o044);
+  }
+  fs.chmodSync(tempPath, mode);
+  const own = fs.statSync(tempPath);
+  if (own.uid !== ref.uid || own.gid !== ref.gid) {
+    try {
+      fs.chownSync(tempPath, ref.uid, ref.gid);
+    } catch {
+      // Not privileged: keep the writer's ownership; mode bits above still apply.
+    }
+  }
+}
+
+/** Creates missing directories with the parent's group/other access bits (and owner, best effort). */
+function mkdirInheritingPermissions(dir: string): void {
+  const parent = path.dirname(dir);
+  if (!fs.existsSync(parent)) mkdirInheritingPermissions(parent);
+  const pst = fs.statSync(parent);
+  const mode = 0o700 | (pst.mode & 0o055);
+  fs.mkdirSync(dir, { mode });
+  fs.chmodSync(dir, mode); // not reduced by umask
+  try {
+    const st = fs.statSync(dir);
+    if (st.uid !== pst.uid || st.gid !== pst.gid) fs.chownSync(dir, pst.uid, pst.gid);
+  } catch {
+    // best effort
   }
 }
 
@@ -99,6 +156,12 @@ export interface ApplyMemoryWriteOptions {
    * targets. Used by the platform when it writes the host copy on behalf of a container.
    */
   readonly rejectSymlinks?: boolean;
+  /**
+   * Keep the replaced file's mode bits and (best effort) owner, and give new files/directories
+   * the read access their parent directory grants. Used by the platform so that a write to the
+   * host copy never makes it unreadable for the container user.
+   */
+  readonly preservePermissions?: boolean;
 }
 
 /**
@@ -216,7 +279,7 @@ export function applyMemoryWriteAtRoot(
       : `${existingContent}\n${input.content}`;
   }
 
-  atomicWriteFileSync(targetPath, finalContent);
+  atomicWriteFileSync(targetPath, finalContent, { preservePermissions: options.preservePermissions === true });
 
   const newHash = computeContentHash(finalContent);
   return {

@@ -207,6 +207,34 @@ describe('applyMemoryWriteAtRoot', () => {
     expect(() => applyMemoryWriteAtRoot(root, 'global', { content: 'three', expectedEtag: a.etag })).toThrow(MemoryWriteConflictError);
   });
 
+  it('preservePermissions keeps the replaced file mode and gives new files/dirs the parent read access', () => {
+    const mode = (p: string) => fs.statSync(p).mode & 0o777;
+    const g = path.join(root, 'global.md');
+    fs.writeFileSync(g, 'one');
+    fs.chmodSync(g, 0o644);
+    const before = fs.statSync(g);
+    applyMemoryWriteAtRoot(root, 'global', { content: 'two', mode: 'append' }, { preservePermissions: true });
+    expect(fs.readFileSync(g, 'utf8')).toBe('one\ntwo');
+    expect(mode(g)).toBe(0o644);
+    expect(fs.statSync(g).uid).toBe(before.uid);
+    expect(fs.statSync(g).gid).toBe(before.gid);
+
+    fs.chmodSync(root, 0o755);
+    applyMemoryWriteAtRoot(root, 'global', { path: 'topics/a.md', content: 'a' }, { preservePermissions: true });
+    expect(mode(path.join(root, 'topics'))).toBe(0o755);
+    expect(mode(path.join(root, 'topics', 'a.md'))).toBe(0o644);
+
+    fs.chmodSync(root, 0o700);
+    applyMemoryWriteAtRoot(root, 'global', { path: 'private/b.md', content: 'b' }, { preservePermissions: true });
+    expect(mode(path.join(root, 'private'))).toBe(0o700);
+    expect(mode(path.join(root, 'private', 'b.md'))).toBe(0o600);
+
+    // Without the option (runtime-local writes) behaviour is unchanged: 0600
+    applyMemoryWriteAtRoot(root, 'global', { content: 'three' });
+    expect(mode(g)).toBe(0o600);
+    expect(fs.readdirSync(root).filter((n) => n.startsWith('.tmp_mem_'))).toEqual([]);
+  });
+
   it('rejects symlinks under the root when asked to', () => {
     const outside = path.join(path.dirname(root), 'outside.md');
     fs.writeFileSync(outside, 'keep');
