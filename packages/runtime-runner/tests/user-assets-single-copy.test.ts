@@ -31,6 +31,7 @@ import {
   readProcessMountPoints,
   normalizeBindSourceForCompare,
   bindSourceMatches,
+  MemoryWriteDedupeCache,
   userAssetMountsEqual,
   CONTAINER_DSH_HOME,
   USER_ASSET_CONTAINER_TARGETS,
@@ -610,12 +611,109 @@ describe('user assets: platform proxy writes the single host copy', () => {
   });
 });
 
+describe('user assets: platform memory write retries are deduplicated by Idempotency-Key', () => {
+  const ROUTE = '/platform/api/user-assets/memory/write';
+  let tmp: string;
+  let memoryRoot: string;
+  let dedupe: MemoryWriteDedupeCache;
+  let written: number;
+  const KEY = '3f1c2a4b-5d6e-4f70-8a9b-0c1d2e3f4a5b';
+
+  function handlerFor() {
+    return createPlatformProxyHandler({
+      platformUserId: ALICE_ID,
+      runtimeIdentity: 'alice',
+      userAssets: { memoryRoot, writeDedupe: dedupe, onMemoryWritten: () => { written++; } },
+    });
+  }
+
+  async function post(handler: PlatformProxyHandler, body: unknown, key?: string) {
+    const stream = new TestClientDuplex();
+    const buf = Buffer.from(JSON.stringify(body), 'utf8');
+    const head = [
+      `POST ${ROUTE} HTTP/1.1`,
+      'Host: 127.0.0.1:8787',
+      'Content-Type: application/json',
+      ...(key ? [`Idempotency-Key: ${key}`] : []),
+      `Content-Length: ${buf.length}`,
+      '',
+      '',
+    ].join('\r\n');
+    stream.push(Buffer.concat([Buffer.from(head, 'utf8'), buf]));
+    stream.push(null);
+    await handler.handle(stream, { kind: 'platform', userId: 'alice' });
+    const raw = stream.responseBuffer.toString('utf8');
+    const idx = raw.indexOf('\r\n\r\n');
+    return { statusCode: parseInt(raw.slice(0, idx).split(' ')[1], 10), body: JSON.parse(raw.slice(idx + 4)) };
+  }
+
+  beforeEach(() => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-user-assets-dedupe-')));
+    memoryRoot = path.join(tmp, 'host-runtimes', 'alice', '.dsh', 'memory');
+    fs.mkdirSync(memoryRoot, { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'global.md'), 'a\n');
+    dedupe = new MemoryWriteDedupeCache();
+    written = 0;
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('a retried append with the same key is applied once and replays the first result, across reconnects', async () => {
+    const first = await post(handlerFor(), { content: 'b', mode: 'append' }, KEY);
+    expect(first.statusCode).toBe(200);
+    const retry = await post(handlerFor(), { content: 'b', mode: 'append' }, KEY); // new handler = tunnel reconnect
+    expect(retry).toEqual(first);
+    expect(fs.readFileSync(path.join(memoryRoot, 'global.md'), 'utf8')).toBe('a\nb');
+    expect(written).toBe(1);
+    // A new key is a new write
+    await post(handlerFor(), { content: 'c', mode: 'append' }, '3f1c2a4b-5d6e-4f70-8a9b-0c1d2e3f4a5c');
+    expect(fs.readFileSync(path.join(memoryRoot, 'global.md'), 'utf8')).toBe('a\nb\nc');
+  });
+
+  it('replays a conflict, rejects key reuse for a different write and malformed keys', async () => {
+    const c1 = await post(handlerFor(), { content: 'x', expectedEtag: '"0000000000000000"' }, KEY);
+    expect(c1.statusCode).toBe(409);
+    expect(await post(handlerFor(), { content: 'x', expectedEtag: '"0000000000000000"' }, KEY)).toEqual(c1);
+    const reused = await post(handlerFor(), { content: 'y' }, KEY);
+    expect(reused.statusCode).toBe(422);
+    expect(reused.body.error.code).toBe('IDEMPOTENCY_KEY_REUSED');
+    const bad = await post(handlerFor(), { content: 'y' }, 'not-a-uuid');
+    expect(bad.statusCode).toBe(400);
+    expect(fs.readFileSync(path.join(memoryRoot, 'global.md'), 'utf8')).toBe('a\n');
+    // Keys are scoped to the memory root (another user never sees a replay)
+    expect(dedupe.lookup(path.join(tmp, 'bob'), KEY, 'f').kind).toBe('miss');
+  });
+
+  it('requests without a key keep working (older runtimes) and are not deduplicated', async () => {
+    await post(handlerFor(), { content: 'b', mode: 'append' });
+    await post(handlerFor(), { content: 'b', mode: 'append' });
+    expect(fs.readFileSync(path.join(memoryRoot, 'global.md'), 'utf8')).toBe('a\nb\nb');
+    expect(dedupe.size).toBe(0);
+  });
+
+  it('cache entries expire and the cache stays bounded', () => {
+    let now = 1000;
+    const c = new MemoryWriteDedupeCache({ ttlMs: 100, maxEntries: 2, now: () => now });
+    c.remember('/r', 'k1', 'f', { status: 200, body: 1 });
+    c.remember('/r', 'k2', 'f', { status: 200, body: 2 });
+    c.remember('/r', 'k3', 'f', { status: 200, body: 3 });
+    expect(c.size).toBe(2);
+    expect(c.lookup('/r', 'k1', 'f').kind).toBe('miss');
+    expect(c.lookup('/r', 'k3', 'f')).toEqual({ kind: 'replay', record: { status: 200, body: 3 } });
+    now += 101;
+    expect(c.lookup('/r', 'k3', 'f').kind).toBe('miss');
+  });
+});
+
 describe('user assets: container memory_write -> platform client -> proxy -> host copy', () => {
   let tmp: string;
   let hostHome: string;
   let containerHome: string;
   let server: http.Server;
   let baseURL: string;
+  let dropNextResponse = false;
 
   beforeEach(async () => {
     tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-user-assets-e2e-')));
@@ -631,7 +729,17 @@ describe('user assets: container memory_write -> platform client -> proxy -> hos
       runtimeIdentity: 'alice',
       userAssets: { memoryRoot: path.join(hostHome, 'memory') },
     });
-    server = http.createServer((req, res) => void handler.handleHttpRequest(req, res));
+    server = http.createServer((req, res) => {
+      if (dropNextResponse) {
+        // The platform applies the write, but the response never reaches the container
+        dropNextResponse = false;
+        res.end = (() => {
+          req.socket.destroy();
+          return res;
+        }) as any;
+      }
+      void handler.handleHttpRequest(req, res);
+    });
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
     const addr = server.address() as { port: number };
     baseURL = `http://127.0.0.1:${addr.port}/platform`;
@@ -659,6 +767,25 @@ describe('user assets: container memory_write -> platform client -> proxy -> hos
 
     await tool.execute({ content: 'line', mode: 'append', path: 'topics/t.md' });
     expect(fs.readFileSync(path.join(hostHome, 'memory', 'topics', 't.md'), 'utf8')).toBe('line');
+  });
+
+  it('an append whose response is lost is retried with the same key and applied exactly once', async () => {
+    const platformClient = new DshPlatformClient({ baseURL, timeoutMs: 5000, retryInitialDelayMs: 10, retryMaxDelayMs: 20 } as any);
+    const seen: string[] = [];
+    const recording = {
+      request: (p: string, o: any) => {
+        seen.push(String(o.headers?.['idempotency-key']));
+        return platformClient.request(p, o);
+      },
+    };
+    const tool = createMemoryWriteTool({ dshHome: containerHome, globalMemoryWrite: 'platform', getClient: () => recording as any });
+    dropNextResponse = true;
+    const res = await tool.execute({ content: 'appended', mode: 'append' });
+    expect(res).toMatchObject({ success: true, etag: etagOf('host v1\nappended') });
+    expect(fs.readFileSync(path.join(hostHome, 'memory', 'global.md'), 'utf8')).toBe('host v1\nappended');
+    expect(dropNextResponse).toBe(false); // the first response really was dropped
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
 });
 

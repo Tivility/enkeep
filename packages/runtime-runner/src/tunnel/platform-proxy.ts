@@ -57,6 +57,7 @@ import type {
   McpServerHealth,
 } from '@enkeep/platform-core';
 import { parseHttp1RequestFromStream, type ParsedHttpRequest } from './llm-proxy.js';
+import { MemoryWriteDedupeCache, memoryWriteFingerprint, sharedMemoryWriteDedupe } from './memory-write-dedupe.js';
 import {
   applyMemoryWriteAtRoot,
   MemoryWriteConflictError,
@@ -173,6 +174,8 @@ export interface PlatformProxyUserAssetsBinding {
   readonly memoryRoot: string;
   /** Optional observer invoked after a successful host memory write (path is relative to memoryRoot) */
   readonly onMemoryWritten?: (event: { path: string; bytesWritten: number; etag: string }) => void;
+  /** Request-id dedupe store (defaults to the process-wide shared one). */
+  readonly writeDedupe?: MemoryWriteDedupeCache;
 }
 
 export interface PlatformProxyBoundOptions extends PlatformProxyBaseOptions {
@@ -1287,6 +1290,9 @@ export class PlatformProxyHandler implements StreamHandler {
    *   symlinks anywhere below the root are rejected.
    * - Concurrency: expectedEtag is checked against the host copy; mismatch is 409. The
    *   read-compare-write runs synchronously in the platform process.
+   * - Retries: an optional `Idempotency-Key` header (canonical lowercase UUID-v4) makes the
+   *   request safe to retry; a repeated key returns the first outcome without writing again,
+   *   and the same key with a different request is 422 IDEMPOTENCY_KEY_REUSED.
    */
   private handleUserMemoryWrite(req: ParsedHttpRequest, stream: Duplex): void {
     const binding = this.userAssets!;
@@ -1350,6 +1356,43 @@ export class PlatformProxyHandler implements StreamHandler {
       return;
     }
 
+    const idempotencyKey = req.headers['idempotency-key'];
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || !CANONICAL_UUID_V4_REGEX.test(idempotencyKey))) {
+      this.writeJsonResponse(stream, 400, {
+        error: { code: 'VALIDATION_ERROR', message: 'Idempotency-Key must be a canonical lowercase UUID-v4' },
+      });
+      return;
+    }
+    const dedupe = binding.writeDedupe ?? sharedMemoryWriteDedupe;
+    const fingerprint = idempotencyKey
+      ? memoryWriteFingerprint({
+          path: relPath,
+          mode: body.mode as string | undefined,
+          content: body.content,
+          expectedEtag: body.expectedEtag as string | undefined,
+        })
+      : '';
+    if (idempotencyKey) {
+      const seen = dedupe.lookup(binding.memoryRoot, idempotencyKey, fingerprint);
+      if (seen.kind === 'replay') {
+        // Same request already handled (the caller retried after a lost/late response)
+        this.writeJsonResponse(stream, seen.record.status, seen.record.body);
+        return;
+      }
+      if (seen.kind === 'mismatch') {
+        this.writeJsonResponse(stream, 422, {
+          error: { code: 'IDEMPOTENCY_KEY_REUSED', message: 'Idempotency-Key was already used for a different memory write' },
+        });
+        return;
+      }
+    }
+    const respond = (status: number, payload: unknown, final: boolean): void => {
+      if (idempotencyKey && final) {
+        dedupe.remember(binding.memoryRoot, idempotencyKey, fingerprint, { status, body: payload });
+      }
+      this.writeJsonResponse(stream, status, payload);
+    };
+
     try {
       const result = applyMemoryWriteAtRoot(
         binding.memoryRoot,
@@ -1368,10 +1411,10 @@ export class PlatformProxyHandler implements StreamHandler {
       } catch (_observerErr: unknown) {
         // Observer failures never affect the write result
       }
-      this.writeJsonResponse(stream, 200, publicResult);
+      respond(200, publicResult, true);
     } catch (err: unknown) {
       if (err instanceof MemoryWriteConflictError) {
-        this.writeJsonResponse(stream, 409, { error: { code: 'MEMORY_WRITE_CONFLICT', message: err.message } });
+        respond(409, { error: { code: 'MEMORY_WRITE_CONFLICT', message: err.message } }, true);
         return;
       }
       if (err instanceof MemoryPathError || (err instanceof Error && err.message.startsWith('Security violation'))) {

@@ -298,6 +298,9 @@ export function applyMemoryWriteAtRoot(
 /** Container-side route that forwards global memory writes to the platform. */
 export const PLATFORM_MEMORY_WRITE_ROUTE = '/api/user-assets/memory/write';
 
+/** Retries (timeouts, connection errors, 429/502/503/504) of one platform memory write. */
+export const PLATFORM_MEMORY_WRITE_MAX_RETRIES = 2;
+
 function errorStatus(err: unknown): number | undefined {
   if (err && typeof err === 'object' && 'status' in err && typeof (err as { status: unknown }).status === 'number') {
     return (err as { status: number }).status;
@@ -409,9 +412,13 @@ export function createMemoryWriteTool(options: MemoryWriteToolOptions): ToolDefi
           throw new Error('Global memory write unavailable: platform connection is not ready');
         }
         let res: { data?: unknown; body?: unknown };
+        // One key per tool call, reused by every retry: the platform applies the write at most
+        // once even if a response is lost or arrives after the timeout (append is not idempotent).
+        const idempotencyKey = crypto.randomUUID();
         try {
           res = await client.request(PLATFORM_MEMORY_WRITE_ROUTE, {
             method: 'POST',
+            headers: { 'idempotency-key': idempotencyKey },
             body: {
               scope: 'global',
               path: relPath,
@@ -420,7 +427,8 @@ export function createMemoryWriteTool(options: MemoryWriteToolOptions): ToolDefi
               ...(args.expectedEtag !== undefined ? { expectedEtag: args.expectedEtag } : {}),
             },
             timeoutMs: 15_000,
-            maxRetries: 0,
+            idempotent: true,
+            maxRetries: PLATFORM_MEMORY_WRITE_MAX_RETRIES,
           });
         } catch (err: unknown) {
           const status = errorStatus(err);

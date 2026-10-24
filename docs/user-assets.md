@@ -68,6 +68,15 @@ memory_write (container)
   `409 MEMORY_WRITE_CONFLICT` and the tool raises `MemoryWriteConflictError`. Re-read with
   `memory_read` and retry.
 - There is **no local fallback**: if the platform is unreachable the write fails.
+- Retries: each `memory_write` call sends one `Idempotency-Key` (UUID-v4) and the client retries
+  up to 2 times on timeouts, connection errors and 429/502/503/504 with the same key. The
+  platform remembers the outcome per memory root and key (200 or 409) for 15 minutes and
+  replays it instead of writing again, so an `append` whose response was lost is applied once.
+  Reusing a key for a different write is `422 IDEMPOTENCY_KEY_REUSED`. The store is in the
+  platform process (it survives tunnel reconnects, not a platform restart). Requests without
+  the header (older runtimes) are accepted and not deduplicated.
+- Permissions: the platform keeps the replaced file's mode (and owner, when it may), and new
+  files/directories get the read access of their parent, so the container keeps reading them.
 - The runtime only uses this path when the platform started the container with the memory mount
   (`ENKEEP_USER_MEMORY_WRITE=platform`). The route exists only for runtimes the platform bound to
   a host memory root; for host-mode runtimes and containers without the mount it returns `404`.
