@@ -9,6 +9,7 @@
 
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import { HostOwnershipError } from '../spec/provider.js';
 import type { HostRuntimeSpec } from './types.js';
 import { validateMountSpec, isPathContained } from '../spec/mount-security.js';
@@ -190,6 +191,16 @@ export function validateHostRuntimePaths(spec: {
   }
 }
 
+/** pnpm's default home directory for the platform's OS user. */
+export function defaultPnpmHome(): string {
+  const home = os.homedir();
+  if (process.platform === 'darwin') return path.join(home, 'Library', 'pnpm');
+  if (process.platform === 'win32') {
+    return path.join(process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'pnpm');
+  }
+  return path.join(process.env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'pnpm');
+}
+
 /**
  * Builds a strictly filtered environment for the spawned Host daemon child process.
  * Never inherits arbitrary variables or secrets from the parent platform process.
@@ -222,6 +233,13 @@ export function filterHostEnvironment(
   env.TMPDIR = spec.runDir;
   env.TEMP = spec.runDir;
   env.TMP = spec.runDir;
+
+  // pnpm keeps its self-managed versions under PNPM_HOME (default: under HOME). With HOME inside the
+  // data dir, that is usually inside a pnpm workspace that pins `packageManager` (the enkeep repo
+  // itself). pnpm then installs the pinned version into a temp dir that belongs to that workspace;
+  // the install process sees the pin again and switches again, recursing until the machine runs out
+  // of memory. Keep PNPM_HOME on the platform user's own pnpm home, outside any workspace.
+  env.PNPM_HOME = process.env.PNPM_HOME || defaultPnpmHome();
 
   // DSH Core configuration
   env.DSH_USER = spec.userId;

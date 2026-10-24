@@ -20,6 +20,7 @@ import {
   HostCollisionError,
   HostNotFoundError,
   filterHostEnvironment,
+  defaultPnpmHome,
   ALLOWED_HOST_ENV_KEYS,
   validateHostRuntimePaths,
   writeProcessMeta,
@@ -175,6 +176,29 @@ describe('Host Runtime Adapter & Lifecycle Subsystem', () => {
         const spec = adapter.createDefaultUserSpec({ userId: 'alice', dataRoot: tmpDataRoot });
         expect(filterHostEnvironment(spec).PTHREAD_MUTEX_USE_ULOCK).toBeUndefined();
       });
+    });
+  });
+
+  describe('2b. PNPM_HOME stays outside the runtime data dir', () => {
+    const origPnpmHome = process.env.PNPM_HOME;
+    afterEach(() => {
+      if (origPnpmHome === undefined) delete process.env.PNPM_HOME;
+      else process.env.PNPM_HOME = origPnpmHome;
+    });
+
+    it('defaults to the platform user pnpm home, not under the runtime HOME', () => {
+      delete process.env.PNPM_HOME;
+      const spec = adapter.createDefaultUserSpec({ userId: 'alice', dataRoot: tmpDataRoot });
+      const env = filterHostEnvironment(spec);
+      expect(env.PNPM_HOME).toBe(defaultPnpmHome());
+      expect(env.PNPM_HOME!.startsWith(tmpDataRoot)).toBe(false);
+      expect(env.PNPM_HOME!.startsWith(spec.dshHome)).toBe(false);
+    });
+
+    it('keeps an explicit PNPM_HOME from the platform environment', () => {
+      process.env.PNPM_HOME = '/tmp/enkeep-test/pnpm-home';
+      const spec = adapter.createDefaultUserSpec({ userId: 'alice', dataRoot: tmpDataRoot });
+      expect(filterHostEnvironment(spec).PNPM_HOME).toBe('/tmp/enkeep-test/pnpm-home');
     });
   });
 
