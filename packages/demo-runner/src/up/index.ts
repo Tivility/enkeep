@@ -93,6 +93,7 @@ import {
   type SessionSeedReceipt,
 } from '@enkeep/runtime-runner';
 import { hostMemoryRootForBinding, hostUserAssetsForHandle } from '../user-assets/index.js';
+import { stopUserRuntimeHandles } from './runtime-stop.js';
 import {
   getDemoPathConfig,
   findRepoRoot,
@@ -2347,36 +2348,16 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       }
       return results;
     },
-    async stopRuntime(targetUserId: string): Promise<{ stopped: boolean; userId: string }> {
-      const normalizedUserId = targetUserId.endsWith('-host')
-        ? targetUserId.slice(0, -5)
-        : targetUserId;
-      let stopped = false;
-      const hostHandle = hostRuntimeHandles.get(normalizedUserId) || hostRuntimeHandles.get(targetUserId);
-      if (hostHandle) {
-        console.info('[host-runtime] stopping runtime', {
-          userId: normalizedUserId,
-          pid: (hostHandle as any).rawHandle?.pid ?? null,
-        });
-        try {
-          await hostHandle.stop();
-          await hostHandle.teardown(false);
-          stopped = true;
-        } catch {}
-        hostRuntimeHandles.delete(normalizedUserId);
-        hostRuntimeHandles.delete(targetUserId);
-      }
-      const handle = runtimeHandles.get(normalizedUserId) || runtimeHandles.get(targetUserId);
-      if (handle) {
-        try {
-          await handle.stop();
-          // Stop container but retain the volume!
-          await handle.teardown(false);
-          stopped = true;
-        } catch {}
-        runtimeHandles.delete(normalizedUserId);
-        runtimeHandles.delete(targetUserId);
-      }
+    async stopRuntime(
+      targetUserId: string,
+      mode?: 'container' | 'host'
+    ): Promise<{ stopped: boolean; userId: string; mode?: 'container' | 'host' }> {
+      // Mode-scoped (auto-upgrader): only that runtime; no mode: both.
+      const { stopped, normalizedUserId } = await stopUserRuntimeHandles(
+        { hostRuntimeHandles, runtimeHandles },
+        targetUserId,
+        mode
+      );
       if (stopped) {
         try {
           if (runtimeDiagnosticsService) {
@@ -2388,9 +2369,9 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
             });
           }
         } catch {}
-        return { stopped: true, userId: targetUserId };
+        return { stopped: true, userId: targetUserId, ...(mode ? { mode } : {}) };
       }
-      return { stopped: false, userId: targetUserId };
+      return { stopped: false, userId: targetUserId, ...(mode ? { mode } : {}) };
     },
     async ensureRuntime(targetUserId: string): Promise<import('@enkeep/platform-server').UserRuntimeStatus | null> {
       try {

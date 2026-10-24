@@ -104,7 +104,8 @@ until they are rebuilt.
 - When the desired mounts differ from what a running container has, the runtime is reported as
   outdated and the existing auto-upgrader rebuilds it **only when it has been idle** (no active
   or queued turns, jobs or subagents). Rebuild stops and removes the container; the volume and
-  all its data are kept.
+  all its data are kept. The rebuild is scoped to the container: the same user's host runtime
+  (and its background tasks) is not stopped.
 - Kill switch: see "Rolling back" below.
 
 ### Rolling back: `ENKEEP_USER_ASSET_MOUNTS=0`
