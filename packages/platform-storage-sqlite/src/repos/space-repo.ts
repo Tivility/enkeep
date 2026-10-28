@@ -265,7 +265,7 @@ export class SqliteTenantScopedSpaceRepository implements TenantScopedSpaceRepos
       params.push(options.status);
     }
 
-    sql += ' ORDER BY created_at ASC';
+    sql += ' ORDER BY created_at ASC, rowid ASC';
 
     if (options?.limit) {
       sql += ' LIMIT ?';

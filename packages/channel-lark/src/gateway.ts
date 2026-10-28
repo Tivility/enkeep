@@ -585,6 +585,32 @@ export class LarkChannelGateway {
   /**
    * Processes a single inbound Lark WebSocket event.
    */
+  /** Chats whose dropped messages were already logged, so a busy group logs once per process. */
+  private readonly loggedDroppedChats = new Set<string>();
+
+  /**
+   * Logs (once per chat and reason) that an inbound message was dropped before it was accepted.
+   * Such messages get no reaction and no reply, so without this line they leave no trace.
+   */
+  private logDroppedInbound(reason: 'no_binding' | 'not_mentioned', chatId: string): void {
+    const key = `${reason}:${chatId}`;
+    if (this.loggedDroppedChats.has(key)) return;
+    if (this.loggedDroppedChats.size > 1000) this.loggedDroppedChats.clear();
+    this.loggedDroppedChats.add(key);
+    console.warn('[lark-gateway] inbound message dropped', { accountId: this.accountId, chatId, reason });
+  }
+
+  /** The user's main space: their earliest-created active space. */
+  private async resolveMainSpaceId(): Promise<string | null> {
+    if (!this.spaceRepo) return null;
+    try {
+      const spaces = await this.spaceRepo.list({ status: 'active', limit: 1 });
+      return spaces[0]?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async handleInboundEvent(rawEvent: LarkRawEvent): Promise<InboundHandlingResult> {
     if (this.isDisposed) {
       return { handled: false, ignoredReason: 'account_disabled' };
@@ -661,6 +687,12 @@ export class LarkChannelGateway {
         }
       }
 
+      // No default space on the bot: use the user's main space (their first active space), so a
+      // new chat lands in that space's main session instead of being dropped without a trace.
+      if (!targetDefaultSpaceId) {
+        targetDefaultSpaceId = await this.resolveMainSpaceId();
+      }
+
       if (targetDefaultSpaceId) {
         let isSpaceActive = true;
         if (this.spaceRepo) {
@@ -685,6 +717,7 @@ export class LarkChannelGateway {
 
     // If still no binding, we cannot route
     if (!binding) {
+      this.logDroppedInbound('no_binding', chatNativeContextId);
       return { handled: false, ignoredReason: 'no_binding' };
     }
 
@@ -727,6 +760,7 @@ export class LarkChannelGateway {
         this.botOpenId
       );
       if (!isMentioned) {
+        this.logDroppedInbound('not_mentioned', chatNativeContextId);
         return { handled: false, ignoredReason: 'not_mentioned' };
       }
     }
