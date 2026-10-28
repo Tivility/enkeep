@@ -5,6 +5,8 @@ import {
   FakeLarkTransport,
   LarkChannelGateway,
   normalizeRestMessageToParsed,
+  parseDbTimestampMs,
+  isLarkChatId,
   type LarkRestMessageItem,
 } from '../src/index.js';
 
@@ -253,5 +255,46 @@ describe('Lark Offline Backfill', () => {
 
     // Generation was flipped during first page, so it should abort and not fetch page 2
     expect(listChatMessagesCallCount).toBe(1);
+  });
+
+  it('4. queries only Lark chat ids, with a start time read as UTC from SQLite and not after the end time', async () => {
+    const chatId = 'oc_synth_chat_utc';
+    for (const nativeContextId of [chatId, 'web:home-synth-01', 'wechat:synth-peer-01']) {
+      await channelRepo.createBinding({ accountId, spaceId, nativeContextId, activationMode: 'always' });
+    }
+    // Last inbox row 10 minutes ago, in SQLite CURRENT_TIMESTAMP form (UTC, no zone suffix)
+    const lastInboxMs = Date.now() - 10 * 60 * 1000;
+    const sqliteUtc = new Date(lastInboxMs).toISOString().slice(0, 19).replace('T', ' ');
+    db.prepare(
+      'INSERT INTO channel_inbox (id, user_id, account_id, native_event_id, native_context_id, payload_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run('inb_synth_utc_01', userId, accountId, 'evt_synth_utc_01', chatId, '{}', 'delivered', sqliteUtc);
+
+    const calls: Array<{ containerId: string; startTimeSec: number; endTimeSec: number }> = [];
+    transport.listChatMessagesHandler = async (params: any) => {
+      calls.push({ containerId: params.containerId, startTimeSec: params.startTimeSec, endTimeSec: params.endTimeSec });
+      return { items: [], hasMore: false };
+    };
+    const gateway = new LarkChannelGateway({
+      account: { id: accountId, userId, appId: botAppId, botOpenId },
+      transport,
+      channelRepo,
+      sessionRouteRepo: { findByRouteIdentity: vi.fn(async () => null), findById: vi.fn(async () => null), create: vi.fn() } as any,
+      runtimeGateway: { dispatchInbound: vi.fn() } as any,
+    });
+    transport.simulateReconnect();
+    await gateway.startBackfill('cold-start', 1);
+
+    expect(calls.map((c) => c.containerId)).toEqual([chatId]);
+    expect(calls[0].startTimeSec).toBeLessThanOrEqual(calls[0].endTimeSec);
+    // since = last inbox - 5 min buffer
+    expect(Math.abs(calls[0].startTimeSec - Math.floor((lastInboxMs - 5 * 60 * 1000) / 1000))).toBeLessThanOrEqual(1);
+  });
+
+  it('5. parses SQLite timestamps as UTC and recognises Lark chat ids', () => {
+    expect(parseDbTimestampMs('2026-01-02 03:04:05')).toBe(Date.parse('2026-01-02T03:04:05Z'));
+    expect(parseDbTimestampMs('2026-01-02T03:04:05.123Z')).toBe(Date.parse('2026-01-02T03:04:05.123Z'));
+    expect(isLarkChatId('oc_0123abcd')).toBe(true);
+    expect(isLarkChatId('feishu')).toBe(false);
+    expect(isLarkChatId('web')).toBe(false);
   });
 });

@@ -136,6 +136,21 @@ export interface InboundHandlingResult {
   };
 }
 
+/** Lark chat ids look like `oc_<hex>`. */
+export function isLarkChatId(id: string | undefined | null): boolean {
+  return typeof id === 'string' && /^oc_[0-9A-Za-z_-]+$/.test(id);
+}
+
+/**
+ * Parses a timestamp stored by SQLite. `CURRENT_TIMESTAMP` writes UTC as `YYYY-MM-DD HH:MM:SS`
+ * without a zone, which `Date` would read as local time; treat zone-less values as UTC.
+ */
+export function parseDbTimestampMs(value: string): number {
+  const v = value.trim();
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(v);
+  return new Date(hasZone ? v : `${v.replace(' ', 'T')}Z`).getTime();
+}
+
 export class LarkChannelGateway {
   readonly account: ChannelAccount | LarkAccountConfig;
   readonly transport: LarkTransport;
@@ -3234,10 +3249,12 @@ export class LarkChannelGateway {
 
       // 1. Get bound chat IDs
       const bindings = await this.channelRepo.listBindings(this.accountId);
+      // Only real Lark chat ids (oc_…); bindings may also hold non-Lark context ids, which the
+      // message-list API rejects.
       const chatIds = Array.from(new Set(
         bindings
           .map((b) => b.nativeContextId.split(':')[0])
-          .filter(Boolean)
+          .filter((id) => isLarkChatId(id))
       ));
       if (chatIds.length === 0) return;
 
@@ -3290,8 +3307,8 @@ export class LarkChannelGateway {
         } catch {}
       }
       if (latestCreatedAt) {
-        const lastTs = new Date(latestCreatedAt).getTime();
-        sinceMs = isNaN(lastTs) ? now - bufferMs : lastTs - bufferMs;
+        const lastTs = parseDbTimestampMs(latestCreatedAt);
+        sinceMs = isNaN(lastTs) ? now - bufferMs : Math.min(lastTs, now) - bufferMs;
       } else {
         sinceMs = now - bufferMs;
       }
