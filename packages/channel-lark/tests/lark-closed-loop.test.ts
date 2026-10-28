@@ -108,6 +108,53 @@ describe('Lark Channel Closed-Loop Communication', () => {
     (gateway.account as any).botOpenId = botOpenId;
   });
 
+  describe('0. Unbound chats on a bot without a default space', () => {
+    const unboundEvent = (eventId: string, chatId: string) => ({
+      header: { event_id: eventId, event_type: 'im.message.receive_v1', create_time: '1700000000000' },
+      event: {
+        sender: { sender_id: { open_id: 'ou_human_sender_9' }, sender_type: 'user' },
+        message: {
+          message_id: `om_${eventId}`,
+          chat_id: chatId,
+          chat_type: 'p2p',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'hello' }),
+          create_time: '1700000000000',
+        },
+      },
+    });
+
+    it("binds the chat to the user's main space instead of dropping the message", async () => {
+      db.prepare(
+        `INSERT INTO spaces (id, user_id, name, folder, execution_mode, created_at) VALUES (?, ?, 'Later Space', 'later-space', 'container', '2999-01-01T00:00:00.000Z')`
+      ).run('spc_lark_space_later', userId);
+      expect((await channelRepo.findAccountById(gateway.accountId))?.defaultSpaceId ?? null).toBeNull();
+
+      const res = await gateway.handleInboundEvent(unboundEvent('evt_unbound_001', 'oc_test_unbound_1') as any);
+      expect(res.ignoredReason).toBeUndefined();
+
+      const binding = await channelRepo.findBindingByContext(gateway.accountId, 'oc_test_unbound_1');
+      expect(binding?.spaceId).toBe(spaceId);
+      expect(binding?.activationMode).toBe('always');
+    });
+
+    it('logs a dropped message once per chat when no space is available', async () => {
+      db.prepare(`UPDATE spaces SET status = 'archived' WHERE user_id = ?`).run(userId);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const first = await gateway.handleInboundEvent(unboundEvent('evt_unbound_101', 'oc_test_unbound_2') as any);
+        const second = await gateway.handleInboundEvent(unboundEvent('evt_unbound_102', 'oc_test_unbound_2') as any);
+        expect(first.ignoredReason).toBe('no_binding');
+        expect(second.ignoredReason).toBe('no_binding');
+        const drops = warn.mock.calls.filter((c) => c[0] === '[lark-gateway] inbound message dropped');
+        expect(drops.length).toBe(1);
+        expect(drops[0][1]).toMatchObject({ chatId: 'oc_test_unbound_2', reason: 'no_binding' });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
   describe('1. Inbound Event to Outbound Agent Reply Delivery Closed-Loop', () => {
     it('simulates inbound Lark WS event, parses content, routes session, and delivers plain text reply', async () => {
       // 1. Setup binding for chat
