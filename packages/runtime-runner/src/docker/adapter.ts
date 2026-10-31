@@ -32,7 +32,14 @@ import {
   DockerNotFoundError,
   DockerDaemonError,
 } from '../spec/validator.js';
-import type { RuntimeContainerSpec, ExactContainerIdentity, RuntimeNetworkMode } from '../spec/types.js';
+import type { RuntimeContainerSpec, ExactContainerIdentity, RuntimeNetworkMode, RuntimeUserAssetMount } from '../spec/types.js';
+import {
+  USER_ASSET_CONTAINER_TARGETS,
+  USER_MEMORY_WRITE_ENV_KEY,
+  USER_MEMORY_WRITE_ENV_PLATFORM,
+  userAssetKindForTarget,
+  userAssetMountsEqual,
+} from '../spec/user-assets.js';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
 import type { RuntimeTurnRequest } from '@enkeep/protocol';
@@ -91,6 +98,35 @@ export interface UserSpecOptions {
   llmProviders?: string | Record<string, unknown>;
   /** Optional idle agent timeout in ms (injects DSH_IDLE_AGENT_TIMEOUT_MS) */
   idleAgentTimeoutMs?: number;
+  /**
+   * Read-only user asset mounts (see `resolveUserAssetMounts`). When a memory mount is present the
+   * container gets `ENKEEP_USER_MEMORY_WRITE=platform` so global memory writes go through the platform.
+   */
+  userAssetMounts?: readonly RuntimeUserAssetMount[];
+}
+
+/**
+ * Reads the user asset bind mounts a container actually has from `docker inspect` output.
+ * `sourcePath` is the source Docker reports; compare it with `normalizeBindSourceForCompare`
+ * (VM-based engines may rewrite it).
+ */
+export function readContainerUserAssetMounts(info: DockerContainerInfo): RuntimeUserAssetMount[] {
+  const result: RuntimeUserAssetMount[] = [];
+  for (const m of info.mounts ?? []) {
+    if (m.type !== 'bind') continue;
+    const kind = userAssetKindForTarget(m.destination);
+    if (!kind) continue;
+    if (m.rw !== false) {
+      throw new DockerOwnershipError(`User asset bind mount "${m.destination}" must be read-only`);
+    }
+    result.push({
+      kind,
+      sourcePath: typeof m.source === 'string' ? m.source : '',
+      targetPath: USER_ASSET_CONTAINER_TARGETS[kind],
+      readOnly: true,
+    });
+  }
+  return result;
 }
 
 
@@ -518,6 +554,13 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       environment: env,
     };
 
+    if (options.userAssetMounts && options.userAssetMounts.length > 0) {
+      spec.userAssetMounts = options.userAssetMounts.map((m) => ({ ...m }));
+      if (spec.userAssetMounts.some((m) => m.kind === 'memory')) {
+        env[USER_MEMORY_WRITE_ENV_KEY] = USER_MEMORY_WRITE_ENV_PLATFORM;
+      }
+    }
+
     return spec;
   }
 
@@ -563,6 +606,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      userAssetMounts: spec.userAssetMounts,
       networkMode: spec.networkMode,
     };
 
@@ -770,6 +814,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       volumeId: spec.volume.volumeId,
       containerPath: spec.volume.containerPath,
       mounts: spec.mounts,
+      userAssetMounts: spec.userAssetMounts,
       networkMode: spec.networkMode,
     };
 
@@ -786,6 +831,16 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       throw new DockerNotFoundError('Cannot connect to runtime container: container not found');
     }
 
+    // User asset mounts are fixed at `docker run`. If the existing container's mounts differ from
+    // the desired ones (kind, or host source path after normalization — e.g. the user's host DSH
+    // home moved), keep serving with what it actually has and flag it for an idle rebuild.
+    const actualUserAssetMounts = readContainerUserAssetMounts(info);
+    let userAssetMountsPending = false;
+    if (!userAssetMountsEqual(actualUserAssetMounts, spec.userAssetMounts)) {
+      expectation.userAssetMounts = actualUserAssetMounts;
+      userAssetMountsPending = true;
+    }
+
     this.client.assertContainerOwnership(info, expectation);
 
     if (info.state !== 'running') {
@@ -793,6 +848,7 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
     }
 
     const handle = this.createActiveRuntimeHandle(spec, info.id, expectation, false);
+    handle.userAssetMountsPending = userAssetMountsPending;
 
     const startTime = Date.now();
     let isHealthy = false;
@@ -871,6 +927,10 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       runId,
       volumeId,
       isCreated,
+      get userAssetMounts() {
+        return expectation.userAssetMounts;
+      },
+      userAssetMountsPending: false,
       get tunnel() {
         return activeTunnel;
       },

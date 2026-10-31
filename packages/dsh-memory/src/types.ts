@@ -14,9 +14,18 @@ export type MemoryScope = 'global' | 'space';
 export type MemorySearchScope = 'all' | 'global' | 'space';
 export type MemoryWriteMode = 'overwrite' | 'append';
 
+/**
+ * Where global-scope memory writes go:
+ * - 'local' (default): write the file under `<dshHome>/memory` directly (host runtimes).
+ * - 'platform': `<dshHome>/memory` is a read-only mount of the host copy (container runtimes);
+ *   writes are sent to the platform, which writes the single host copy.
+ */
+export type GlobalMemoryWriteTarget = 'local' | 'platform';
+
 export interface MemoryPluginConfig {
   readonly defaultMaxGlobalBytes?: number;
   readonly injectGlobalMemory?: MemoryInjectionMode;
+  readonly globalMemoryWrite?: GlobalMemoryWriteTarget;
 }
 
 /**
@@ -103,6 +112,8 @@ export interface AssembleMemoryOptions {
   readonly injectGlobalMemory?: MemoryInjectionMode;
   readonly maxGlobalBytes?: number;
   readonly memoryPlan?: MemoryPlan | null;
+  /** Global memory is the host copy mounted read-only (globalMemoryWrite: 'platform'). */
+  readonly globalMemoryReadOnlyMount?: boolean;
 }
 
 /**
