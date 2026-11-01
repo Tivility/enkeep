@@ -302,7 +302,8 @@ describe('M33 Channel Account Default Workspace Focused Test', () => {
     });
     expect(clearedAccount.defaultSpaceId).toBeNull();
 
-    // New chat C arrives -> Must NOT fallback to Space A or Space B, returns no_binding
+    // New chat C arrives -> with no default space the bot falls back to the user's main space
+    // (earliest active space), so the chat is bound there instead of being dropped.
     const eventC1: any = {
       header: { event_id: 'evt_chat_c_1' },
       event: {
@@ -317,8 +318,10 @@ describe('M33 Channel Account Default Workspace Focused Test', () => {
       },
     };
     const resC1 = await gateway.handleInboundEvent(eventC1);
-    expect(resC1.handled).toBe(false);
-    expect(resC1.ignoredReason).toBe('no_binding');
+    expect(resC1.ignoredReason).toBeUndefined();
+    const mainSpace = (await aliceTenant.spaces.list({ status: 'active', limit: 1 }))[0];
+    const bindingC = await aliceTenant.channels.findBindingByContext(account.id, 'oc_chat_C');
+    expect(bindingC?.spaceId).toBe(mainSpace?.id);
 
     // 7. Restart simulation: Reconstruct repo and gateway, restore default to Space B
     await service.updateAccount(aliceUser.id, account.id, {
