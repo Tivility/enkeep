@@ -599,7 +599,8 @@ export class EventRelayService implements IEventRelayService {
 
       // (4) Fallback: match from summary regex or content text for standalone/legacy events
       if (summary) {
-        const match = summary.match(/(?:job\s+)?([a-zA-Z0-9_\-]+-\d+)/i);
+        // Job ids are `<kind>-N` before DSH 0.2.1 and `<kind>-<16 hex>` from 0.2.1 on.
+        const match = summary.match(/(?:job\s+)?([a-zA-Z0-9_\-]+-(?:[0-9a-f]{16}|\d+))\b/i);
         if (match) return match[1].replace(/[.,;:\s]+$/, '').trim();
       }
 
