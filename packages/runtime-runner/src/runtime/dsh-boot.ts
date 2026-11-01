@@ -46,7 +46,7 @@ import SystemPromptRegistry from '@deepseek-ai/dsh-system-prompt';
 import ToolsRegistry from '@deepseek-ai/dsh-tools';
 import { AgentLoop } from '@deepseek-ai/dsh-agent-loop';
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model';
-import SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
+import * as SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import { MemoryService } from '@enkeep/dsh-memory';
 import { WorkspaceAttachmentStore } from './workspace-attachments.js';
@@ -1132,6 +1132,21 @@ function pullInRetentionScope<T>(
  * @param config - Boot parameters for user, directories, and model config.
  * @returns An active booted runtime handle.
  */
+/**
+ * How a DSH `turn/start` seen while a platform turn is bound maps onto that platform turn.
+ * Only the first DSH turn after binding belongs to it: `rebind` when its number differs from the
+ * guess, `keep` when the guess was right, and `ignore` for every later DSH turn, which the event
+ * relay reports as an autonomous continuation.
+ */
+export function platformTurnRebindDecision(
+  ownTurnObserved: boolean,
+  boundIntTurn: number | undefined,
+  startedIntTurn: number
+): 'rebind' | 'keep' | 'ignore' {
+  if (ownTurnObserved) return 'ignore';
+  return startedIntTurn === boundIntTurn ? 'keep' : 'rebind';
+}
+
 export async function bootDshRuntime(config: DshRuntimeBootConfig | unknown): Promise<DshBootedRuntime> {
   const startedAt = Date.now();
   const validConfig = validateDshRuntimeBootConfig(config);
@@ -3912,13 +3927,21 @@ function logWarn(agentCtx: Context, message: string): void {
       });
 
       if (typeof ctx?.on === 'function') {
+        // Correct the guessed DSH turn number with the first turn that actually starts for this
+        // platform turn. Later DSH turns (a child's message or completion notice arriving right after
+        // this turn ended, before the daemon finished it) are autonomous continuations: rebinding them
+        // to this platform turn left the relay's turn_auto id without a completion and reported this
+        // platform turn as completed twice.
+        let ownTurnObserved = false;
         const unsubTurnStart = ctx.on('session/event', (s: any, ev: any) => {
           if (
             (s?.id === effSessionId || s?.header?.id === effSessionId) &&
             ev?.type === 'turn/start' &&
             typeof ev.data?.turn === 'number'
           ) {
-            if (ev.data.turn !== currentIntTurn) {
+            const decision = platformTurnRebindDecision(ownTurnObserved, currentIntTurn, ev.data.turn);
+            ownTurnObserved = true;
+            if (decision === 'rebind') {
               currentIntTurn = ev.data.turn;
               eventRelay.bindTurnContext(effSessionId, {
                 turnId: assignedTurnId,
