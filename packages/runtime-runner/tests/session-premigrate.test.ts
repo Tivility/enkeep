@@ -4,7 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
-import SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
+import * as SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
 import {
   runSessionPremigrate,
   runSessionPremigrateCli,

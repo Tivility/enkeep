@@ -17,6 +17,7 @@ import {
   bootDshRuntime,
   type DshBootedRuntime,
 } from '../src/runtime/dsh-boot.js';
+import { waitForSubagents } from './support/subagent-activation.js';
 
 describe('Subagent Model Switch Notice Filtering', () => {
   let tmpDir: string;
@@ -99,13 +100,13 @@ describe('Subagent Model Switch Notice Filtering', () => {
         prompt: promptWith5Steps,
         provider: 'cpa-synthetic-child',
         model: 'synth-child-model',
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
 
     expect(subagentResult).toBeDefined();
-    expect(subagentResult.kind).toBe('foreground');
+    expect(subagentResult.kind).toBe('activation');
+    await waitForSubagents(parentAgent);
 
     // Locate child session persistence file
     const sessionsDir = path.join(dshHome, 'sessions');

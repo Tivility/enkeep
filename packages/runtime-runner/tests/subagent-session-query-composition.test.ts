@@ -99,7 +99,8 @@ describe('Subagent Session Query Mounting & Cold Continuation', () => {
     const subagents = runtime.context.get('subagents');
     expect(subagents).toBeDefined();
 
-    const started = await subagents!.startContinuable({
+    const started = await subagents!.startActivation({
+      delivery: 'parent',
       provider: 'spawn',
       label: 'synthetic-child-01',
       request: {
@@ -140,7 +141,8 @@ describe('Subagent Session Query Mounting & Cold Continuation', () => {
     expect(subagents).toBeDefined();
 
     // Start continuable subagent
-    const started = await subagents!.startContinuable({
+    const started = await subagents!.startActivation({
+      delivery: 'parent',
       provider: 'spawn',
       label: 'synthetic-child-cold',
       request: {

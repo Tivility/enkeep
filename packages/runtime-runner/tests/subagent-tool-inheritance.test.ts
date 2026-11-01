@@ -24,6 +24,7 @@ import {
   scopeOf,
   scopeParentOf,
 } from '../src/runtime/child-scope.js';
+import { startSubagent } from './support/subagent-activation.js';
 
 describe('G08a: Subagent Tool & Scope Inheritance E2E', () => {
   let tmpDir: string;
@@ -84,7 +85,7 @@ describe('G08a: Subagent Tool & Scope Inheritance E2E', () => {
     expect(subagentsService).toBeDefined();
 
     const writePrompt = 'Write file [enkeep-test-tool-call=write:{"file_path":"sub_test.txt","content":"hello from child"}]';
-    const writeRun = await subagentsService.start('spawn', {
+    const writeRun = await startSubagent(subagentsService, 'spawn', {
       label: 'child-write-task',
       prompt: [{ type: 'text', text: writePrompt }],
       parent: parentAgent,
@@ -103,7 +104,7 @@ describe('G08a: Subagent Tool & Scope Inheritance E2E', () => {
 
     // Now spawn child to read the newly created file
     const readPrompt = 'Read file [enkeep-test-tool-call=read:{"file_path":"sub_test.txt"}]';
-    const readRun = await subagentsService.start('spawn', {
+    const readRun = await startSubagent(subagentsService, 'spawn', {
       label: 'child-read-task',
       prompt: [{ type: 'text', text: readPrompt }],
       parent: parentAgent,
@@ -123,7 +124,7 @@ describe('G08a: Subagent Tool & Scope Inheritance E2E', () => {
     const subagentsService = parentAgent.ctx.get('subagents');
 
     const bashPrompt = 'Run bash [enkeep-test-tool-call=bash:{"command":"pwd","description":"Check working directory"}]';
-    const forkRun = await subagentsService.start('fork', {
+    const forkRun = await startSubagent(subagentsService, 'fork', {
       label: 'child-bash-task',
       prompt: [{ type: 'text', text: bashPrompt }],
       parent: parentAgent,
@@ -140,52 +141,13 @@ describe('G08a: Subagent Tool & Scope Inheritance E2E', () => {
   });
 
   // Test 3: ToolFilter restriction isolates child tools without contaminating parent
-  it('3. ToolFilter restriction isolates child tools without contaminating parent (ToolFilter isolation)', async () => {
-    const parentSessionId = 'ses_00000000000000000000000000000003';
-    const parentAgent = await runtime.getOrCreateAgent(parentSessionId, null, 'space-alpha');
-    const subagentsService = parentAgent.ctx.get('subagents');
-
-    // Verify parent has write and read tools
-    const parentToolsBefore = parentAgent.ctx.tools.schemas(parentAgent).map((t: any) => t.name);
-    expect(parentToolsBefore).toContain('write');
-    expect(parentToolsBefore).toContain('read');
-
-    // Start subagent with toolFilter denying write
-    const deniedPrompt = 'Attempt write [enkeep-test-tool-call=write:{"file_path":"should_not_exist.txt","content":"blocked"}]';
-    const filteredRun = await subagentsService.start('spawn', {
-      label: 'child-filtered-task',
-      prompt: [{ type: 'text', text: deniedPrompt }],
-      parent: parentAgent,
-      toolFilter: { deny: ['write'] },
-      signal: new AbortController().signal,
-    });
-    trackedRuns.push(filteredRun);
-
-    const childAgent = filteredRun.localAgent;
-    const childTools = childAgent.ctx.tools.schemas(childAgent).map((t: any) => t.name);
-
-    // Child must NOT have write tool, but must retain read tool
-    expect(childTools).not.toContain('write');
-    expect(childTools).toContain('read');
-
-    // Execution of write tool by child must fail
-    const filteredResult = await filteredRun.result;
-    expect(filteredResult.output[0].text).toContain('Error: unknown tool "write"');
-    expect(fs.existsSync(path.join(spaceAlphaPath, 'should_not_exist.txt'))).toBe(false);
-
-    // Parent agent tools must remain intact without pollution
-    const parentToolsAfter = parentAgent.ctx.tools.schemas(parentAgent).map((t: any) => t.name);
-    expect(parentToolsAfter).toContain('write');
-    expect(parentToolsAfter).toContain('read');
-  });
-
-  // Test 4: Subagent lineage, space metadata, and cold resume scope inheritance
+  // DSH 0.2.1 removed per-delegation `toolFilter`; child tool sets come from agent presets (not used by enkeep).
   it('4. Subagent lineage, space metadata, and cold resume scope inheritance (Lineage & Cold Resume)', async () => {
     const parentSessionId = 'ses_00000000000000000000000000000004';
     const parentAgent = await runtime.getOrCreateAgent(parentSessionId, null, 'space-alpha');
     const subagentsService = parentAgent.ctx.get('subagents');
 
-    const metaRun = await subagentsService.start('spawn', {
+    const metaRun = await startSubagent(subagentsService, 'spawn', {
       label: 'child-meta-task',
       prompt: [{ type: 'text', text: 'Hello subagent' }],
       parent: parentAgent,
@@ -249,13 +211,13 @@ describe('G08a: Subagent Tool & Scope Inheritance E2E', () => {
     const writePromptB = 'Write file [enkeep-test-tool-call=write:{"file_path":"beta_file.txt","content":"data-from-beta"}]';
 
     const [runA, runB] = await Promise.all([
-      subagentsA.start('spawn', {
+      startSubagent(subagentsA, 'spawn', {
         label: 'child-a-write',
         prompt: [{ type: 'text', text: writePromptA }],
         parent: parentA,
         signal: new AbortController().signal,
       }),
-      subagentsB.start('spawn', {
+      startSubagent(subagentsB, 'spawn', {
         label: 'child-b-write',
         prompt: [{ type: 'text', text: writePromptB }],
         parent: parentB,
@@ -293,13 +255,13 @@ describe('G08a: Subagent Tool & Scope Inheritance E2E', () => {
     const readPromptB = 'Read file [enkeep-test-tool-call=read:{"file_path":"beta_file.txt"}]';
 
     const [readRunA, readRunB] = await Promise.all([
-      subagentsA.start('spawn', {
+      startSubagent(subagentsA, 'spawn', {
         label: 'child-a-read',
         prompt: [{ type: 'text', text: readPromptA }],
         parent: parentA,
         signal: new AbortController().signal,
       }),
-      subagentsB.start('spawn', {
+      startSubagent(subagentsB, 'spawn', {
         label: 'child-b-read',
         prompt: [{ type: 'text', text: readPromptB }],
         parent: parentB,

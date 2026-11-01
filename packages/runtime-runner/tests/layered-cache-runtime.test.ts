@@ -16,6 +16,7 @@ import {
   getPlatformTopLevelCacheRetention,
   getPlatformChildCacheRetention,
 } from '@enkeep/platform-core';
+import { waitForSubagents } from './support/subagent-activation.js';
 
 describe('Layered Prompt Cache Retention in Runtime (Synthetic End-to-End Tests)', () => {
   let tempDir: string;
@@ -500,14 +501,13 @@ describe('Layered Prompt Cache Retention in Runtime (Synthetic End-to-End Tests)
       {
         description: 'verify-child-delegation',
         prompt: 'Say CHILD_PONG in one word',
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
 
     expect(subagentResult).toBeDefined();
-    expect(subagentResult.kind).toBe('foreground');
-    expect(subagentResult.output?.[0]?.text).toBe('Synthetic Anthropic response');
+    expect(subagentResult.kind).toBe('activation');
+    await waitForSubagents(parentAgent);
 
     // Verify subagent child session jsonl has valid JSON-serializable request/header
     const sessionsDir = path.join(dshHome, 'sessions');
@@ -527,6 +527,7 @@ describe('Layered Prompt Cache Retention in Runtime (Synthetic End-to-End Tests)
 
     const subLines = fs.readFileSync(subagentSessionFile!, 'utf8').trim().split('\n');
     const subEvents = subLines.map((l) => JSON.parse(l));
+    expect(JSON.stringify(subEvents.filter((e) => e.type === 'assistant/message'))).toContain('Synthetic Anthropic response');
 
     const requestHeaderEvent = subEvents.find((e) => e.type === 'request/header');
     expect(requestHeaderEvent).toBeDefined();

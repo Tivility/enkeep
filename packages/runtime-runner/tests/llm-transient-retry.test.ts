@@ -26,6 +26,7 @@ import {
   DEFAULT_LLM_RETRY_BACKOFF_SCHEDULE_MS,
   abortableSleep,
 } from '../src/runtime/dsh-boot.js';
+import { startSubagent } from './support/subagent-activation.js';
 
 class MockStreamAdapter extends DeterministicDemoLlmAdapter {
   constructor(private readonly streamFn: (options: GenerateOptions) => AsyncIterable<StreamChunk>) {
@@ -444,7 +445,7 @@ describe('LLM Transient Error Retry & Backoff Engine', () => {
       expect(subagentsService).toBeDefined();
 
       // Test spawn child retry
-      const childRun = await subagentsService.start('spawn', {
+      const childRun = await startSubagent(subagentsService, 'spawn', {
         label: 'child-502-task',
         prompt: [{ type: 'text', text: 'Execute delegated task' }],
         parent: parentAgent,
@@ -462,7 +463,7 @@ describe('LLM Transient Error Retry & Backoff Engine', () => {
 
       // Test fork child retry
       callCount = 0;
-      const forkRun = await subagentsService.start('fork', {
+      const forkRun = await startSubagent(subagentsService, 'fork', {
         label: 'child-fork-task',
         prompt: [{ type: 'text', text: 'Execute delegated fork task' }],
         parent: parentAgent,
@@ -582,7 +583,7 @@ describe('LLM Transient Error Retry & Backoff Engine', () => {
       const subagentsService = parentAgent.ctx.get('subagents');
       expect(subagentsService).toBeDefined();
 
-      const childRun = await subagentsService.start('spawn', {
+      const childRun = await startSubagent(subagentsService, 'spawn', {
         label: 'child-400-task',
         prompt: [{ type: 'text', text: 'Invalid prompt' }],
         parent: parentAgent,

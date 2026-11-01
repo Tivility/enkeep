@@ -21,6 +21,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { bootDshRuntime } from '../src/runtime/dsh-boot.js';
 import { DshPlatformClient } from '@enkeep/dsh-platform-client';
+import { startSubagent } from './support/subagent-activation.js';
 
 describe('Memory Tools Integration in DSH Runtime', () => {
   let tmpDir: string;
@@ -179,7 +180,7 @@ describe('Memory Tools Integration in DSH Runtime', () => {
       const subagents = runtime.context.get('subagents');
       expect(subagents).toBeDefined();
 
-      const run = await subagents.start('spawn', {
+      const run = await startSubagent(subagents, 'spawn', {
         label: 'test-child-memory',
         prompt: [{ type: 'text', text: 'Subagent verifying memory access.' }],
         parent: agent,
@@ -238,7 +239,7 @@ describe('Memory Tools Integration in DSH Runtime', () => {
       const subagents = runtime.context.get('subagents');
       expect(subagents).toBeDefined();
 
-      const run = await subagents.start('spawn', {
+      const run = await startSubagent(subagents, 'spawn', {
         label: 'test-spaceless-child',
         prompt: [{ type: 'text', text: 'Spaceless child verifying failclosed memory.' }],
         parent: rootAgent,

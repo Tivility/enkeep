@@ -23,6 +23,7 @@ import {
   DEFAULT_ENKEEP_PROVIDERS,
   extractAllowedModelRoutes,
 } from '../src/runtime/official-plugins.js';
+import { waitForSubagents } from './support/subagent-activation.js';
 
 describe('Subagent Model Selection & Workflow Tool Composition', () => {
   let tmpDir: string;
@@ -319,13 +320,13 @@ describe('Subagent Model Selection & Workflow Tool Composition', () => {
         prompt: 'Reply with TEST_PONG',
         provider: 'cpa-synthetic-child',
         model: 'synth-child-model',
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
 
     expect(subagentResult).toBeDefined();
-    expect(subagentResult.kind).toBe('foreground');
+    expect(subagentResult.kind).toBe('activation');
+    await waitForSubagents(parentAgent);
 
     // Verify child session persistence records used cpa-synthetic-child / synth-child-model
     const sessionsDir = path.join(dshHome, 'sessions');

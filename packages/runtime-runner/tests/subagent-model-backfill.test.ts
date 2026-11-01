@@ -24,6 +24,7 @@ import {
   recordSubagentModelSelection,
   backfillSubagentModelSelection,
 } from '../src/runtime/official-plugins.js';
+import { startSubagent } from './support/subagent-activation.js';
 
 describe('Subagent Model Selection Backfill for Existing Sessions', () => {
   let tmpDir: string;
@@ -205,19 +206,16 @@ describe('Subagent Model Selection Backfill for Existing Sessions', () => {
     expect(subagentsService).toBeDefined();
 
     // Spawn a child agent
-    const spawnRun = await subagentsService.start('spawn', {
+    const spawnRun = await startSubagent(subagentsService, 'spawn', {
       label: 'synthetic-child-task',
       prompt: [{ type: 'text', text: 'Synthesize report' }],
       parent: parentAgent,
       signal: new AbortController().signal,
     });
+    // DSH 0.2.1: a caller-delivered child is released after it settles; hold its Session first.
+    const childSession = spawnRun.localAgent?.session as any;
     const result = await spawnRun.result;
     expect(result.stopReason).toBe('completed');
-
-    // Find the spawned child session from sessions registry
-    const sessionsRegistry = runtime.context.get('sessions')!;
-    const allSessions = sessionsRegistry.list();
-    const childSession = allSessions.find((s) => s.header.origin === 'subagent' && s.header.parentSession === parentSessionId);
     expect(childSession).toBeDefined();
     expect(childSession!.header.origin).toBe('subagent');
 

@@ -25,6 +25,7 @@ import {
   isChildSession,
   resolveSubagentGlobalMemoryMode,
 } from '../src/runtime/dsh-boot.js';
+import { startSubagent } from './support/subagent-activation.js';
 
 describe('Subagent Global Memory Injection Configuration', () => {
   let tmpDir: string;
@@ -118,7 +119,7 @@ describe('Subagent Global Memory Injection Configuration', () => {
     expect(subagentsService).toBeDefined();
 
     // Spawn child agent
-    const spawnRun = await subagentsService.start('spawn', {
+    const spawnRun = await startSubagent(subagentsService, 'spawn', {
       label: 'test-child-spawn',
       prompt: [{ type: 'text', text: 'Hello child agent' }],
       parent: parentAgent,
@@ -149,7 +150,7 @@ describe('Subagent Global Memory Injection Configuration', () => {
     await spawnRun.dispose();
 
     // Fork child agent also gets no global memory
-    const forkRun = await subagentsService.start('fork', {
+    const forkRun = await startSubagent(subagentsService, 'fork', {
       label: 'test-child-fork',
       prompt: [{ type: 'text', text: 'Hello fork agent' }],
       parent: parentAgent,
@@ -193,7 +194,7 @@ describe('Subagent Global Memory Injection Configuration', () => {
     const subagentsService = parentAgent.ctx.get('subagents');
     expect(subagentsService).toBeDefined();
 
-    const spawnRun = await subagentsService.start('spawn', {
+    const spawnRun = await startSubagent(subagentsService, 'spawn', {
       label: 'test-child-always-mem',
       prompt: [{ type: 'text', text: 'Hello child agent with memory' }],
       parent: parentAgent,

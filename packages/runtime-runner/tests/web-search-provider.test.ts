@@ -21,6 +21,7 @@ import os from 'node:os';
 import { WebError, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from '@deepseek-ai/dsh-web';
 import { bootDshRuntime } from '../src/runtime/dsh-boot.js';
 import { parseDshConfigFiles } from '../src/config/dsh-config-loader.js';
+import { startSubagent } from './support/subagent-activation.js';
 
 describe('G09 WebSearch Provider Integration & Model Tool Exposure', () => {
   let tmpDir: string;
@@ -294,7 +295,7 @@ describe('G09 WebSearch Provider Integration & Model Tool Exposure', () => {
         expect(subagents).toBeDefined();
 
         // Spawn a subagent to verify tool inheritance
-        const run = await subagents.start('spawn', {
+        const run = await startSubagent(subagents, 'spawn', {
           label: 'search-child-worker',
           prompt: [{ type: 'text', text: 'Search child task.' }],
           parent: parentAgent,

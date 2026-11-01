@@ -37,6 +37,7 @@ import {
   type DshBootedRuntime,
   isChildSession,
 } from '../src/runtime/dsh-boot.js';
+import { waitForSubagents } from './support/subagent-activation.js';
 
 describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
   let tmpDir: string;
@@ -172,13 +173,13 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
         description: 'subagent with global memory',
         prompt: 'Task with global memory',
         global_memory: true,
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
     unlistenA();
 
-    expect(resA.kind).toBe('foreground');
+    expect(resA.kind).toBe('activation');
+    await waitForSubagents(parentAgent);
     expect(capturedAgentA).toBeDefined();
     expect(isChildSession(capturedAgentA, runtime.context)).toBe(true);
     expect(assemblyA).toBeDefined();
@@ -202,13 +203,13 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
         description: 'subagent without global memory',
         prompt: 'Task without global memory',
         global_memory: false,
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
     unlistenB();
 
-    expect(resB.kind).toBe('foreground');
+    expect(resB.kind).toBe('activation');
+    await waitForSubagents(parentAgent);
     expect(capturedAgentB).toBeDefined();
     const memSectionB = assemblyB.sections.find((s: any) => s.name === 'memory:enkeep');
     expect(memSectionB).toBeDefined();
@@ -230,13 +231,13 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
       {
         description: 'subagent with omitted global memory',
         prompt: 'Task with omitted global memory',
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
     unlistenC();
 
-    expect(resC.kind).toBe('foreground');
+    expect(resC.kind).toBe('activation');
+    await waitForSubagents(parentAgent);
     expect(capturedAgentC).toBeDefined();
     const memSectionC = assemblyC.sections.find((s: any) => s.name === 'memory:enkeep');
     expect(memSectionC).toBeDefined();
@@ -391,13 +392,13 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
       {
         description: 'fork agent run',
         prompt: 'Fork task',
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
     unlisten();
 
-    expect(res.kind).toBe('foreground');
+    expect(res.kind).toBe('activation');
+    await waitForSubagents(parentAgent);
     expect(capturedForkAgent).toBeDefined();
     expect(isChildSession(capturedForkAgent, runtime.context)).toBe(true);
     const forkMemSection = forkAssembly.sections.find((s: any) => s.name === 'memory:enkeep');
@@ -436,7 +437,6 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
       {
         description: 'subagent without global memory flag',
         prompt: 'Check memory with env always',
-        run_in_background: false,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
@@ -492,13 +492,12 @@ describe('Per-Call Subagent and Workflow Global Memory Plugins', () => {
         provider: 'cpa-synthetic-alpha',
         model: 'synth-model-pro',
         global_memory: true,
-        run_in_background: true,
       },
       { agent: parentAgent, signal: new AbortController().signal } as any
     );
     unlisten();
 
-    expect(bgRes.kind).toBe('continuable');
+    expect(bgRes.kind).toBe('activation');
     expect(bgRes.subagentId).toBeDefined();
     expect(capturedChild).toBeDefined();
 
