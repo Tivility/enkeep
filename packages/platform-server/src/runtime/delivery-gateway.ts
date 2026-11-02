@@ -95,6 +95,12 @@ export const DEFAULT_QUOTA_RESERVATION_GRACE_SECONDS =
 export { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS };
 export type { DeliveryDispatchOptions };
 
+/**
+ * Channels whose turns are not tied to an IM chat (Jarvis shows whole sessions itself). Background
+ * tasks started from them are never listed in a Lark/WeChat chat-filtered view.
+ */
+export const NON_CHAT_ORIGIN_CHANNELS: ReadonlySet<string> = new Set(['jarvis']);
+
 export type InspectedTurnErrorCode =
   | 'EXECUTION_FAILED'
   | 'TURN_TIMEOUT'
@@ -4158,6 +4164,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       }
     }
 
+    // Origin channel of each enriched item. Items that originated from a channel without IM chats
+    // (Jarvis shows whole sessions itself) never belong to a Lark/WeChat chat-filtered list.
+    const originChannels = new Map<object, string>();
+
     // Enrich with originTurnId and originChatContextId from DB / chained resolver / fallback
     if (this.db) {
       const resolveTurnOriginRecursive = (
@@ -4298,10 +4308,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             resolveTurnOriginRecursive(item.originTurnId, dshSessionId, new Set<string>(), 0);
           if (resolved?.nativeContextId) {
             item.originChatContextId = resolved.nativeContextId;
+            if (resolved.channel) originChannels.set(item, resolved.channel);
           } else {
             const fallback = resolveFallbackChatOrigin(sessionId) || resolveFallbackChatOrigin(dshSessionId);
             if (fallback?.nativeContextId) {
               item.originChatContextId = fallback.nativeContextId;
+              if (fallback.channel) originChannels.set(item, fallback.channel);
             }
           }
         }
@@ -4369,6 +4381,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
             return true;
           }
+          return false;
+        }
+        const originChannel = originChannels.get(t);
+        if (originChannel && NON_CHAT_ORIGIN_CHANNELS.has(originChannel)) {
           return false;
         }
         const itemChatLevelId = getChatLevelNativeContextId(t.originChatContextId, 'lark');
