@@ -29,8 +29,13 @@ import type {
   ListBackgroundTasksResponse,
   StopBackgroundTaskResponse,
   SteerResponse,
+  ReadSessionEventsParams,
+  ReadSessionEventsResult,
+  ReadAttachmentParams,
+  ReadAttachmentResult,
 } from '../runtime/daemon-protocol.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
+import type { HostSessionEventListener, HostTurnChunkListener } from './session-history-client.js';
 
 /**
  * Standard runtime protocol error codes.
@@ -344,6 +349,14 @@ export interface RuntimeDaemonTransportPort {
   compactSession?(sessionId: string): Promise<CompactSessionResponse>;
   listBackgroundTasks?(sessionId: string): Promise<ListBackgroundTasksResponse>;
   stopBackgroundTask?(sessionId: string, taskId: string): Promise<StopBackgroundTaskResponse>;
+  /** One read-only page of a DSH session log (rejects with e.g. code `session/not-found`). */
+  readSessionEvents?(params: ReadSessionEventsParams, timeoutMs?: number): Promise<ReadSessionEventsResult>;
+  /** A whole image attachment cited by a session's events. */
+  readAttachment?(params: ReadAttachmentParams, timeoutMs?: number): Promise<ReadAttachmentResult>;
+  /** Live DSH session events (`turn/event`) of every session in the runtime; returns unsubscribe. */
+  onSessionEvent?(listener: HostSessionEventListener): () => void;
+  /** Live model output deltas (`turn/chunk`); returns unsubscribe. */
+  onTurnChunk?(listener: HostTurnChunkListener): () => void;
   request?<TReq extends DaemonRequest, TRes extends DaemonResponse>(
     req: TReq,
     timeoutMs?: number

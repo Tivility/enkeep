@@ -57,8 +57,20 @@ import {
   type StopBackgroundTaskResponse,
   type SteerRequest,
   type SteerResponse,
+  type ReadSessionEventsParams,
+  type ReadSessionEventsResult,
+  type ReadAttachmentParams,
+  type ReadAttachmentResult,
   DEFAULT_DAEMON_SOCKET_PATH,
 } from '../runtime/daemon-protocol.js';
+import {
+  readAttachmentVia,
+  readSessionEventsVia,
+  subscribeSessionEvents,
+  subscribeTurnChunks,
+  type HostSessionEventListener,
+  type HostTurnChunkListener,
+} from '../transport/session-history-client.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
 import {
   type RuntimeDaemonTransportPort,
@@ -113,6 +125,8 @@ export interface HostDaemonTransportOptions {
   defaultIdleTimeoutMs?: number;
   /** Optional default execution budget hardcap in ms for followup turns */
   defaultExecutionBudgetMs?: number;
+  /** Runtime owner, stamped on `onSessionEvent` / `onTurnChunk` notifications. */
+  userId?: string;
 }
 
 export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTransportPort {
@@ -120,7 +134,8 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
   readonly endpoint: string;
 
   private readonly socketPath: string;
-  private readonly options: Required<HostDaemonTransportOptions>;
+  private readonly userId: string | undefined;
+  private readonly options: Required<Omit<HostDaemonTransportOptions, 'userId'>>;
   private socket: net.Socket | null = null;
   private decoder: DaemonRpcDecoder | null = null;
   private encoder: DaemonRpcEncoder | null = null;
@@ -136,6 +151,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
     super();
     this.socketPath = options.socketPath ?? DEFAULT_DAEMON_SOCKET_PATH;
     this.endpoint = `uds://${this.socketPath}`;
+    this.userId = options.userId;
     this.options = {
       socketPath: this.socketPath,
       maxConcurrentRequests: options.maxConcurrentRequests ?? MAX_CONCURRENT_HOST_REQUESTS,
@@ -143,7 +159,7 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       autoReconnect: options.autoReconnect ?? true,
       defaultIdleTimeoutMs: options.defaultIdleTimeoutMs,
       defaultExecutionBudgetMs: options.defaultExecutionBudgetMs,
-    } as Required<HostDaemonTransportOptions>;
+    } as Required<Omit<HostDaemonTransportOptions, 'userId'>>;
   }
 
   private clearWaiterTimers(waiter: TurnWaiter): void {
@@ -738,5 +754,24 @@ export class HostDaemonTransport extends EventEmitter implements RuntimeDaemonTr
       sessionId,
       taskId,
     });
+  }
+  /** One page of a DSH session log of this runtime (read-only; see `ReadSessionEventsParams`). */
+  public async readSessionEvents(params: ReadSessionEventsParams, timeoutMs?: number): Promise<ReadSessionEventsResult> {
+    return readSessionEventsVia((req, t) => this.request(req, t), params, timeoutMs);
+  }
+
+  /** A whole image attachment cited by a session's events (fetched in frame-sized chunks). */
+  public async readAttachment(params: ReadAttachmentParams, timeoutMs?: number): Promise<ReadAttachmentResult> {
+    return readAttachmentVia((req, t) => this.request(req, t), params, timeoutMs);
+  }
+
+  /** Live DSH session events (`turn/event`) of every session in this runtime; returns unsubscribe. */
+  public onSessionEvent(listener: HostSessionEventListener): () => void {
+    return subscribeSessionEvents(this, this.userId, listener);
+  }
+
+  /** Live model output deltas (`turn/chunk`); returns unsubscribe. */
+  public onTurnChunk(listener: HostTurnChunkListener): () => void {
+    return subscribeTurnChunks(this, this.userId, listener);
   }
 }

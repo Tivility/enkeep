@@ -51,7 +51,11 @@ import {
 import { TunnelHost } from '../tunnel/host.js';
 import type { TunnelHostOptions } from '../tunnel/types.js';
 import { DaemonDockerTransport, type DaemonDockerTransportOptions } from '../transport/daemon-transport.js';
-import { DaemonProtocolError } from '../runtime/daemon-protocol.js';
+import {
+  DaemonProtocolError,
+  type ReadAttachmentParams,
+  type ReadSessionEventsParams,
+} from '../runtime/daemon-protocol.js';
 import type { ActiveRuntimeHandle, RuntimeExecutionProvider } from '../spec/provider.js';
 
 export type { ActiveRuntimeHandle };
@@ -1371,6 +1375,21 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
         }
         const res = await transport.listBackgroundTasks(sessionId);
         return res.items ?? [];
+      },
+      // Read-only DSH session history; errors (e.g. `session/not-found`) propagate.
+      readSessionEvents: async (params: ReadSessionEventsParams) => {
+        const transport = await getOrStartTransport();
+        if (!transport.readSessionEvents) {
+          throw new DockerDaemonError('Transport does not support readSessionEvents');
+        }
+        return transport.readSessionEvents(params);
+      },
+      readAttachment: async (params: ReadAttachmentParams) => {
+        const transport = await getOrStartTransport();
+        if (!transport.readAttachment) {
+          throw new DockerDaemonError('Transport does not support readAttachment');
+        }
+        return transport.readAttachment(params);
       },
       stopBackgroundTask: async (sessionId: string, taskId: string) => {
         try {

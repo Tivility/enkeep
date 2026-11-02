@@ -63,7 +63,11 @@ import type { RuntimeTurnRequest } from '@enkeep/protocol';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
 import type { FileOperationRequest } from '../runtime/file-ops.js';
 import type { RuntimeHealthStatus } from '../transport/types.js';
-import { DaemonProtocolError } from '../runtime/daemon-protocol.js';
+import {
+  DaemonProtocolError,
+  type ReadAttachmentParams,
+  type ReadSessionEventsParams,
+} from '../runtime/daemon-protocol.js';
 
 function resolveDefaultCliPath(): string {
   const currentFile = fileURLToPath(import.meta.url);
@@ -294,6 +298,7 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
       socketPath: effSpec.socketPath,
       defaultExecutionBudgetMs: this.options.defaultExecutionBudgetMs,
       defaultIdleTimeoutMs: this.options.defaultIdleTimeoutMs,
+      userId: effSpec.userId,
     });
 
     const handle = this.createActiveRuntimeHandle(effSpec, childPid, transport, llmProxyServer, platformProxyServer, true);
@@ -383,6 +388,7 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
       socketPath: spec.socketPath,
       defaultExecutionBudgetMs: this.options.defaultExecutionBudgetMs,
       defaultIdleTimeoutMs: this.options.defaultIdleTimeoutMs,
+      userId: spec.userId,
     });
 
     const handle = this.createActiveRuntimeHandle(spec, existingMeta.pid, transport, undefined, undefined, false);
@@ -823,6 +829,9 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
         const res = await transport.listBackgroundTasks(sessionId);
         return res.items ?? [];
       },
+      // Read-only DSH session history; errors (e.g. `session/not-found`) propagate.
+      readSessionEvents: (params: ReadSessionEventsParams) => transport.readSessionEvents(params),
+      readAttachment: (params: ReadAttachmentParams) => transport.readAttachment(params),
       stopBackgroundTask: async (sessionId: string, taskId: string) => {
         try {
           const res = await transport.stopBackgroundTask(sessionId, taskId);

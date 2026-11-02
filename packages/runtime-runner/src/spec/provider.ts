@@ -27,7 +27,13 @@ import type { DaemonDockerTransportOptions } from '../transport/daemon-transport
 import type { HostDaemonTransportOptions } from '../host/transport.js';
 import type { HostPlatformProxyPort } from '../host/types.js';
 import type { PlatformProxyHandler } from '../tunnel/platform-proxy.js';
-import type { BackgroundTask } from '../runtime/daemon-protocol.js';
+import type {
+  BackgroundTask,
+  ReadAttachmentParams,
+  ReadAttachmentResult,
+  ReadSessionEventsParams,
+  ReadSessionEventsResult,
+} from '../runtime/daemon-protocol.js';
 
 export type RuntimeExecutionMode = 'docker' | 'host';
 
@@ -156,6 +162,14 @@ export interface ActiveRuntimeHandle {
   }): Promise<ExecCliEnvelope>;
   listBackgroundTasks?(sessionId: string): Promise<BackgroundTask[]>;
   stopBackgroundTask?(sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
+  /**
+   * One read-only page of a DSH session log (original DSH seqs). Errors propagate as
+   * `DaemonProtocolError` with codes such as `session/not-found`. Live updates: subscribe with
+   * `transport.onSessionEvent` (after `startTransport()`).
+   */
+  readSessionEvents?(params: ReadSessionEventsParams): Promise<ReadSessionEventsResult>;
+  /** A whole image attachment cited by a session's events; errors propagate (`attachment/*`). */
+  readAttachment?(params: ReadAttachmentParams): Promise<ReadAttachmentResult>;
   fileWriteStream?(
     options: {
       space: string;

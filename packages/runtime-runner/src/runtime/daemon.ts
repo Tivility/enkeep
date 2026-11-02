@@ -45,6 +45,7 @@ import {
   computeSessionEventsChecksum,
   computeSessionSeedReceipt,
   extractTurnResultFromEvents,
+  isChildSession,
   type DshRuntimeBootConfig,
   type DshBootedRuntime,
   type SessionSeedReceipt,
@@ -146,7 +147,17 @@ import {
   type StopBackgroundTaskResponse,
   type SteerRequest,
   type SteerResponse,
+  type ReadSessionEventsRequest,
+  type ReadSessionEventsResponse,
+  type ReadAttachmentRequest,
+  type ReadAttachmentResponse,
 } from './daemon-protocol.js';
+import {
+  readSessionEventsPage,
+  readSessionAttachmentChunk,
+  SessionHistoryError,
+  type SessionHistoryDeps,
+} from './session-history.js';
 import type {
   AgentFollowupResponse,
   AgentFollowupCompletedResponse,
@@ -189,6 +200,8 @@ function haveSkillsChanged(
 }
 
 export const DEFAULT_ANOMALY_CALLBACK_WAIT_MS = 2000;
+/** Largest run of unpublished (pre-attach) session events re-pushed as `turn/event`. */
+const MAX_UNPUBLISHED_BACKFILL_EVENTS = 256;
 
 export interface DaemonOptions extends DshRuntimeBootConfig {
   /** Maximum number of active agents held in memory (default: 16, or env DSH_MAX_AGENTS) */
@@ -345,6 +358,10 @@ export class RuntimeDaemon extends EventEmitter {
   private readonly workflowAgentChildIds = new Set<string>();
   private readonly autonomousTurnsTracker = new Map<string, { sessionId: string; turnNumber?: number; startedAt: number }>();
   private readonly sessionMaintenanceLocks = new Map<string, Promise<void>>();
+  /** Per-agent cache of {@link isChildSession} (a session header never changes). */
+  private readonly childSessionAgents = new WeakMap<object, boolean>();
+  /** Last seq pushed as `turn/event`, per live DSH Session object (one per lifecycle). */
+  private readonly pushedSessionSeqs = new WeakMap<object, number>();
 
   constructor(private readonly options: DaemonOptions) {
     super();
@@ -376,6 +393,49 @@ export class RuntimeDaemon extends EventEmitter {
     this.journal = new DaemonTurnJournal(this.dshHome);
     this.settlementJournal = new DaemonSettlementJournal(this.dshHome);
     this.activeTaskJournal = new DaemonActiveTaskJournal(this.dshHome);
+  }
+
+  /**
+   * Events of `session` before `event` that this Session object committed but never published
+   * on `session/event`: from its first lifecycle seq (or the last pushed seq) up to `event`.
+   * DSH appends e.g. the `session/end-seed` marker of a resumed session before the store
+   * attaches. The fork-inherited prefix (seed) is outside the lifecycle and is not returned.
+   */
+  private unpublishedSessionEvents(session: any, event: SessionEvent): readonly SessionEvent[] {
+    if (!session || typeof session !== 'object' || typeof event?.seq !== 'number') return [];
+    const lastPushed = this.pushedSessionSeqs.get(session);
+    this.pushedSessionSeqs.set(session, Math.max(lastPushed ?? -1, event.seq));
+    let from: number;
+    if (lastPushed !== undefined) {
+      from = lastPushed + 1;
+    } else {
+      const lifecycleStart = Number(session.firstLifecycleSeq);
+      if (!Number.isSafeInteger(lifecycleStart) || lifecycleStart < 0) return [];
+      from = lifecycleStart;
+    }
+    if (from >= event.seq || typeof session.snapshotEvents !== 'function') return [];
+    // Expected gaps are a marker plus a few closers; anything larger is left to readSessionEvents.
+    if (event.seq - from > MAX_UNPUBLISHED_BACKFILL_EVENTS) return [];
+    try {
+      const missed = session.snapshotEvents(from, event.seq) as readonly SessionEvent[];
+      return missed.filter((e, i) => e?.seq === from + i);
+    } catch {
+      return [];
+    }
+  }
+
+  private isChildSessionAgent(agent: unknown, ctx: Context): boolean {
+    if (!agent || typeof agent !== 'object') return false;
+    const cached = this.childSessionAgents.get(agent);
+    if (cached !== undefined) return cached;
+    let child = false;
+    try {
+      child = isChildSession(agent, ctx);
+    } catch {
+      child = false;
+    }
+    this.childSessionAgents.set(agent, child);
+    return child;
   }
 
   private getOrCreateSessionQueue(sessionId: string): QueuedTurnItem[] {
@@ -523,6 +583,21 @@ export class RuntimeDaemon extends EventEmitter {
 
       const entry = this.agents.get(sessionIdStr);
       const turnId = this.currentTurns.get(sessionIdStr)?.turnId ?? entry?.currentTurn?.turnId;
+
+      // Events DSH committed to this Session object without publishing them (a resumed
+      // session's `session/end-seed` marker, a fork's child-owned seed marker and closers) are
+      // persisted like any other: push them first so the host sees a contiguous seq stream.
+      for (const missed of this.unpublishedSessionEvents(subject, event)) {
+        this.emit('stream', {
+          type: 'event',
+          event: DAEMON_STREAM_EVENTS.TURN_EVENT,
+          sessionId: sessionIdStr,
+          turnId: turnId ?? '',
+          seq: missed.seq,
+          timestamp: Date.now(),
+          sessionEvent: missed,
+        } satisfies DaemonStreamEvent);
+      }
 
       // Real-time session event stream push
       const streamEvent: DaemonStreamEvent = {
@@ -815,17 +890,19 @@ export class RuntimeDaemon extends EventEmitter {
       const entry = this.agents.get(sessionIdStr);
       const turnId = this.currentTurns.get(sessionIdStr)?.turnId ?? entry?.currentTurn?.turnId;
       const chunkData = frame.chunk;
-      if (chunkData && turnId) {
-        const chunkPush: DaemonStreamEvent = {
-          type: 'event',
-          event: DAEMON_STREAM_EVENTS.TURN_CHUNK,
-          turnId,
-          sessionId: sessionIdStr,
-          timestamp: Date.now(),
-          chunk: chunkData,
-        };
-        this.emit('stream', chunkPush);
-      }
+      if (!chunkData) return;
+      // Outside a submitted turn (autonomous continuation, e.g. after a background task notice),
+      // stream top-level sessions only; subagent/workflow children stay off the wire.
+      if (!turnId && this.isChildSessionAgent(agent, ctx)) return;
+      const chunkPush: DaemonStreamEvent = {
+        type: 'event',
+        event: DAEMON_STREAM_EVENTS.TURN_CHUNK,
+        turnId: turnId ?? '',
+        sessionId: sessionIdStr,
+        timestamp: Date.now(),
+        chunk: chunkData,
+      };
+      this.emit('stream', chunkPush);
     });
 
     // Track live background subagents via lifecycle events
@@ -1342,6 +1419,12 @@ export class RuntimeDaemon extends EventEmitter {
         case DAEMON_OPS.STEER:
         case 'steer':
           return await this.handleSteer(request as SteerRequest);
+
+        case DAEMON_OPS.READ_SESSION_EVENTS:
+          return await this.handleReadSessionEvents(request as ReadSessionEventsRequest);
+
+        case DAEMON_OPS.READ_ATTACHMENT:
+          return await this.handleReadAttachment(request as ReadAttachmentRequest);
 
         case DAEMON_OPS.ACTIVITY_STATUS:
         case 'activityStatus':
@@ -2957,6 +3040,66 @@ export class RuntimeDaemon extends EventEmitter {
       ok: true,
       approvals: list,
     };
+  }
+
+  /** DSH services the read-only history ops use; never activates an Agent. */
+  private sessionHistoryDeps(): SessionHistoryDeps {
+    const ctx = this.bootedRuntime.context as any;
+    const lookup = (name: string) => {
+      try {
+        return ctx?.[name] ?? (typeof ctx?.get === 'function' ? ctx.get(name) : undefined);
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      persistence: lookup('sessionPersistence'),
+      sessions: lookup('sessions'),
+      attachments: lookup('attachments'),
+      spacesDir: this.spacesDir,
+    };
+  }
+
+  private sessionHistoryErrorResponse(request: DaemonRequest, err: unknown): DaemonErrorResponse {
+    const known = err instanceof SessionHistoryError;
+    return {
+      id: request.id,
+      op: request.op,
+      ok: false,
+      error: {
+        code: known ? err.code : DAEMON_ERROR_CODES.INTERNAL_ERROR,
+        // Messages of SessionHistoryError never carry filesystem paths; other errors may.
+        message: known ? err.message : 'Session history read failed',
+      },
+    };
+  }
+
+  /**
+   * Read-only page of a DSH session log (persisted log through DSH persistence's read handle,
+   * plus the in-memory unflushed tail of a live session). Takes no maintenance lock, so it
+   * neither waits for nor blocks a running turn.
+   */
+  public async handleReadSessionEvents(
+    request: ReadSessionEventsRequest
+  ): Promise<ReadSessionEventsResponse | DaemonErrorResponse> {
+    try {
+      const result = await readSessionEventsPage(this.sessionHistoryDeps(), request);
+      return { id: request.id, op: 'readSessionEvents', ok: true, ...result };
+    } catch (err: unknown) {
+      return this.sessionHistoryErrorResponse(request, err);
+    }
+  }
+
+  /** One chunk of an image attachment cited by a session's events; read-only. */
+  public async handleReadAttachment(
+    request: ReadAttachmentRequest
+  ): Promise<ReadAttachmentResponse | DaemonErrorResponse> {
+    try {
+      const chunk = await readSessionAttachmentChunk(this.sessionHistoryDeps(), request);
+      return { id: request.id, op: 'readAttachment', ok: true, ...chunk };
+    } catch (err: unknown) {
+      return this.sessionHistoryErrorResponse(request, err);
+    }
   }
 
   private async handleShutdown(request: ShutdownRequest): Promise<ShutdownResponse> {

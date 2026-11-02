@@ -79,7 +79,19 @@ import {
   type StopBackgroundTaskResponse,
   type SteerRequest,
   type SteerResponse,
+  type ReadSessionEventsParams,
+  type ReadSessionEventsResult,
+  type ReadAttachmentParams,
+  type ReadAttachmentResult,
 } from '../runtime/daemon-protocol.js';
+import {
+  readAttachmentVia,
+  readSessionEventsVia,
+  subscribeSessionEvents,
+  subscribeTurnChunks,
+  type HostSessionEventListener,
+  type HostTurnChunkListener,
+} from './session-history-client.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
 import {
@@ -948,6 +960,32 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       sessionId,
       taskId,
     });
+  }
+
+  /**
+   * One page of a DSH session log of this user's runtime (read-only; see `ReadSessionEventsParams`).
+   * Rejects with a `DaemonProtocolError` whose `code` is e.g. `session/not-found`.
+   */
+  public async readSessionEvents(params: ReadSessionEventsParams, timeoutMs?: number): Promise<ReadSessionEventsResult> {
+    return readSessionEventsVia((req, t) => this.request(req, t), params, timeoutMs);
+  }
+
+  /**
+   * A whole image attachment cited by a session's events (fetched in frame-sized chunks).
+   * Rejects with `attachment/not-found`, `attachment/too-large`, `attachment/not-image`, ….
+   */
+  public async readAttachment(params: ReadAttachmentParams, timeoutMs?: number): Promise<ReadAttachmentResult> {
+    return readAttachmentVia((req, t) => this.request(req, t), params, timeoutMs);
+  }
+
+  /** Live DSH session events (`turn/event`) of every session in this runtime; returns unsubscribe. */
+  public onSessionEvent(listener: HostSessionEventListener): () => void {
+    return subscribeSessionEvents(this, this.expectation?.userId, listener);
+  }
+
+  /** Live model output deltas (`turn/chunk`); returns unsubscribe. */
+  public onTurnChunk(listener: HostTurnChunkListener): () => void {
+    return subscribeTurnChunks(this, this.expectation?.userId, listener);
   }
 
   /**

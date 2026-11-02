@@ -59,6 +59,8 @@ export const DAEMON_OPS = {
   LIST_BACKGROUND_TASKS: 'listBackgroundTasks',
   STOP_BACKGROUND_TASK: 'stopBackgroundTask',
   STEER: 'steer',
+  READ_SESSION_EVENTS: 'readSessionEvents',
+  READ_ATTACHMENT: 'readAttachment',
 } as const;
 
 export type DaemonOp = (typeof DAEMON_OPS)[keyof typeof DAEMON_OPS];
@@ -97,7 +99,48 @@ export const DAEMON_ERROR_CODES = {
   INTERNAL_ERROR: 'INTERNAL_ERROR',
 } as const;
 
-export type DaemonErrorCode = (typeof DAEMON_ERROR_CODES)[keyof typeof DAEMON_ERROR_CODES];
+/**
+ * Error codes of the read-only session history ops (`readSessionEvents`, `readAttachment`).
+ * Kept apart from {@link DAEMON_ERROR_CODES} because callers route on them by name.
+ */
+export const SESSION_HISTORY_ERROR_CODES = {
+  /** No persisted (or created-in-this-process) DSH session has that id. */
+  SESSION_NOT_FOUND: 'session/not-found',
+  /** The session log exists but DSH refused to read it (corrupt or unsupported format). */
+  SESSION_UNREADABLE: 'session/unreadable',
+  /** No image with that id/path is cited by the session, or its bytes are gone. */
+  ATTACHMENT_NOT_FOUND: 'attachment/not-found',
+  /** The image exceeds {@link READ_ATTACHMENT_MAX_BYTES}. */
+  ATTACHMENT_TOO_LARGE: 'attachment/too-large',
+  /** The cited file is not a PNG/JPEG/GIF/WebP image. */
+  ATTACHMENT_NOT_IMAGE: 'attachment/not-image',
+  /** The stored bytes failed integrity verification, or changed between chunk reads. */
+  ATTACHMENT_UNREADABLE: 'attachment/unreadable',
+} as const;
+
+export type SessionHistoryErrorCode =
+  (typeof SESSION_HISTORY_ERROR_CODES)[keyof typeof SESSION_HISTORY_ERROR_CODES];
+
+export type DaemonErrorCode =
+  | (typeof DAEMON_ERROR_CODES)[keyof typeof DAEMON_ERROR_CODES]
+  | SessionHistoryErrorCode;
+
+/** `readSessionEvents`: default page length. */
+export const READ_SESSION_EVENTS_DEFAULT_LIMIT = 200;
+/** `readSessionEvents`: larger `limit` values are clamped to this. */
+export const READ_SESSION_EVENTS_MAX_LIMIT = 1000;
+/** `readSessionEvents`: default byte budget of one page (serialized events). */
+export const READ_SESSION_EVENTS_DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * `readSessionEvents`: hard byte cap of one page, well under {@link MAX_DAEMON_FRAME_SIZE}.
+ * Larger `maxBytes` values are clamped to this; a single event above it can never be returned
+ * and is reported in `omitted` instead.
+ */
+export const READ_SESSION_EVENTS_MAX_BYTES_CAP = 8 * 1024 * 1024;
+/** `readAttachment`: largest image the ops serve (matches the runtime's image admission limit). */
+export const READ_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+/** `readAttachment`: largest raw chunk per frame (base64 ≈ 8 MiB, under the 10 MiB frame limit). */
+export const READ_ATTACHMENT_MAX_CHUNK_BYTES = 6 * 1024 * 1024;
 
 export class DaemonProtocolError extends Error {
   readonly code: DaemonErrorCode;
@@ -342,6 +385,130 @@ export interface SteerRequest extends DaemonRequestBase {
   readonly spaceId?: string;
 }
 
+/**
+ * Parameters of the read-only `readSessionEvents` op (one page of a DSH session log).
+ *
+ * Paging (all seqs are ORIGINAL DSH seqs, counting from 0):
+ * - `afterSeq` → the oldest events with `seq > afterSeq` (forward paging; `hasMore` = newer remain).
+ *   With `beforeSeq` too, the page stays inside the open interval (afterSeq, beforeSeq).
+ * - `beforeSeq` alone → the newest events with `seq < beforeSeq` (`hasMore` = older remain).
+ * - neither → the newest events of the log (`hasMore` = older remain).
+ * Events always come back ascending.
+ */
+export interface ReadSessionEventsParams {
+  /** The DSH session id (the id the daemon's submitTurn/listApprovals ops use). */
+  readonly sessionId: string;
+  /** Integer ≥ -1. */
+  readonly afterSeq?: number;
+  /** Integer ≥ 0. */
+  readonly beforeSeq?: number;
+  /** Positive integer; default {@link READ_SESSION_EVENTS_DEFAULT_LIMIT}, clamped to {@link READ_SESSION_EVENTS_MAX_LIMIT}. */
+  readonly limit?: number;
+  /**
+   * Byte budget of the serialized events; default {@link READ_SESSION_EVENTS_DEFAULT_MAX_BYTES},
+   * clamped to {@link READ_SESSION_EVENTS_MAX_BYTES_CAP}. A page holds fewer events (and
+   * `hasMore: true`) when the next event would exceed it; a page always holds at least one
+   * event when one is available, even if that event alone exceeds `maxBytes`.
+   */
+  readonly maxBytes?: number;
+  /**
+   * Also return events the session committed in memory but the JSONL write-behind buffer has
+   * not written yet (≤ ~200 ms), for a session that is live in this daemon. Default true, so a
+   * read started after subscribing to `turn/event` never misses an event pushed before it.
+   * False → strictly what is on disk. Neither variant writes or flushes anything.
+   */
+  readonly includeUnflushed?: boolean;
+}
+
+/** An event a page skipped because it can never fit a daemon frame. */
+export interface OmittedSessionEvent {
+  readonly seq: number;
+  readonly type: string;
+  /** Serialized size in bytes (when known). */
+  readonly bytes: number;
+  readonly reason: 'too-large' | 'too-deep';
+}
+
+/** Result of `readSessionEvents`. */
+export interface ReadSessionEventsResult {
+  /** The DSH session id whose log was read (identifies the log; a reset session gets a new id). */
+  readonly dshSessionId: string;
+  /** Ascending by seq, the events exactly as DSH stored them (original seqs, unmodified). */
+  readonly events: readonly SessionEvent[];
+  /** The newest seq in the WHOLE log (not just this page); -1 when the log is empty. */
+  readonly lastSeq: number;
+  /** The newest seq already on disk; < `lastSeq` only while unflushed events were included. */
+  readonly persistedLastSeq: number;
+  /** More events exist beyond this page in the read direction (after: newer; before/newest: older). */
+  readonly hasMore: boolean;
+  /** Present only when the page skipped events that can never fit a frame (seq gaps in `events`). */
+  readonly omitted?: readonly OmittedSessionEvent[];
+}
+
+export interface ReadSessionEventsRequest extends DaemonRequestBase, ReadSessionEventsParams {
+  readonly op: 'readSessionEvents';
+}
+
+/**
+ * Parameters of `readAttachment`: an image cited by the session's events. Exactly one of
+ * `attachmentId` / `path` is required.
+ */
+export interface ReadAttachmentParams {
+  /** The DSH session id whose events cite the image. */
+  readonly sessionId: string;
+  /** A DSH image attachment id (`sha256:<64 hex>`) from an `image` content block in the log. */
+  readonly attachmentId?: string;
+  /**
+   * A workspace file path as the log cites it (enkeep passes user-sent files to DSH as workspace
+   * paths in text): relative to the session's working directory (its space), or absolute inside it.
+   */
+  readonly path?: string;
+}
+
+/** Wire parameters of one `readAttachment` chunk (the host transport loops over chunks). */
+export interface ReadAttachmentChunkParams extends ReadAttachmentParams {
+  /** Byte offset of the chunk; default 0. */
+  readonly offset?: number;
+  /** Raw bytes per chunk; default and maximum {@link READ_ATTACHMENT_MAX_CHUNK_BYTES}. */
+  readonly maxChunkBytes?: number;
+}
+
+export interface ReadAttachmentRequest extends DaemonRequestBase, ReadAttachmentChunkParams {
+  readonly op: 'readAttachment';
+}
+
+/** One chunk of an attachment as the daemon returns it. */
+export interface ReadAttachmentChunk {
+  readonly mime: string;
+  /** Total size of the image in bytes. */
+  readonly bytes: number;
+  /** Byte offset of this chunk. */
+  readonly offset: number;
+  /** Raw bytes in this chunk. */
+  readonly chunkBytes: number;
+  /** Base64 of this chunk. */
+  readonly data: string;
+  /** This chunk ends the image. */
+  readonly done: boolean;
+  /** Lowercase hex sha256 of the WHOLE image (detects a file that changed between chunks). */
+  readonly sha256: string;
+  readonly width?: number;
+  readonly height?: number;
+  readonly name?: string;
+}
+
+/** A whole attachment, as the host transport's `readAttachment` returns it. */
+export interface ReadAttachmentResult {
+  readonly mime: string;
+  /** Base64 of the whole image. */
+  readonly data: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly width?: number;
+  readonly height?: number;
+  readonly name?: string;
+}
+
 export type DaemonRequest =
   | SubmitTurnRequest
   | CancelRequest
@@ -363,7 +530,9 @@ export type DaemonRequest =
   | ActivityStatusRequest
   | ListBackgroundTasksRequest
   | StopBackgroundTaskRequest
-  | SteerRequest;
+  | SteerRequest
+  | ReadSessionEventsRequest
+  | ReadAttachmentRequest;
 
 // ---------------------------------------------------------------------------
 // Response Envelopes
@@ -619,6 +788,16 @@ export interface SteerResponse extends DaemonResponseBase {
   readonly clientRequestId?: string;
 }
 
+export interface ReadSessionEventsResponse extends DaemonResponseBase, ReadSessionEventsResult {
+  readonly op: 'readSessionEvents';
+  readonly ok: true;
+}
+
+export interface ReadAttachmentResponse extends DaemonResponseBase, ReadAttachmentChunk {
+  readonly op: 'readAttachment';
+  readonly ok: true;
+}
+
 export interface DaemonErrorResponse extends DaemonResponseBase {
   readonly ok: false;
   readonly error: {
@@ -650,12 +829,20 @@ export type DaemonResponse =
   | ListBackgroundTasksResponse
   | StopBackgroundTaskResponse
   | SteerResponse
+  | ReadSessionEventsResponse
+  | ReadAttachmentResponse
   | DaemonErrorResponse;
 
 // ---------------------------------------------------------------------------
 // Streaming Push Events (Sent from Daemon to Client asynchronously)
 // ---------------------------------------------------------------------------
 
+/**
+ * A live model output delta (text, reasoning, tool-call arguments) of a top-level session, or of
+ * any session while it runs a submitted turn. `turnId` is `''` for turns the runtime started on
+ * its own (e.g. a background task's completion notice continuing the conversation). Subagent and
+ * workflow child sessions do not stream chunks outside submitted turns.
+ */
 export interface DaemonStreamChunkEvent {
   readonly type: 'event';
   readonly event: 'turn/chunk';
@@ -669,6 +856,14 @@ export interface DaemonStreamChunkEvent {
   };
 }
 
+/**
+ * One DSH session event, pushed right after DSH committed it, for EVERY session of the runtime
+ * (top-level, subagent and workflow children; submitted, autonomous and compaction turns alike):
+ * it mirrors the `session/event` feed the JSONL persistence backend writes from. `seq` is the
+ * original DSH seq. `turnId` is `''` outside a submitted turn. Not pushed: seed events of a
+ * forked/imported session (DSH never publishes those) and anything while no client is connected
+ * (no replay) — read those with `readSessionEvents`.
+ */
 export interface DaemonStreamSessionEvent {
   readonly type: 'event';
   readonly event: 'turn/event';
