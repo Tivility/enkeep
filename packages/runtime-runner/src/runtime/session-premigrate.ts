@@ -18,7 +18,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
-import SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
+import * as SessionPersistenceJsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
 import { createSessionFormatCatalogWithChildren } from '@deepseek-ai/dsh-session-format-catalog';
 
 export const PACKED_CHUNK_TYPES = new Set([

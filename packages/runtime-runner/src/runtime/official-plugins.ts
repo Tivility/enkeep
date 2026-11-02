@@ -91,6 +91,7 @@ import SubagentRuntime from '@deepseek-ai/dsh-subagent';
 import * as SubagentSpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process';
 import * as SubagentForkPlugin from '@deepseek-ai/dsh-subagent-fork-in-process';
 import * as ToolSubagentPlugin from '@deepseek-ai/dsh-tool-subagent';
+import WorkingDirectoryPlugin from '@deepseek-ai/dsh-working-directory';
 import * as ToolSubagentMemoryPlugin from '@tivility/dsh-tool-subagent-memory';
 import SubagentModelSelectionConfig from '@deepseek-ai/dsh-tool-subagent/model-selection-settings';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
@@ -576,6 +577,15 @@ export class SpaceIsolatedFileSystem extends LocalFileSystem {
     return 'workspace-write';
   }
 
+  /**
+   * DSH 0.2.1 tools report `processPath(target)` to the model (read/write/edit/read_image results).
+   * Mount targets are keyed by their host path; report them as `/mnt/<name>/...` like `displayPath`
+   * so host paths never reach the model.
+   */
+  override processPath(target: FsTarget): string {
+    return this.mountResolver.sanitizeText(super.processPath(target));
+  }
+
   override async resolve(
     filePath: string,
     opts?: { cwd?: string; signal?: AbortSignal }
@@ -987,13 +997,23 @@ export class SpaceIsolatedBashExecutor extends LocalBashExecutor {
     return {
       ...spec,
       command: commandToRun,
-      workdir: realWorkdir,
+      // DSH 0.2.1 records the resolved workdir in the tool result (`cwd`); keep mount workdirs virtual
+      // there and translate them to the host path only when the process is spawned.
+      workdir: resolvedTarget.isMount ? resolvedTarget.displayPath : realWorkdir,
     };
   }
 
   override async execute(spec: ShellExecSpec): Promise<ShellExecution> {
-    const execution = await super.execute(spec);
+    const execution = await super.execute(this.withPhysicalWorkdir(spec));
     return this.wrapSanitizedExecution(execution);
+  }
+
+  /** Map a virtual `/mnt/<name>/...` workdir from {@link resolve} back to its host path for spawning. */
+  private withPhysicalWorkdir(spec: ShellExecSpec): ShellExecSpec {
+    if (typeof spec.workdir !== 'string' || !spec.workdir.startsWith('/mnt/')) return spec;
+    const target = this.mountResolver.resolvePath(spec.workdir);
+    if (!target.isMount || !target.physicalPath) return spec;
+    return { ...spec, workdir: fs.realpathSync(target.physicalPath) };
   }
 
   async run(spec: ShellExecSpec): Promise<ShellRunResult> {
@@ -1148,6 +1168,24 @@ export class SpaceIsolatedSubprocessRuntime extends LocalSubprocessRuntime {
  * @param options - Workspace mounting options including spacePath and dshHome.
  * @returns WorkspaceToolsHandle for ordered fiber cleanup.
  */
+/**
+ * Run `mount` with `$DSH_HOME` (and `$DSH_AGENTS_HOME` under it) pointing at `dshHome`, restoring both after.
+ * DSH plugins that resolve the harness home from the environment at apply time then see this runtime's home.
+ */
+async function withHarnessHomeEnv<T>(dshHome: string, mount: () => Promise<T> | T): Promise<T> {
+  const previous = { home: process.env.DSH_HOME, agents: process.env.DSH_AGENTS_HOME };
+  process.env.DSH_HOME = dshHome;
+  process.env.DSH_AGENTS_HOME = path.join(dshHome, '.agents');
+  try {
+    return await mount();
+  } finally {
+    if (previous.home === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous.home;
+    if (previous.agents === undefined) delete process.env.DSH_AGENTS_HOME;
+    else process.env.DSH_AGENTS_HOME = previous.agents;
+  }
+}
+
 export async function mountWorkspaceTools(
   agentCtx: Context,
   options: WorkspaceToolsMountOptions
@@ -1283,8 +1321,9 @@ export async function mountWorkspaceTools(
     } as any);
     fibers.push(instructionsFsFiber);
 
-    const instructionsFiber = await instructionsCtx.plugin(AgentInstructionsPlugin, {
-      dshHome,
+    // DSH 0.2.1 dropped the `dshHome` option: the loader reads `$DSH_HOME` / `$DSH_AGENTS_HOME` while it
+    // applies. Pin both to this runtime's home for the mount, so one process can host several homes.
+    const instructionsFiber = await withHarnessHomeEnv(dshHome, () => instructionsCtx.plugin(AgentInstructionsPlugin, {
       maxBytes: options.instructions?.maxBytes ?? 65536,
       maxSourceBytes: options.instructions?.maxSourceBytes ?? 20480,
       instructionFileCandidates: options.instructions?.instructionFileCandidates ?? [
@@ -1292,7 +1331,7 @@ export async function mountWorkspaceTools(
         'CLAUDE.md',
       ],
       projectRootMarkers: options.instructions?.projectRootMarkers ?? ['.git'],
-    });
+    }));
     fibers.push(instructionsFiber);
 
     // 13. Skills scoped to spacePath/.skills and bundled
@@ -1369,7 +1408,6 @@ export async function mountWorkspaceTools(
       provider: 'spawn',
       toolName: 'subagent',
       maxDepth: maxSubagentDepth,
-      backgroundMode: 'continuable',
       modelSelectionSettings: subagentModelSelectionEnabled,
     });
     fibers.push(toolSubagentFiber);
@@ -1378,7 +1416,6 @@ export async function mountWorkspaceTools(
       provider: 'fork',
       toolName: 'subagent_fork',
       maxDepth: maxSubagentDepth,
-      backgroundMode: 'continuable',
     });
     fibers.push(toolForkFiber);
 
@@ -1758,6 +1795,20 @@ export async function mountOfficialPlugins(
   let activeSubagentsCount = 0;
 
   try {
+    // 0. Working directory (DSH 0.2.1). Tools, instructions, skills, subagents and workflows resolve each
+    // Session's directory through one process-wide `workingDirectory` service: a Session starts in its
+    // header cwd (the space directory). It validates directories through its own filesystem, isolated
+    // from the host scope so no host-level `fs` appears; every tool still reads and writes through the
+    // space-isolated filesystem of its agent.
+    const workingDirectoryCtx = ctx.isolate('fs');
+    const workingDirectoryFsFiber = await workingDirectoryCtx.plugin(LocalFileSystem, { cwd: config.spacesDir } as any);
+    fibers.push(workingDirectoryFsFiber);
+    const workingDirectoryFiber = await workingDirectoryCtx.plugin(WorkingDirectoryPlugin as any, {
+      defaultDirectory: config.spacesDir,
+    });
+    fibers.push(workingDirectoryFiber);
+    mountedPlugins.set('working-directory', workingDirectoryFiber);
+
     // 1. P0: Compaction Subsystem (Process-global)
     // 1.1 TokenMeter (provides ctx.tokenMeter)
     const tokenMeterFiber = await ctx.plugin(TokenMeter);
@@ -2062,7 +2113,7 @@ export async function mountOfficialPlugins(
     const forkFiber = mountedPlugins.get('subagent-fork-in-process');
     const subagentReady = Boolean(
       subagentsService &&
-        typeof subagentsService.startContinuable === 'function' &&
+        typeof subagentsService.startActivation === 'function' &&
         subagentsService.getProvider('spawn') &&
         subagentsService.getProvider('fork') &&
         isFiberActive(spawnFiber) &&

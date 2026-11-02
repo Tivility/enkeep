@@ -2,18 +2,19 @@ packages:
   - packages/*
 
 overrides:
-  '@deepseek-ai/dsh-anonymous-user-id': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-atomic-write': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-attachment': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-authorization': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-credentials': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-home-paths': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-launch-environment': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-ptc-runtime': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-scope': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-session-persistence': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-settings': '0.2.0-rc.2'
-  '@deepseek-ai/dsh-subagent-in-process-driver': '0.2.0-rc.2'
+  '@deepseek-ai/cordis-plugin-group': '1.0.5'
+  '@deepseek-ai/dsh-compaction-basic': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-anonymous-user-id': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-atomic-write': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-attachment': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-authorization': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-credentials': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-home-paths': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-launch-environment': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-ptc-runtime': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-scope': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-session-persistence': '0.2.1-rc.5'
+  '@deepseek-ai/dsh-settings': '0.2.1-rc.5'
 
 allowBuilds:
   '@deepseek-ai/dsh-subprocess-local': true
@@ -25,8 +26,8 @@ allowBuilds:
 
 minimumReleaseAgeExclude:
   - '@tivility/dsh-compaction-window@0.1.0'
-  - '@tivility/dsh-tool-subagent-memory@0.1.0'
-  - '@tivility/dsh-tool-workflow-memory@0.1.0'
+  - '@tivility/dsh-tool-subagent-memory@0.2.0'
+  - '@tivility/dsh-tool-workflow-memory@0.2.0'
 
 patchedDependencies:
-  '@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2': patches/@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch
+  '@deepseek-ai/dsh-llm-pi-ai@0.2.1-rc.5': patches/@deepseek-ai__dsh-llm-pi-ai@0.2.1-rc.5.patch

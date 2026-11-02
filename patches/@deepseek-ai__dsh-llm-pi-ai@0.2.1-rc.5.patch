@@ -1,5 +1,5 @@
 diff --git a/lib/index.js b/lib/index.js
-index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae42b68b4e1 100644
+index 4b1e5ad..eda3734 100644
 --- a/lib/index.js
 +++ b/lib/index.js
 @@ -3,7 +3,7 @@ import { CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, IMAGE_OFFLOAD_REQUIR
@@ -10,8 +10,8 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae4
 +import { longEdgeDimensions, requestImageDimensions } from "@deepseek-ai/dsh-attachment";
  import z from "@deepseek-ai/schemastery";
  import { credentialKey, credentialKeyId, credentialKeyScope, credentialRef, isCredentialKeySegment, isCredentialRefName } from "@deepseek-ai/dsh-credentials";
- import { builtinModels, builtinProviders, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
-@@ -923,6 +923,8 @@ const DEFAULT_MAX_REQUEST_IMAGE_BYTES = 20 * 1024 * 1024;
+ import { builtinModels, builtinProviders, getAllBuiltinModels, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+@@ -955,6 +955,8 @@ const DEFAULT_MAX_REQUEST_IMAGE_BYTES = 20 * 1024 * 1024;
  const DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET = 2048 * 2048;
  /** Default raw encoded-byte target before inline base64 expansion; the smallest quality-ladder output is used when no quality fits. */
  const DEFAULT_REQUEST_IMAGE_MAX_BYTES = 1024 * 1024;
@@ -20,7 +20,7 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae4
  /** Context capacity assumed for a model neither configuration nor the catalog sizes. */
  const DEFAULT_CONTEXT_WINDOW = 262144;
  /** Output capability assumed for a model neither configuration nor the catalog sizes. */
-@@ -1045,6 +1047,7 @@ const profile = z.object({
+@@ -1077,6 +1079,7 @@ const profile = z.object({
  	maxRequestImageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES),
  	requestImagePixelBudget: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET),
  	requestImageMaxBytes: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES),
@@ -28,7 +28,7 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae4
  	retryPolicy: RetryPolicySchema
  });
  /** Runtime schema for {@link Config}. */
-@@ -1100,6 +1103,8 @@ function resolveProfiles(providers, validation = "strict") {
+@@ -1132,6 +1135,8 @@ function resolveProfiles(providers, validation = "strict") {
  		if (!Number.isSafeInteger(requestImagePixelBudget) || requestImagePixelBudget <= 0) throw new Error(`llm-pi-ai: provider "${provider}" requestImagePixelBudget must be a positive safe integer`);
  		const requestImageMaxBytes = source.requestImageMaxBytes ?? 1048576;
  		if (!Number.isSafeInteger(requestImageMaxBytes) || requestImageMaxBytes <= 0) throw new Error(`llm-pi-ai: provider "${provider}" requestImageMaxBytes must be a positive safe integer`);
@@ -37,7 +37,7 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae4
  		const defaultInput = [...source.defaultInput ?? DEFAULT_INPUT];
  		if (defaultInput.length === 0) throw new Error(`llm-pi-ai: provider "${provider}" defaultInput must name at least one modality`);
  		const displayName = source.displayName ?? provider;
-@@ -1141,6 +1146,7 @@ function resolveProfiles(providers, validation = "strict") {
+@@ -1173,6 +1178,7 @@ function resolveProfiles(providers, validation = "strict") {
  			maxRequestImageBytes,
  			requestImagePixelBudget,
  			requestImageMaxBytes,
@@ -45,9 +45,9 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae4
  			retryPolicy: resolveRetryPolicy(retryPolicy, `llm-pi-ai: provider "${provider}" retryPolicy`),
  			...rest.headers === void 0 ? {} : { headers: { ...rest.headers } },
  			...rest.thinkingBudgets === void 0 ? {} : { thinkingBudgets: { ...rest.thinkingBudgets } },
-@@ -1309,8 +1315,10 @@ function textOnlyContext(options, onReplayDegrade) {
- }
- /** Deterministic request target for one source under the route budgets. */
+@@ -1377,8 +1383,10 @@ function textOnlyContext(options, onReplayDegrade) {
+ * @returns dimensions and byte target shared by serialization and screenshot coordinate mapping.
+ */
  function requestImageTarget(ref, budget) {
 +	const byPixels = requestImageDimensions(ref.width, ref.height, budget.maxPixels);
 +	const maxEdge = budget.maxEdge ?? DEFAULT_REQUEST_IMAGE_MAX_EDGE;
@@ -57,7 +57,7 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae4
  		maxBytes: budget.maxBytes
  	};
  }
-@@ -1321,7 +1329,8 @@ async function toPiContextWithImages(options, images, onReplayDegrade) {
+@@ -1389,7 +1397,8 @@ async function toPiContextWithImages(options, images, onReplayDegrade) {
  	const { attachments, resolveImageAccess, maxRequestImageBytes } = images;
  	const requestImagePolicy = images.requestImagePolicy ?? {
  		maxPixels: 4194304,
@@ -67,7 +67,7 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..e8d386f0150f96197d06e3265dbfaae4
  	};
  	assertSupportedHistory(options.messages);
  	const split = splitSystemPrompt(options);
-@@ -1875,7 +1884,8 @@ var PiAiAdapter = class extends LlmAdapter {
+@@ -1977,7 +1986,8 @@ var PiAiAdapter = class extends LlmAdapter {
  					maxRequestImageBytes: profile.maxRequestImageBytes,
  					requestImagePolicy: {
  						maxPixels: profile.requestImagePixelBudget,

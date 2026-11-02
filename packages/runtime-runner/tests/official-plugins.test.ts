@@ -36,6 +36,7 @@ import {
   DEMO_PROVIDER_ID,
   DEMO_MODEL_ID,
 } from '../src/runtime/demo-model-plugin.js';
+import { startSubagent } from './support/subagent-activation.js';
 
 describe('Official DSH 0.1.1-rc.2 Capability Plugins Integration', () => {
   let tmpDir: string;
@@ -463,7 +464,7 @@ description: Bob private skill.
         const parentAgent = await runtime.getOrCreateAgent(sessionId);
 
         // Start a spawn subagent directly via SubagentRuntime
-        const run = await subagents.start('spawn', {
+        const run = await startSubagent(subagents, 'spawn', {
           label: 'spawn-worker',
           prompt: [{ type: 'text', text: 'Subagent prompt execution.' }],
           parent: parentAgent,
@@ -504,7 +505,7 @@ description: Bob private skill.
         const subagents = runtime.context.get('subagents');
 
         // 2. Start fork subagent
-        const run = await subagents.start('fork', {
+        const run = await startSubagent(subagents, 'fork', {
           label: 'fork-worker',
           prompt: [{ type: 'text', text: 'Fork subagent continuation prompt.' }],
           parent: parentAgent,
@@ -539,7 +540,7 @@ description: Bob private skill.
         const subagents = runtime.context.get('subagents');
 
         // Depth 1 child
-        const child1 = await subagents.start('spawn', {
+        const child1 = await startSubagent(subagents, 'spawn', {
           label: 'depth-1-child',
           prompt: [{ type: 'text', text: 'Depth 1 work.' }],
           parent: parentAgent,
@@ -549,7 +550,7 @@ description: Bob private skill.
         expect(child1.localAgent).toBeDefined();
 
         // Depth 2 grandchild
-        const child2 = await subagents.start('spawn', {
+        const child2 = await startSubagent(subagents, 'spawn', {
           label: 'depth-2-child',
           prompt: [{ type: 'text', text: 'Depth 2 work.' }],
           parent: child1.localAgent!,
@@ -560,7 +561,7 @@ description: Bob private skill.
 
         // Depth 3 great-grandchild must be rejected by depth limit!
         await expect(
-          subagents.start('spawn', {
+          startSubagent(subagents, 'spawn', {
             label: 'depth-3-child-overflow',
             prompt: [{ type: 'text', text: 'Depth 3 invalid.' }],
             parent: child2.localAgent!,
@@ -576,7 +577,7 @@ description: Bob private skill.
       }
     });
 
-    it('propagates parent turn cancellation to in-flight subagents', async () => {
+    it('cancels an in-flight subagent through its activation (DSH 0.2.1: dispose owns cancellation)', async () => {
       const runtime = await bootDshRuntime({
         userId: 'alice',
         dshHome: aliceHome,
@@ -590,19 +591,17 @@ description: Bob private skill.
 
         const abortController = new AbortController();
 
-        const run = await subagents.start('spawn', {
+        const run = await startSubagent(subagents, 'spawn', {
           label: 'cancellable-child',
           prompt: [{ type: 'text', text: 'Long task with delay [enkeep-test-delay-ms=2000]' }],
           parent: parentAgent,
           signal: abortController.signal,
         });
 
-        // Abort the parent turn signal
-        abortController.abort();
-
-        const result = await run.result;
-        expect(result.stopReason).toBe('aborted');
+        // After publication the startup signal no longer owns the child; dispose() cancels it.
         await run.dispose();
+        const result = await run.result;
+        expect(result.stopReason).not.toBe('completed');
       } finally {
         await runtime.dispose();
       }
@@ -624,7 +623,7 @@ description: Bob private skill.
         const bobAgent = await bobRuntime.getOrCreateAgent(bobSessionId);
         const bobSubagents = bobRuntime.context.get('subagents');
 
-        const bobChildRun = await bobSubagents.start('spawn', {
+        const bobChildRun = await startSubagent(bobSubagents, 'spawn', {
           label: 'bob-worker',
           prompt: [{ type: 'text', text: 'Bob subagent working in Bob workspace.' }],
           parent: bobAgent,

@@ -30,6 +30,7 @@ import {
 } from '../src/runtime/official-plugins.js';
 import { Context } from '@deepseek-ai/cordis';
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local';
+import { startSubagent } from './support/subagent-activation.js';
 
 describe('Official DSH Workspace Tools & Multi-Space Isolation', () => {
   let tmpDir: string;
@@ -302,7 +303,7 @@ describe('Official DSH Workspace Tools & Multi-Space Isolation', () => {
       const subagents = runtime.context.get('subagents');
       expect(subagents).toBeDefined();
 
-      const run = await subagents.start('spawn', {
+      const run = await startSubagent(subagents, 'spawn', {
         label: 'test-child',
         prompt: [{ type: 'text', text: 'Subagent reading shared workspace.' }],
         parent: parentAgent,

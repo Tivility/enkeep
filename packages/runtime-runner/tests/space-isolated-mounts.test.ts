@@ -312,7 +312,9 @@ describe('Space-Isolated Controlled Mounts & Virtual Path Routing', () => {
         workdir: '/mnt/readonly-data',
       });
 
-      expect(spec.workdir).toBe(fs.realpathSync(hostDatasetRO));
+      // The resolved spec keeps the virtual mount path (it is recorded in tool results); the host path is
+      // substituted only when the process is spawned.
+      expect(spec.workdir).toBe('/mnt/readonly-data');
 
       const res = await bash.run(spec);
       expect(res.exitCode).toBe(0);

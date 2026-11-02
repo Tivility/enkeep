@@ -20,7 +20,8 @@ async function loadDshStack() {
     Session: sessionMod.Session,
     SessionId: sessionMod.SessionId,
     SessionLogOffset: sessionMod.SessionLogOffset,
-    JsonlSessionPersistence: jsonlMod.JsonlSessionPersistence ?? jsonlMod.default,
+    // DSH 0.2.1 publishes the JSONL backend as a namespace plugin (`name`/`Config`/`apply`), no default export.
+    JsonlSessionPersistence: jsonlMod.JsonlSessionPersistence ?? jsonlMod.default ?? jsonlMod,
   }
 }
 
