@@ -324,6 +324,20 @@ jarvisd node 和 enkeep 在同一台 Mac 上时，走 127.0.0.1 就够了，不�
      "url": "ws://127.0.0.1:<port>/api/jarvis/runtime", "token_file": "<token-file>"}]}
    ```
 
-   node 10 秒内会读到这个文件，自己连上。
+   node 大约 10 秒内会自己读到这个文件并连上，不用重启。连上以后，「渠道」页的 Jarvis 卡片显示「已连接（自 …）」、最近使用时间和 token 的创建时间（点「刷新」重新读取）；管理 API 里对应账户的 `jarvis` 字段（`connected`、`connectedAt`、`lastConnectedAt`、`lastDisconnectedAt`、`lastUsedAt`、`tokenCreatedAt`），不含 token 或它的 hash。
+
+   **不用 Web 的做法（同一台机器上的运维）**：用 demo-runner 的命令行直接签发或吊销，所有值都从参数给，没有默认值：
+
+   ```bash
+   node packages/demo-runner/dist/demo-runner.js jarvis-token issue \
+     --data-dir <data-dir> --user <username> --token-file <token-file>
+   node packages/demo-runner/dist/demo-runner.js jarvis-token revoke \
+     --data-dir <data-dir> --user <username>
+   ```
+
+   - `issue`：这个用户还没有 Jarvis 账户就建一个（和 API 一样，只限启用中的管理员），已有就换 token。token 只写进 `<token-file>`（新建时权限 0600；是符号链接或属于别的用户的文件一律拒绝），屏幕上只打印账户 id 和文件路径。不给 `--token-file` 时，token 打印到 stdout 一次，stderr 上有警告。
+   - `revoke`：删除这个用户的 Jarvis 账户和它的 token，和卡片上的「删除」（API 的 DELETE）效果一样。
+   - 平台运行时也可以用：直接打开 `<data-dir>/platform.db`（WAL，带 busy timeout，每次只做很短的写入），不起服务、不跑迁移；签发、换、吊销都写审计日志（`via: 'cli'`）。
+   - 命令行关不掉正在运行的平台上的连接：旧 token 立即不能再连；还用着旧 token 的连接，会在下一次检查时被平台断开（它的下一个请求，或者最多约 30 秒后的会话列表刷新）。
 3. 提问工具在这个用户的 runtime 下一次重建时打开。重建由发布脚本在空闲时做，也可以由管理员重启这个用户的 runtime。
 4. 审批卡片在手机上的停留时间，由部署设置的 `ENKEEP_APPROVAL_TIMEOUT_MS` 决定（默认 60 秒；想在手机上从容回答，可以设成比如 600000）。
