@@ -273,11 +273,12 @@ export class PlatformJarvisSource implements JarvisChannelSource {
       .all(this.userId) as unknown as RouteRow[];
     if (routes.length === 0) return [];
 
+    // One indexed single-row read per session (see lastMessageAtOf): a GROUP BY over the user's messages reads
+    // created_at past every message's content and blocked the event loop for seconds on large databases.
     const lastMessageAt = new Map<string, string>();
-    for (const row of this.db
-      .prepare('SELECT session_id, MAX(created_at) AS last_at FROM web_messages WHERE user_id = ? GROUP BY session_id')
-      .all(this.userId) as Array<{ session_id: string; last_at: string | null }>) {
-      if (row.last_at) lastMessageAt.set(row.session_id, row.last_at);
+    for (const r of routes) {
+      const at = this.lastMessageAtOf(r.id);
+      if (at) lastMessageAt.set(r.id, at);
     }
     const pinned = this.busyRouteIds();
     const cutoff = this.now() - JARVIS_LIST_RECENT_MS;
@@ -853,19 +854,24 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     return path.posix.join(dir, folder);
   }
 
+  /** When the session's newest message was written (its newest row by rowid; one indexed read). */
+  private lastMessageAtOf(routeId: string): string | undefined {
+    const row = this.db
+      .prepare('SELECT created_at FROM web_messages WHERE session_id = ? AND +user_id = ? ORDER BY rowid DESC LIMIT 1')
+      .get(routeId, this.userId) as { created_at: string | null } | undefined;
+    return row?.created_at ?? undefined;
+  }
+
   private async rowOf(route: RouteRow, lastMessageAt?: string): Promise<JarvisSessionRow> {
+    // The newest assistant row by rowid, walking the session index backwards (role sits before content in the row,
+    // so non-matching rows are cheap). `+user_id` keeps SQLite off the user index, which would scan every message
+    // of the user and sort them.
     const last = this.db
       .prepare(
-        "SELECT content FROM web_messages WHERE user_id = ? AND session_id = ? AND role = 'assistant' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        "SELECT content FROM web_messages WHERE session_id = ? AND +user_id = ? AND role = 'assistant' ORDER BY rowid DESC LIMIT 1"
       )
-      .get(this.userId, route.id) as { content: string | null } | undefined;
-    let messageAt = lastMessageAt;
-    if (messageAt === undefined) {
-      const row = this.db
-        .prepare('SELECT MAX(created_at) AS last_at FROM web_messages WHERE user_id = ? AND session_id = ?')
-        .get(this.userId, route.id) as { last_at: string | null } | undefined;
-      messageAt = row?.last_at ?? undefined;
-    }
+      .get(route.id, this.userId) as { content: string | null } | undefined;
+    const messageAt = lastMessageAt ?? this.lastMessageAtOf(route.id);
     const status = await this.statusOf(route.id, last !== undefined);
     const rev = this.revOf(route);
     const updatedMs = this.activityMs(route, messageAt) || this.now();
@@ -893,8 +899,9 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     let watermark: number | undefined;
     try {
       const w = this.db
-        .prepare('SELECT MAX(rowid) AS w FROM web_events WHERE user_id = ? AND session_id = ?')
-        .get(this.userId, route.id) as { w: number | bigint | null } | undefined;
+        // Through the session index (`+user_id`: not the user index, which scans all the user's events).
+        .prepare('SELECT MAX(rowid) AS w FROM web_events WHERE session_id = ? AND +user_id = ?')
+        .get(route.id, this.userId) as { w: number | bigint | null } | undefined;
       if (w?.w !== null && w?.w !== undefined) watermark = Number(w.w);
     } catch {}
     const seq = this.options.events?.lastSeq(this.userId, route.dsh_session_id);

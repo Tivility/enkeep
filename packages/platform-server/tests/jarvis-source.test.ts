@@ -277,6 +277,30 @@ describe('PlatformJarvisSource', () => {
       expect(await s.getSession(ROUTE_ARCHIVED)).toBeNull();
     });
 
+    it('lists through the per-session indexes, never scanning or sorting all of the user\'s rows', async () => {
+      addMessage(ROUTE_DONE, 'assistant', 'synthetic reply');
+      // Every statement the listing prepares: none may use the per-user indexes (a scan of all the user's events or
+      // messages blocked the event loop for seconds on a large database) or sort in a temp b-tree.
+      const statements: string[] = [];
+      const prepare = db.prepare.bind(db);
+      (db as any).prepare = (sql: string) => {
+        statements.push(sql);
+        return prepare(sql);
+      };
+      try {
+        await source().listSessions();
+      } finally {
+        (db as any).prepare = prepare;
+      }
+      const touchingBigTables = [...new Set(statements)].filter((sql) => /\b(web_events|web_messages)\b/.test(sql));
+      expect(touchingBigTables.length).toBeGreaterThan(0);
+      for (const sql of touchingBigTables) {
+        const args = (sql.match(/\?/g) ?? []).map(() => 'x');
+        const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args) as Array<{ detail: string }>).map((r) => r.detail).join(' | ');
+        expect(plan, sql).not.toMatch(/idx_web_(events|messages)_user_id|TEMP B-TREE|SCAN web_/);
+      }
+    });
+
     it('marks recovery_required and waiting_approval as blocked', async () => {
       statuses.set(ROUTE_IDLE, 'recovery_required');
       statuses.set(ROUTE_DONE, 'waiting_approval');
