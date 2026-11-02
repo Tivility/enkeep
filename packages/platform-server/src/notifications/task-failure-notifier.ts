@@ -11,7 +11,7 @@
 
 import type { DatabaseSync } from 'node:sqlite';
 import type { TaskNotificationEventType } from '@enkeep/platform-core';
-import { resolveTaskOriginDelivery } from '@enkeep/platform-operations';
+import { resolveTaskOriginDelivery, isNoopTaskDeliveryChannel } from '@enkeep/platform-operations';
 
 export const TASK_ROUTE_EVENTS: TaskNotificationEventType[] = ['failed', 'timeout'];
 export const DEFAULT_MISSED_RUN_THRESHOLD_MS = 30 * 60 * 1000;
@@ -192,7 +192,8 @@ function validateExplicitDelivery(
 
 /**
  * Resolves where a failure notification of this task goes.
- * 1. payload.delivery (lark/wechat) when it is a valid route of this user;
+ * 1. payload.delivery (lark/wechat) when it is a valid route of this user; a jarvis delivery
+ *    stays in-app (Jarvis shows the session);
  * 2. the lark/wechat chat bound to the anchor session (or the unique chat bound to its space);
  * 3. an in-app message in the anchor session.
  */
@@ -206,6 +207,10 @@ export function resolveTaskRouteTarget(db: DatabaseSync, task: TaskRouteTaskCont
     const channel = str(delivery.channel);
     const accountId = str(delivery.accountId);
     const nativeContextId = str(delivery.nativeContextId);
+    if (isNoopTaskDeliveryChannel(channel)) {
+      // Jarvis shows the session itself: notify in the anchor session, never in a guessed IM chat.
+      return { kind: 'in_app', sessionId };
+    }
     if (
       (channel === 'lark' || channel === 'wechat') &&
       accountId &&

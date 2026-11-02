@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "@enkeep/backup-restore": "workspace:*",
+    "@enkeep/channel-jarvis": "workspace:*",
     "@enkeep/channel-lark": "workspace:*",
     "@enkeep/channel-wechat": "workspace:*",
     "@enkeep/dsh-enkeep-bundle": "workspace:*",

@@ -79,7 +79,28 @@ import {
   type StopBackgroundTaskResponse,
   type SteerRequest,
   type SteerResponse,
+  type ReadSessionEventsParams,
+  type ReadSessionEventsResult,
+  type ReadAttachmentParams,
+  type ReadAttachmentResult,
+  type ListQuestionsResult,
+  type AnswerQuestionResult,
+  type QuestionAnswer,
 } from '../runtime/daemon-protocol.js';
+import {
+  answerQuestionVia,
+  listQuestionsVia,
+  subscribeQuestionEvents,
+  type HostQuestionEventListener,
+} from './questions-client.js';
+import {
+  readAttachmentVia,
+  readSessionEventsVia,
+  subscribeSessionEvents,
+  subscribeTurnChunks,
+  type HostSessionEventListener,
+  type HostTurnChunkListener,
+} from './session-history-client.js';
 import type { FileOperationRequest, FileOperationResult } from '../runtime/file-ops.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
 import {
@@ -104,10 +125,8 @@ import {
   HC_DEFAULT_IDLE_TIMEOUT_MS,
   calculateTurnBudgets,
   clearWaiterTimers,
-  pauseWaiterIdleTimer,
   refreshWaiterIdleTimer,
-  extractVerifiedApprovalAsked,
-  extractVerifiedApprovalDecided,
+  applyInteractionWait,
   isGenuineTurnProgress,
   type TurnWatchdogWaiter,
 } from './types.js';
@@ -321,24 +340,14 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       this.emit('stream', event);
       this.emit(event.event, event);
 
-      // Refresh idle activity deadline or pause during approval waiting
+      // Refresh idle activity deadline or pause during approval / question waiting
       const progressTurnId = 'turnId' in event && typeof event.turnId === 'string' ? event.turnId : undefined;
       if (progressTurnId && this.turnWaiters.has(progressTurnId)) {
         const waiter = this.turnWaiters.get(progressTurnId)!;
-        const asked = extractVerifiedApprovalAsked(event);
-        if (asked) {
-          waiter.pendingApprovals.add(asked.approvalId);
-          pauseWaiterIdleTimer(waiter);
-        } else {
-          const decided = extractVerifiedApprovalDecided(event);
-          if (decided) {
-            waiter.pendingApprovals.delete(decided.decisionId);
-            if (waiter.pendingApprovals.size === 0) {
-              this.refreshWaiterIdleTimer(waiter);
-            }
-          } else if (isGenuineTurnProgress(event)) {
-            this.refreshWaiterIdleTimer(waiter);
-          }
+        // Approvals and questions pause the idle watchdog until they settle.
+        const change = applyInteractionWait(waiter, event, () => this.refreshWaiterIdleTimer(waiter));
+        if (!change && isGenuineTurnProgress(event)) {
+          this.refreshWaiterIdleTimer(waiter);
         }
       }
 
@@ -948,6 +957,59 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       sessionId,
       taskId,
     });
+  }
+
+  /**
+   * One page of a DSH session log of this user's runtime (read-only; see `ReadSessionEventsParams`).
+   * Rejects with a `DaemonProtocolError` whose `code` is e.g. `session/not-found`.
+   */
+  public async readSessionEvents(params: ReadSessionEventsParams, timeoutMs?: number): Promise<ReadSessionEventsResult> {
+    return readSessionEventsVia((req, t) => this.request(req, t), params, timeoutMs);
+  }
+
+  /**
+   * A whole image attachment cited by a session's events (fetched in frame-sized chunks).
+   * Rejects with `attachment/not-found`, `attachment/too-large`, `attachment/not-image`, ….
+   */
+  public async readAttachment(params: ReadAttachmentParams, timeoutMs?: number): Promise<ReadAttachmentResult> {
+    return readAttachmentVia((req, t) => this.request(req, t), params, timeoutMs);
+  }
+
+  /** Live DSH session events (`turn/event`) of every session in this runtime; returns unsubscribe. */
+  public onSessionEvent(listener: HostSessionEventListener): () => void {
+    return subscribeSessionEvents(this, this.expectation?.userId, listener);
+  }
+
+  /** Live model output deltas (`turn/chunk`); returns unsubscribe. */
+  public onTurnChunk(listener: HostTurnChunkListener): () => void {
+    return subscribeTurnChunks(this, this.expectation?.userId, listener);
+  }
+
+  /**
+   * Pending `ask_user_question` questions of this runtime (optionally of one DSH session), and
+   * whether the runtime offers questions at all (ENKEEP_USER_QUESTIONS=1).
+   */
+  public async listQuestions(sessionId?: string, timeoutMs?: number): Promise<ListQuestionsResult> {
+    return listQuestionsVia((req, t) => this.request(req, t), sessionId, timeoutMs);
+  }
+
+  /**
+   * Answers a pending question (`{ id, selected: [labels], custom? }` per question); the first
+   * accepted answer wins and resolves the tool call. Rejects with codes `question/not-found`,
+   * `question/expired` (deliver the answer as a message instead), `question/already-settled`,
+   * `question/invalid-answers`, `question/unavailable`.
+   */
+  public async answerQuestion(
+    questionId: string,
+    answers: readonly QuestionAnswer[],
+    timeoutMs?: number
+  ): Promise<AnswerQuestionResult> {
+    return answerQuestionVia((req, t) => this.request(req, t), questionId, answers, timeoutMs);
+  }
+
+  /** Live `question/asked` / `question/settled` pushes (also emitted as those event names); returns unsubscribe. */
+  public onQuestionEvent(listener: HostQuestionEventListener): () => void {
+    return subscribeQuestionEvents(this, this.expectation?.userId, listener);
   }
 
   /**

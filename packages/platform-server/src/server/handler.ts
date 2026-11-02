@@ -113,6 +113,8 @@ import type { InstructionsRoutes } from "../instructions/index.js";
 import type { ChannelRoutes } from "../channels/channel-routes.js";
 import { SpaceMountService } from "../mounts/space-mount-service.js";
 import type { IExternalInteractionService, ApprovalOutcome } from "@enkeep/dsh-external-interaction";
+import { ApprovalBridge } from "../interactions/approval-bridge.js";
+import { toPendingQuestionView, type QuestionBridge } from "../interactions/question-bridge.js";
 import { DualStorageReconcileService } from "../storage/dual-storage-reconcile.js";
 import { VolumeScanService } from "../storage/volume-scan.js";
 import { createManagementOperationsAdapter } from "../operations/management-adapter.js";
@@ -305,6 +307,8 @@ export interface PlatformServerHandlerOptions {
   taskNotificationService?: TaskNotificationService;
   modelSelectionService?: ModelSelectionService;
   externalInteractionService?: IExternalInteractionService;
+  /** Runtime ask_user_question questions behind `/api/interactions/questions*`. */
+  questionBridge?: QuestionBridge;
   sessionLifecycleService?: SessionLifecycleService;
   runtimeArtifactPort?: RuntimeArtifactPort;
   spaceMountService?: SpaceMountService;
@@ -317,6 +321,20 @@ function isValidIsoDate(raw: unknown): boolean {
   if (typeof raw !== "string" || raw.length === 0) return false;
   const d = new Date(raw);
   return !isNaN(d.getTime()) && d.toISOString() === raw;
+}
+
+/** A question id path segment: the runtime's id (a tool call id, `[A-Za-z0-9_.:-]`, ≤ 128). */
+function parseQuestionId(raw: unknown): string {
+  let decoded = "";
+  try {
+    decoded = typeof raw === "string" ? decodeURIComponent(raw) : "";
+  } catch {
+    throw new ValidationError("Malformed question id");
+  }
+  if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(decoded) || decoded.includes("..")) {
+    throw new ValidationError("Invalid question id");
+  }
+  return decoded;
 }
 
 function validateExactTrimmed(val: unknown, fieldName: string): string {
@@ -559,6 +577,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
     taskNotificationService: customTaskNotificationService,
     modelSelectionService: customModelSelectionService,
     externalInteractionService,
+    questionBridge,
     sessionLifecycleService: customSessionLifecycleService,
     runtimeArtifactPort: customRuntimeArtifactPort,
     spaceMountService,
@@ -4117,7 +4136,14 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             throw new ValidationError('Field "outcome" must be "allowed-once" or "rejected"');
           }
 
-          const decided = externalInteractionService ? externalInteractionService.answerApproval(approvalId, outcome) : false;
+          // The ApprovalBridge answers through the user's runtime transport; await it so `decided`
+          // reflects whether this answer won. Plain services answer synchronously.
+          const decided = externalInteractionService instanceof ApprovalBridge
+            ? (await externalInteractionService.decide(approvalId, outcome, {
+                userId: user.role === "admin" ? undefined : user.id,
+                decidedBy: "web",
+              })).ok
+            : externalInteractionService ? externalInteractionService.answerApproval(approvalId, outcome) : false;
           sendJsonResponse(res, 200, createSuccessEnvelope({
             id: approvalId,
             status: outcome,
@@ -4134,7 +4160,12 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           const body = await parseJsonBody(req, maxBodyBytes);
           const reason = typeof body.reason === "string" ? body.reason : undefined;
 
-          const cancelled = externalInteractionService ? externalInteractionService.cancelApproval(approvalId, reason) : false;
+          const cancelled = externalInteractionService instanceof ApprovalBridge
+            ? (await externalInteractionService.cancel(approvalId, {
+                userId: user.role === "admin" ? undefined : user.id,
+                decidedBy: "web",
+              })).ok
+            : externalInteractionService ? externalInteractionService.cancelApproval(approvalId, reason) : false;
           sendJsonResponse(res, 200, createSuccessEnvelope({
             id: approvalId,
             status: "cancelled",
@@ -4144,6 +4175,70 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
         }
 
         throw new NotFoundError(`Endpoint "${pathname}" not found`);
+      }
+
+      // 6.7 User questions API (/api/interactions/questions/*): ask_user_question questions waiting in
+      // the user's runtime. Strictly tenant-scoped (admins see only their own questions too).
+      if (pathname === "/api/interactions/questions" || pathname.startsWith("/api/interactions/questions/")) {
+        const user = await getRequiredAuthUser(req);
+        const sub = pathname.slice("/api/interactions/questions".length);
+
+        if (sub === "" || sub === "/") {
+          if (method !== "GET") {
+            throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+          }
+          const sessionIdParam = parsedUrl.searchParams.get("sessionId") || undefined;
+          if (sessionIdParam) {
+            validatePathId(sessionIdParam, "sessionId");
+            const session = await platformApi.getSession(user.id, sessionIdParam);
+            if (!session) {
+              throw new NotFoundError(`Session "${sessionIdParam}" not found`);
+            }
+          }
+          const questions = questionBridge
+            ? questionBridge
+                .listPending({ userId: user.id })
+                .filter((q) => !sessionIdParam || (q.routeResolved && q.sessionId === sessionIdParam))
+                .map(toPendingQuestionView)
+            : [];
+          sendJsonResponse(res, 200, createSuccessEnvelope(questions));
+          return;
+        }
+
+        // Subpath: /api/interactions/questions/:questionId/answer
+        const segments = sub.slice(1).split("/");
+        const questionId = parseQuestionId(segments[0]);
+        if (segments.length !== 2 || segments[1] !== "answer") {
+          throw new NotFoundError(`Endpoint "${pathname}" not found`);
+        }
+        if (method !== "POST") {
+          throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+        }
+        validateCsrf(req, { csrfToken });
+        const body = await parseJsonBody(req, maxBodyBytes);
+        if (!Array.isArray(body.answers)) {
+          throw new ValidationError('Field "answers" must be an array of { id, selected, custom? }');
+        }
+        if (!questionBridge) {
+          throw new NotFoundError(`Question "${questionId}" not found`);
+        }
+        const result = await questionBridge.answer(questionId, body.answers, { userId: user.id, decidedBy: "web" });
+        switch (result.status) {
+          case "answered":
+            sendJsonResponse(res, 200, createSuccessEnvelope({ id: questionId, status: "answered", answered: true }));
+            return;
+          case "invalid":
+            throw new ValidationError(result.error ?? "The answers do not fit the questions");
+          case "not_found":
+            throw new NotFoundError(`Question "${questionId}" not found`);
+          case "expired":
+            throw new ConflictError("The question has expired", "QUESTION_EXPIRED");
+          case "already_settled":
+          case "already_answering":
+            throw new ConflictError("The question has already been answered", "QUESTION_SETTLED");
+          default:
+            throw new PlatformError("The runtime could not take the answer", "RUNTIME_UNAVAILABLE", 503);
+        }
       }
 
       // 7. Manage Routes (/api/manage/*)

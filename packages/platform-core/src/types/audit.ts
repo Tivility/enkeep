@@ -30,7 +30,12 @@ export type AuthAuditAction =
   | 'browser.screenshot'
   | 'browser.close'
   | 'mcp.call'
-  | 'mcp.cancel';
+  | 'mcp.cancel'
+  | 'jarvis.token_issued'
+  | 'jarvis.token_rotated'
+  | 'jarvis.token_revoked'
+  | 'jarvis.connection_opened'
+  | 'jarvis.connection_closed';
 
 export interface AuthAuditLog {
   id: string;

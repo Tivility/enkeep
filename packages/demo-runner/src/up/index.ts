@@ -57,6 +57,17 @@ import {
   SpaceMountService,
   ExtensionService,
   mapFileOpError,
+  ApprovalBridge,
+  type ApprovalRuntimeTransport,
+  QuestionBridge,
+  type QuestionRuntimeTransport,
+  RuntimeSessionEventHub,
+  type SessionEventRuntimeTransport,
+  JarvisRuntimeManager,
+  DEFAULT_RUNTIME_SPACES_DIR,
+  type RuntimeSessionReader,
+  type RuntimeSessionEventsPage,
+  type RuntimeAttachmentData,
 } from '@enkeep/platform-server';
 import {
   PlatformError,
@@ -153,6 +164,14 @@ export interface RunningDemoSystem {
   database: DatabaseSync;
   runtimeHandles: Map<string, UserRuntimeHandle>;
   hostRuntimeHandles: Map<string, UserRuntimeHandle>;
+  /** Host side of runtime approvals (also `platformServer.approvalBridge`); channels subscribe here. */
+  approvalBridge: ApprovalBridge;
+  /** Host side of runtime `ask_user_question` questions (also `platformServer.questionBridge`). */
+  questionBridge: QuestionBridge;
+  /** Live DSH session events and text chunks of every bound runtime, per user. */
+  sessionEventHub: RuntimeSessionEventHub;
+  /** The Jarvis channel (`/api/jarvis/runtime`), unless disabled with `jarvisChannel: false`. */
+  jarvisRuntimeManager?: JarvisRuntimeManager;
   managementProvider?: ManagementRuntimeProvider;
   restartRuntime(targetUserId?: string): Promise<RuntimeRestartResult>;
   connectRuntime(userId: string): Promise<UserRuntimeHandle>;
@@ -633,6 +652,63 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
   let targetVersionRepo: RuntimeTargetVersionRepo | null = null;
   let allActiveUsers: Array<{ id: string; username: string; status: string; role: string }> = [];
 
+  // Host side of in-container approvals for every user runtime (container and host): one bridge
+  // backs /api/interactions/approvals and waiting_approval on every startup path (CLI `up` included)
+  // and is shared by the channels (Web, Lark, Jarvis).
+  const ownsApprovalBridge = !options.approvalBridge;
+  let approvalBridgeInstance: ApprovalBridge | null = options.approvalBridge ?? null;
+  function getApprovalBridge(): ApprovalBridge {
+    if (!approvalBridgeInstance) {
+      approvalBridgeInstance = new ApprovalBridge({ db: db ?? undefined });
+    }
+    return approvalBridgeInstance;
+  }
+  // Host side of in-runtime ask_user_question questions, attached like the approval bridge (same
+  // slots): backs /api/interactions/questions, the waiting status and Jarvis question cards.
+  const ownsQuestionBridge = !options.questionBridge;
+  let questionBridgeInstance: QuestionBridge | null = options.questionBridge ?? null;
+  function getQuestionBridge(): QuestionBridge {
+    if (!questionBridgeInstance) {
+      questionBridgeInstance = new QuestionBridge({ db: db ?? undefined });
+    }
+    return questionBridgeInstance;
+  }
+  /**
+   * The per-user `userQuestions` runtime option: true while the user has an active Jarvis channel
+   * account (the runtime then composes ask_user_question); otherwise unset, so the process-wide
+   * ENKEEP_USER_QUESTIONS stays the deployment default. Read when a runtime spec is built: a change
+   * applies when that user's runtime is next (re)created.
+   */
+  function userQuestionsFor(platformUserId: string): true | undefined {
+    try {
+      const row = db?.prepare(
+        "SELECT 1 AS ok FROM channel_accounts WHERE user_id = ? AND type = 'jarvis' AND status = 'active' LIMIT 1"
+      ).get(platformUserId);
+      return row ? true : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  // Live DSH session streams (turn/event, turn/chunk) of every user runtime, attached like the
+  // approval bridge (same slots); channels that show whole sessions (Jarvis) subscribe here.
+  const ownsSessionEventHub = !options.sessionEventHub;
+  const sessionEventHub: RuntimeSessionEventHub = options.sessionEventHub ?? new RuntimeSessionEventHub();
+  /** One bridge slot per runtime (a user can have a container and a host runtime). */
+  function approvalSlotOf(handle: UserRuntimeHandle): string {
+    return `runtime:${handle.userId}`;
+  }
+  /** Unsubscribes the approval and question bridges and the session event hub from a runtime that goes away. */
+  function detachRuntimeListeners(platformUserId: string, handle: UserRuntimeHandle | undefined): void {
+    if (!handle) return;
+    if (approvalBridgeInstance) {
+      approvalBridgeInstance.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
+    }
+    if (questionBridgeInstance) {
+      questionBridgeInstance.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
+    }
+    sessionEventHub.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
+  }
+
   function getEffectiveTargetRuntimeVersion(): { image: string; daemonCliPath?: string } {
     const persisted = targetVersionRepo?.getTargetVersion();
     const image = persisted?.image || options.runtimeImage || process.env.ENKEEP_RUNTIME_IMAGE?.trim() || 'enkeep-demo-runtime:acceptance';
@@ -744,6 +820,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         llmProvider: options.llmProvider,
         llmModel: options.llmModel,
         networkMode: containerNetworkMode,
+        userQuestions: userQuestionsFor(u.id),
       });
       userHandle.launchedImage = userHandle.meta?.image || targetVer.image;
       newlyCreatedHandles.push(userHandle);
@@ -844,6 +921,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       }
       // Process is not alive, evict stale handle
       console.info('[host-runtime] evicting handle of exited daemon', { userId: rawUserId, pid: pid ?? null });
+      detachRuntimeListeners(rawUserId, existing);
       hostRuntimeHandles.delete(rawUserId);
     }
 
@@ -875,6 +953,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           llmProvider: options.llmProvider,
           llmModel: options.llmModel,
           browserService,
+          userQuestions: userQuestionsFor(userRecord.id),
         });
         handle.launchedDaemonCliPath = targetVer.daemonCliPath || null;
         console.info('[host-runtime] runtime ready', {
@@ -933,6 +1012,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           resourceSuffix: options.resourceSuffix,
           timeoutMs: options.timeoutMs ?? 15000,
           networkMode: containerNetworkMode,
+          userQuestions: userQuestionsFor(userRecord.id),
         });
         handle.launchedImage = handle.meta?.image || targetVer.image;
 
@@ -1282,6 +1362,35 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     },
     async steerTurn(req) {
       return bgDelegates.steerTurn(req);
+    },
+    // Read-only DSH session history of the runtime the session's space runs in (errors keep the
+    // runtime's codes, e.g. `session/not-found`).
+    async readSessionEvents(userId, params): Promise<RuntimeSessionEventsPage> {
+      const { handle } = await resolveRuntimeForSpace(userId, params.platformSpaceId);
+      const raw = handle.rawHandle;
+      if (!raw || typeof raw.readSessionEvents !== 'function') {
+        throw Object.assign(new Error('Runtime does not support reading session events'), { code: 'unsupported' });
+      }
+      const page = await raw.readSessionEvents({
+        sessionId: params.dshSessionId,
+        ...(params.afterSeq !== undefined ? { afterSeq: params.afterSeq } : {}),
+        ...(params.beforeSeq !== undefined ? { beforeSeq: params.beforeSeq } : {}),
+        ...(params.limit !== undefined ? { limit: params.limit } : {}),
+        ...(params.maxBytes !== undefined ? { maxBytes: params.maxBytes } : {}),
+      });
+      return page as unknown as RuntimeSessionEventsPage;
+    },
+    async readAttachment(userId, params): Promise<RuntimeAttachmentData> {
+      const { handle } = await resolveRuntimeForSpace(userId, params.platformSpaceId);
+      const raw = handle.rawHandle;
+      if (!raw || typeof raw.readAttachment !== 'function') {
+        throw Object.assign(new Error('Runtime does not support reading attachments'), { code: 'unsupported' });
+      }
+      return raw.readAttachment({
+        sessionId: params.dshSessionId,
+        ...(params.attachmentId !== undefined ? { attachmentId: params.attachmentId } : {}),
+        ...(params.path !== undefined ? { path: params.path } : {}),
+      });
     },
   };
 
@@ -1810,6 +1919,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               try {
                 await hostHandle.stop();
               } catch {}
+              detachRuntimeListeners(userId, hostHandle);
               hostRuntimeHandles.delete(userId);
             }
           }
@@ -1830,6 +1940,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                   pathOptions
                 );
               } catch {}
+              detachRuntimeListeners(userId, containerHandle);
               runtimeHandles.delete(userId);
 
               // Recreate runtime container mounting same owned volume and updated union mounts
@@ -1846,6 +1957,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                   resourceSuffix: options.resourceSuffix,
                   timeoutMs: options.timeoutMs ?? 15000,
                   mounts: allMounts,
+                  userQuestions: userQuestionsFor(userRecord.id),
                 });
                 newHandle.launchedImage = targetVer.image;
                 await bindRuntimeServices(newHandle, userRecord.id);
@@ -1911,7 +2023,8 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     modelSelectionService,
     mountResolver: demoSpaceMountService,
     extensionResolver: demoExtensionService,
-    externalInteractionService: options.externalInteractionService as any,
+    externalInteractionService: getApprovalBridge(),
+    questionService: getQuestionBridge(),
   });
 
   let platformServer: PlatformServer | undefined;
@@ -1987,72 +2100,20 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       (rawHandle as any).setPlatformProxyHandler(platformHandler);
     }
 
-    // Subscribe to daemon transport stream to bridge runtime approval events into ExternalInteractionService
+    // Bridge this runtime's approval events (approval/asked, approval/decided) into the platform
+    // ApprovalBridge; answers go back through the same transport.
     const transport = rawHandle.transport ?? (await rawHandle.startTransport?.());
-    const extService = options.externalInteractionService;
-    if (transport && extService && typeof (transport as any).on === 'function') {
-      const handleAsked = (event: any) => {
-        const app = event?.approval;
-        if (app && app.id) {
-          const pendingApp: any = {
-            id: app.id,
-            toolName: app.toolName ?? 'browser_interact',
-            risk: app.risk ?? 'medium',
-            safeSummary: app.safeSummary ?? 'Browser interaction requires human approval',
-            userId: platformUserId,
-            sessionId: event.sessionId,
-            sessionSource: 'web',
-            createdAt: new Date(event.timestamp || Date.now()).toISOString(),
-            timeoutMs: 60000,
-            status: 'pending',
-            preview: app.parameters
-              ? { toolName: app.toolName ?? 'browser_interact', parameters: app.parameters }
-              : { toolName: app.toolName ?? 'browser_interact' },
-            resolve: (outcome: 'allowed-once' | 'rejected') => {
-              if (typeof (transport as any).answerApproval === 'function') {
-                (transport as any).answerApproval(event.sessionId, app.id, outcome).catch(() => {});
-              }
-            },
-          };
-          if ((extService as any).approvals instanceof Map) {
-            (extService as any).approvals.set(app.id, pendingApp);
-          } else {
-            if (!(extService as any).approvals) {
-              (extService as any).approvals = new Map();
-            }
-            (extService as any).approvals.set(app.id, pendingApp);
-          }
-        }
-      };
-
-      (transport as any).on('stream', (event: any) => {
-        if (event && event.event === 'approval/asked') {
-          handleAsked(event);
-        } else if (event && event.event === 'approval/decided') {
-          const decision = event.decision;
-          if (decision && decision.id && (extService as any).approvals instanceof Map) {
-            (extService as any).approvals.delete(decision.id);
-          }
-        }
+    if (transport && typeof (transport as any).on === 'function') {
+      getApprovalBridge().attachTransport(platformUserId, transport as unknown as ApprovalRuntimeTransport, {
+        slot: approvalSlotOf(handle),
       });
-      (transport as any).on('approval/asked', handleAsked);
+      getQuestionBridge().attachTransport(platformUserId, transport as unknown as QuestionRuntimeTransport, {
+        slot: approvalSlotOf(handle),
+      });
+      sessionEventHub.attachTransport(platformUserId, transport as unknown as SessionEventRuntimeTransport, {
+        slot: approvalSlotOf(handle),
+      });
     }
-  }
-
-  // Hook extService.answerApproval to broadcast to all container daemon transports
-  const configuredExtService = options.externalInteractionService;
-  if (configuredExtService && typeof configuredExtService.answerApproval === 'function') {
-    const origAnswer = configuredExtService.answerApproval.bind(configuredExtService);
-    configuredExtService.answerApproval = (id: string, outcome: 'allowed-once' | 'rejected') => {
-      const answered = origAnswer(id, outcome);
-      for (const h of runtimeHandles.values()) {
-        const trans = (h.rawHandle as any)?.transport;
-        if (trans && typeof trans.answerApproval === 'function') {
-          trans.answerApproval('', id, outcome).catch(() => {});
-        }
-      }
-      return answered;
-    };
   }
 
   // Phase 2 Binding: Bind full platform and events handlers to all active runtime tunnels
@@ -2316,6 +2377,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await hostHandle.teardown(false);
           stopped = true;
         } catch {}
+        detachRuntimeListeners(normalizedUserId, hostHandle);
         hostRuntimeHandles.delete(normalizedUserId);
         hostRuntimeHandles.delete(targetUserId);
       }
@@ -2327,6 +2389,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await handle.teardown(false);
           stopped = true;
         } catch {}
+        detachRuntimeListeners(normalizedUserId, handle);
         runtimeHandles.delete(normalizedUserId);
         runtimeHandles.delete(targetUserId);
       }
@@ -2392,6 +2455,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
             await oldHostHandle.stop();
             await oldHostHandle.teardown(false);
           } catch {}
+          detachRuntimeListeners(uid, oldHostHandle);
           hostRuntimeHandles.delete(uid);
           try {
             const newHostHandle = await ensureUserHostRuntime(uid);
@@ -2422,6 +2486,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           } catch (oldTeardownErr: unknown) {
             // Ignore error during teardown of old container
           }
+          detachRuntimeListeners(uid, oldHandle);
           runtimeHandles.delete(uid);
 
           try {
@@ -2439,6 +2504,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               mode: options.mode,
               resourceSuffix: options.resourceSuffix,
               timeoutMs: options.timeoutMs ?? 15000,
+              userQuestions: userQuestionsFor(uid),
             });
             newHandle.launchedImage = targetVer.image;
             await bindRuntimeServices(newHandle, uid);
@@ -2870,6 +2936,38 @@ fs.appendFileSync(p, corruptData);
   let platformUrl = '';
   let platformActualPort = 0;
 
+  // 8a. Jarvis channel: a jarvisd node dials /api/jarvis/runtime with a per-user token.
+  const jarvisRuntimeManager =
+    options.jarvisChannel === false
+      ? undefined
+      : new JarvisRuntimeManager({
+          db: db!,
+          storage: storage!,
+          gateway: deliveryGateway,
+          // The platform API exists once the server is built; Jarvis calls only arrive after it listens.
+          sessionApi: () => platformServer?.platformApi,
+          approvalBridge: getApprovalBridge(),
+          questionBridge: getQuestionBridge(),
+          sessionEvents: sessionEventHub,
+          sessionReader: dockerTurnExecutor as RuntimeSessionReader,
+          fileProvider: demoFileProvider,
+          version: process.env.ENKEEP_VERSION?.trim() || undefined,
+          // The phone's wait per card: long enough for a question (10 min by default); every card
+          // also carries its own expiry, so approval cards still end when their approval does.
+          approvalTimeoutSeconds: () =>
+            Math.max(getApprovalBridge().getApprovalTimeoutMs(), getQuestionBridge().getQuestionTimeoutMs()) / 1000,
+          runtimeSpacesDir: ({ userId, executionMode }) => {
+            if (executionMode !== 'host') return DEFAULT_RUNTIME_SPACES_DIR;
+            const row = db!.prepare('SELECT username FROM users WHERE id = ?').get(userId) as { username?: string } | undefined;
+            return row?.username ? join(paths.dataRoot, 'host-runtimes', row.username, 'spaces') : DEFAULT_RUNTIME_SPACES_DIR;
+          },
+          log: {
+            info: (obj, msg) => console.info(`[jarvis] ${msg ?? ''}`, obj ?? {}),
+            warn: (obj, msg) => console.warn(`[jarvis] ${msg ?? ''}`, obj ?? {}),
+            error: (obj, msg) => console.error(`[jarvis] ${msg ?? ''}`, obj ?? {}),
+          },
+        });
+
   try {
     const firstHandleForRunId = runtimeHandles.values().next().value;
     const demoRunId = firstHandleForRunId?.runId ?? generateRunId();
@@ -2894,7 +2992,9 @@ fs.appendFileSync(p, corruptData);
       mountReconciler: defaultMountReconciler,
       spaceMountService: demoSpaceMountService,
       extensionService: demoExtensionService,
-      externalInteractionService: options.externalInteractionService,
+      approvalBridge: getApprovalBridge(),
+      questionBridge: getQuestionBridge(),
+      ...(jarvisRuntimeManager ? { channelManagers: { jarvis: jarvisRuntimeManager } } : {}),
       cookieSecret: secrets.cookieSecret,
       csrfToken: secrets.csrfToken,
       host,
@@ -2950,6 +3050,10 @@ fs.appendFileSync(p, corruptData);
         await mcpManager.dispose();
       } catch {}
     }
+    if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
+    if (ownsQuestionBridge) questionBridgeInstance?.dispose();
+    jarvisRuntimeManager?.stop();
+    if (ownsSessionEventHub) sessionEventHub.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
     try {
       await storage.close();
@@ -3082,6 +3186,10 @@ fs.appendFileSync(p, corruptData);
       database: db!,
       runtimeHandles,
       hostRuntimeHandles,
+      approvalBridge: getApprovalBridge(),
+      questionBridge: getQuestionBridge(),
+      sessionEventHub,
+      ...(jarvisRuntimeManager ? { jarvisRuntimeManager } : {}),
       connectRuntime: async (userId: string) => {
         const userRecord = await storage!.users.findById(userId);
         if (!userRecord || !userRecord.id) {
@@ -3097,6 +3205,7 @@ fs.appendFileSync(p, corruptData);
           mode: options.mode,
           resourceSuffix: options.resourceSuffix,
           timeoutMs: options.timeoutMs ?? 15000,
+          userQuestions: userQuestionsFor(userRecord.id),
         };
         const handle = await containerAdapter.startUserRuntime(startOpts);
         handle.launchedImage = handle.meta?.image || targetVer.image;
@@ -3215,6 +3324,16 @@ fs.appendFileSync(p, corruptData);
         } catch (err: unknown) {
           allErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
+        jarvisRuntimeManager?.stop();
+        if (ownsApprovalBridge) {
+          approvalBridgeInstance?.dispose();
+        }
+        if (ownsQuestionBridge) {
+          questionBridgeInstance?.dispose();
+        }
+        if (ownsSessionEventHub) {
+          sessionEventHub.dispose();
+        }
 
         try {
           await storage.close();
@@ -3269,6 +3388,10 @@ fs.appendFileSync(p, corruptData);
     } catch (storageErr: unknown) {
       postSetupErrors.push(storageErr instanceof Error ? storageErr : new Error(String(storageErr)));
     }
+    if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
+    if (ownsQuestionBridge) questionBridgeInstance?.dispose();
+    jarvisRuntimeManager?.stop();
+    if (ownsSessionEventHub) sessionEventHub.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
     postSetupErrors.push(...teardownErrs);
     const primary = err instanceof Error ? err : new Error(String(err));

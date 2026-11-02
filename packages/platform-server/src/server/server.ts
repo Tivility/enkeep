@@ -1,4 +1,5 @@
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
+import type { Duplex } from 'node:stream';
 import { createHash, createDecipheriv } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -30,6 +31,7 @@ import {
   API_CACHE_CONTROL_HEADERS,
   MIN_COOKIE_SECRET_LENGTH,
   MIN_CSRF_TOKEN_LENGTH,
+  validateHost,
 } from '../safety/limits.js';
 import { SqliteWebMessageStore } from '../storage/web-messages.js';
 import { PlatformServerMigrationRunner, ALL_PLATFORM_MIGRATIONS } from '../storage/migrations.js';
@@ -92,6 +94,8 @@ import {
   createProfileService,
 } from '../profiles/profile-service.js';
 import type { IExternalInteractionService } from '@enkeep/dsh-external-interaction';
+import type { ApprovalBridge } from '../interactions/approval-bridge.js';
+import type { QuestionBridge } from '../interactions/question-bridge.js';
 import {
   HappyClawMigrationService,
 } from '../imports/happyclaw-migration-service.js';
@@ -121,6 +125,9 @@ import {
 import {
   ChannelManagementService,
   ChannelRoutes,
+  isChannelConnectionEndpoint,
+  type ChannelAccountLifecycle,
+  type ChannelConnectionEndpoint,
 } from '../channels/channel-routes.js';
 import {
   ChannelRuntimeManager,
@@ -245,6 +252,8 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'webhookSecurityOptions',
   'modelSelectionService',
   'externalInteractionService',
+  'approvalBridge',
+  'questionBridge',
   'runtimeProviderRegistry',
   'hostProvider',
   'containerProvider',
@@ -253,6 +262,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'browserService',
   'mcpService',
   'channelService',
+  'channelManagers',
   'channelRoutes',
   'channelRuntimeManager',
   'wechatRuntimeManager',
@@ -406,6 +416,17 @@ export interface PlatformServerOptions {
   modelSelectionService?: ModelSelectionService;
   /** Optional external interaction service for approvals and interactive questions */
   externalInteractionService?: IExternalInteractionService;
+  /**
+   * Host-side bridge of runtime approvals (subscribes to every user's runtime transport).
+   * Backs `/api/interactions/approvals*` when `externalInteractionService` is not given and is
+   * exposed as `server.approvalBridge` for channels (e.g. Jarvis).
+   */
+  approvalBridge?: ApprovalBridge;
+  /**
+   * Host-side bridge of runtime `ask_user_question` questions. Backs `/api/interactions/questions*`
+   * and the gateway's `waitingFor: 'question'`; exposed as `server.questionBridge` for channels.
+   */
+  questionBridge?: QuestionBridge;
   /** Optional runtime provider registry managing multi-mode execution */
   runtimeProviderRegistry?: RuntimeProviderRegistry;
   /** Optional host runtime provider for host mode execution */
@@ -424,6 +445,11 @@ export interface PlatformServerOptions {
   runtimeAutoUpgrader?: RuntimeAutoUpgrader;
   /** Optional channel management service */
   channelService?: ChannelManagementService;
+  /**
+   * Optional runtime managers of non-builtin channel types (e.g. `{ jarvis: manager }`).
+   * Registered on the channel management service; accounts of unregistered types are rejected.
+   */
+  channelManagers?: Readonly<Record<string, ChannelAccountLifecycle>>;
   /** Optional channel management routes */
   channelRoutes?: ChannelRoutes;
   /** Optional channel runtime manager */
@@ -518,6 +544,8 @@ export class PlatformServer {
   public readonly wechatOnboardingService?: WeChatOnboardingService;
   public readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
   public readonly externalInteractionService?: IExternalInteractionService;
+  public readonly approvalBridge?: ApprovalBridge;
+  public readonly questionBridge?: QuestionBridge;
   public readonly mountReconciler?: RuntimeMountReconciler;
   public readonly spaceMountService?: SpaceMountService;
   public readonly browserService?: BrowserService;
@@ -527,6 +555,8 @@ export class PlatformServer {
   public readonly dataRoot?: string;
 
   private activeSockets = new Set<import('node:net').Socket>();
+  /** Channels whose clients dial in over a WebSocket upgrade (e.g. Jarvis), by upgrade path. */
+  private readonly connectionEndpoints: ChannelConnectionEndpoint[] = [];
 
   constructor(options: PlatformServerOptions) {
     if (!options || typeof options !== 'object') {
@@ -812,7 +842,14 @@ export class PlatformServer {
     this.skillCatalogService = skillCatalogService;
     this.instructionsService = instructionsService;
     this.instructionsRoutes = instructionsRoutes;
-    this.externalInteractionService = options.externalInteractionService;
+    this.approvalBridge = options.approvalBridge;
+    this.externalInteractionService = options.externalInteractionService ?? options.approvalBridge;
+    this.questionBridge = options.questionBridge;
+    if (this.questionBridge) {
+      // Sessions waiting for an answer report waitingFor: 'question' (unless the gateway has a source).
+      const gateway = this.runtimeGateway as { setQuestionService?: (service: QuestionBridge) => void } | undefined;
+      gateway?.setQuestionService?.(this.questionBridge);
+    }
 
     this.mountReconciler = options.mountReconciler;
     this.spaceMountService =
@@ -872,6 +909,14 @@ export class PlatformServer {
     this.channelService =
       options.channelService ??
       new ChannelManagementService(this.storage, undefined);
+    if (options.channelManagers) {
+      for (const [type, manager] of Object.entries(options.channelManagers)) {
+        this.channelService.registerManager(type, manager);
+        if (isChannelConnectionEndpoint(manager) && !this.connectionEndpoints.includes(manager)) {
+          this.connectionEndpoints.push(manager);
+        }
+      }
+    }
 
     let defaultSpaceResolver = options.larkDefaultSpaceResolver;
 
@@ -1145,7 +1190,8 @@ export class PlatformServer {
       modelSelectionService: this.modelSelectionService,
       sessionLifecycleService: this.sessionLifecycleService,
       runtimeArtifactPort: this.runtimeArtifactPort,
-      externalInteractionService: options.externalInteractionService,
+      externalInteractionService: this.externalInteractionService,
+      questionBridge: this.questionBridge,
       spaceMountService: this.spaceMountService,
       browserService: this.browserService,
       mcpService: this.mcpService,
@@ -1297,6 +1343,11 @@ export class PlatformServer {
       });
     });
 
+    // WebSocket upgrades: only channel endpoints (e.g. /api/jarvis/runtime), after Host validation.
+    server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+      void this.handleUpgrade(req, socket, head);
+    });
+
     let workerStarted = false;
     let listenerBound = false;
 
@@ -1406,6 +1457,11 @@ export class PlatformServer {
         await this.wechatRuntimeManager.start();
       }
 
+      // 5.65 Start channel connection endpoints (e.g. Jarvis)
+      for (const endpoint of this.connectionEndpoints) {
+        await endpoint.start?.();
+      }
+
       // 5.7 Start Runtime Auto-Upgrader
       if (this.runtimeAutoUpgrader) {
         this.runtimeAutoUpgrader.start();
@@ -1454,6 +1510,7 @@ export class PlatformServer {
       }
 
       // Roll back channel runtime managers if started
+      await this.stopConnectionEndpoints(rollbackErrors);
       if (this.wechatRuntimeManager) {
         try {
           await this.wechatRuntimeManager.stop();
@@ -1604,6 +1661,7 @@ export class PlatformServer {
       }
 
       // 2.5 Stop channel runtime manager
+      await this.stopConnectionEndpoints(errors);
       if (this.channelRuntimeManager) {
         try {
           await this.channelRuntimeManager.stop();
@@ -1717,6 +1775,51 @@ export class PlatformServer {
     }
   }
 
+  /**
+   * One HTTP upgrade request. Only paths of registered channel endpoints are upgraded, and only
+   * after the same Host/socket authority validation as every HTTP request; anything else is
+   * answered with a plain HTTP error and the socket is destroyed.
+   */
+  private async handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    const onError = () => {};
+    socket.on('error', onError);
+    let pathname = '';
+    try {
+      pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    } catch {
+      pathname = '';
+    }
+    const endpoint = this.connectionEndpoints.find((e) => e.upgradePath === pathname);
+    if (!endpoint || !this.isRunning) {
+      refuseUpgrade(socket, endpoint ? 503 : 404);
+      return;
+    }
+    try {
+      validateHost(req);
+    } catch (err) {
+      const status = err instanceof PlatformError && err.status >= 400 && err.status < 500 ? err.status : 403;
+      refuseUpgrade(socket, status);
+      return;
+    }
+    socket.off('error', onError);
+    try {
+      await endpoint.handleUpgrade(req, socket, head);
+    } catch {
+      if (socket.listenerCount('error') === 0) socket.on('error', onError);
+      refuseUpgrade(socket, 500);
+    }
+  }
+
+  private async stopConnectionEndpoints(errors: Error[]): Promise<void> {
+    for (const endpoint of this.connectionEndpoints) {
+      try {
+        await endpoint.stop();
+      } catch (err: unknown) {
+        errors.push(err instanceof Error ? err : new Error('Channel connection endpoint stop failed', { cause: err }));
+      }
+    }
+  }
+
   getPort(): number {
     if (!this.server || !this.isRunning) {
       return this.requestedPort;
@@ -1732,6 +1835,26 @@ export class PlatformServer {
     const port = this.getPort();
     return `http://${this.host}:${port}`;
   }
+}
+
+const UPGRADE_STATUS_TEXT: Record<number, string> = {
+  400: 'Bad Request',
+  403: 'Forbidden',
+  404: 'Not Found',
+  421: 'Misdirected Request',
+  500: 'Internal Server Error',
+  503: 'Service Unavailable',
+};
+
+/** Answer an upgrade request with a plain HTTP error and close the socket. */
+function refuseUpgrade(socket: Duplex, status: number): void {
+  if (socket.destroyed) return;
+  const text = UPGRADE_STATUS_TEXT[status] ?? 'Error';
+  const body = `${text}\n`;
+  socket.once('finish', () => socket.destroy());
+  socket.end(
+    `HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
+  );
 }
 
 /**

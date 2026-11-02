@@ -215,10 +215,10 @@ describe('dsh-external-interaction', () => {
       expect(pending.length).toBe(1);
       expect(pending[0].questions[0].id).toBe('q1');
 
-      service.answerQuestion(pending[0].id, { q1: 'Docker' });
+      expect(service.answerQuestion(pending[0].id, [{ id: 'q1', selected: ['Docker'] }])).toBe(true);
 
       const res = await promise;
-      expect(res.answers).toEqual([{ id: 'q1', answer: 'Docker' }]);
+      expect(res).toEqual({ outcome: 'answered', questionId: pending[0].id, answers: [{ id: 'q1', selected: ['Docker'] }] });
       expect(service.listPendingQuestions().length).toBe(0);
     });
 
@@ -236,7 +236,7 @@ describe('dsh-external-interaction', () => {
 
       service.cancelQuestion(pending[0].id, 'Aborted by operator');
 
-      await expect(promise).rejects.toThrow('Aborted by operator');
+      await expect(promise).resolves.toEqual({ outcome: 'cancelled', questionId: pending[0].id, reason: 'Aborted by operator' });
     });
   });
 

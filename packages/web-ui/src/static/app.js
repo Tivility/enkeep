@@ -1427,6 +1427,7 @@ const state = {
   filesSpacePaths: {},
   // Approvals & Interactions State
   pendingApprovals: [],
+  pendingQuestions: [],
   approvalsPollTimer: null,
   // Skills / Extensions Governance Filter State
   activeExtensionFilterKind: 'all',
@@ -8812,12 +8813,20 @@ function updateApprovalBadges(approvals) {
   }
   const effectiveApprovals = Array.isArray(approvals) ? approvals : (state.pendingApprovals || []);
   const pendingCount = effectiveApprovals.filter((a) => a.status === 'pending').length;
+  const questionCount = (state.pendingQuestions || []).filter((q) => q.status === 'pending').length;
   const chatApprovalBtn = document.getElementById('btn-chat-approvals');
 
   if (chatApprovalBtn) {
-    if (pendingCount > 0) {
+    if (pendingCount > 0 || questionCount > 0) {
+      const parts = [];
+      if (pendingCount > 0) {
+        parts.push(`⚠️ ${t('approvals.headerPendingCount', { count: pendingCount }, `${pendingCount} Pending Approvals`)}`);
+      }
+      if (questionCount > 0) {
+        parts.push(`❓ ${t('approvals.questionsPendingCount', { count: questionCount }, `${questionCount} questions waiting`)}`);
+      }
       chatApprovalBtn.classList.remove('hidden');
-      chatApprovalBtn.textContent = `⚠️ ${t('approvals.headerPendingCount', { count: pendingCount }, `${pendingCount} Pending Approvals`)}`;
+      chatApprovalBtn.textContent = parts.join(' · ');
     } else {
       chatApprovalBtn.classList.add('hidden');
     }
@@ -8833,6 +8842,7 @@ async function openApprovalsModal(sessionIdFilter) {
   }
   openModal('modal-approvals');
 
+  await fetchPendingQuestions(sessionIdFilter || state.currentSessionId);
   const approvals = await fetchPendingApprovals(sessionIdFilter || state.currentSessionId);
   if (contentEl) {
     renderApprovalsList(contentEl, approvals);
@@ -8843,7 +8853,8 @@ function renderApprovalsList(container, approvals) {
   container.replaceChildren();
 
   const pending = (approvals || []).filter((a) => a.status === 'pending');
-  if (pending.length === 0) {
+  const questions = (state.pendingQuestions || []).filter((q) => q.status === 'pending');
+  if (pending.length === 0 && questions.length === 0) {
     container.appendChild(createStateCard('approvals.emptyTitle', 'approvals.emptyDesc'));
     return;
   }
@@ -8929,6 +8940,9 @@ function renderApprovalsList(container, approvals) {
     card.appendChild(actions);
     container.appendChild(card);
   });
+
+  // Questions the agent asked (ask_user_question) wait here too, after the approvals.
+  questions.forEach((q) => container.appendChild(renderQuestionCard(q, container)));
 }
 
 async function decideApproval(approvalId, outcome, container) {
@@ -8942,7 +8956,7 @@ async function decideApproval(approvalId, outcome, container) {
     showToast(outcome === 'allowed-once' ? t('approvals.allowSuccess', null, 'Tool execution allowed.') : t('approvals.rejectSuccess', null, 'Tool execution rejected.'), 'success');
     const fresh = await fetchPendingApprovals(state.currentSessionId);
     if (container) renderApprovalsList(container, fresh);
-    if (fresh.length === 0) closeModal('modal-approvals');
+    if (fresh.length === 0 && (state.pendingQuestions || []).length === 0) closeModal('modal-approvals');
   } catch (err) {
     showToast(getSafeErrorMessage(err, 'Failed to decide approval.'), 'error');
   }
@@ -8959,10 +8973,159 @@ async function cancelApproval(approvalId, reason, container) {
     showToast(t('approvals.cancelSuccess', null, 'Approval request cancelled.'), 'info');
     const fresh = await fetchPendingApprovals(state.currentSessionId);
     if (container) renderApprovalsList(container, fresh);
-    if (fresh.length === 0) closeModal('modal-approvals');
+    if (fresh.length === 0 && (state.pendingQuestions || []).length === 0) closeModal('modal-approvals');
   } catch (err) {
     showToast(getSafeErrorMessage(err, 'Failed to cancel approval.'), 'error');
   }
+}
+
+/**
+ * ==========================================================================
+ * USER QUESTIONS (GET/POST /api/interactions/questions/*): ask_user_question
+ * ==========================================================================
+ */
+
+async function fetchPendingQuestions(sessionIdFilter) {
+  try {
+    const params = new URLSearchParams();
+    if (sessionIdFilter) params.append('sessionId', sessionIdFilter);
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await apiRequest(`/api/interactions/questions${query}`);
+    const raw = res && res.data;
+    state.pendingQuestions = Array.isArray(raw) ? raw : [];
+  } catch {
+    state.pendingQuestions = [];
+  }
+  return state.pendingQuestions;
+}
+
+/**
+ * The answers of one question card: per question, the chosen option labels and the user's own
+ * words (`{ id, selected, custom? }`); a question with neither is skipped.
+ */
+function buildQuestionAnswers(question, choices) {
+  const answers = [];
+  for (const q of (question && Array.isArray(question.questions) ? question.questions : [])) {
+    const choice = (choices && choices[q.id]) || {};
+    const offered = new Set((q.options || []).map((o) => o.label));
+    let selected = Array.isArray(choice.selected) ? choice.selected.filter((label) => offered.has(label)) : [];
+    if (!q.multiSelect) selected = selected.slice(0, 1);
+    const custom = typeof choice.custom === 'string' ? choice.custom.trim() : '';
+    if (selected.length === 0 && !custom) continue;
+    answers.push(custom ? { id: q.id, selected, custom } : { id: q.id, selected });
+  }
+  return answers;
+}
+
+function renderQuestionCard(question, container) {
+  const card = document.createElement('div');
+  card.className = 'approval-card question-card';
+
+  const header = document.createElement('div');
+  header.className = 'approval-header';
+  const title = document.createElement('span');
+  title.className = 'approval-tool-name';
+  title.textContent = t('approvals.questionCardTitle', null, 'Question from the agent');
+  header.appendChild(title);
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'text-muted text-xs';
+  timeSpan.textContent = question.expiresAt
+    ? t('approvals.questionExpiresAt', { time: formatDate(question.expiresAt) }, `Waits until ${formatDate(question.expiresAt)}`)
+    : '';
+  header.appendChild(timeSpan);
+  card.appendChild(header);
+
+  const choices = {};
+  (question.questions || []).forEach((q) => {
+    const choice = { selected: [], custom: '' };
+    choices[q.id] = choice;
+
+    const block = document.createElement('div');
+    block.className = 'question-block';
+    if (q.header) {
+      const h = document.createElement('div');
+      h.className = 'question-header text-xs text-muted';
+      h.textContent = q.header;
+      block.appendChild(h);
+    }
+    const text = document.createElement('div');
+    text.className = 'approval-summary question-text';
+    text.textContent = q.question;
+    block.appendChild(text);
+
+    if (Array.isArray(q.options) && q.options.length > 0) {
+      const options = document.createElement('div');
+      options.className = 'question-options';
+      q.options.forEach((opt) => {
+        const label = document.createElement('label');
+        label.className = 'question-option';
+        const input = document.createElement('input');
+        input.type = q.multiSelect ? 'checkbox' : 'radio';
+        input.name = `question-${question.id}-${q.id}`;
+        input.value = opt.label;
+        input.addEventListener('change', () => {
+          if (q.multiSelect) {
+            choice.selected = input.checked
+              ? [...choice.selected.filter((l) => l !== opt.label), opt.label]
+              : choice.selected.filter((l) => l !== opt.label);
+          } else if (input.checked) {
+            choice.selected = [opt.label];
+          }
+        });
+        label.appendChild(input);
+        const span = document.createElement('span');
+        span.textContent = opt.description ? `${opt.label} — ${opt.description}` : opt.label;
+        label.appendChild(span);
+        options.appendChild(label);
+      });
+      block.appendChild(options);
+    }
+
+    const custom = document.createElement('textarea');
+    custom.className = 'question-custom';
+    custom.rows = 2;
+    custom.maxLength = 8000;
+    custom.placeholder = t('approvals.questionCustomPlaceholder', null, 'Your own answer (optional)');
+    custom.addEventListener('input', () => {
+      choice.custom = custom.value;
+    });
+    block.appendChild(custom);
+    card.appendChild(block);
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+  const btnSubmit = document.createElement('button');
+  btnSubmit.type = 'button';
+  btnSubmit.className = 'btn btn-primary btn-sm';
+  btnSubmit.textContent = t('approvals.questionBtnSubmit', null, 'Send answer');
+  btnSubmit.addEventListener('click', async () => {
+    btnSubmit.disabled = true;
+    try {
+      await submitQuestionAnswer(question.id, buildQuestionAnswers(question, choices), container);
+    } finally {
+      btnSubmit.disabled = false;
+    }
+  });
+  actions.appendChild(btnSubmit);
+  card.appendChild(actions);
+  return card;
+}
+
+async function submitQuestionAnswer(questionId, answers, container) {
+  try {
+    await apiRequest(`/api/interactions/questions/${encodeURIComponent(questionId)}/answer`, {
+      method: 'POST',
+      body: { answers },
+    });
+    showToast(t('approvals.questionAnswerSuccess', null, 'Answer sent.'), 'success');
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, 'Failed to send the answer.'), 'error');
+  }
+  await fetchPendingQuestions(state.currentSessionId);
+  const fresh = await fetchPendingApprovals(state.currentSessionId);
+  if (container) renderApprovalsList(container, fresh);
+  if (fresh.length === 0 && (state.pendingQuestions || []).length === 0) closeModal('modal-approvals');
 }
 
 /**
@@ -10245,6 +10408,275 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
   openModal('modal-channel-onboarding');
 }
 
+// 2.8b Jarvis channel card: create (token shown once), rotate token, delete.
+function jarvisDaemonsJsonExample() {
+  const port = (window.location && window.location.port) ? window.location.port : "<port>";
+  return JSON.stringify({
+    daemons: [{
+      id: "enkeep",
+      name: "Enkeep",
+      agent: "dsh",
+      launcher: "enkeep",
+      url: "ws://127.0.0.1:" + port + "/api/jarvis/runtime",
+      token_file: "<token-file>",
+    }],
+  }, null, 2);
+}
+
+function renderJarvisTokenPanel(token) {
+  const panel = document.createElement("div");
+  panel.className = "jarvis-token-panel";
+
+  const warn = document.createElement("p");
+  warn.className = "jarvis-token-warning";
+  warn.textContent = "这个 token 只显示这一次。请把它保存到本机的一个文件里（下面示例中的 <token-file>，建议权限 600），不要发给别人。";
+  panel.appendChild(warn);
+
+  const row = document.createElement("div");
+  row.className = "jarvis-token-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.readOnly = true;
+  input.className = "form-control form-control-sm jarvis-token-value";
+  input.value = token;
+  input.addEventListener("focus", () => input.select());
+  row.appendChild(input);
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "btn btn-secondary btn-sm jarvis-token-copy";
+  copyBtn.textContent = "复制";
+  copyBtn.addEventListener("click", () => {
+    const done = () => showToast("已复制 token", "success");
+    if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(token).then(done).catch(() => {
+        input.select();
+        showToast("复制失败，请手动复制", "error");
+      });
+    } else {
+      input.select();
+      try {
+        document.execCommand("copy");
+        done();
+      } catch (err) {
+        showToast("复制失败，请手动复制", "error");
+      }
+    }
+  });
+  row.appendChild(copyBtn);
+  panel.appendChild(row);
+
+  const hint = document.createElement("p");
+  hint.className = "jarvis-token-hint";
+  hint.textContent = "在运行 jarvisd 的同一台电脑上，把下面这段加入 ~/.jarvis/daemons.json。jarvisd node 大约 10 秒内会自动读到并连上，不需要重启：";
+  panel.appendChild(hint);
+
+  const pre = document.createElement("pre");
+  pre.className = "jarvis-daemons-example";
+  pre.textContent = jarvisDaemonsJsonExample();
+  panel.appendChild(pre);
+  return panel;
+}
+
+// Connection status text of a Jarvis account (`account.jarvis` from the channel account API).
+function jarvisStatusSummary(status, fmt) {
+  const s = status && typeof status === "object" ? status : {};
+  const connected = s.connected === true;
+  const text = connected
+    ? (s.connectedAt ? "已连接（自 " + fmt(s.connectedAt) + "）" : "已连接")
+    : "未连接";
+  const details = [];
+  if (s.lastUsedAt) details.push("最近使用：" + fmt(s.lastUsedAt));
+  if (s.tokenCreatedAt) details.push("token 创建于：" + fmt(s.tokenCreatedAt));
+  return { connected, text, details };
+}
+
+function renderJarvisStatusLine(status) {
+  const summary = jarvisStatusSummary(status, (value) => formatDate(value));
+  const line = document.createElement("div");
+  line.className = "jarvis-status";
+  const main = document.createElement("span");
+  main.className = "jarvis-status-main";
+  const dot = document.createElement("span");
+  dot.className = "jarvis-status-dot" + (summary.connected ? " is-connected" : "");
+  dot.setAttribute("aria-hidden", "true");
+  main.appendChild(dot);
+  const text = document.createElement("span");
+  text.className = "jarvis-status-text";
+  text.textContent = summary.text;
+  main.appendChild(text);
+  line.appendChild(main);
+  summary.details.forEach((detail) => {
+    const item = document.createElement("span");
+    item.className = "jarvis-status-detail";
+    item.textContent = detail;
+    line.appendChild(item);
+  });
+  return line;
+}
+
+function renderJarvisChannelCard(account, isAdminUser) {
+  const card = document.createElement("div");
+  card.className = "channel-account-card jarvis-channel-card";
+
+  const header = document.createElement("div");
+  header.className = "channel-account-header";
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "channel-account-title";
+  const name = document.createElement("span");
+  name.className = "channel-provider-name";
+  name.textContent = "Jarvis";
+  titleWrap.appendChild(name);
+  header.appendChild(titleWrap);
+  if (account) {
+    const active = account.status === "active";
+    header.appendChild(createBadgeElement(active ? "已启用" : "已停用", active ? "success" : "neutral"));
+  }
+  card.appendChild(header);
+
+  const body = document.createElement("div");
+  body.className = "channel-account-body";
+  const desc = document.createElement("p");
+  desc.className = "channel-trigger-hint";
+  desc.textContent = account
+    ? "本机的 jarvisd 用 token 连接 enkeep，在手机和手表上查看你的会话、发消息、批准工具调用。重新生成 token 后，旧 token 立即失效，已有连接会断开。"
+    : "启用后会生成一个 token，本机的 jarvisd 用它连接 enkeep，在手机和手表上查看你的会话、发消息、批准工具调用。";
+  body.appendChild(desc);
+
+  // Connection status (`account.jarvis`); the 刷新 button reloads it in place, no timers.
+  let refreshStatus = async () => {};
+  if (account && account.jarvis && typeof account.jarvis === "object") {
+    const statusRow = document.createElement("div");
+    statusRow.className = "jarvis-status-row";
+    const statusSlot = document.createElement("div");
+    statusSlot.className = "jarvis-status-slot";
+    statusSlot.appendChild(renderJarvisStatusLine(account.jarvis));
+    statusRow.appendChild(statusSlot);
+
+    const refreshBtn = document.createElement("button");
+    refreshBtn.type = "button";
+    refreshBtn.className = "btn btn-secondary btn-sm jarvis-status-refresh";
+    refreshBtn.textContent = "刷新";
+    refreshStatus = async (quiet) => {
+      refreshBtn.disabled = true;
+      try {
+        const res = await apiRequest("/api/manage/channels/accounts?type=jarvis");
+        const list = res && res.data && Array.isArray(res.data.accounts) ? res.data.accounts : [];
+        const fresh = list.find((a) => a.id === account.id);
+        if (!fresh) {
+          if (!quiet) await renderManagementView("management/workspaces/channels");
+          return;
+        }
+        statusSlot.replaceChildren(renderJarvisStatusLine(fresh.jarvis));
+      } catch (err) {
+        if (!quiet) showToast(err.message || "刷新失败", "error");
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    };
+    refreshBtn.addEventListener("click", () => refreshStatus(false));
+    statusRow.appendChild(refreshBtn);
+    body.appendChild(statusRow);
+  }
+
+  const tokenSlot = document.createElement("div");
+  tokenSlot.className = "jarvis-token-slot";
+
+  const actions = document.createElement("div");
+  actions.className = "channel-acc-actions";
+
+  const showToken = (token) => {
+    tokenSlot.replaceChildren(renderJarvisTokenPanel(token));
+    const doneBtn = document.createElement("button");
+    doneBtn.type = "button";
+    doneBtn.className = "btn btn-primary btn-sm jarvis-token-done";
+    doneBtn.textContent = "我已保存";
+    doneBtn.addEventListener("click", () => renderManagementView("management/workspaces/channels"));
+    tokenSlot.appendChild(doneBtn);
+  };
+
+  if (!account) {
+    if (isAdminUser) {
+      const createBtn = document.createElement("button");
+      createBtn.type = "button";
+      createBtn.className = "btn btn-primary btn-sm jarvis-create-btn";
+      createBtn.textContent = "启用 Jarvis";
+      createBtn.addEventListener("click", async () => {
+        createBtn.disabled = true;
+        try {
+          const res = await apiRequest("/api/manage/channels/accounts", { method: "POST", body: { type: "jarvis" } });
+          const token = res && res.data ? res.data.token : null;
+          if (!token) throw new Error("没有收到 token");
+          showToast("Jarvis 已启用", "success");
+          actions.replaceChildren();
+          showToken(token);
+        } catch (err) {
+          createBtn.disabled = false;
+          showToast(err.message || "启用 Jarvis 失败", "error");
+        }
+      });
+      actions.appendChild(createBtn);
+    }
+  } else {
+    if (isAdminUser) {
+      const rotateBtn = document.createElement("button");
+      rotateBtn.type = "button";
+      rotateBtn.className = "btn btn-secondary btn-sm jarvis-rotate-btn";
+      rotateBtn.textContent = "重新生成 token";
+      rotateBtn.addEventListener("click", async () => {
+        const ok = await showConfirmDialog("重新生成 Jarvis token", "旧 token 会立即失效，正在连接的 jarvisd 会断开。确定继续吗？");
+        if (!ok) return;
+        rotateBtn.disabled = true;
+        try {
+          const res = await apiRequest("/api/manage/channels/accounts/" + encodeURIComponent(account.id) + "/token", { method: "POST", body: {} });
+          const token = res && res.data ? res.data.token : null;
+          if (!token) throw new Error("没有收到 token");
+          showToast("已生成新 token", "success");
+          showToken(token);
+          void refreshStatus(true);
+        } catch (err) {
+          showToast(err.message || "重新生成 token 失败", "error");
+        } finally {
+          rotateBtn.disabled = false;
+        }
+      });
+      actions.appendChild(rotateBtn);
+    }
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "btn btn-secondary btn-sm jarvis-delete-btn";
+    delBtn.textContent = "删除";
+    delBtn.addEventListener("click", async () => {
+      const ok = await showConfirmDialog("删除 Jarvis", "删除后 token 立即失效，jarvisd 会断开连接。确定删除吗？");
+      if (!ok) return;
+      try {
+        await apiRequest("/api/manage/channels/accounts/" + encodeURIComponent(account.id), { method: "DELETE" });
+        showToast("Jarvis 已删除", "success");
+        await renderManagementView("management/workspaces/channels");
+      } catch (err) {
+        showToast(err.message || "删除 Jarvis 失败", "error");
+      }
+    });
+    actions.appendChild(delBtn);
+  }
+
+  body.appendChild(actions);
+  body.appendChild(tokenSlot);
+  card.appendChild(body);
+
+  const section = document.createElement("div");
+  section.className = "management-section jarvis-channel-section";
+  const sectionHeader = document.createElement("div");
+  sectionHeader.className = "section-header";
+  const sectionTitle = document.createElement("h3");
+  sectionTitle.textContent = "Jarvis";
+  sectionHeader.appendChild(sectionTitle);
+  section.appendChild(sectionHeader);
+  section.appendChild(card);
+  return section;
+}
+
 // 2.9 Channels View (GET/POST/DELETE /api/manage/channels/accounts & bindings)
 async function renderChannelsView(container) {
   let accounts = [];
@@ -10301,6 +10733,14 @@ async function renderChannelsView(container) {
   toolbarSection.appendChild(btnCreateNew);
   container.appendChild(toolbarSection);
 
+  // ──────── Jarvis (admins; one account per user, connected by the local jarvisd) ────────
+  const jarvisAccount = accounts.find((a) => a.type === "jarvis") || null;
+  const isAdminUser = Boolean(state.currentUser && state.currentUser.role === "admin");
+  if (isAdminUser || jarvisAccount) {
+    container.appendChild(renderJarvisChannelCard(jarvisAccount, isAdminUser));
+  }
+  accounts = accounts.filter((a) => a.type !== "jarvis");
+
   // ──────── Accounts Section (Cards) ────────
   const accSection = document.createElement("div");
   accSection.className = "management-section";
@@ -10337,6 +10777,8 @@ async function renderChannelsView(container) {
         providerSpan.textContent = getLocale() === "zh-CN" ? "微信 / WeChat" : "WeChat";
       } else if (acc.type === "dingtalk") {
         providerSpan.textContent = getLocale() === "zh-CN" ? "钉钉 / DingTalk" : "DingTalk";
+      } else if (acc.type === "jarvis") {
+        providerSpan.textContent = "Jarvis";
       } else {
         providerSpan.textContent = acc.type || "Unknown";
       }
@@ -14781,6 +15223,8 @@ const CHAT_I18N_EN = {
   'chat.channelDiscordAria': 'Source: Discord',
   'chat.channelGeneric': 'Channel',
   'chat.channelGenericAria': 'Source: Channel',
+  'chat.channelJarvis': 'Jarvis',
+  'chat.channelJarvisAria': 'Source: Jarvis',
   'chat.channelLark': 'Lark',
   'chat.channelLarkAria': 'Source: Lark',
   'chat.channelQQ': 'QQ',
@@ -15033,6 +15477,8 @@ const CHAT_I18N_ZH = {
   'chat.channelDiscordAria': '来源：Discord',
   'chat.channelGeneric': '渠道',
   'chat.channelGenericAria': '来源：渠道',
+  'chat.channelJarvis': 'Jarvis',
+  'chat.channelJarvisAria': '来源：Jarvis',
   'chat.channelLark': '飞书',
   'chat.channelLarkAria': '来源：飞书',
   'chat.channelQQ': 'QQ',
@@ -15387,6 +15833,12 @@ function updateTurnStatusBadge(optionalApprovals = null) {
     turnBadge.classList.remove('hidden');
     turnBadge.className = 'badge badge-warning';
     turnBadge.textContent = t('approvals.chatWaitingBadge', null, 'Waiting Approval');
+    return;
+  }
+  if ((state.pendingQuestions || []).some((q) => q.status === 'pending')) {
+    turnBadge.classList.remove('hidden');
+    turnBadge.className = 'badge badge-warning';
+    turnBadge.textContent = t('approvals.questionWaitingBadge', null, 'Waiting for your answer');
     return;
   }
 
@@ -17302,6 +17754,13 @@ function getSessionSourceBadgeInfo(session) {
         type: 'wechat',
         label: tr('chat.channelWeChat', null, 'WeChat'),
         ariaLabel: tr('chat.channelWeChatAria', null, 'Source: WeChat'),
+      };
+    }
+    if (rawChannel === 'jarvis') {
+      return {
+        type: 'jarvis',
+        label: tr('chat.channelJarvis', null, 'Jarvis'),
+        ariaLabel: tr('chat.channelJarvisAria', null, 'Source: Jarvis'),
       };
     }
     if (rawChannel === 'qq') {
@@ -21819,7 +22278,8 @@ async function pollEvents(sessionId) {
     // Synchronize queued turns for session
     await fetchQueuedTurns(sessionId);
 
-    // Synchronize pending approvals for session/turn
+    // Synchronize pending questions and approvals for session/turn (the badges count both)
+    await fetchPendingQuestions(sessionId);
     await fetchPendingApprovals(sessionId);
   } catch (err) {
     state.consecutivePollingFailures += 1;

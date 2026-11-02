@@ -587,6 +587,67 @@ export type {
   RuntimeMountResolver,
 } from '@enkeep/platform-core';
 
+// Runtime approvals bridge (host side of in-container approvals)
+export {
+  ApprovalBridge,
+  type ApprovalBridgeOptions,
+  type ApprovalBridgeEventMap,
+  type ApprovalBridgeLogger,
+  type ApprovalAskedEvent,
+  type ApprovalSettledEvent,
+  type ApprovalSettledOutcome,
+  type ApprovalSettledSource,
+  type ApprovalDecision,
+  type ApprovalDecisionOptions,
+  type ApprovalDecisionResult,
+  type ApprovalRuntimeTransport,
+  type BridgedApproval,
+  type PendingApprovalView,
+} from './interactions/approval-bridge.js';
+
+// Runtime ask_user_question bridge (host side of in-container user questions)
+export {
+  QuestionBridge,
+  toPendingQuestionView,
+  type QuestionBridgeOptions,
+  type QuestionBridgeEventMap,
+  type QuestionBridgeLogger,
+  type QuestionAskedEvent,
+  type QuestionSettledEvent,
+  type QuestionSettledOutcome,
+  type QuestionSettledSource,
+  type QuestionAnswerOptions,
+  type QuestionAnswerResult,
+  type QuestionAnswerStatus,
+  type QuestionRuntimeTransport,
+  type BridgedQuestion,
+  type PendingQuestionView,
+} from './interactions/question-bridge.js';
+
+// Live DSH session streams of the user runtimes (turn/event, turn/chunk)
+export {
+  RuntimeSessionEventHub,
+  type RuntimeSessionEventHubOptions,
+  type RuntimeSessionEventListener,
+  type HubSessionEvent,
+  type HubTurnChunk,
+  type HubRuntimeChange,
+  type SessionEventRuntimeTransport,
+} from './runtime/session-event-hub.js';
+export type {
+  RuntimeSessionReader,
+  RuntimeQuestionStatusSource,
+  CurrentTurnStatus,
+  RuntimeSessionEventsQuery,
+  RuntimeSessionEventsPage,
+  RuntimeSessionEvent,
+  RuntimeAttachmentQuery,
+  RuntimeAttachmentData,
+} from './runtime/delivery-gateway.js';
+
+// Jarvis channel
+export * from './channels/jarvis/index.js';
+
 // Channel Management & Routes
 export {
   ChannelManagementService,
@@ -596,6 +657,10 @@ export {
   ALLOWED_CHANNEL_BINDING_CREATE_KEYS,
   ALLOWED_CHANNEL_BINDING_UPDATE_KEYS,
   ALLOWED_ONBOARDING_JOB_CREATE_KEYS,
+  BUILTIN_CHANNEL_ACCOUNT_TYPES,
+  isChannelConnectionEndpoint,
+  type ChannelAccountLifecycle,
+  type ChannelConnectionEndpoint,
 } from './channels/channel-routes.js';
 export {
   ChannelRuntimeManager,

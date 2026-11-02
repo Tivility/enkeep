@@ -206,6 +206,11 @@ export interface RuntimeContainerPort {
     browserService?: import('@enkeep/platform-core').BrowserService;
     networkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
     mounts?: readonly import('@enkeep/platform-core').RuntimeMountSpec[];
+    /**
+     * Offer the agent `ask_user_question` (ENKEEP_USER_QUESTIONS=1 in this runtime). Unset: the
+     * platform process's ENKEEP_USER_QUESTIONS applies. Takes effect when the runtime is created.
+     */
+    userQuestions?: boolean;
   }): Promise<UserRuntimeHandle>;
   connectUserRuntime?(options: {
     userId: 'alice' | 'bob' | string;
@@ -697,6 +702,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
     llmEnabled?: boolean;
     networkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
     mounts?: readonly import('@enkeep/platform-core').RuntimeMountSpec[];
+    userQuestions?: boolean;
   }): Promise<UserRuntimeHandle> {
     const pathOptions: DemoPathOptions = {
       repoRoot: options.repoRoot,
@@ -904,6 +910,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
       llmProvider,
       llmModel,
       llmProviders: inContainerProviders,
+      ...(options.userQuestions !== undefined ? { userQuestions: options.userQuestions } : {}),
     });
     if (options.mounts && options.mounts.length > 0) {
       spec.mounts = [...options.mounts];
@@ -1261,6 +1268,7 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
     platformProxyOptions?: import('@enkeep/runtime-runner').PlatformProxyOptions;
     platformProxyHandler?: import('@enkeep/runtime-runner').PlatformProxyHandler;
     mounts?: readonly import('@enkeep/platform-core').RuntimeMountSpec[];
+    userQuestions?: boolean;
   }): Promise<UserRuntimeHandle> {
     const pathOptions: DemoPathOptions = {
       repoRoot: options.repoRoot,
@@ -1338,6 +1346,7 @@ export class HostRuntimePortAdapter implements RuntimeContainerPort {
             )
           : undefined,
       mounts: options.mounts ? [...options.mounts] : undefined,
+      ...(options.userQuestions !== undefined ? { userQuestions: options.userQuestions } : {}),
     });
 
     let activeHandle: ActiveRuntimeHandle;

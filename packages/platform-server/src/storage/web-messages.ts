@@ -189,6 +189,24 @@ export type WebEventRecord =
   | WebStatusEventRecord
   | WebErrorEventRecord;
 
+/**
+ * Event types returned by pollEvents. Other rows in web_events (legacy or internal markers such as
+ * `session_recovery_required`) are skipped by the poller instead of failing it.
+ */
+export const PUBLIC_WEB_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'message',
+  'assistant_delta',
+  'assistant_stream_end',
+  'thinking',
+  'reasoning_delta',
+  'tool_status',
+  'turn_status',
+  'turn_failed',
+  'turn_cancelled',
+  'status_update',
+  'error',
+]);
+
 export const SAFE_TOOL_NAMES = new Set([
   'send_platform_message',
   'send_message',
@@ -2234,6 +2252,11 @@ export class SqliteWebMessageStore {
         throw new PlatformError('Corrupted web_events row in database', 'DATABASE_CORRUPTED', 500);
       }
 
+      if (!PUBLIC_WEB_EVENT_TYPES.has(r.type)) {
+        // Unknown or legacy type: not part of the public stream (see the switch default below).
+        continue;
+      }
+
       let parsedPayload: Record<string, unknown>;
       try {
         const json = JSON.parse(r.payload);
@@ -2372,7 +2395,11 @@ export class SqliteWebMessageStore {
           break;
         }
         default:
-          throw new PlatformError(`Corrupted web_events row: unknown type ${r.type}`, 'DATABASE_CORRUPTED', 500);
+          // Unknown or legacy event types (e.g. `session_recovery_required`, whose information is
+          // already carried by the `turn_failed` RECOVERY_REQUIRED event of the same turn) are not
+          // part of the public stream. Skip them instead of failing the poll, so the Web UI keeps
+          // polling; the cursor still advances past them below.
+          continue;
       }
 
       events.push(record);
@@ -2380,14 +2407,15 @@ export class SqliteWebMessageStore {
 
     let nextCursor: string | null = null;
     if (selectedRows.length > 0) {
+      // Cursor follows the last scanned row (not the last emitted event) so skipped rows are not re-read.
       const lastRow = selectedRows[selectedRows.length - 1];
-      const lastEvent = events[events.length - 1];
       nextCursor = encodeOpaqueCursor({
         v: 2,
         kind: 'event',
-        id: lastEvent.id,
+        // Every scanned row passed the string checks at the top of the loop.
+        id: lastRow.id as string,
         seq: Number(lastRow.rowid),
-        createdAt: lastEvent.createdAt,
+        createdAt: lastRow.created_at as string,
       });
     } else if (rawCursor) {
       nextCursor = rawCursor;

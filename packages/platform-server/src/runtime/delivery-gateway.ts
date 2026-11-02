@@ -95,6 +95,12 @@ export const DEFAULT_QUOTA_RESERVATION_GRACE_SECONDS =
 export { DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS };
 export type { DeliveryDispatchOptions };
 
+/**
+ * Channels whose turns are not tied to an IM chat (Jarvis shows whole sessions itself). Background
+ * tasks started from them are never listed in a Lark/WeChat chat-filtered view.
+ */
+export const NON_CHAT_ORIGIN_CHANNELS: ReadonlySet<string> = new Set(['jarvis']);
+
 export type InspectedTurnErrorCode =
   | 'EXECUTION_FAILED'
   | 'TURN_TIMEOUT'
@@ -140,6 +146,81 @@ export interface DeliveryTurnExecutor {
     attachments?: readonly any[];
     clientRequestId?: string;
   }): Promise<{ ok: boolean; error?: { code: string; message?: string } }>;
+  /**
+   * Read-only page of a DSH session log in the user's runtime (original DSH seqs). Errors keep the
+   * runtime's code (e.g. `session/not-found`).
+   */
+  readSessionEvents?(userId: string, params: RuntimeSessionEventsQuery): Promise<RuntimeSessionEventsPage>;
+  /** A whole image attachment cited by a session's events (errors keep codes like `attachment/not-found`). */
+  readAttachment?(userId: string, params: RuntimeAttachmentQuery): Promise<RuntimeAttachmentData>;
+}
+
+/** Which page of a DSH session log to read (see the runtime's `readSessionEvents`). */
+export interface RuntimeSessionEventsQuery {
+  /** The space the session runs in (selects the container or host runtime). */
+  readonly platformSpaceId: string;
+  readonly dshSessionId: string;
+  /** Only events with seq > afterSeq. */
+  readonly afterSeq?: number;
+  /** Only events with seq < beforeSeq (the newest such events). */
+  readonly beforeSeq?: number;
+  readonly limit?: number;
+  readonly maxBytes?: number;
+}
+
+/** One DSH session event as persisted (seq counts from 0). */
+export interface RuntimeSessionEvent {
+  readonly seq: number;
+  readonly type: string;
+  readonly [key: string]: unknown;
+}
+
+export interface RuntimeSessionEventsPage {
+  readonly dshSessionId: string;
+  /** Ascending by seq. */
+  readonly events: readonly RuntimeSessionEvent[];
+  /** Newest seq of the whole log; -1 when empty. */
+  readonly lastSeq: number;
+  readonly persistedLastSeq?: number;
+  readonly hasMore: boolean;
+}
+
+export interface RuntimeAttachmentQuery {
+  readonly platformSpaceId: string;
+  readonly dshSessionId: string;
+  /** A DSH image attachment id (`sha256:<hex>`). */
+  readonly attachmentId?: string;
+  /** A workspace path as the session's events cite it. */
+  readonly path?: string;
+}
+
+export interface RuntimeAttachmentData {
+  readonly mime: string;
+  /** Base64 of the whole image. */
+  readonly data: string;
+  readonly bytes?: number;
+  readonly sha256?: string;
+  readonly width?: number;
+  readonly height?: number;
+  readonly name?: string;
+}
+
+/** Read access to the runtime's DSH-native session history (implemented by turn executors). */
+export type RuntimeSessionReader = Required<Pick<DeliveryTurnExecutor, 'readSessionEvents' | 'readAttachment'>>;
+
+/** Pending user questions per session (implemented by the platform QuestionBridge). */
+export interface RuntimeQuestionStatusSource {
+  listPending(filter: { userId?: string; sessionId?: string }): ReadonlyArray<unknown>;
+}
+
+/** What getCurrentTurnStatus reports for a session's current turn. */
+export interface CurrentTurnStatus {
+  status: TurnExecutionStatus;
+  code?: PublicEventCode;
+  queuePosition?: number;
+  turnId?: string;
+  /** With `waiting_approval`: set to `question` when the turn waits for the user's answer to a question. */
+  waitingFor?: 'question';
 }
 
 export type RuntimeTurnExecutor = DeliveryTurnExecutor;
@@ -169,7 +250,7 @@ export interface DrainableRuntimeGateway extends RuntimeGateway {
   drain(timeoutMs?: number): Promise<boolean>;
   redriveHeld(): Promise<number>;
   recoverQueuedTurns?(): Promise<number>;
-  getCurrentTurnStatus(userId: string, sessionId: string): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number; turnId?: string } | null>;
+  getCurrentTurnStatus(userId: string, sessionId: string): Promise<CurrentTurnStatus | null>;
   cancelCurrentTurn(userId: string, sessionId: string): Promise<boolean>;
   getBackgroundTasks?(userId: string, sessionId: string, options?: { chatContextId?: string }): Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
   stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
@@ -584,8 +665,13 @@ export interface DeliveryRuntimeGatewayOptions {
     userId?: string;
   }) => Promise<boolean> | boolean;
   externalInteractionService?: {
-    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
+    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => ReadonlyArray<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
+  /**
+   * Pending `ask_user_question` questions (the platform QuestionBridge). A session with one reports
+   * `waiting_approval` with `waitingFor: 'question'` from getCurrentTurnStatus.
+   */
+  questionService?: RuntimeQuestionStatusSource;
   mountResolver?: RuntimeMountResolver;
   extensionResolver?: ExtensionPlanResolver;
   quotaTokenFloor?: number;
@@ -646,8 +732,9 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   private readonly modelSelectionService?: ModelSelectionService;
   private readonly chatCommandService?: ChatCommandService;
   private readonly externalInteractionService?: {
-    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
+    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => ReadonlyArray<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
+  private questionService?: RuntimeQuestionStatusSource;
   private mountResolver?: RuntimeMountResolver;
   private extensionResolver?: ExtensionPlanResolver;
   private readonly quotaTokenFloor: number;
@@ -770,6 +857,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           })
         : undefined);
     this.externalInteractionService = options.externalInteractionService;
+    this.questionService = options.questionService;
     this.mountResolver = options.mountResolver;
 
     // Initialize turn quota reservation tuning parameters with defaults and environment overrides
@@ -795,6 +883,15 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
     // Launch background scheduler loop
     this.startScheduler();
+  }
+
+  /** Pending user questions (the QuestionBridge) behind `waitingFor: 'question'`; set once. */
+  public setQuestionService(service: RuntimeQuestionStatusSource | undefined): void {
+    if (!this.questionService) this.questionService = service;
+  }
+
+  public getQuestionService(): RuntimeQuestionStatusSource | undefined {
+    return this.questionService;
   }
 
   public getMountResolver(): RuntimeMountResolver | undefined {
@@ -3782,7 +3879,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   async getCurrentTurnStatus(
     userId: string,
     sessionId: string
-  ): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number; turnId?: string } | null> {
+  ): Promise<CurrentTurnStatus | null> {
     if (typeof userId !== 'string' || typeof sessionId !== 'string') {
       throw new ValidationError('Invalid arguments for getCurrentTurnStatus');
     }
@@ -3816,6 +3913,21 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           return {
             status: 'waiting_approval',
             code: 'WAITING_APPROVAL',
+          };
+        }
+      } catch {}
+    }
+
+    // 2b. A pending ask_user_question: the turn waits for the user's answer. TurnExecutionStatus
+    // has no dedicated value; waiting_approval (the human-wait state) is reported with waitingFor.
+    if (this.questionService && typeof this.questionService.listPending === 'function') {
+      try {
+        const questions = this.questionService.listPending({ userId, sessionId });
+        if (Array.isArray(questions) && questions.length > 0) {
+          return {
+            status: 'waiting_approval',
+            code: 'WAITING_APPROVAL',
+            waitingFor: 'question',
           };
         }
       } catch {}
@@ -4158,6 +4270,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       }
     }
 
+    // Origin channel of each enriched item. Items that originated from a channel without IM chats
+    // (Jarvis shows whole sessions itself) never belong to a Lark/WeChat chat-filtered list.
+    const originChannels = new Map<object, string>();
+
     // Enrich with originTurnId and originChatContextId from DB / chained resolver / fallback
     if (this.db) {
       const resolveTurnOriginRecursive = (
@@ -4298,10 +4414,12 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             resolveTurnOriginRecursive(item.originTurnId, dshSessionId, new Set<string>(), 0);
           if (resolved?.nativeContextId) {
             item.originChatContextId = resolved.nativeContextId;
+            if (resolved.channel) originChannels.set(item, resolved.channel);
           } else {
             const fallback = resolveFallbackChatOrigin(sessionId) || resolveFallbackChatOrigin(dshSessionId);
             if (fallback?.nativeContextId) {
               item.originChatContextId = fallback.nativeContextId;
+              if (fallback.channel) originChannels.set(item, fallback.channel);
             }
           }
         }
@@ -4369,6 +4487,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
             }
             return true;
           }
+          return false;
+        }
+        const originChannel = originChannels.get(t);
+        if (originChannel && NON_CHAT_ORIGIN_CHANNELS.has(originChannel)) {
           return false;
         }
         const itemChatLevelId = getChatLevelNativeContextId(t.originChatContextId, 'lark');

@@ -2009,7 +2009,8 @@ export async function mountOfficialPlugins(
       const toolName = exec.name;
 
       // 1. Safe read/inspection tools are unconditionally allowed in any mode
-      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'list_subagent_models', 'check_quota', 'web_search', 'web_fetch'].includes(toolName)) {
+      //    (ask_user_question only asks the user, so it never needs an approval of its own)
+      if (['read', 'read_image', 'glob', 'grep', 'list_agents', 'list_subagent_models', 'check_quota', 'web_search', 'web_fetch', 'ask_user_question'].includes(toolName)) {
         return await next();
       }
 

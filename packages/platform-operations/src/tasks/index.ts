@@ -33,4 +33,4 @@ export {
   type ScheduleCalculationParams,
 } from './schedule-calculator.js';
 
-export { resolveTaskOriginDelivery } from './task-delivery-route.js';
+export { resolveTaskOriginDelivery, isNoopTaskDeliveryChannel, NOOP_TASK_DELIVERY_CHANNELS } from './task-delivery-route.js';

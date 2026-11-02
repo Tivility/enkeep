@@ -1,6 +1,17 @@
 import type { TaskDeliveryTarget } from '../types/task.js';
 
 /**
+ * Delivery channels that are valid task targets but need no outbound message: Jarvis shows the
+ * session content (and its new revision) itself, so delivering a task result there is a no-op.
+ */
+export const NOOP_TASK_DELIVERY_CHANNELS: ReadonlySet<string> = new Set(['jarvis']);
+
+/** True when a task delivery channel is valid but its delivery is a successful no-op. */
+export function isNoopTaskDeliveryChannel(channel: unknown): boolean {
+  return typeof channel === 'string' && NOOP_TASK_DELIVERY_CHANNELS.has(channel.trim());
+}
+
+/**
  * Resolves the IM route of a task from its anchor session when the task has no explicit delivery.
  * Priority:
  * 1. Channel binding of the origin session (session_routes) if bound to lark/wechat.
@@ -42,6 +53,12 @@ export function resolveTaskOriginDelivery(
     }
 
     const resolvedSpaceId = payload.spaceId || routeRow?.space_id;
+
+    // A session that belongs to a no-op channel (Jarvis) keeps its results in the session itself:
+    // never guess an IM chat bound to the space for it.
+    if (routeRow && isNoopTaskDeliveryChannel(routeRow.channel)) {
+      return undefined;
+    }
 
     // 1a. If origin session itself has a direct channel binding (lark or wechat)
     if (

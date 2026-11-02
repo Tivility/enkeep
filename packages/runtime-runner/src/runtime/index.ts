@@ -14,6 +14,7 @@ export * from './exec-cli.js';
 export * from './file-ops.js';
 export * from './tunnel-agent.js';
 export * from './daemon-protocol.js';
+export * from './session-history.js';
 export * from './daemon-journal.js';
 export * from './daemon.js';
 export * from './daemon-cli.js';

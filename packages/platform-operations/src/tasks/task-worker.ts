@@ -25,7 +25,7 @@ import type { TenantScopedTaskRepository } from '../ports/task-port.js';
 import type { TenantScopedQuotaLedgerRepository } from '../ports/quota-ledger-port.js';
 import { TaskOperationService } from '../services/task-operation-service.js';
 import { QuotaOperationService } from '../services/quota-operation-service.js';
-import { resolveTaskOriginDelivery } from './task-delivery-route.js';
+import { resolveTaskOriginDelivery, isNoopTaskDeliveryChannel } from './task-delivery-route.js';
 import {
   TaskLeaseExpiredError,
   TaskAlreadyClaimedError,
@@ -1305,10 +1305,12 @@ export class AgentPromptTaskWorker {
           };
         }
 
-        // 6. Proactive channel delivery (Lark & WeChat supported)
+        // 6. Proactive channel delivery (Lark & WeChat supported; Jarvis is a valid no-op target
+        // because it shows the session content itself)
         let delivery = payload.delivery;
         if (
           !payload.silent &&
+          !isNoopTaskDeliveryChannel(delivery?.channel) &&
           (!delivery || !delivery.channel || !delivery.accountId || !delivery.nativeContextId)
         ) {
           delivery = this.resolveFallbackDelivery(tenantId, payload);

@@ -7,6 +7,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Duplex } from 'node:stream';
 import {
   PlatformError,
   NotFoundError,
@@ -77,19 +78,183 @@ export const ALLOWED_ONBOARDING_JOB_VERIFY_KEYS = Object.freeze([
   'verifyCode',
 ]);
 
+/**
+ * Runtime side of one channel type, as seen by account management.
+ * Every hook receives the owning user and the account id; failures are swallowed by the caller
+ * (account data changes must not fail because a runtime could not be (re)started).
+ */
+export interface ChannelAccountLifecycle {
+  /** Called after an active account was created. Defaults to `onAccountUpdated`. */
+  onAccountCreated?(userId: string, accountId: string): Promise<unknown>;
+  /** Called after an account was updated (status, credentials, default space...). */
+  onAccountUpdated(userId: string, accountId: string): Promise<unknown>;
+  /** Called after an account row was deleted. */
+  onAccountDeleted(userId: string, accountId: string): Promise<unknown>;
+  /** Explicit sync request (`POST /api/manage/channels/accounts/:id/sync`). */
+  syncAccount(userId: string, accountId: string): Promise<unknown>;
+  /**
+   * Optional gate run before an account row of this type is written (e.g. admin only, one per
+   * user). Throw a PlatformError (403, 409…) to refuse.
+   */
+  beforeCreateAccount?(userId: string, input: { type: string; status?: string; defaultSpaceId?: string | null }): Promise<void>;
+  /**
+   * Optional provisioning right after the row was written. The returned fields are added to the
+   * creation response once (e.g. a freshly issued bearer token). Throwing removes the account again.
+   */
+  provisionAccount?(userId: string, account: ChannelAccount): Promise<Record<string, unknown> | void>;
+  /**
+   * Optional: issue a new bearer token for the account (`POST /api/manage/channels/accounts/:id/token`),
+   * replacing the old one. The token is returned once.
+   */
+  rotateAccountToken?(userId: string, accountId: string): Promise<{ token: string }>;
+  /**
+   * Optional: a small status object of an account of this type for the management API (account
+   * list and single account GET), attached under the type's name (e.g. `account.jarvis`). Called
+   * only with an account of this type owned by `userId`. It must never carry credentials, tokens
+   * or their hashes. A failure leaves the status out.
+   */
+  describeAccountStatus?(userId: string, account: ChannelAccount): object | undefined | Promise<object | undefined>;
+}
+
+/**
+ * A channel whose clients dial into the platform over a WebSocket upgrade (e.g. Jarvis). The
+ * platform server hands it upgrade requests for `upgradePath` after its own Host validation and
+ * starts/stops it with the server.
+ */
+export interface ChannelConnectionEndpoint {
+  readonly upgradePath: string;
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void>;
+  start?(): void | Promise<void>;
+  /** Close every live connection and refuse new ones until started again. */
+  stop(): void | Promise<void>;
+}
+
+export function isChannelConnectionEndpoint(value: unknown): value is ChannelConnectionEndpoint {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as ChannelConnectionEndpoint).upgradePath === 'string' &&
+    typeof (value as ChannelConnectionEndpoint).handleUpgrade === 'function' &&
+    typeof (value as ChannelConnectionEndpoint).stop === 'function'
+  );
+}
+
+/** Channel account types that always have a dedicated manager slot. */
+export const BUILTIN_CHANNEL_ACCOUNT_TYPES = Object.freeze(['lark', 'wechat'] as const);
+
+function larkLifecycle(manager: ChannelRuntimeManager): ChannelAccountLifecycle {
+  return {
+    onAccountCreated: (userId, accountId) => manager.onAccountUpdated(userId, accountId),
+    onAccountUpdated: (userId, accountId) => manager.onAccountUpdated(userId, accountId),
+    onAccountDeleted: (userId, accountId) => manager.onAccountDeleted(userId, accountId),
+    syncAccount: (userId, accountId) => manager.syncAccount(userId, accountId),
+  };
+}
+
+function wechatLifecycle(manager: WeChatRuntimeManager): ChannelAccountLifecycle {
+  // The WeChat manager reconciles every change (create/update/delete) through syncAccount.
+  return {
+    onAccountCreated: (userId, accountId) => manager.syncAccount(userId, accountId),
+    onAccountUpdated: (userId, accountId) => manager.syncAccount(userId, accountId),
+    onAccountDeleted: (userId, accountId) => manager.syncAccount(userId, accountId),
+    syncAccount: (userId, accountId) => manager.syncAccount(userId, accountId),
+  };
+}
+
 export class ChannelManagementService {
   private readonly storage: PlatformStorage;
-  private runtimeManager?: ChannelRuntimeManager;
-  private wechatRuntimeManager?: WeChatRuntimeManager;
+  private larkRuntimeManager?: ChannelRuntimeManager;
+  private wechatManager?: WeChatRuntimeManager;
+  /** Managers of non-builtin channel types (e.g. 'jarvis'), registered by the server wiring. */
+  private readonly extraManagers = new Map<string, ChannelAccountLifecycle>();
 
   constructor(
     storage: PlatformStorage,
     runtimeManager?: ChannelRuntimeManager,
-    wechatRuntimeManager?: WeChatRuntimeManager
+    wechatRuntimeManager?: WeChatRuntimeManager,
+    extraManagers?: Readonly<Record<string, ChannelAccountLifecycle>>
   ) {
     this.storage = storage;
-    this.runtimeManager = runtimeManager;
-    this.wechatRuntimeManager = wechatRuntimeManager;
+    this.larkRuntimeManager = runtimeManager;
+    this.wechatManager = wechatRuntimeManager;
+    if (extraManagers) {
+      for (const [type, manager] of Object.entries(extraManagers)) {
+        this.registerManager(type, manager);
+      }
+    }
+  }
+
+  /** Lark runtime manager (kept as a property for existing late-binding wiring). */
+  get runtimeManager(): ChannelRuntimeManager | undefined {
+    return this.larkRuntimeManager;
+  }
+
+  set runtimeManager(manager: ChannelRuntimeManager | undefined) {
+    this.larkRuntimeManager = manager;
+  }
+
+  /** WeChat runtime manager (kept as a property for existing late-binding wiring). */
+  get wechatRuntimeManager(): WeChatRuntimeManager | undefined {
+    return this.wechatManager;
+  }
+
+  set wechatRuntimeManager(manager: WeChatRuntimeManager | undefined) {
+    this.wechatManager = manager;
+  }
+
+  /**
+   * Registers the runtime manager of a non-builtin channel type (for example `jarvis`).
+   * Accounts of a type are only accepted once the type is builtin or registered.
+   */
+  registerManager(type: string, manager: ChannelAccountLifecycle): void {
+    const normalized = typeof type === 'string' ? type.trim() : '';
+    if (!normalized || !/^[a-z][a-z0-9_-]{0,31}$/.test(normalized)) {
+      throw new ValidationError(`Invalid channel type "${String(type)}"`);
+    }
+    if ((BUILTIN_CHANNEL_ACCOUNT_TYPES as readonly string[]).includes(normalized)) {
+      throw new ValidationError(`Channel type "${normalized}" is builtin and cannot be re-registered`);
+    }
+    this.extraManagers.set(normalized, manager);
+  }
+
+  unregisterManager(type: string): boolean {
+    return this.extraManagers.delete(type);
+  }
+
+  /** Channel account types this server accepts: builtin types plus registered ones. */
+  getSupportedTypes(): string[] {
+    return [...BUILTIN_CHANNEL_ACCOUNT_TYPES, ...this.extraManagers.keys()];
+  }
+
+  isSupportedType(type: string | undefined | null): boolean {
+    if (typeof type !== 'string') return false;
+    return (BUILTIN_CHANNEL_ACCOUNT_TYPES as readonly string[]).includes(type) || this.extraManagers.has(type);
+  }
+
+  /**
+   * Resolves the lifecycle of one channel type. Lark and WeChat each go to their own manager;
+   * registered types go to their registered manager. Unknown types resolve to undefined and are
+   * never handed to another channel's manager.
+   */
+  private lifecycleFor(type: string | undefined | null): ChannelAccountLifecycle | undefined {
+    if (type === 'lark') {
+      return this.larkRuntimeManager ? larkLifecycle(this.larkRuntimeManager) : undefined;
+    }
+    if (type === 'wechat') {
+      return this.wechatManager ? wechatLifecycle(this.wechatManager) : undefined;
+    }
+    if (typeof type === 'string') {
+      return this.extraManagers.get(type);
+    }
+    return undefined;
+  }
+
+  private assertSupportedType(type: string | undefined | null): void {
+    if (!this.isSupportedType(type)) {
+      throw new ValidationError(
+        `Unsupported channel type "${String(type)}". Allowed: ${this.getSupportedTypes().join(', ')}.`
+      );
+    }
   }
 
   // ──────── Account Management ────────
@@ -106,6 +271,36 @@ export class ChannelManagementService {
     return account;
   }
 
+  /**
+   * The user's accounts as the management API returns them: each with its type's status object
+   * (`account[type]`) when the type's manager provides one (see
+   * {@link ChannelAccountLifecycle.describeAccountStatus}).
+   */
+  async listAccountsWithStatus(userId: string, type?: string): Promise<Array<ChannelAccount & Record<string, unknown>>> {
+    const accounts = await this.listAccounts(userId, type);
+    return Promise.all(accounts.map((account) => this.withStatus(userId, account)));
+  }
+
+  /** One of the user's accounts as the management API returns it (see {@link listAccountsWithStatus}). */
+  async getAccountWithStatus(userId: string, accountId: string): Promise<ChannelAccount & Record<string, unknown>> {
+    return this.withStatus(userId, await this.getAccount(userId, accountId));
+  }
+
+  private async withStatus(userId: string, account: ChannelAccount): Promise<ChannelAccount & Record<string, unknown>> {
+    const plain = account as ChannelAccount & Record<string, unknown>;
+    // Tenant scoping: only the owner's accounts, and never shadow a field of the account itself.
+    if (account.userId !== userId || Object.prototype.hasOwnProperty.call(account, account.type)) return plain;
+    const lifecycle = this.lifecycleFor(account.type);
+    if (!lifecycle?.describeAccountStatus) return plain;
+    try {
+      const status = await lifecycle.describeAccountStatus(userId, account);
+      if (!status || typeof status !== 'object') return plain;
+      return { ...account, [account.type]: status };
+    } catch {
+      return plain;
+    }
+  }
+
   async createAccount(
     userId: string,
     input: {
@@ -115,7 +310,11 @@ export class ChannelManagementService {
       defaultSpaceId?: string | null;
       groupActivationMode?: 'mention' | 'always';
     }
-  ): Promise<ChannelAccount> {
+  ): Promise<ChannelAccount & Record<string, unknown>> {
+    const type = typeof input.type === 'string' ? input.type.trim() : '';
+    this.assertSupportedType(type);
+    const typeLifecycle = this.lifecycleFor(type);
+
     let defaultSpaceId = input.defaultSpaceId;
     if (defaultSpaceId !== undefined && defaultSpaceId !== null) {
       const trimmed = typeof defaultSpaceId === 'string' ? defaultSpaceId.trim() : '';
@@ -130,25 +329,51 @@ export class ChannelManagementService {
       }
     }
 
+    if (typeLifecycle?.beforeCreateAccount) {
+      await typeLifecycle.beforeCreateAccount(userId, { type, status: input.status, defaultSpaceId });
+    }
+
     const created = await this.storage.forTenant(userId).channels.createAccount({
-      type: input.type,
+      type,
       status: input.status,
       credentialRef: input.credentialRef,
       defaultSpaceId,
       groupActivationMode: input.groupActivationMode,
     });
-    if (created.status === 'active') {
+    let extras: Record<string, unknown> | void = undefined;
+    if (typeLifecycle?.provisionAccount) {
       try {
-        if (created.type === 'wechat') {
-          if (this.wechatRuntimeManager) {
-            await this.wechatRuntimeManager.syncAccount(userId, created.id);
-          }
-        } else if (this.runtimeManager) {
-          await this.runtimeManager.onAccountUpdated(userId, created.id);
+        extras = await typeLifecycle.provisionAccount(userId, created);
+      } catch (err) {
+        try {
+          await this.storage.forTenant(userId).channels.deleteAccount(created.id);
+        } catch {}
+        throw err;
+      }
+    }
+    if (created.status === 'active') {
+      const lifecycle = this.lifecycleFor(created.type);
+      try {
+        if (lifecycle) {
+          await (lifecycle.onAccountCreated ?? lifecycle.onAccountUpdated).call(lifecycle, userId, created.id);
         }
       } catch {}
     }
-    return created;
+    return (extras ? { ...created, ...extras } : created) as ChannelAccount & Record<string, unknown>;
+  }
+
+  /**
+   * Issues a new bearer token for an account of a type that has tokens (e.g. jarvis), replacing the
+   * old one. The account must belong to the user; the type's manager applies its own policy.
+   */
+  async rotateAccountToken(userId: string, accountId: string): Promise<{ accountId: string; token: string }> {
+    const account = await this.getAccount(userId, accountId);
+    const lifecycle = this.lifecycleFor(account.type);
+    if (!lifecycle?.rotateAccountToken) {
+      throw new ValidationError(`Channel type "${account.type}" has no token`);
+    }
+    const { token } = await lifecycle.rotateAccountToken(userId, account.id);
+    return { accountId: account.id, token };
   }
 
   async updateAccount(
@@ -183,13 +408,11 @@ export class ChannelManagementService {
     if (input.groupActivationMode !== undefined) {
       await this.storage.forTenant(userId).channels.setGroupActivationModeForAccountBindings(accountId, input.groupActivationMode);
     }
+    // Unknown (e.g. legacy imported) types stay editable but are never handed to another channel's runtime.
+    const lifecycle = this.lifecycleFor(updated.type);
     try {
-      if (updated.type === 'wechat') {
-        if (this.wechatRuntimeManager) {
-          await this.wechatRuntimeManager.syncAccount(userId, accountId);
-        }
-      } else if (this.runtimeManager) {
-        await this.runtimeManager.onAccountUpdated(userId, accountId);
+      if (lifecycle) {
+        await lifecycle.onAccountUpdated(userId, accountId);
       }
     } catch {}
     return updated;
@@ -200,13 +423,10 @@ export class ChannelManagementService {
     const channelType = existing?.type;
     const deleted = await this.storage.forTenant(userId).channels.deleteAccount(accountId);
     if (deleted) {
+      const lifecycle = this.lifecycleFor(channelType);
       try {
-        if (channelType === 'wechat') {
-          if (this.wechatRuntimeManager) {
-            await this.wechatRuntimeManager.syncAccount(userId, accountId);
-          }
-        } else if (this.runtimeManager) {
-          await this.runtimeManager.onAccountDeleted(userId, accountId);
+        if (lifecycle) {
+          await lifecycle.onAccountDeleted(userId, accountId);
         }
       } catch {}
     }
@@ -215,12 +435,10 @@ export class ChannelManagementService {
 
   async syncAccount(userId: string, accountId: string): Promise<ChannelAccount> {
     const account = await this.getAccount(userId, accountId);
-    if (account.type === 'wechat') {
-      if (this.wechatRuntimeManager) {
-        await this.wechatRuntimeManager.syncAccount(userId, accountId);
-      }
-    } else if (this.runtimeManager) {
-      await this.runtimeManager.syncAccount(userId, accountId);
+    this.assertSupportedType(account.type);
+    const lifecycle = this.lifecycleFor(account.type);
+    if (lifecycle) {
+      await lifecycle.syncAccount(userId, accountId);
     }
     return account;
   }
@@ -452,7 +670,7 @@ export class ChannelRoutes {
       if (method === 'GET') {
         const url = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
         const type = url.searchParams.get('type') || undefined;
-        const accounts = await this.service.listAccounts(user.id, type);
+        const accounts = await this.service.listAccountsWithStatus(user.id, type);
         sendJsonResponse(res, 200, createSuccessEnvelope({ accounts }));
         return true;
       }
@@ -495,6 +713,21 @@ export class ChannelRoutes {
       }
     }
 
+    // ──────────────── /api/manage/channels/accounts/:id/token ────────────────
+    const accountTokenMatch = pathname.match(/^\/api\/manage\/channels\/accounts\/([^/]+)\/token$/);
+    if (accountTokenMatch) {
+      const accountId = decodeURIComponent(accountTokenMatch[1]);
+      if (method === 'POST') {
+        if (this.expectedCsrfToken) {
+          validateCsrf(req, { csrfToken: this.expectedCsrfToken });
+        }
+        const rotated = await this.service.rotateAccountToken(user.id, accountId);
+        // The token is shown once: never cache this response.
+        sendJsonResponse(res, 200, createSuccessEnvelope(rotated));
+        return true;
+      }
+    }
+
     // ──────────────── /api/manage/channels/accounts/:id/sync ────────────────
     const accountSyncMatch = pathname.match(/^\/api\/manage\/channels\/accounts\/([^/]+)\/sync$/);
     if (accountSyncMatch) {
@@ -515,7 +748,7 @@ export class ChannelRoutes {
       const accountId = decodeURIComponent(accountMatch[1]);
 
       if (method === 'GET') {
-        const account = await this.service.getAccount(user.id, accountId);
+        const account = await this.service.getAccountWithStatus(user.id, accountId);
         sendJsonResponse(res, 200, createSuccessEnvelope(account));
         return true;
       }

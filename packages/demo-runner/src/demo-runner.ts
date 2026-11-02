@@ -12,6 +12,7 @@ import { launchDemoSystem } from './up/index.js';
 import { downDemo } from './down/index.js';
 import { runDemoTestSuite } from './test/index.js';
 import { runPreflight } from './preflight/index.js';
+import { runJarvisTokenCli } from './jarvis-token/index.js';
 import { listSignedProcesses, listSignedContainers } from './utils/crypto-meta.js';
 import { validateSafePort } from './utils/probes.js';
 import {
@@ -49,6 +50,10 @@ COMMANDS:
   status     Show current status of demo services, processes, and containers
   preflight  Verify platform and all host/container runtimes quiescence before deploy or stop
   bind-lark  Explicitly bind a Lark chatId to the dedicated test space
+  jarvis-token issue|revoke  Issue (create or rotate) or revoke a user's Jarvis token without the Web UI:
+             jarvis-token issue  --data-dir <data-dir> --user <username> [--token-file <token-file>]
+             jarvis-token revoke --data-dir <data-dir> --user <username>
+             (all values from flags; the token goes only to --token-file, mode 0600)
   help       Display this help message
 
 OPTIONS:
@@ -796,6 +801,13 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         } else {
           console.log(`\n✔ Successfully bound Lark chat "${chatId}" to space "${LARK_TEST_SPACE_FOLDER}" (mode: ${mode}, bindingId: ${binding.id})\n`);
         }
+        break;
+      }
+
+      case 'jarvis-token': {
+        // Values come from flags only (no ENKEEP_DATA_DIR fallback); the token is never logged.
+        const exitCode = await runJarvisTokenCli(args);
+        if (exitCode !== 0) process.exit(exitCode);
         break;
       }
 

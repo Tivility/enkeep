@@ -359,6 +359,9 @@ export class ChannelRuntimeManager {
     let accountId: string | undefined;
     let nativeEventId: string | undefined;
 
+    // A turn whose recorded origin is another channel (WeChat, Jarvis, ...) is never delivered to Lark,
+    // even when it runs on a route that is also bound to a Lark chat.
+    let foreignOrigin = false;
     if (this.db) {
       try {
         const originRow = this.db.prepare(
@@ -367,8 +370,13 @@ export class ChannelRuntimeManager {
         if (originRow && originRow.channel === 'lark' && originRow.account_id) {
           accountId = originRow.account_id;
           nativeEventId = originRow.native_event_id || undefined;
+        } else if (originRow && typeof originRow.channel === 'string' && originRow.channel !== 'lark') {
+          foreignOrigin = true;
         }
       } catch {}
+    }
+    if (foreignOrigin) {
+      return;
     }
 
     if (!accountId && idempotencyKey) {
@@ -661,6 +669,9 @@ export class ChannelRuntimeManager {
     let accountId: string | undefined;
     let nativeEventId: string | undefined;
 
+    // A turn whose recorded origin is another channel (WeChat, Jarvis, ...) is never delivered to Lark,
+    // even when it runs on a route that is also bound to a Lark chat.
+    let foreignOrigin = false;
     if (this.db) {
       try {
         const originRow = this.db.prepare(
@@ -669,8 +680,13 @@ export class ChannelRuntimeManager {
         if (originRow && originRow.channel === 'lark' && originRow.account_id) {
           accountId = originRow.account_id;
           nativeEventId = originRow.native_event_id || undefined;
+        } else if (originRow && typeof originRow.channel === 'string' && originRow.channel !== 'lark') {
+          foreignOrigin = true;
         }
       } catch {}
+    }
+    if (foreignOrigin) {
+      return;
     }
 
     if (!accountId && idempotencyKey) {
