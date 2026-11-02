@@ -6252,3 +6252,54 @@ aside.workspace-sidebar.is-collapsed {
   align-self: flex-start;
   margin-top: 8px;
 }
+
+/* Jarvis connection status (account.jarvis): dot + text, details, refresh */
+.jarvis-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 10px;
+}
+
+.jarvis-status-slot {
+  flex: 1;
+  min-width: 0;
+}
+
+.jarvis-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.jarvis-status-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.jarvis-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-muted);
+}
+
+.jarvis-status-dot.is-connected {
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success-border);
+}
+
+.jarvis-status-detail {
+  color: var(--text-muted);
+}
+
+.jarvis-status-refresh {
+  flex-shrink: 0;
+}

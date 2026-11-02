@@ -10468,7 +10468,7 @@ function renderJarvisTokenPanel(token) {
 
   const hint = document.createElement("p");
   hint.className = "jarvis-token-hint";
-  hint.textContent = "在运行 jarvisd 的同一台电脑上，把下面这段加入 ~/.jarvis/daemons.json，然后重启 jarvisd node：";
+  hint.textContent = "在运行 jarvisd 的同一台电脑上，把下面这段加入 ~/.jarvis/daemons.json。jarvisd node 大约 10 秒内会自动读到并连上，不需要重启：";
   panel.appendChild(hint);
 
   const pre = document.createElement("pre");
@@ -10476,6 +10476,43 @@ function renderJarvisTokenPanel(token) {
   pre.textContent = jarvisDaemonsJsonExample();
   panel.appendChild(pre);
   return panel;
+}
+
+// Connection status text of a Jarvis account (`account.jarvis` from the channel account API).
+function jarvisStatusSummary(status, fmt) {
+  const s = status && typeof status === "object" ? status : {};
+  const connected = s.connected === true;
+  const text = connected
+    ? (s.connectedAt ? "已连接（自 " + fmt(s.connectedAt) + "）" : "已连接")
+    : "未连接";
+  const details = [];
+  if (s.lastUsedAt) details.push("最近使用：" + fmt(s.lastUsedAt));
+  if (s.tokenCreatedAt) details.push("token 创建于：" + fmt(s.tokenCreatedAt));
+  return { connected, text, details };
+}
+
+function renderJarvisStatusLine(status) {
+  const summary = jarvisStatusSummary(status, (value) => formatDate(value));
+  const line = document.createElement("div");
+  line.className = "jarvis-status";
+  const main = document.createElement("span");
+  main.className = "jarvis-status-main";
+  const dot = document.createElement("span");
+  dot.className = "jarvis-status-dot" + (summary.connected ? " is-connected" : "");
+  dot.setAttribute("aria-hidden", "true");
+  main.appendChild(dot);
+  const text = document.createElement("span");
+  text.className = "jarvis-status-text";
+  text.textContent = summary.text;
+  main.appendChild(text);
+  line.appendChild(main);
+  summary.details.forEach((detail) => {
+    const item = document.createElement("span");
+    item.className = "jarvis-status-detail";
+    item.textContent = detail;
+    line.appendChild(item);
+  });
+  return line;
 }
 
 function renderJarvisChannelCard(account, isAdminUser) {
@@ -10505,6 +10542,42 @@ function renderJarvisChannelCard(account, isAdminUser) {
     ? "本机的 jarvisd 用 token 连接 enkeep，在手机和手表上查看你的会话、发消息、批准工具调用。重新生成 token 后，旧 token 立即失效，已有连接会断开。"
     : "启用后会生成一个 token，本机的 jarvisd 用它连接 enkeep，在手机和手表上查看你的会话、发消息、批准工具调用。";
   body.appendChild(desc);
+
+  // Connection status (`account.jarvis`); the 刷新 button reloads it in place, no timers.
+  let refreshStatus = async () => {};
+  if (account && account.jarvis && typeof account.jarvis === "object") {
+    const statusRow = document.createElement("div");
+    statusRow.className = "jarvis-status-row";
+    const statusSlot = document.createElement("div");
+    statusSlot.className = "jarvis-status-slot";
+    statusSlot.appendChild(renderJarvisStatusLine(account.jarvis));
+    statusRow.appendChild(statusSlot);
+
+    const refreshBtn = document.createElement("button");
+    refreshBtn.type = "button";
+    refreshBtn.className = "btn btn-secondary btn-sm jarvis-status-refresh";
+    refreshBtn.textContent = "刷新";
+    refreshStatus = async (quiet) => {
+      refreshBtn.disabled = true;
+      try {
+        const res = await apiRequest("/api/manage/channels/accounts?type=jarvis");
+        const list = res && res.data && Array.isArray(res.data.accounts) ? res.data.accounts : [];
+        const fresh = list.find((a) => a.id === account.id);
+        if (!fresh) {
+          if (!quiet) await renderManagementView("management/workspaces/channels");
+          return;
+        }
+        statusSlot.replaceChildren(renderJarvisStatusLine(fresh.jarvis));
+      } catch (err) {
+        if (!quiet) showToast(err.message || "刷新失败", "error");
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    };
+    refreshBtn.addEventListener("click", () => refreshStatus(false));
+    statusRow.appendChild(refreshBtn);
+    body.appendChild(statusRow);
+  }
 
   const tokenSlot = document.createElement("div");
   tokenSlot.className = "jarvis-token-slot";
@@ -10560,6 +10633,7 @@ function renderJarvisChannelCard(account, isAdminUser) {
           if (!token) throw new Error("没有收到 token");
           showToast("已生成新 token", "success");
           showToken(token);
+          void refreshStatus(true);
         } catch (err) {
           showToast(err.message || "重新生成 token 失败", "error");
         } finally {
