@@ -2485,12 +2485,7 @@ export class PlatformProxyHandler implements StreamHandler {
         const insertStmt = this.db.prepare(`
           INSERT INTO web_events (id, session_id, user_id, type, payload, created_at)
           VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            session_id = excluded.session_id,
-            user_id = excluded.user_id,
-            type = excluded.type,
-            payload = excluded.payload,
-            created_at = excluded.created_at
+          ON CONFLICT(id) DO NOTHING
         `);
 
         let lastTimeMs = 0;
@@ -2715,7 +2710,7 @@ export class PlatformProxyHandler implements StreamHandler {
             sanitizedPayload['causeChildId'] = rawCauseChildId;
           }
 
-          insertStmt.run(
+          const inserted = insertStmt.run(
             eventId,
             targetSessionId,
             targetUserId,
@@ -2723,6 +2718,9 @@ export class PlatformProxyHandler implements StreamHandler {
             JSON.stringify(sanitizedPayload),
             createdAt
           );
+          // A frame the relay re-sent after a flush it thought had failed carries the id it was stored
+          // under: skip it, and do not fire completion side effects a second time.
+          if (Number(inserted.changes) === 0) continue;
           insertedCount++;
 
           if (

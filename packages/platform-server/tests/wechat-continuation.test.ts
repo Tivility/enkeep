@@ -5,7 +5,7 @@
  * - Drives the real persistence entry point (PlatformProxyHandler POST /api/events)
  * - Injects onAutonomousTurnCompleted callback wired to WeChatRuntimeManager.handleAutonomousTurnCompleted
  * - Resolves causal origin via channel_turn_origins
- * - Deduplicates outbox ID per Rule C (cont_<originTurnId>_<causeChildId>)
+ * - Deduplicates outbox ID per autonomous turn (cont_<originTurnId>_<turnId>)
  * - Extracts final answer text strictly from assistant_delta (filtering thinking/reasoning and converting markdown)
  * - Proactively delivers to WeChat recipient using cached context_token
  * - Skips without crashing when context_token is absent
@@ -368,8 +368,8 @@ describe('Item E: WeChat Continuation Delivery', () => {
       expect(text).toContain('Subagent Summary');
       expect(text).toContain('All 3 items processed successfully.');
 
-      // Verify deterministic outbox ID matching Rule C: cont_<originTurnId>_<causeChildId>
-      const expectedOutboxId = `cont_${originTurnId}_${causeChildId}`;
+      // Verify deterministic outbox ID: one per autonomous turn, cont_<originTurnId>_<turnId>
+      const expectedOutboxId = `cont_${originTurnId}_${autoTurnId}`;
       const outboxRow = db
         .prepare('SELECT id, status, account_id FROM channel_outbox WHERE id = ?')
         .get(expectedOutboxId) as any;
@@ -377,7 +377,7 @@ describe('Item E: WeChat Continuation Delivery', () => {
       expect(outboxRow.status).toBe('delivered');
       expect(outboxRow.account_id).toBe(accountId);
 
-      // 5. Duplicate terminal frame must be skipped (Rule C deduplication)
+      // 5. A replayed terminal frame for the same autonomous turn must be skipped
       await sendEvents(
         proxyHandler,
         [
@@ -394,6 +394,19 @@ describe('Item E: WeChat Continuation Delivery', () => {
 
       await new Promise((r) => setTimeout(r, 100));
       expect(fakeServer.sendMessages.length).toBe(1); // No second message
+
+      // 6. A second wake-up from the same subagent is a new autonomous turn with its own reply: delivered
+      const secondAutoTurnId = 'turn_auto_001b';
+      await sendEvents(proxyHandler, [
+        { type: 'assistant_delta', sessionId: sessionRouteId, turnId: secondAutoTurnId, payload: { delta: 'Second update from the same subagent.' } },
+        { type: 'turn_status', sessionId: sessionRouteId, turnId: secondAutoTurnId, originTurnId, causeChildId, payload: { status: 'completed' } },
+      ]);
+      let waits = 30;
+      while (waits-- > 0 && fakeServer.sendMessages.length < 2) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(fakeServer.sendMessages.length).toBe(2);
+      expect(fakeServer.sendMessages[1].body.msg.item_list[0].text_item.text).toBe('Second update from the same subagent.');
     } finally {
       await manager.stop();
     }
@@ -589,8 +602,8 @@ describe('Item E: WeChat Continuation Delivery', () => {
       );
       expect(auto2Message).toBeDefined();
 
-      // 6. Verify dedupe outbox key uses immediate originTurnId: cont_<originTurnId>_<causeChildId>
-      const expectedOutboxId = `cont_${auto1TurnId}_${causeChildId}`;
+      // 6. Verify dedupe outbox key uses immediate originTurnId: cont_<originTurnId>_<turnId>
+      const expectedOutboxId = `cont_${auto1TurnId}_${auto2TurnId}`;
       const outboxRow = db.prepare('SELECT id, status FROM channel_outbox WHERE id = ?').get(expectedOutboxId) as any;
       expect(outboxRow).toBeDefined();
       expect(outboxRow.id).toBe(expectedOutboxId);

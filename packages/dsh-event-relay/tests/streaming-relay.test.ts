@@ -346,6 +346,15 @@ describe('EventRelayService Streaming & Batching Pipeline', () => {
     expect(types).toContain('turn_started');
     expect(types).toContain('turn_completed');
 
+    // The re-sent frame keeps the id it carried the first time, so a platform that already stored it
+    // (the timed-out request may have succeeded) can drop the copy.
+    const firstIds = requestCalls[0].body.events.map((e: any) => e.id);
+    expect(firstIds.every((id: unknown) => typeof id === 'string' && /^evt_[0-9a-f]{32}$/.test(id as string))).toBe(true);
+    const resent = secondCallEvents.find((e: any) => e.type === 'turn_started');
+    expect(resent.id).toBe(requestCalls[0].body.events.find((e: any) => e.type === 'turn_started').id);
+    const allIds = secondCallEvents.map((e: any) => e.id);
+    expect(new Set(allIds).size).toBe(allIds.length);
+
     service.clear();
   });
 

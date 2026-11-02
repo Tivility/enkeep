@@ -47,6 +47,21 @@ const parsedBudget = envBudget ? parseInt(envBudget, 10) : NaN;
 export const DEFAULT_CONTINUATION_INACTIVITY_TIMEOUT_MS =
   Number.isSafeInteger(parsedBudget) && parsedBudget > 0 ? parsedBudget : 3_600_000;
 
+
+/**
+ * Outbox id of the continuation card for one autonomous turn: `cont_<origin turn>_<autonomous turn>`.
+ * Falls back to the causing child only when the turn id is unknown. Undefined without an origin.
+ */
+export function continuationOutboxId(
+  originTurnId: string | undefined,
+  turnId: string | undefined,
+  causeChildId: string | undefined
+): string | undefined {
+  if (!originTurnId) return undefined;
+  const key = turnId || causeChildId;
+  return key ? `cont_${originTurnId}_${key}` : undefined;
+}
+
 export class ContinuationWatcher {
   private readonly sessionRouteId: string;
   private readonly accountId: string;
@@ -338,10 +353,12 @@ export class ContinuationWatcher {
           }
         }
 
+        // One card per autonomous turn. A child can wake its parent several times (progress messages,
+        // then its completion notice), and each wake is a separate model turn with its own reply, so the
+        // key is the autonomous turn; replaying the same turn still dedupes.
         const causeChildId = (runningEvt as any).causeChildId;
-        const outboxId = runningEvt.originTurnId
-          ? `cont_${runningEvt.originTurnId}_${causeChildId || runningEvt.turnId}`
-          : (this.deriveOutboxId?.(`cont_row_${runningEvt.rowId}`) ?? `cont_${runningEvt.turnId || `row_${runningEvt.rowId}`}`);
+        const outboxId = continuationOutboxId(runningEvt.originTurnId, runningEvt.turnId, causeChildId)
+          ?? (this.deriveOutboxId?.(`cont_row_${runningEvt.rowId}`) ?? `cont_${runningEvt.turnId || `row_${runningEvt.rowId}`}`);
 
         if (typeof this.channelRepo.findOutboxById === 'function') {
           const existing = await this.channelRepo.findOutboxById(outboxId).catch(() => null);
