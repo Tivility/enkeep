@@ -39,7 +39,7 @@ import type {
   LoginResult,
 } from '@enkeep/web-channel';
 import { WEB_CHANNEL_NAME, DEFAULT_WEB_ACCOUNT_ID } from '@enkeep/web-channel';
-import { SqliteWebMessageStore, generate32HexId } from './web-messages.js';
+import { SqliteWebMessageStore, generate32HexId, PUBLIC_WEB_EVENT_TYPES } from './web-messages.js';
 import { computeAgentProfilePromptHash, canonicalJsonStringify } from '../profiles/profile-service.js';
 import type { ForkService } from '../sessions/fork-service.js';
 import type { SessionLifecycleService } from '../sessions/session-lifecycle-service.js';
@@ -1850,7 +1850,8 @@ export class SqlitePlatformWebApiAdapter implements PlatformWebApi {
     await this.ensureSessionAccess(userId, sessionId);
 
     const result = await this.messageStore.pollEvents(userId, sessionId, cursor);
-    const events: PublicWebChannelEvent[] = result.events.map((e) => {
+    // The store only returns public event types; anything else is dropped here instead of failing the poll.
+    const events: PublicWebChannelEvent[] = result.events.filter((e) => PUBLIC_WEB_EVENT_TYPES.has(e.type)).map((e) => {
       if (!e.id || typeof e.id !== 'string') {
         throw new PlatformError('Corrupted event record: missing id', 'DATABASE_CORRUPTED', 500);
       }
