@@ -92,6 +92,11 @@ export interface HostUserSpecOptions {
   maxConcurrentSessions?: number;
   mounts?: readonly RuntimeMountSpec[];
   extraEnv?: Record<string, string>;
+  /**
+   * Offer the agent `ask_user_question` (sets ENKEEP_USER_QUESTIONS=1/0 in the daemon env, over
+   * the platform process's value). When omitted, the platform process's value applies.
+   */
+  userQuestions?: boolean;
 }
 
 export interface HostProcessMetadata {

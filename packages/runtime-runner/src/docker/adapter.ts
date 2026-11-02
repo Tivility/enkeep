@@ -33,6 +33,10 @@ import {
   DockerDaemonError,
   APPROVAL_TIMEOUT_ENV_KEY,
   normalizeApprovalTimeoutEnv,
+  USER_QUESTIONS_ENV_KEY,
+  normalizeUserQuestionsEnv,
+  QUESTION_TIMEOUT_ENV_KEY,
+  normalizeQuestionTimeoutEnv,
 } from '../spec/validator.js';
 import type { RuntimeContainerSpec, ExactContainerIdentity, RuntimeNetworkMode } from '../spec/types.js';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
@@ -53,6 +57,7 @@ import type { TunnelHostOptions } from '../tunnel/types.js';
 import { DaemonDockerTransport, type DaemonDockerTransportOptions } from '../transport/daemon-transport.js';
 import {
   DaemonProtocolError,
+  type QuestionAnswer,
   type ReadAttachmentParams,
   type ReadSessionEventsParams,
 } from '../runtime/daemon-protocol.js';
@@ -97,6 +102,11 @@ export interface UserSpecOptions {
   llmProviders?: string | Record<string, unknown>;
   /** Optional idle agent timeout in ms (injects DSH_IDLE_AGENT_TIMEOUT_MS) */
   idleAgentTimeoutMs?: number;
+  /**
+   * Offer the agent `ask_user_question` (injects ENKEEP_USER_QUESTIONS=1/0). When omitted, the
+   * platform process's ENKEEP_USER_QUESTIONS is passed through when it is `1` or `0`.
+   */
+  userQuestions?: boolean;
 }
 
 
@@ -482,6 +492,18 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
     const approvalTimeout = normalizeApprovalTimeoutEnv(process.env[APPROVAL_TIMEOUT_ENV_KEY]);
     if (approvalTimeout !== undefined) {
       env[APPROVAL_TIMEOUT_ENV_KEY] = approvalTimeout;
+    }
+
+    const userQuestions =
+      options.userQuestions !== undefined
+        ? (options.userQuestions ? '1' : '0')
+        : normalizeUserQuestionsEnv(process.env[USER_QUESTIONS_ENV_KEY]);
+    if (userQuestions !== undefined) {
+      env[USER_QUESTIONS_ENV_KEY] = userQuestions;
+    }
+    const questionTimeout = normalizeQuestionTimeoutEnv(process.env[QUESTION_TIMEOUT_ENV_KEY]);
+    if (questionTimeout !== undefined) {
+      env[QUESTION_TIMEOUT_ENV_KEY] = questionTimeout;
     }
 
     if (isLlmEnabled) {
@@ -1390,6 +1412,21 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           throw new DockerDaemonError('Transport does not support readAttachment');
         }
         return transport.readAttachment(params);
+      },
+      // ask_user_question questions; errors (e.g. `question/not-found`) propagate.
+      listQuestions: async (sessionId?: string) => {
+        const transport = await getOrStartTransport();
+        if (!transport.listQuestions) {
+          throw new DockerDaemonError('Transport does not support listQuestions');
+        }
+        return transport.listQuestions(sessionId);
+      },
+      answerQuestion: async (questionId: string, answers: readonly QuestionAnswer[]) => {
+        const transport = await getOrStartTransport();
+        if (!transport.answerQuestion) {
+          throw new DockerDaemonError('Transport does not support answerQuestion');
+        }
+        return transport.answerQuestion(questionId, answers);
       },
       stopBackgroundTask: async (sessionId: string, taskId: string) => {
         try {

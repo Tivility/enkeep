@@ -65,6 +65,7 @@ import type { FileOperationRequest } from '../runtime/file-ops.js';
 import type { RuntimeHealthStatus } from '../transport/types.js';
 import {
   DaemonProtocolError,
+  type QuestionAnswer,
   type ReadAttachmentParams,
   type ReadSessionEventsParams,
 } from '../runtime/daemon-protocol.js';
@@ -158,7 +159,10 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
       idleAgentTimeoutMs: options.idleAgentTimeoutMs ?? 3_600_000,
       maxConcurrentSessions: options.maxConcurrentSessions ?? 4,
       mounts: options.mounts,
-      environment: options.extraEnv || {},
+      environment: {
+        ...(options.extraEnv || {}),
+        ...(options.userQuestions !== undefined ? { ENKEEP_USER_QUESTIONS: options.userQuestions ? '1' : '0' } : {}),
+      },
     };
 
     validateHostRuntimePaths(spec);
@@ -832,6 +836,10 @@ export class HostRuntimeAdapter implements RuntimeExecutionProvider<HostRuntimeS
       // Read-only DSH session history; errors (e.g. `session/not-found`) propagate.
       readSessionEvents: (params: ReadSessionEventsParams) => transport.readSessionEvents(params),
       readAttachment: (params: ReadAttachmentParams) => transport.readAttachment(params),
+      // ask_user_question questions; errors (e.g. `question/not-found`) propagate.
+      listQuestions: (sessionId?: string) => transport.listQuestions(sessionId),
+      answerQuestion: (questionId: string, answers: readonly QuestionAnswer[]) =>
+        transport.answerQuestion(questionId, answers),
       stopBackgroundTask: async (sessionId: string, taskId: string) => {
         try {
           const res = await transport.stopBackgroundTask(sessionId, taskId);

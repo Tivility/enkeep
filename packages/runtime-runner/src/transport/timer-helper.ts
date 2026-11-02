@@ -220,6 +220,58 @@ export function extractVerifiedApprovalDecided(event: unknown): { decisionId: st
 }
 
 /**
+ * A waiting `ask_user_question` (`question/asked` push): its key in the waiter's pending set
+ * (prefixed so it never collides with an approval id).
+ */
+export function extractVerifiedQuestionAsked(event: unknown): { waitKey: string } | null {
+  if (!event || typeof event !== 'object') return null;
+  const ev = event as Record<string, unknown>;
+  if (ev.type !== 'event' || ev.event !== 'question/asked') return null;
+  const question = ev.question as Record<string, unknown> | undefined;
+  if (question && typeof question === 'object' && typeof question.id === 'string' && question.id.trim()) {
+    return { waitKey: `question:${question.id.trim()}` };
+  }
+  return null;
+}
+
+/** A question that ended (`question/settled` push): the key to remove from the waiter's pending set. */
+export function extractVerifiedQuestionSettled(event: unknown): { waitKey: string; outcome?: string } | null {
+  if (!event || typeof event !== 'object') return null;
+  const ev = event as Record<string, unknown>;
+  if (ev.type !== 'event' || ev.event !== 'question/settled') return null;
+  if (typeof ev.id === 'string' && ev.id.trim()) {
+    return { waitKey: `question:${ev.id.trim()}`, outcome: typeof ev.outcome === 'string' ? ev.outcome : undefined };
+  }
+  return null;
+}
+
+/**
+ * Pauses or resumes a turn's idle watchdog around a human interaction (approval or question):
+ * returns 'paused' / 'resumed' when the event started or ended one, otherwise null.
+ */
+export function applyInteractionWait(
+  waiter: TurnWatchdogWaiter,
+  event: unknown,
+  refresh: () => void
+): 'paused' | 'resumed' | null {
+  const asked = extractVerifiedApprovalAsked(event);
+  const questionAsked = asked ? null : extractVerifiedQuestionAsked(event);
+  if (asked || questionAsked) {
+    waiter.pendingApprovals.add(asked ? asked.approvalId : questionAsked!.waitKey);
+    pauseWaiterIdleTimer(waiter);
+    return 'paused';
+  }
+  const decided = extractVerifiedApprovalDecided(event);
+  const questionSettled = decided ? null : extractVerifiedQuestionSettled(event);
+  if (decided || questionSettled) {
+    waiter.pendingApprovals.delete(decided ? decided.decisionId : questionSettled!.waitKey);
+    if (waiter.pendingApprovals.size === 0) refresh();
+    return 'resumed';
+  }
+  return null;
+}
+
+/**
  * Evaluates whether an incoming daemon push stream event constitutes genuine turn progress.
  *
  * Genuine progress resets the idle activity deadline (watching for hung/stalled agents),
@@ -263,6 +315,12 @@ export function isGenuineTurnProgress(event: unknown): boolean {
   }
   if (eventName === 'approval/decided') {
     return extractVerifiedApprovalDecided(event) !== null;
+  }
+  if (eventName === 'question/asked') {
+    return extractVerifiedQuestionAsked(event) !== null;
+  }
+  if (eventName === 'question/settled') {
+    return extractVerifiedQuestionSettled(event) !== null;
   }
 
   // Session events inside turn/event

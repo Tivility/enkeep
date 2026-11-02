@@ -6,24 +6,41 @@ import type {
   ApprovalRiskLevel,
   PendingApproval,
   AskUserQuestionRequest,
-  AskUserQuestionAnswer,
-  AskUserQuestionAnswerItem,
-  PendingQuestion,
   IExternalInteractionService,
+  QuestionAnswerAttempt,
 } from './types.js';
 
 import {
   DEFAULT_INTERACTION_TIMEOUT_MS,
   classifyToolRiskAndSummary,
 } from './approval-policy.js';
+import {
+  DEFAULT_QUESTION_TIMEOUT_MS,
+  normalizeAskUserQuestionInput,
+  validateQuestionAnswers,
+  type PendingQuestion,
+  type QuestionAnswer,
+  type QuestionOutcome,
+  type QuestionResolution,
+  type QuestionSettlement,
+  type UserQuestion,
+} from './user-questions.js';
 
 export { DEFAULT_INTERACTION_TIMEOUT_MS, classifyToolRiskAndSummary };
 
 export interface ExternalInteractionConfig {
   defaultTimeoutMs?: number;
-  /** Wait for an approval answer; defaults to `defaultTimeoutMs`. Questions keep `defaultTimeoutMs`. */
+  /** Wait for an approval answer; defaults to `defaultTimeoutMs`. */
   approvalTimeoutMs?: number;
+  /** Wait for a question answer; defaults to 10 min. */
+  questionTimeoutMs?: number;
 }
+
+/** How many settled questions are remembered (to tell "expired" from "unknown" on late answers). */
+export const SETTLED_QUESTION_RETENTION = 256;
+
+/** Tool call ids usable as question ids as they are. */
+const REUSABLE_QUESTION_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 
 /**
  * Helper to inspect agent/session metadata and determine the session source.
@@ -90,21 +107,31 @@ interface PendingApprovalInternal extends PendingApproval {
   signal?: AbortSignal;
 }
 
-interface PendingQuestionInternal extends PendingQuestion {
-  resolve: (answer: AskUserQuestionAnswer) => void;
-  reject: (err: unknown) => void;
+interface PendingQuestionInternal {
+  record: PendingQuestion;
+  resolve: (resolution: QuestionResolution) => void;
   timer?: NodeJS.Timeout;
   signalListener?: () => void;
   signal?: AbortSignal;
+}
+
+function copyQuestion(record: PendingQuestion): PendingQuestion {
+  return {
+    ...record,
+    // Questions are deep-frozen at normalization; answers are copied.
+    ...(record.answers ? { answers: record.answers.map((a) => ({ ...a, selected: [...a.selected] })) } : {}),
+  };
 }
 
 export class ExternalInteractionService extends Service implements IExternalInteractionService {
   private readonly approvals = new Map<string, PendingApprovalInternal>();
   private readonly settledApprovals = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestionInternal>();
+  private readonly settledQuestions = new Map<string, PendingQuestion>();
 
   private readonly approvalListeners = new Set<(pending: PendingApproval) => void>();
   private readonly questionListeners = new Set<(pending: PendingQuestion) => void>();
+  private readonly questionSettledListeners = new Set<(settlement: QuestionSettlement) => void>();
 
   constructor(ctx: Context, private readonly interactionConfig: ExternalInteractionConfig = {}) {
     super(ctx, 'externalInteraction');
@@ -117,6 +144,11 @@ export class ExternalInteractionService extends Service implements IExternalInte
   /** Effective wait for an approval answer before it resolves `unavailable` (expired). */
   get approvalTimeoutMs(): number {
     return this.interactionConfig.approvalTimeoutMs ?? this.timeoutMs;
+  }
+
+  /** Effective wait for a question answer before it settles `expired`. */
+  get questionTimeoutMs(): number {
+    return this.interactionConfig.questionTimeoutMs ?? DEFAULT_QUESTION_TIMEOUT_MS;
   }
 
   listPendingApprovals(filter?: { userId?: string; sessionId?: string }): readonly PendingApproval[] {
@@ -267,20 +299,7 @@ export class ExternalInteractionService extends Service implements IExternalInte
   }
 
   listPendingQuestions(filter?: { userId?: string; sessionId?: string }): readonly PendingQuestion[] {
-    const list = Array.from(this.questions.values()).map(
-      ({ id, sessionId, userId, spaceId, sessionSource, questions, createdAt, timeoutMs, status }) => ({
-        id,
-        sessionId,
-        userId,
-        spaceId,
-        sessionSource,
-        questions,
-        createdAt,
-        timeoutMs,
-        status: status ?? 'pending',
-      })
-    );
-
+    const list = Array.from(this.questions.values()).map((entry) => copyQuestion(entry.record));
     if (!filter) return list;
     return list.filter((item) => {
       if (filter.userId && item.userId && item.userId !== filter.userId) return false;
@@ -289,45 +308,61 @@ export class ExternalInteractionService extends Service implements IExternalInte
     });
   }
 
+  /** A pending question by id (undefined once settled). */
   getPendingQuestion(id: string): PendingQuestion | undefined {
     const entry = this.questions.get(id);
-    if (!entry) return undefined;
-    const { sessionId, userId, spaceId, sessionSource, questions, createdAt, timeoutMs, status } = entry;
-    return { id, sessionId, userId, spaceId, sessionSource, questions, createdAt, timeoutMs, status: status ?? 'pending' };
+    return entry ? copyQuestion(entry.record) : undefined;
   }
 
-  answerQuestion(
-    id: string,
-    answers: Record<string, string | string[]> | AskUserQuestionAnswerItem[]
-  ): boolean {
+  /** A pending question, or a recently settled one (with its final `status`). */
+  getQuestion(id: string): PendingQuestion | undefined {
     const entry = this.questions.get(id);
-    if (!entry) return false;
+    if (entry) return copyQuestion(entry.record);
+    const settled = this.settledQuestions.get(id);
+    return settled ? copyQuestion(settled) : undefined;
+  }
 
-    this.cleanupQuestion(id);
+  answerQuestion(id: string, answers: readonly QuestionAnswer[]): boolean {
+    return this.tryAnswerQuestion(id, answers).ok;
+  }
 
-    let answerItems: AskUserQuestionAnswerItem[];
-    if (Array.isArray(answers)) {
-      answerItems = answers;
-    } else {
-      answerItems = Object.entries(answers).map(([qId, val]) => ({
-        id: qId,
-        answer: val,
-      }));
+  /**
+   * Answers a pending question with `{ id, selected, custom? }` items (validated against the
+   * questions asked). The first accepted answer wins; see {@link QuestionAnswerAttempt} for why
+   * an answer is refused.
+   */
+  tryAnswerQuestion(id: string, answers: unknown): QuestionAnswerAttempt {
+    const entry = this.questions.get(id);
+    if (!entry) {
+      const settled = this.settledQuestions.get(id);
+      if (!settled) {
+        return { ok: false, code: 'not-found', message: `No question with id "${id}"` };
+      }
+      if (settled.status === 'expired') {
+        return {
+          ok: false,
+          code: 'expired',
+          message: `Question "${id}" expired before it was answered`,
+          question: copyQuestion(settled),
+        };
+      }
+      return {
+        ok: false,
+        code: 'already-settled',
+        message: `Question "${id}" is already ${settled.status}`,
+        question: copyQuestion(settled),
+      };
     }
-
-    entry.resolve({ answers: answerItems });
-    return true;
+    const validated = validateQuestionAnswers(entry.record.questions, answers);
+    if (!validated.ok) {
+      return { ok: false, code: 'invalid-answers', message: validated.error };
+    }
+    const record = this.settleQuestion(id, 'answered', { answers: validated.value });
+    return { ok: true, question: record!, answers: validated.value.map((a) => ({ ...a, selected: [...a.selected] })) };
   }
 
   cancelQuestion(id: string, reason = 'Question cancelled'): boolean {
-    const entry = this.questions.get(id);
-    if (!entry) return false;
-
-    this.cleanupQuestion(id);
-    const err = new Error(reason);
-    (err as any).code = 'ASK_CANCELLED';
-    entry.reject(err);
-    return true;
+    return this.settleQuestion(id, 'cancelled', { reason }) !== undefined;
   }
 
   onApprovalAsked(handler: (pending: PendingApproval) => void): () => void {
@@ -338,6 +373,12 @@ export class ExternalInteractionService extends Service implements IExternalInte
   onQuestionAsked(handler: (pending: PendingQuestion) => void): () => void {
     this.questionListeners.add(handler);
     return () => this.questionListeners.delete(handler);
+  }
+
+  /** Every settlement of a question (answered, expired, cancelled), exactly once per question. */
+  onQuestionSettled(handler: (settlement: QuestionSettlement) => void): () => void {
+    this.questionSettledListeners.add(handler);
+    return () => this.questionSettledListeners.delete(handler);
   }
 
   /**
@@ -452,80 +493,129 @@ export class ExternalInteractionService extends Service implements IExternalInte
   }
 
   /**
-   * Suspend a question request until answered, timed out, or cancelled.
+   * Holds a question until the user answers, it expires (`questionTimeoutMs`), or the request's
+   * signal aborts. Never rejects for those outcomes: it resolves with the {@link QuestionResolution}.
+   * Throws a TypeError when the questions are invalid.
    */
-  async suspendQuestion(
-    req: AskUserQuestionRequest,
-    sessionSource: string
-  ): Promise<AskUserQuestionAnswer> {
-    const id = crypto.randomUUID();
-    const sessionId = req.agent?.session?.id ?? 'unknown-session';
+  async suspendQuestion(req: AskUserQuestionRequest, sessionSource: string): Promise<QuestionResolution> {
+    const normalized = normalizeAskUserQuestionInput({ questions: req.questions });
+    if (!normalized.ok) {
+      throw new TypeError(`Invalid questions: ${normalized.error}`);
+    }
+    const questions: UserQuestion[] = normalized.value;
+    const callId = typeof req.callId === 'string' && req.callId ? String(req.callId) : undefined;
+    const id = this.newQuestionId(callId);
+    if (req.signal?.aborted) {
+      return { outcome: 'cancelled', questionId: id, reason: 'aborted before asking' };
+    }
+
+    const sessionId = String(req.agent?.session?.id ?? 'unknown-session');
     const { userId, spaceId } = resolveTenantAndSpace(req.agent);
-    const timeout = this.timeoutMs;
-    const createdAt = new Date().toISOString();
+    const timeoutMs = this.questionTimeoutMs;
+    const createdAtMs = Date.now();
+    const record: PendingQuestion = {
+      id,
+      sessionId,
+      ...(callId ? { callId } : {}),
+      ...(userId ? { userId } : {}),
+      ...(spaceId ? { spaceId } : {}),
+      sessionSource,
+      questions,
+      createdAt: new Date(createdAtMs).toISOString(),
+      timeoutMs,
+      expiresAt: new Date(createdAtMs + timeoutMs).toISOString(),
+      status: 'pending',
+    };
 
-    return new Promise<AskUserQuestionAnswer>((resolve, reject) => {
-      const entry: PendingQuestionInternal = {
-        id,
-        sessionId: String(sessionId),
-        userId,
-        spaceId,
-        sessionSource,
-        questions: req.questions,
-        createdAt,
-        timeoutMs: timeout,
-        status: 'pending',
-        resolve,
-        reject,
-        signal: req.signal,
-      };
-
-      if (req.signal?.aborted) {
-        const err = new Error('ask_user_question was aborted before answering');
-        (err as any).code = 'ASK_ABORTED';
-        reject(err);
-        return;
-      }
-
+    return new Promise<QuestionResolution>((resolve) => {
+      const entry: PendingQuestionInternal = { record, resolve, signal: req.signal };
       if (req.signal) {
         const onAbort = () => {
-          this.cleanupQuestion(id);
-          const err = new Error('ask_user_question was aborted before answering');
-          (err as any).code = 'ASK_ABORTED';
-          reject(err);
+          this.settleQuestion(id, 'cancelled', { reason: 'the tool call was aborted' });
         };
         req.signal.addEventListener('abort', onAbort, { once: true });
         entry.signalListener = onAbort;
       }
-
       entry.timer = setTimeout(() => {
-        this.cleanupQuestion(id);
-        const err = new Error('ask_user_question timed out');
-        (err as any).code = 'TIMEOUT';
-        reject(err);
-      }, timeout);
-
+        this.settleQuestion(id, 'expired');
+      }, timeoutMs);
       this.questions.set(id, entry);
 
-      // Notify listeners
       for (const listener of this.questionListeners) {
         try {
-          listener({
-            id,
-            sessionId: String(sessionId),
-            userId,
-            spaceId,
-            sessionSource,
-            questions: req.questions,
-            createdAt,
-            timeoutMs: timeout,
-            status: 'pending',
-          });
+          listener(copyQuestion(record));
         } catch {
           // Ignore listener error
         }
       }
     });
+  }
+
+  /** The tool call id when it is usable and free, else a fresh `q_<uuid>`. */
+  private newQuestionId(callId: string | undefined): string {
+    if (
+      callId &&
+      REUSABLE_QUESTION_ID.test(callId) &&
+      !this.questions.has(callId) &&
+      !this.settledQuestions.has(callId)
+    ) {
+      return callId;
+    }
+    return `q_${crypto.randomUUID().replace(/-/g, '')}`;
+  }
+
+  /** Settles a pending question once: records it, notifies listeners, resolves the asker. */
+  private settleQuestion(
+    id: string,
+    outcome: QuestionOutcome,
+    detail: { answers?: QuestionAnswer[]; reason?: string } = {}
+  ): PendingQuestion | undefined {
+    const entry = this.questions.get(id);
+    if (!entry) return undefined;
+    this.cleanupQuestion(id);
+
+    const settledAt = new Date().toISOString();
+    const settled: PendingQuestion = {
+      ...entry.record,
+      status: outcome,
+      settledAt,
+      ...(outcome === 'answered' ? { answers: detail.answers ?? [] } : {}),
+    };
+    this.settledQuestions.set(id, settled);
+    while (this.settledQuestions.size > SETTLED_QUESTION_RETENTION) {
+      const oldest = this.settledQuestions.keys().next().value;
+      if (oldest === undefined) break;
+      this.settledQuestions.delete(oldest);
+    }
+
+    const settlement: QuestionSettlement = {
+      id,
+      sessionId: settled.sessionId,
+      ...(settled.callId ? { callId: settled.callId } : {}),
+      outcome,
+      ...(outcome === 'answered' ? { answers: (detail.answers ?? []).map((a) => ({ ...a, selected: [...a.selected] })) } : {}),
+      settledAt,
+      ...(outcome === 'cancelled' && detail.reason ? { reason: detail.reason } : {}),
+    };
+    for (const listener of this.questionSettledListeners) {
+      try {
+        listener(settlement);
+      } catch {
+        // Ignore listener error
+      }
+    }
+
+    switch (outcome) {
+      case 'answered':
+        entry.resolve({ outcome, questionId: id, answers: detail.answers ?? [] });
+        break;
+      case 'expired':
+        entry.resolve({ outcome, questionId: id, timeoutMs: entry.record.timeoutMs });
+        break;
+      default:
+        entry.resolve({ outcome: 'cancelled', questionId: id, ...(detail.reason ? { reason: detail.reason } : {}) });
+    }
+    return copyQuestion(settled);
   }
 
   private cleanupApproval(id: string): void {
@@ -564,17 +654,13 @@ export class ExternalInteractionService extends Service implements IExternalInte
     this.approvals.clear();
     this.settledApprovals.clear();
 
-    for (const [id, entry] of this.questions) {
-      if (entry.timer) clearTimeout(entry.timer);
-      if (entry.signal && entry.signalListener) {
-        entry.signal.removeEventListener('abort', entry.signalListener);
-      }
-      const err = new Error('External interaction plugin unloaded');
-      (err as any).code = 'DISPOSED';
-      entry.reject(err);
+    for (const id of Array.from(this.questions.keys())) {
+      this.settleQuestion(id, 'cancelled', { reason: 'the runtime is shutting down' });
     }
     this.questions.clear();
+    this.settledQuestions.clear();
     this.approvalListeners.clear();
     this.questionListeners.clear();
+    this.questionSettledListeners.clear();
   }
 }

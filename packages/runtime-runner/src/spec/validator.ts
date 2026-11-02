@@ -160,6 +160,27 @@ export function normalizeApprovalTimeoutEnv(raw: unknown): string | undefined {
   return value;
 }
 
+/** Runtime env gate read by `@enkeep/dsh-external-interaction`: `1` composes `ask_user_question`. */
+export const USER_QUESTIONS_ENV_KEY = 'ENKEEP_USER_QUESTIONS';
+
+/** Runtime env key read by `@enkeep/dsh-external-interaction` for the question wait (ms). */
+export const QUESTION_TIMEOUT_ENV_KEY = 'ENKEEP_QUESTION_TIMEOUT_MS';
+
+/** The user-questions gate to pass to a runtime process: `'1'` or `'0'` (trimmed), else `undefined`. */
+export function normalizeUserQuestionsEnv(raw: unknown): '1' | '0' | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  return value === '1' || value === '0' ? value : undefined;
+}
+
+/**
+ * The question wait timeout to pass to a runtime process: a positive integer string (ms) as given,
+ * otherwise `undefined` (the runtime bounds it to 1 s .. 24 h and defaults to 10 min).
+ */
+export function normalizeQuestionTimeoutEnv(raw: unknown): string | undefined {
+  return normalizeApprovalTimeoutEnv(raw);
+}
+
 export const ALLOWED_ENV_KEYS = new Set([
   'DSH_USER',
   'DSH_HOME',
@@ -169,6 +190,8 @@ export const ALLOWED_ENV_KEYS = new Set([
   'DSH_MAX_CONCURRENT_SESSIONS',
   'ENKEEP_CONTEXT_WINDOW_DEFAULT',
   'ENKEEP_APPROVAL_TIMEOUT_MS',
+  'ENKEEP_USER_QUESTIONS',
+  'ENKEEP_QUESTION_TIMEOUT_MS',
   'ENKEEP_LLM_ENABLED',
   'ENKEEP_LLM_PROVIDER',
   'ENKEEP_LLM_MODEL',
@@ -364,6 +387,16 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
     if ('ENKEEP_APPROVAL_TIMEOUT_MS' in environment && environment.ENKEEP_APPROVAL_TIMEOUT_MS !== undefined) {
       if (normalizeApprovalTimeoutEnv(environment.ENKEEP_APPROVAL_TIMEOUT_MS) !== environment.ENKEEP_APPROVAL_TIMEOUT_MS) {
         errors.push('environment.ENKEEP_APPROVAL_TIMEOUT_MS must be a positive integer string');
+      }
+    }
+    if ('ENKEEP_USER_QUESTIONS' in environment && environment.ENKEEP_USER_QUESTIONS !== undefined) {
+      if (environment.ENKEEP_USER_QUESTIONS !== '1' && environment.ENKEEP_USER_QUESTIONS !== '0') {
+        errors.push('environment.ENKEEP_USER_QUESTIONS must be "1" or "0"');
+      }
+    }
+    if ('ENKEEP_QUESTION_TIMEOUT_MS' in environment && environment.ENKEEP_QUESTION_TIMEOUT_MS !== undefined) {
+      if (normalizeQuestionTimeoutEnv(environment.ENKEEP_QUESTION_TIMEOUT_MS) !== environment.ENKEEP_QUESTION_TIMEOUT_MS) {
+        errors.push('environment.ENKEEP_QUESTION_TIMEOUT_MS must be a positive integer string');
       }
     }
     if ('DSH_MAX_AGENTS' in environment && environment.DSH_MAX_AGENTS !== undefined) {

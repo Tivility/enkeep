@@ -28,7 +28,10 @@ import type { HostDaemonTransportOptions } from '../host/transport.js';
 import type { HostPlatformProxyPort } from '../host/types.js';
 import type { PlatformProxyHandler } from '../tunnel/platform-proxy.js';
 import type {
+  AnswerQuestionResult,
   BackgroundTask,
+  ListQuestionsResult,
+  QuestionAnswer,
   ReadAttachmentParams,
   ReadAttachmentResult,
   ReadSessionEventsParams,
@@ -170,6 +173,13 @@ export interface ActiveRuntimeHandle {
   readSessionEvents?(params: ReadSessionEventsParams): Promise<ReadSessionEventsResult>;
   /** A whole image attachment cited by a session's events; errors propagate (`attachment/*`). */
   readAttachment?(params: ReadAttachmentParams): Promise<ReadAttachmentResult>;
+  /**
+   * Pending `ask_user_question` questions (optionally of one DSH session) and whether the runtime
+   * offers questions. Live updates: `transport.onQuestionEvent` (after `startTransport()`).
+   */
+  listQuestions?(sessionId?: string): Promise<ListQuestionsResult>;
+  /** Answers a pending question; errors propagate as `DaemonProtocolError` (`question/*` codes). */
+  answerQuestion?(questionId: string, answers: readonly QuestionAnswer[]): Promise<AnswerQuestionResult>;
   fileWriteStream?(
     options: {
       space: string;

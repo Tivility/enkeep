@@ -14,7 +14,26 @@ import { HostOwnershipError } from '../spec/provider.js';
 import type { HostRuntimeSpec } from './types.js';
 import { validateMountSpec, isPathContained } from '../spec/mount-security.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
-import { APPROVAL_TIMEOUT_ENV_KEY, normalizeApprovalTimeoutEnv } from '../spec/validator.js';
+import {
+  APPROVAL_TIMEOUT_ENV_KEY,
+  normalizeApprovalTimeoutEnv,
+  USER_QUESTIONS_ENV_KEY,
+  normalizeUserQuestionsEnv,
+  QUESTION_TIMEOUT_ENV_KEY,
+  normalizeQuestionTimeoutEnv,
+} from '../spec/validator.js';
+
+/** Env values admitted only in their normalized form (others are dropped). */
+const NORMALIZED_HOST_ENV: Readonly<Record<string, (raw: unknown) => string | undefined>> = {
+  [APPROVAL_TIMEOUT_ENV_KEY]: normalizeApprovalTimeoutEnv,
+  [USER_QUESTIONS_ENV_KEY]: normalizeUserQuestionsEnv,
+  [QUESTION_TIMEOUT_ENV_KEY]: normalizeQuestionTimeoutEnv,
+};
+
+function isMalformedHostEnv(key: string, value: string): boolean {
+  const normalize = NORMALIZED_HOST_ENV[key];
+  return normalize !== undefined && normalize(value) !== value;
+}
 
 export const ALLOWED_HOST_ENV_KEYS = new Set([
   'PATH',
@@ -31,6 +50,8 @@ export const ALLOWED_HOST_ENV_KEYS = new Set([
   'DSH_MOUNTS_FILE',
   'ENKEEP_CONTEXT_WINDOW_DEFAULT',
   'ENKEEP_APPROVAL_TIMEOUT_MS',
+  'ENKEEP_USER_QUESTIONS',
+  'ENKEEP_QUESTION_TIMEOUT_MS',
   'DSH_MAX_AGENTS',
   'DSH_IDLE_AGENT_TIMEOUT_MS',
   'DSH_MAX_CONCURRENT_SESSIONS',
@@ -270,6 +291,17 @@ export function filterHostEnvironment(
     env[APPROVAL_TIMEOUT_ENV_KEY] = approvalTimeout;
   }
 
+  // User questions gate and question wait (ms), from the platform process; a per-user
+  // spec.environment value (below) overrides them.
+  const userQuestions = normalizeUserQuestionsEnv(process.env[USER_QUESTIONS_ENV_KEY]);
+  if (userQuestions !== undefined) {
+    env[USER_QUESTIONS_ENV_KEY] = userQuestions;
+  }
+  const questionTimeout = normalizeQuestionTimeoutEnv(process.env[QUESTION_TIMEOUT_ENV_KEY]);
+  if (questionTimeout !== undefined) {
+    env[QUESTION_TIMEOUT_ENV_KEY] = questionTimeout;
+  }
+
   // LLM and placeholder credentials
   env.ENKEEP_LLM_ENABLED = spec.llmEnabled ? '1' : '0';
   if (spec.llmProvider) {
@@ -319,7 +351,7 @@ export function filterHostEnvironment(
             break;
           }
         }
-        if (key === APPROVAL_TIMEOUT_ENV_KEY && normalizeApprovalTimeoutEnv(val) !== val) {
+        if (isMalformedHostEnv(key, val)) {
           continue;
         }
         if (!isSensitive) {
@@ -332,7 +364,7 @@ export function filterHostEnvironment(
   if (extraAllowlist) {
     for (const [key, val] of Object.entries(extraAllowlist)) {
       if (ALLOWED_HOST_ENV_KEYS.has(key)) {
-        if (key === APPROVAL_TIMEOUT_ENV_KEY && normalizeApprovalTimeoutEnv(val) !== val) continue;
+        if (isMalformedHostEnv(key, val)) continue;
         env[key] = val;
       }
     }

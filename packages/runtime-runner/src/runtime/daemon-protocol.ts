@@ -31,6 +31,20 @@ import type {
   ExtensionActivationPlan,
 } from '@enkeep/protocol';
 import { validateExtraReadableRoots } from '../spec/mount-security.js';
+import type {
+  PendingQuestion,
+  QuestionAnswer,
+  QuestionOutcome,
+} from '@enkeep/dsh-external-interaction/user-questions';
+
+export type {
+  PendingQuestion,
+  QuestionAnswer,
+  QuestionOption,
+  QuestionOutcome,
+  QuestionStatus,
+  UserQuestion,
+} from '@enkeep/dsh-external-interaction/user-questions';
 
 export const MAX_DAEMON_FRAME_SIZE = 10 * 1024 * 1024; // 10 MiB frame limit
 export const MAX_JSON_DEPTH = 64; // Safe nested levels for deep tool schemas, session events and profile snapshots
@@ -61,6 +75,8 @@ export const DAEMON_OPS = {
   STEER: 'steer',
   READ_SESSION_EVENTS: 'readSessionEvents',
   READ_ATTACHMENT: 'readAttachment',
+  LIST_QUESTIONS: 'listQuestions',
+  ANSWER_QUESTION: 'answerQuestion',
 } as const;
 
 export type DaemonOp = (typeof DAEMON_OPS)[keyof typeof DAEMON_OPS];
@@ -75,6 +91,8 @@ export const DAEMON_STREAM_EVENTS = {
   TURN_FAILED: 'turn/failed',
   APPROVAL_ASKED: 'approval/asked',
   APPROVAL_DECIDED: 'approval/decided',
+  QUESTION_ASKED: 'question/asked',
+  QUESTION_SETTLED: 'question/settled',
   AGENT_EVICTED: 'agent/evicted',
   DAEMON_STATS: 'daemon/stats',
 } as const;
@@ -121,9 +139,30 @@ export const SESSION_HISTORY_ERROR_CODES = {
 export type SessionHistoryErrorCode =
   (typeof SESSION_HISTORY_ERROR_CODES)[keyof typeof SESSION_HISTORY_ERROR_CODES];
 
+/** Error codes of the question ops (`listQuestions`, `answerQuestion`); callers route on them by name. */
+export const QUESTION_ERROR_CODES = {
+  /** No question with that id (never asked here, or forgotten after many later questions). */
+  NOT_FOUND: 'question/not-found',
+  /**
+   * The question timed out before this answer; the tool call already returned "no answer".
+   * `details` carries `{ questionId, sessionId, expiresAt }`: deliver the answer as a message
+   * instead (see `formatLateQuestionAnswers`).
+   */
+  EXPIRED: 'question/expired',
+  /** Already answered (the first answer won) or cancelled; `details.status` says which. */
+  ALREADY_SETTLED: 'question/already-settled',
+  /** The answers do not fit the questions (unknown id or label, too many selections, …). */
+  INVALID_ANSWERS: 'question/invalid-answers',
+  /** This runtime does not offer user questions (ENKEEP_USER_QUESTIONS is not 1). */
+  UNAVAILABLE: 'question/unavailable',
+} as const;
+
+export type QuestionErrorCode = (typeof QUESTION_ERROR_CODES)[keyof typeof QUESTION_ERROR_CODES];
+
 export type DaemonErrorCode =
   | (typeof DAEMON_ERROR_CODES)[keyof typeof DAEMON_ERROR_CODES]
-  | SessionHistoryErrorCode;
+  | SessionHistoryErrorCode
+  | QuestionErrorCode;
 
 /** `readSessionEvents`: default page length. */
 export const READ_SESSION_EVENTS_DEFAULT_LIMIT = 200;
@@ -326,6 +365,23 @@ export interface AnswerApprovalRequest extends DaemonRequestBase {
 export interface ListApprovalsRequest extends DaemonRequestBase {
   readonly op: 'listApprovals';
   readonly sessionId?: string;
+}
+
+/** Pending `ask_user_question` questions of the runtime (optionally of one DSH session). */
+export interface ListQuestionsRequest extends DaemonRequestBase {
+  readonly op: 'listQuestions';
+  readonly sessionId?: string;
+}
+
+/**
+ * Answer a pending question: `answers` are `{ id, selected: [option labels], custom? }` items,
+ * one per question id at most; a question without an item (or with nothing selected and no
+ * `custom`) counts as skipped. The first accepted answer wins.
+ */
+export interface AnswerQuestionRequest extends DaemonRequestBase {
+  readonly op: 'answerQuestion';
+  readonly questionId: string;
+  readonly answers: readonly QuestionAnswer[];
 }
 
 export interface ShutdownRequest extends DaemonRequestBase {
@@ -532,7 +588,9 @@ export type DaemonRequest =
   | StopBackgroundTaskRequest
   | SteerRequest
   | ReadSessionEventsRequest
-  | ReadAttachmentRequest;
+  | ReadAttachmentRequest
+  | ListQuestionsRequest
+  | AnswerQuestionRequest;
 
 // ---------------------------------------------------------------------------
 // Response Envelopes
@@ -696,6 +754,32 @@ export interface ListApprovalsResponse extends DaemonResponseBase {
   readonly approvals: readonly any[];
 }
 
+/** Result of `listQuestions` (as the host transports return it). */
+export interface ListQuestionsResult {
+  /** Whether this runtime offers `ask_user_question` at all (ENKEEP_USER_QUESTIONS=1). */
+  readonly enabled: boolean;
+  /** Pending questions, oldest first. */
+  readonly questions: readonly PendingQuestion[];
+}
+
+export interface ListQuestionsResponse extends DaemonResponseBase, ListQuestionsResult {
+  readonly op: 'listQuestions';
+  readonly ok: true;
+}
+
+/** Result of an accepted `answerQuestion` (as the host transports return it). */
+export interface AnswerQuestionResult {
+  readonly questionId: string;
+  readonly answered: true;
+  /** The answers as accepted (normalized, in question order). */
+  readonly answers: readonly QuestionAnswer[];
+}
+
+export interface AnswerQuestionResponse extends DaemonResponseBase, AnswerQuestionResult {
+  readonly op: 'answerQuestion';
+  readonly ok: true;
+}
+
 export interface ShutdownResponse extends DaemonResponseBase {
   readonly op: 'shutdown';
   readonly ok: true;
@@ -831,6 +915,8 @@ export type DaemonResponse =
   | SteerResponse
   | ReadSessionEventsResponse
   | ReadAttachmentResponse
+  | ListQuestionsResponse
+  | AnswerQuestionResponse
   | DaemonErrorResponse;
 
 // ---------------------------------------------------------------------------
@@ -932,6 +1018,33 @@ export interface DaemonStreamApprovalDecidedEvent {
   };
 }
 
+/**
+ * An `ask_user_question` call is waiting for the user. `question` is the full pending record
+ * (id, DSH sessionId, callId, questions, createdAt, timeoutMs, expiresAt). `turnId` is the
+ * submitted turn it belongs to (absent for autonomous turns). The host transports pause the
+ * turn's idle watchdog until `question/settled`.
+ */
+export interface DaemonStreamQuestionAskedEvent {
+  readonly type: 'event';
+  readonly event: 'question/asked';
+  readonly sessionId: string;
+  readonly turnId?: string;
+  readonly timestamp: number;
+  readonly question: PendingQuestion;
+}
+
+/** A question ended: answered (with the accepted answers), expired, or cancelled (turn interrupted, shutdown). */
+export interface DaemonStreamQuestionSettledEvent {
+  readonly type: 'event';
+  readonly event: 'question/settled';
+  readonly sessionId: string;
+  readonly turnId?: string;
+  readonly timestamp: number;
+  readonly id: string;
+  readonly outcome: QuestionOutcome;
+  readonly answers?: readonly QuestionAnswer[];
+}
+
 export type DaemonEvictionReason =
   | 'idle_timeout'
   | 'lru_capacity'
@@ -963,6 +1076,8 @@ export type DaemonStreamEvent =
   | DaemonStreamTurnFailedEvent
   | DaemonStreamApprovalAskedEvent
   | DaemonStreamApprovalDecidedEvent
+  | DaemonStreamQuestionAskedEvent
+  | DaemonStreamQuestionSettledEvent
   | DaemonStreamAgentEvictedEvent
   | DaemonStreamStatsEvent;
 
