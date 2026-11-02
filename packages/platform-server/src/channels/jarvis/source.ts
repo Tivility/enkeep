@@ -110,7 +110,10 @@ export interface PlatformJarvisSourceOptions {
   imageIngestor?: JarvisImageIngestor;
   /** The spaces directory as the runtime sees it. Defaults to {@link DEFAULT_RUNTIME_SPACES_DIR}. */
   runtimeSpacesDir?: (space: { userId: string; executionMode: string }) => string;
-  /** Checked before every listing; false → `onRevoked` and the listing fails. */
+  /**
+   * Checked before every listing and every request from the node; false → `onRevoked` and the call
+   * fails with `unauthorized` (the account's token was rotated or revoked, possibly by another process).
+   */
   isAuthorized?: () => boolean;
   onRevoked?: () => void;
   log?: JarvisLogger;
@@ -255,11 +258,16 @@ export class PlatformJarvisSource implements JarvisChannelSource {
 
   // ───────────────────────────── Sessions ─────────────────────────────
 
-  async listSessions(): Promise<JarvisSessionRow[]> {
+  /** Refuses the call (and drops the connection) once the connection's token is no longer valid. */
+  private authorize(): void {
     if (this.options.isAuthorized && !this.options.isAuthorized()) {
       this.options.onRevoked?.();
       throw new RpcError('this Jarvis token is no longer valid', 'unauthorized');
     }
+  }
+
+  async listSessions(): Promise<JarvisSessionRow[]> {
+    this.authorize();
     const routes = this.db
       .prepare(`${ROUTE_SELECT} WHERE r.user_id = ? AND r.status = 'active' AND (s.status IS NULL OR s.status = 'active')`)
       .all(this.userId) as unknown as RouteRow[];
@@ -285,6 +293,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   }
 
   async getSession(sessionId: string): Promise<JarvisSessionRow | null> {
+    this.authorize();
     const route = this.ownedRoute(sessionId);
     if (!route || !isActive(route.status) || !isActive(route.space_status)) return null;
     return this.rowOf(route);
@@ -293,6 +302,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   // ───────────────────────────── History ─────────────────────────────
 
   async readEvents(sessionId: string, query: ReadEventsQuery): Promise<ReadEventsResult> {
+    this.authorize();
     const route = this.requireRoute(sessionId);
     const history = `dsh:${route.dsh_session_id}`;
     const reader = this.options.reader;
@@ -320,6 +330,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   }
 
   async readImage(sessionId: string, ref: string): Promise<{ mime: string; data: string }> {
+    this.authorize();
     const route = this.requireRoute(sessionId);
     const reader = this.options.reader;
     if (!reader?.readAttachment) throw new RpcError('images are not available', 'unavailable');
@@ -347,6 +358,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     images: Array<{ mime: string; data: string; name?: string }>;
     clientMsgId: string;
   }): Promise<void> {
+    this.authorize();
     const text = (params.text ?? '').trim();
     if (text.startsWith('/')) throw new RpcError(JARVIS_SLASH_REFUSAL, 'unsupported');
     if (typeof params.clientMsgId !== 'string' || params.clientMsgId.length === 0 || params.clientMsgId.length > 256) {
@@ -384,6 +396,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   }
 
   async interrupt(sessionId: string): Promise<void> {
+    this.authorize();
     const route = this.requireRoute(sessionId);
     try {
       await this.options.gateway.cancelCurrentTurn(this.userId, route.id);
@@ -393,6 +406,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   }
 
   async start(params: { cwd: string; prompt?: string }): Promise<JarvisSessionRow> {
+    this.authorize();
     const prompt = (params.prompt ?? '').trim();
     if (prompt.startsWith('/')) throw new RpcError(JARVIS_SLASH_REFUSAL, 'unsupported');
     const api = this.sessionApi();
@@ -421,6 +435,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
+    this.authorize();
     const route = this.requireRoute(sessionId);
     const clean = truncateChars((title ?? '').trim().normalize('NFC'), 256).trim();
     if (clean.length === 0) throw new RpcError('title required', 'invalid_params');
@@ -433,6 +448,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   }
 
   async close(sessionId: string): Promise<void> {
+    this.authorize();
     const route = this.requireRoute(sessionId);
     try {
       await this.sessionApi().archiveSession(this.userId, route.id);
@@ -445,6 +461,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   // ───────────────────────────── Interactions ─────────────────────────────
 
   async answerApproval(id: string, decision: { allow: boolean; message?: string }): Promise<void> {
+    this.authorize();
     const approvals = this.options.approvals;
     if (!approvals) throw new RpcError('approvals are not available', 'unavailable');
     const pending = approvals.getPending(id, this.userId);
@@ -480,6 +497,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   }
 
   async answerQuestion(id: string, answers: QuestionAnswers): Promise<void> {
+    this.authorize();
     const questions = this.options.questions;
     if (!questions) throw new RpcError('questions are not available', 'unavailable');
     const result = await questions.answer(id, answers, { userId: this.userId, decidedBy: 'jarvis' });

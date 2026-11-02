@@ -139,6 +139,7 @@ describe('Jarvis endpoint', () => {
     expect(client.frames[0]).toMatchObject({ method: 'runtime.hello', params: { runtime: 'enkeep', agent: 'dsh' } });
     expect(client.frames.find((f) => f.event === 'runtime.sessions')!.params).toEqual({ sessions: [row(SESSION_A, 'idle')] });
     expect(connections.at(-1)).toMatchObject(ALICE);
+    expect(connections.at(-1)).not.toHaveProperty('credential');
 
     // Requests from the node are answered over the same socket.
     client.ws.send(JSON.stringify({ id: 'n1', method: 'session.nope', params: {} }));
@@ -159,6 +160,22 @@ describe('Jarvis endpoint', () => {
     second.ws.close();
     await second.closed;
     await waitFor(() => endpoint.size === 0);
+  });
+
+  it('hands the credential tag from authenticate to onConnection', async () => {
+    endpoint.closeAll();
+    const seen: JarvisConnection[] = [];
+    endpoint = createJarvisEndpoint({
+      authenticate: async (token) => (token === GOOD_TOKEN ? { ...ALICE, credential: 'credential-tag-0001' } : null),
+      onConnection: (connection) => {
+        seen.push(connection);
+        connection.socket.close(1000, 'done');
+      },
+    });
+    const client = connect();
+    await client.closed;
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ ...ALICE, credential: 'credential-tag-0001' });
   });
 
   it('closes everything on closeAll and refuses later upgrades', async () => {

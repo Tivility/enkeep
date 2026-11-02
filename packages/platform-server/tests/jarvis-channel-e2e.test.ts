@@ -14,6 +14,8 @@ import { PlatformServer, SqliteWebMessageStore } from '../src/index.js';
 import { ApprovalBridge } from '../src/interactions/approval-bridge.js';
 import { RuntimeSessionEventHub } from '../src/runtime/session-event-hub.js';
 import { JarvisRuntimeManager } from '../src/channels/jarvis/manager.js';
+import { JarvisAccountLifecycle } from '../src/channels/jarvis/accounts.js';
+import { ChannelManagementService } from '../src/channels/channel-routes.js';
 import { JarvisTokenStore, JarvisTokenOwnerConflictError, hashJarvisToken } from '../src/channels/jarvis/token-store.js';
 import { TestOnlyRuntimeGateway } from './test-runtime-gateway.js';
 
@@ -21,6 +23,7 @@ const CSRF = 'test-csrf-token-32-chars-long-secure-12345678!';
 const SUBPROTOCOL = 'jarvis-runtime.v1';
 const ROUTE = 'ses_00000000000000000000000000000021';
 const DSH_ROUTE = 'ses_00000000000000000000000000000121';
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 async function waitFor<T>(fn: () => T | undefined | null | false, timeoutMs = 5000): Promise<T> {
   const start = Date.now();
@@ -333,6 +336,103 @@ describe('Jarvis channel on platform-server', () => {
     expect(blob).not.toContain(token);
     expect(blob).not.toContain(rotated.data.token);
     expect(blob).not.toContain(hashJarvisToken(token));
+  });
+
+  it('reports the connection status of a Jarvis account to its owner only, without secrets', async () => {
+    const { id, token } = await createJarvis();
+    const responses: unknown[] = [];
+    const getJson = async (cookie: string, path: string) => {
+      const json = (await (await manage(cookie, 'GET', path)).json()) as any;
+      responses.push(json);
+      return json;
+    };
+
+    const before = (await getJson(adminCookie, '/api/manage/channels/accounts')).data.accounts.find((a: any) => a.id === id);
+    expect(before.jarvis).toEqual({ connected: false, tokenCreatedAt: expect.stringMatching(ISO) });
+
+    const client = connect(token);
+    await waitFor(() => client.frames.find((f) => f.event === 'runtime.sessions'));
+    const live = (await getJson(adminCookie, `/api/manage/channels/accounts/${id}`)).data;
+    expect(live).toMatchObject({ id, type: 'jarvis', status: 'active' });
+    expect(live.jarvis).toEqual({
+      connected: true,
+      connectedAt: expect.stringMatching(ISO),
+      lastConnectedAt: expect.stringMatching(ISO),
+      lastUsedAt: expect.stringMatching(ISO),
+      tokenCreatedAt: before.jarvis.tokenCreatedAt,
+    });
+    expect(live.jarvis.connectedAt).toBe(live.jarvis.lastConnectedAt);
+    const filtered = (await getJson(adminCookie, '/api/manage/channels/accounts?type=jarvis')).data.accounts;
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].jarvis.connected).toBe(true);
+
+    client.ws.close();
+    await client.closed;
+    await waitFor(() => manager.connectionCount === 0);
+    const after = (await getJson(adminCookie, `/api/manage/channels/accounts/${id}`)).data.jarvis;
+    expect(after).toEqual({
+      connected: false,
+      lastConnectedAt: live.jarvis.lastConnectedAt,
+      lastDisconnectedAt: expect.stringMatching(ISO),
+      lastUsedAt: live.jarvis.lastUsedAt,
+      tokenCreatedAt: before.jarvis.tokenCreatedAt,
+    });
+    expect(after.lastDisconnectedAt >= after.lastConnectedAt).toBe(true);
+
+    // Other channel types carry no status; other users never see the account or its status.
+    const lark = await server.storage.forTenant(adminId).channels.createAccount({ type: 'lark', status: 'disabled' });
+    const all = (await getJson(adminCookie, '/api/manage/channels/accounts')).data.accounts;
+    const larkListed = all.find((a: any) => a.id === lark.id);
+    expect(larkListed).toBeDefined();
+    expect(larkListed).not.toHaveProperty('jarvis');
+    expect(larkListed).not.toHaveProperty('lark');
+    expect((await manage(userCookie, 'GET', `/api/manage/channels/accounts/${id}`)).status).toBe(404);
+    expect((await getJson(userCookie, '/api/manage/channels/accounts')).data.accounts).toEqual([]);
+
+    const blob = JSON.stringify(responses);
+    expect(blob).not.toContain(token);
+    expect(blob).not.toContain(hashJarvisToken(token));
+    expect(blob).not.toMatch(/token_?hash/i);
+  });
+
+  it('drops a live connection whose token another process rotated or revoked (the admin CLI path)', async () => {
+    const { id, token } = await createJarvis();
+    const client = connect(token);
+    await waitFor(() => client.frames.find((f) => f.event === 'runtime.sessions'));
+
+    // Another process (the admin CLI) goes through its own account lifecycle on the same database:
+    // it has no way to reach this platform's connections.
+    const offline = new ChannelManagementService(server.storage, undefined, undefined, {
+      jarvis: new JarvisAccountLifecycle({ db, storage: server.storage, auditDetails: { via: 'cli' } }),
+    });
+    const rotated = await offline.rotateAccountToken(adminId, id);
+    expect(rotated.token).toMatch(/^ejv_/);
+    expect(manager.connectionCount).toBe(1);
+
+    // The old token is refused at once; the live connection counts as disconnected and is dropped
+    // at its next check (here: the status read).
+    expect(await upgradeStatus({ Authorization: `Bearer ${token}`, 'Sec-WebSocket-Protocol': SUBPROTOCOL })).toBe(401);
+    const status = ((await (await manage(adminCookie, 'GET', `/api/manage/channels/accounts/${id}`)).json()) as any).data.jarvis;
+    expect(status.connected).toBe(false);
+    expect((await client.closed).code).toBe(4001);
+
+    // The new token connects; revoking it elsewhere (deleting the account) drops the connection at
+    // its next request, which is refused.
+    const second = connect(rotated.token);
+    await waitFor(() => second.frames.find((f) => f.event === 'runtime.sessions'));
+    expect(await offline.deleteAccount(adminId, id)).toBe(true);
+    expect(manager.connectionCount).toBe(1);
+    second.ws.send(JSON.stringify({ id: 'n1', method: 'session.send', params: { session_id: ROUTE, text: 'synthetic stale send', client_msg_id: 'phone-msg-stale-0001' } }));
+    expect((await second.closed).code).toBe(4001);
+    await waitFor(() => manager.connectionCount === 0);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM channel_turn_origins WHERE channel = 'jarvis'").get()).toEqual({ c: 0 });
+    expect(await upgradeStatus({ Authorization: `Bearer ${rotated.token}`, 'Sec-WebSocket-Protocol': SUBPROTOCOL })).toBe(401);
+
+    const audit = db.prepare("SELECT action, details FROM auth_audit_log WHERE action IN ('jarvis.token_rotated', 'jarvis.token_revoked') ORDER BY rowid").all() as any[];
+    expect(audit.map((a) => [a.action, JSON.parse(a.details)])).toEqual([
+      ['jarvis.token_rotated', { accountId: id, closedConnections: 0, via: 'cli' }],
+      ['jarvis.token_revoked', { accountId: id, reason: 'account_deleted', closedConnections: 0, via: 'cli' }],
+    ]);
   });
 
   it('closes Jarvis connections when the server stops', async () => {

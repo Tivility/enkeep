@@ -291,6 +291,29 @@ describe('PlatformJarvisSource', () => {
       await expect(s.listSessions()).rejects.toMatchObject({ code: 'unauthorized' });
       expect(onRevoked).toHaveBeenCalledTimes(1);
     });
+
+    it('refuses every node request once the token is no longer valid (rotated elsewhere)', async () => {
+      let authorized = true;
+      const onRevoked = vi.fn();
+      const s = source({ isAuthorized: () => authorized, onRevoked });
+      expect(await s.getSession(ROUTE_IDLE)).not.toBeNull();
+      authorized = false;
+      await expect(s.getSession(ROUTE_IDLE)).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(s.readEvents(ROUTE_IDLE, {})).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(s.readImage(ROUTE_IDLE, 'att:sha256:missing')).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(
+        s.send({ sessionId: ROUTE_IDLE, text: 'synthetic text', images: [], clientMsgId: 'phone-msg-stale-0001' })
+      ).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(s.interrupt(ROUTE_IDLE)).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(s.rename(ROUTE_IDLE, 'Synthetic title')).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(s.close(ROUTE_IDLE)).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(s.start({ cwd: '/tmp/enkeep-test/none' })).rejects.toMatchObject({ code: 'unauthorized' });
+      await expect(s.answerApproval('apr-synthetic-0001', { allow: true })).rejects.toMatchObject({ code: 'unauthorized' });
+      expect(onRevoked).toHaveBeenCalledTimes(9);
+      expect(fakeGateway.dispatchInbound).not.toHaveBeenCalled();
+      expect(fakeGateway.cancelCurrentTurn).not.toHaveBeenCalled();
+      expect(reader.calls).toHaveLength(0);
+    });
   });
 
   describe('history', () => {

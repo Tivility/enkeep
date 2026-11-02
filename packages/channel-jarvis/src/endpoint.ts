@@ -25,6 +25,12 @@ export const JARVIS_CLOSE_REPLACED = 4000;
 export interface JarvisPrincipal {
   accountId: string;
   userId: string;
+  /**
+   * Opaque tag of the credential the connection authenticated with (for example the token's hash,
+   * never the token), handed back in {@link JarvisConnection} so the platform can later check that
+   * this very credential is still the account's current one. Never logged.
+   */
+  credential?: string;
 }
 
 export interface JarvisConnection extends JarvisPrincipal {
@@ -199,7 +205,12 @@ export function createJarvisEndpoint(options: JarvisEndpointOptions): JarvisEndp
 
     const socket = wrapWebSocket(ws, log);
     try {
-      const pending = options.onConnection({ accountId, userId, socket });
+      const pending = options.onConnection({
+        accountId,
+        userId,
+        ...(principal.credential !== undefined ? { credential: principal.credential } : {}),
+        socket,
+      });
       if (pending && typeof (pending as Promise<void>).catch === 'function') {
         (pending as Promise<void>).catch((err: unknown) => {
           log?.error?.({ accountId, err: describe(err) }, 'jarvis endpoint: onConnection failed');

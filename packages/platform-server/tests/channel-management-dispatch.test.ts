@@ -95,6 +95,29 @@ describe('ChannelManagementService dispatch by channel type', () => {
     expect(wechat.syncAccount).not.toHaveBeenCalled();
   });
 
+  it('adds a registered type\'s status object to its own accounts only, and survives a failing provider', async () => {
+    const describeAccountStatus = vi.fn((_userId: string, account: { id: string }) => ({ connected: account.id.length > 0 }));
+    service.registerManager('jarvis', { ...jarvis, describeAccountStatus });
+    const jarvisAccount = await service.createAccount(userId, { type: 'jarvis', status: 'active' });
+    const larkAccount = await service.createAccount(userId, { type: 'lark', status: 'disabled' });
+
+    const listed = await service.listAccountsWithStatus(userId);
+    expect(listed.find((a) => a.id === jarvisAccount.id)).toMatchObject({ id: jarvisAccount.id, jarvis: { connected: true } });
+    expect(listed.find((a) => a.id === larkAccount.id)).not.toHaveProperty('jarvis');
+    expect(describeAccountStatus).toHaveBeenCalledTimes(1);
+    expect(describeAccountStatus).toHaveBeenCalledWith(userId, expect.objectContaining({ id: jarvisAccount.id, userId }));
+    expect(await service.getAccountWithStatus(userId, jarvisAccount.id)).toMatchObject({ jarvis: { connected: true } });
+    // Plain reads used by the rest of the platform stay unchanged.
+    expect(await service.getAccount(userId, jarvisAccount.id)).not.toHaveProperty('jarvis');
+
+    describeAccountStatus.mockImplementation(() => {
+      throw new Error('synthetic status failure');
+    });
+    const fallback = await service.getAccountWithStatus(userId, jarvisAccount.id);
+    expect(fallback).toMatchObject({ id: jarvisAccount.id, type: 'jarvis' });
+    expect(fallback).not.toHaveProperty('jarvis');
+  });
+
   it('accepts managers through the constructor map and refuses to override builtin types', () => {
     const svc = new ChannelManagementService(storage, undefined, undefined, { jarvis });
     expect(svc.isSupportedType('jarvis')).toBe(true);

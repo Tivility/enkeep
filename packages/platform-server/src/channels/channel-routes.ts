@@ -107,6 +107,13 @@ export interface ChannelAccountLifecycle {
    * replacing the old one. The token is returned once.
    */
   rotateAccountToken?(userId: string, accountId: string): Promise<{ token: string }>;
+  /**
+   * Optional: a small status object of an account of this type for the management API (account
+   * list and single account GET), attached under the type's name (e.g. `account.jarvis`). Called
+   * only with an account of this type owned by `userId`. It must never carry credentials, tokens
+   * or their hashes. A failure leaves the status out.
+   */
+  describeAccountStatus?(userId: string, account: ChannelAccount): object | undefined | Promise<object | undefined>;
 }
 
 /**
@@ -262,6 +269,36 @@ export class ChannelManagementService {
       throw new NotFoundError(`Channel account "${accountId}" not found`);
     }
     return account;
+  }
+
+  /**
+   * The user's accounts as the management API returns them: each with its type's status object
+   * (`account[type]`) when the type's manager provides one (see
+   * {@link ChannelAccountLifecycle.describeAccountStatus}).
+   */
+  async listAccountsWithStatus(userId: string, type?: string): Promise<Array<ChannelAccount & Record<string, unknown>>> {
+    const accounts = await this.listAccounts(userId, type);
+    return Promise.all(accounts.map((account) => this.withStatus(userId, account)));
+  }
+
+  /** One of the user's accounts as the management API returns it (see {@link listAccountsWithStatus}). */
+  async getAccountWithStatus(userId: string, accountId: string): Promise<ChannelAccount & Record<string, unknown>> {
+    return this.withStatus(userId, await this.getAccount(userId, accountId));
+  }
+
+  private async withStatus(userId: string, account: ChannelAccount): Promise<ChannelAccount & Record<string, unknown>> {
+    const plain = account as ChannelAccount & Record<string, unknown>;
+    // Tenant scoping: only the owner's accounts, and never shadow a field of the account itself.
+    if (account.userId !== userId || Object.prototype.hasOwnProperty.call(account, account.type)) return plain;
+    const lifecycle = this.lifecycleFor(account.type);
+    if (!lifecycle?.describeAccountStatus) return plain;
+    try {
+      const status = await lifecycle.describeAccountStatus(userId, account);
+      if (!status || typeof status !== 'object') return plain;
+      return { ...account, [account.type]: status };
+    } catch {
+      return plain;
+    }
   }
 
   async createAccount(
@@ -633,7 +670,7 @@ export class ChannelRoutes {
       if (method === 'GET') {
         const url = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
         const type = url.searchParams.get('type') || undefined;
-        const accounts = await this.service.listAccounts(user.id, type);
+        const accounts = await this.service.listAccountsWithStatus(user.id, type);
         sendJsonResponse(res, 200, createSuccessEnvelope({ accounts }));
         return true;
       }
@@ -711,7 +748,7 @@ export class ChannelRoutes {
       const accountId = decodeURIComponent(accountMatch[1]);
 
       if (method === 'GET') {
-        const account = await this.service.getAccount(user.id, accountId);
+        const account = await this.service.getAccountWithStatus(user.id, accountId);
         sendJsonResponse(res, 200, createSuccessEnvelope(account));
         return true;
       }

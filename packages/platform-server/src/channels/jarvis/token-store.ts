@@ -92,11 +92,17 @@ export class JarvisTokenStore {
     return Boolean(this.db.prepare('SELECT 1 FROM channel_account_tokens WHERE account_id = ? LIMIT 1').get(accountId));
   }
 
-  /** Token metadata (never the hash). */
-  describe(accountId: string): { createdAt: string; lastUsedAt: string | null } | null {
-    const row = this.db
-      .prepare('SELECT created_at, last_used_at FROM channel_account_tokens WHERE account_id = ? LIMIT 1')
-      .get(accountId) as { created_at: string; last_used_at: string | null } | undefined;
+  /** Token metadata (never the hash); with `userId`, only when the token belongs to that user. */
+  describe(accountId: string, userId?: string): { createdAt: string; lastUsedAt: string | null } | null {
+    const row = (
+      userId === undefined
+        ? this.db
+            .prepare('SELECT created_at, last_used_at FROM channel_account_tokens WHERE account_id = ? LIMIT 1')
+            .get(accountId)
+        : this.db
+            .prepare('SELECT created_at, last_used_at FROM channel_account_tokens WHERE account_id = ? AND user_id = ? LIMIT 1')
+            .get(accountId, userId)
+    ) as { created_at: string; last_used_at: string | null } | undefined;
     return row ? { createdAt: row.created_at, lastUsedAt: row.last_used_at } : null;
   }
 
@@ -128,18 +134,20 @@ export class JarvisTokenStore {
     return { accountId: row.account_id, userId: row.user_id };
   }
 
-  /** Whether the account (and its owner) may still hold a connection. */
-  isActive(accountId: string, userId: string): boolean {
-    return Boolean(
-      this.db
-        .prepare(
-          `SELECT 1 FROM channel_account_tokens t
+  /**
+   * Whether the account (and its owner) may still hold a connection. With `tokenHash` (the hash of
+   * the token the connection authenticated with), also whether that token is still the account's
+   * current one: a token rotated by another process (the admin CLI) then fails the check.
+   */
+  isActive(accountId: string, userId: string, tokenHash?: string): boolean {
+    const sql = `SELECT 1 FROM channel_account_tokens t
            JOIN channel_accounts a ON a.id = t.account_id AND a.user_id = t.user_id
            JOIN users u ON u.id = t.user_id
-           WHERE t.account_id = ? AND t.user_id = ? AND a.type = 'jarvis' AND a.status = 'active' AND u.status = 'active'
-           LIMIT 1`
-        )
-        .get(accountId, userId)
+           WHERE t.account_id = ? AND t.user_id = ? AND a.type = 'jarvis' AND a.status = 'active' AND u.status = 'active'`;
+    return Boolean(
+      tokenHash === undefined
+        ? this.db.prepare(`${sql} LIMIT 1`).get(accountId, userId)
+        : this.db.prepare(`${sql} AND t.token_hash = ? LIMIT 1`).get(accountId, userId, tokenHash)
     );
   }
 }

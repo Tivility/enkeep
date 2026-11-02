@@ -2,13 +2,17 @@
  * Jarvis channel runtime manager (docs/jarvis-channel.md §3.2, §3.7).
  *
  * - Account lifecycle for `channel_accounts.type = 'jarvis'` (registered as the `jarvis` channel
- *   manager): creating one is admin-only and one per user; creation issues a bearer token returned
- *   once; rotation replaces it; deleting or disabling the account revokes it. Every live
- *   connection of an account whose token changes or goes away is closed.
+ *   manager), inherited from {@link JarvisAccountLifecycle}: creating one is admin-only and one per
+ *   user; creation issues a bearer token returned once; rotation replaces it; deleting or disabling
+ *   the account revokes it. Every live connection of an account whose token changes or goes away
+ *   is closed; a token changed by another process (the admin CLI) is noticed at the connection's
+ *   next authorization check, which compares the hash it authenticated with.
  * - The WebSocket endpoint (`/api/jarvis/runtime`): the platform server hands it upgrades after
  *   its Host validation; the engine refuses an Origin, a bad token or a missing subprotocol.
  * - Per connection: a {@link PlatformJarvisSource} scoped to the account owner and a
  *   {@link JarvisRuntime} speaking the Jarvis runtime protocol.
+ * - Connection status for the management API (`account.jarvis`): live connections and their
+ *   times are kept in memory per account; token times come from `channel_account_tokens`.
  *
  * Tokens never reach logs or audit details; audit entries carry the account id only.
  *
@@ -28,14 +32,7 @@ import {
   type JarvisRuntimeTiming,
   type MessageSocket,
 } from '@enkeep/channel-jarvis';
-import {
-  ConflictError,
-  ForbiddenError,
-  NotFoundError,
-  type AuthAuditAction,
-  type ChannelAccount,
-  type PlatformStorage,
-} from '@enkeep/platform-core';
+import type { ChannelAccount, PlatformStorage } from '@enkeep/platform-core';
 import type { ChannelAccountLifecycle, ChannelConnectionEndpoint } from '../channel-routes.js';
 import type { ApprovalBridge } from '../../interactions/approval-bridge.js';
 import type { QuestionBridge } from '../../interactions/question-bridge.js';
@@ -43,7 +40,8 @@ import type { RuntimeSessionEventHub } from '../../runtime/session-event-hub.js'
 import type { RuntimeSessionReader } from '../../runtime/delivery-gateway.js';
 import type { TenantRuntimeFileProvider } from '../../files/runtime-file-api.js';
 import { TenantScopedLarkImageIngestor } from '../lark-image-ingestor.js';
-import { JarvisTokenOwnerConflictError, JarvisTokenStore } from './token-store.js';
+import { JARVIS_CHANNEL_TYPE, JarvisAccountLifecycle } from './accounts.js';
+import { hashJarvisToken } from './token-store.js';
 import {
   PlatformJarvisSource,
   type JarvisDeliveryPort,
@@ -51,7 +49,7 @@ import {
   type JarvisSessionApi,
 } from './source.js';
 
-export const JARVIS_CHANNEL_TYPE = 'jarvis';
+export { JARVIS_CHANNEL_TYPE } from './accounts.js';
 export const JARVIS_DEFAULT_VERSION = '0.1.0';
 /** Close code sent when the account's token was rotated or revoked (application range 4000–4999). */
 export const JARVIS_CLOSE_REVOKED = 4001;
@@ -92,32 +90,66 @@ export interface JarvisRuntimeManagerOptions {
   runtimeTiming?: Partial<JarvisRuntimeTiming>;
 }
 
+/**
+ * Connection status of a Jarvis account as the management API shows it (`account.jarvis`).
+ * Times are ISO strings; connection times are those seen by this platform process.
+ */
+export interface JarvisAccountStatus {
+  /** A jarvisd node is connected with the account's current token. */
+  connected: boolean;
+  /** When the current connection was opened. */
+  connectedAt?: string;
+  lastConnectedAt?: string;
+  lastDisconnectedAt?: string;
+  /** When the token last authenticated a connection (`channel_account_tokens.last_used_at`). */
+  lastUsedAt?: string;
+  tokenCreatedAt?: string;
+}
+
 interface LiveConnection {
   accountId: string;
   userId: string;
   socket: MessageSocket;
   source: PlatformJarvisSource;
   runtime: JarvisRuntime;
+  openedAt: string;
+  /** Hash of the token the connection authenticated with (never exposed). */
+  credential?: string;
 }
 
-export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelConnectionEndpoint {
+/** Connection times of one account in this process (kept in memory only). */
+interface AccountConnectionTimes {
+  lastConnectedAt?: string;
+  lastDisconnectedAt?: string;
+}
+
+/** A stored time as ISO 8601 (SQLite's `CURRENT_TIMESTAMP` is UTC without a zone). */
+function toIsoTime(value: string | null | undefined): string | undefined {
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  const raw = value.trim();
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw) ? `${raw.replace(' ', 'T')}Z` : raw;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
+export class JarvisRuntimeManager
+  extends JarvisAccountLifecycle
+  implements ChannelAccountLifecycle, ChannelConnectionEndpoint
+{
   readonly upgradePath = JARVIS_RUNTIME_PATH;
-  readonly tokens: JarvisTokenStore;
   private readonly options: JarvisRuntimeManagerOptions;
-  private readonly log: JarvisLogger;
   private endpoint: JarvisEndpoint | null = null;
   private readonly connections = new Set<LiveConnection>();
+  private readonly connectionTimes = new Map<string, AccountConnectionTimes>();
   private readonly onTurnSettled: TurnSettledListener;
   private gatewayHooked = false;
-  private auditChain: Promise<void> = Promise.resolve();
 
   constructor(options: JarvisRuntimeManagerOptions) {
     if (!options?.db || !options.storage || !options.gateway) {
       throw new TypeError('JarvisRuntimeManager requires db, storage and gateway');
     }
+    super({ db: options.db, storage: options.storage, log: options.log });
     this.options = options;
-    this.log = options.log ?? {};
-    this.tokens = new JarvisTokenStore(options.db);
     this.onTurnSettled = (event) => {
       for (const conn of this.connections) {
         if (conn.userId === event.userId) conn.source.notifyTurnSettled(event.sessionId);
@@ -131,10 +163,56 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
   }
 
   /** Live connections of one account (normally at most one). */
-  connectionsOf(accountId: string): number {
+  override connectionsOf(accountId: string): number {
     let n = 0;
     for (const conn of this.connections) if (conn.accountId === accountId) n++;
     return n;
+  }
+
+  // ─────────────────────────── Status ───────────────────────────
+
+  /**
+   * The connection status of one of the user's Jarvis accounts (`account.jarvis` in the management
+   * API). Never carries the token or its hash. A live connection whose token is no longer the
+   * account's current one (rotated or revoked by another process) counts as disconnected and is
+   * dropped here.
+   */
+  describeAccountStatus(userId: string, account: ChannelAccount): JarvisAccountStatus | undefined {
+    if (!account || account.type !== JARVIS_CHANNEL_TYPE || account.userId !== userId) return undefined;
+    let connectedAt: string | undefined;
+    for (const conn of Array.from(this.connections)) {
+      if (conn.accountId !== account.id || conn.userId !== userId) continue;
+      // A connection whose token was rotated or revoked elsewhere (the admin CLI) is not connected:
+      // drop it now instead of at its next session refresh.
+      if (!this.tokens.isActive(conn.accountId, conn.userId, conn.credential)) {
+        this.dropConnection(conn, JARVIS_CLOSE_REVOKED, 'revoked');
+        continue;
+      }
+      if (connectedAt === undefined || conn.openedAt > connectedAt) connectedAt = conn.openedAt;
+    }
+    const times = this.connectionTimes.get(account.id);
+    const token = this.tokens.describe(account.id, userId);
+    const lastUsedAt = toIsoTime(token?.lastUsedAt);
+    const tokenCreatedAt = toIsoTime(token?.createdAt);
+    return {
+      connected: connectedAt !== undefined,
+      ...(connectedAt !== undefined ? { connectedAt } : {}),
+      ...(times?.lastConnectedAt ? { lastConnectedAt: times.lastConnectedAt } : {}),
+      ...(times?.lastDisconnectedAt ? { lastDisconnectedAt: times.lastDisconnectedAt } : {}),
+      ...(lastUsedAt ? { lastUsedAt } : {}),
+      ...(tokenCreatedAt ? { tokenCreatedAt } : {}),
+    };
+  }
+
+  private noteConnectionTime(accountId: string, key: keyof AccountConnectionTimes, at: string): void {
+    const times = this.connectionTimes.get(accountId) ?? {};
+    times[key] = at;
+    this.connectionTimes.set(accountId, times);
+  }
+
+  override async onAccountDeleted(userId: string, accountId: string): Promise<void> {
+    await super.onAccountDeleted(userId, accountId);
+    if (this.connectionsOf(accountId) === 0) this.connectionTimes.delete(accountId);
   }
 
   // ─────────────────────────── Endpoint ───────────────────────────
@@ -142,7 +220,11 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
   start(): void {
     if (!this.endpoint) {
       this.endpoint = createJarvisEndpoint({
-        authenticate: async (token) => this.authenticate(token),
+        authenticate: async (token) => {
+          const principal = this.authenticate(token);
+          // The connection keeps the hash of its token, so a rotation by another process is noticed.
+          return principal ? { ...principal, credential: hashJarvisToken(token) } : null;
+        },
         onConnection: (connection) => this.onConnection(connection),
         log: this.log,
       });
@@ -182,7 +264,7 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
   }
 
   private onConnection(connection: JarvisConnection): void {
-    const { accountId, userId, socket } = connection;
+    const { accountId, userId, socket, credential } = connection;
     let conn: LiveConnection | null = null;
     const source = new PlatformJarvisSource({
       userId,
@@ -196,7 +278,7 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
       reader: this.options.sessionReader,
       imageIngestor: this.imageIngestor(),
       runtimeSpacesDir: this.options.runtimeSpacesDir,
-      isAuthorized: () => this.tokens.isActive(accountId, userId),
+      isAuthorized: () => this.tokens.isActive(accountId, userId, credential),
       onRevoked: () => {
         if (conn) this.dropConnection(conn, JARVIS_CLOSE_REVOKED, 'revoked');
       },
@@ -212,11 +294,14 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
       ...(timeout !== undefined ? { approvalTimeoutSeconds: timeout } : {}),
       ...(this.options.runtimeTiming ? { timing: this.options.runtimeTiming } : {}),
     });
-    conn = { accountId, userId, socket, source, runtime };
+    const openedAt = new Date().toISOString();
+    conn = { accountId, userId, socket, source, runtime, openedAt, ...(credential !== undefined ? { credential } : {}) };
     this.connections.add(conn);
+    this.noteConnectionTime(accountId, 'lastConnectedAt', openedAt);
     const opened = conn;
     socket.onClose((code) => {
       if (!this.connections.delete(opened)) return;
+      this.noteConnectionTime(accountId, 'lastDisconnectedAt', new Date().toISOString());
       opened.source.dispose();
       void this.audit(userId, 'jarvis.connection_closed', { accountId, code });
     });
@@ -226,6 +311,7 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
 
   private dropConnection(conn: LiveConnection, code: number, reason: string): void {
     if (!this.connections.delete(conn)) return;
+    this.noteConnectionTime(conn.accountId, 'lastDisconnectedAt', new Date().toISOString());
     conn.source.dispose();
     // Close with our code first; the engine's stop() would otherwise close with 1001.
     conn.socket.close(code, reason);
@@ -234,7 +320,7 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
   }
 
   /** Close every live connection of an account. */
-  closeAccountConnections(accountId: string, code = JARVIS_CLOSE_REVOKED, reason = 'revoked'): number {
+  override closeAccountConnections(accountId: string, code = JARVIS_CLOSE_REVOKED, reason = 'revoked'): number {
     let closed = 0;
     for (const conn of Array.from(this.connections)) {
       if (conn.accountId !== accountId) continue;
@@ -254,101 +340,5 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
     const raw = this.options.approvalTimeoutSeconds;
     const value = typeof raw === 'function' ? raw() : raw;
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
-  }
-
-  // ─────────────────────────── Account lifecycle ───────────────────────────
-
-  async beforeCreateAccount(userId: string): Promise<void> {
-    const user = await this.options.storage.users.findById(userId);
-    if (!user || user.role !== 'admin') {
-      throw new ForbiddenError('Creating a Jarvis channel is limited to administrators');
-    }
-    const existing = await this.options.storage.forTenant(userId).channels.listAccounts(JARVIS_CHANNEL_TYPE);
-    if (existing.length > 0) {
-      throw new ConflictError('This user already has a Jarvis channel', 'JARVIS_ACCOUNT_EXISTS');
-    }
-  }
-
-  async provisionAccount(userId: string, account: ChannelAccount): Promise<{ token: string }> {
-    let token: string;
-    try {
-      token = this.tokens.issue(account.id, userId);
-    } catch (err) {
-      // A concurrent creation won the race for this user's one Jarvis account (the caller
-      // deletes the account it just created).
-      if (err instanceof JarvisTokenOwnerConflictError) {
-        throw new ConflictError('This user already has a Jarvis channel', 'JARVIS_ACCOUNT_EXISTS');
-      }
-      throw err;
-    }
-    await this.audit(userId, 'jarvis.token_issued', { accountId: account.id });
-    return { token };
-  }
-
-  async rotateAccountToken(userId: string, accountId: string): Promise<{ token: string }> {
-    const user = await this.options.storage.users.findById(userId);
-    if (!user || user.role !== 'admin') {
-      throw new ForbiddenError('Rotating a Jarvis token is limited to administrators');
-    }
-    const account = await this.options.storage.forTenant(userId).channels.findAccountById(accountId);
-    if (!account || account.type !== JARVIS_CHANNEL_TYPE) {
-      throw new NotFoundError(`Channel account "${accountId}" not found`);
-    }
-    const token = this.tokens.issue(account.id, userId);
-    const closed = this.closeAccountConnections(account.id);
-    await this.audit(userId, 'jarvis.token_rotated', { accountId: account.id, closedConnections: closed });
-    return { token };
-  }
-
-  async onAccountCreated(_userId: string, _accountId: string): Promise<void> {
-    // The token is issued by provisionAccount; nothing runs until a node connects.
-  }
-
-  async onAccountUpdated(userId: string, accountId: string): Promise<void> {
-    const account = await this.options.storage.forTenant(userId).channels.findAccountById(accountId);
-    if (account && account.status === 'active') return;
-    await this.revoke(userId, accountId, account ? 'account_disabled' : 'account_missing');
-  }
-
-  async onAccountDeleted(userId: string, accountId: string): Promise<void> {
-    await this.revoke(userId, accountId, 'account_deleted');
-  }
-
-  async syncAccount(userId: string, accountId: string): Promise<{ connections: number; token: boolean }> {
-    const account = await this.options.storage.forTenant(userId).channels.findAccountById(accountId);
-    if (!account || account.status !== 'active') {
-      this.closeAccountConnections(accountId);
-    }
-    return { connections: this.connectionsOf(accountId), token: this.tokens.has(accountId) };
-  }
-
-  private async revoke(userId: string, accountId: string, reason: string): Promise<void> {
-    const removed = this.tokens.revoke(accountId);
-    const closed = this.closeAccountConnections(accountId);
-    // A deleted account's token row may already be gone through the foreign key cascade.
-    if (removed || closed > 0 || reason === 'account_deleted') {
-      await this.audit(userId, 'jarvis.token_revoked', { accountId, reason, closedConnections: closed });
-    }
-  }
-
-  /** Audit entries are written in the order they happen (connection close before rotation, …). */
-  private audit(userId: string, action: AuthAuditAction, details: Record<string, unknown>): Promise<void> {
-    const write = this.auditChain.then(() => this.writeAudit(userId, action, details));
-    this.auditChain = write;
-    return write;
-  }
-
-  private async writeAudit(userId: string, action: AuthAuditAction, details: Record<string, unknown>): Promise<void> {
-    try {
-      const user = await this.options.storage.users.findById(userId);
-      await this.options.storage.auditLogs.create({
-        userId: user ? userId : null,
-        username: user?.username ?? null,
-        action,
-        details,
-      });
-    } catch (err) {
-      this.log.warn?.({ action, err: err instanceof Error ? err.name : typeof err }, 'jarvis: audit log write failed');
-    }
   }
 }

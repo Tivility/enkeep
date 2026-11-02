@@ -1,18 +1,24 @@
 /**
- * Jarvis channel on the platform: accounts and tokens, the `/api/jarvis/runtime` endpoint and the
- * per-connection source behind the `@enkeep/channel-jarvis` engine.
+ * Jarvis channel on the platform: accounts and tokens (also usable offline, by the admin CLI), the
+ * `/api/jarvis/runtime` endpoint and the per-connection source behind the `@enkeep/channel-jarvis`
+ * engine.
  *
  * @module @enkeep/platform-server/channels/jarvis
  */
 
 export {
   JarvisRuntimeManager,
-  JARVIS_CHANNEL_TYPE,
   JARVIS_CLOSE_REVOKED,
   JARVIS_DEFAULT_VERSION,
+  type JarvisAccountStatus,
   type JarvisManagerDeliveryPort,
   type JarvisRuntimeManagerOptions,
 } from './manager.js';
+export {
+  JarvisAccountLifecycle,
+  JARVIS_CHANNEL_TYPE,
+  type JarvisAccountLifecycleOptions,
+} from './accounts.js';
 export {
   PlatformJarvisSource,
   DEFAULT_RUNTIME_SPACES_DIR,
