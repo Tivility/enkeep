@@ -1914,6 +1914,12 @@ aside.workspace-sidebar.is-collapsed {
   border: 1px solid var(--accent-border);
 }
 
+.badge-channel-jarvis {
+  background: var(--accent-bg);
+  color: var(--accent-light);
+  border: 1px solid var(--accent-border);
+}
+
 .badge-channel-generic,
 .badge-channel-canonical,
 .badge-channel-default {
@@ -6168,3 +6174,47 @@ aside.workspace-sidebar.is-collapsed {
 }
 
 
+
+/* Jarvis channel card (token shown once, daemons.json example) */
+.jarvis-token-panel {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.jarvis-token-warning {
+  margin: 0;
+  color: var(--warning-text, var(--text-muted));
+}
+
+.jarvis-token-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.jarvis-token-value {
+  flex: 1;
+  font-family: var(--font-mono, monospace);
+}
+
+.jarvis-token-hint {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.jarvis-daemons-example {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+
+.jarvis-token-done {
+  align-self: flex-start;
+  margin-top: 8px;
+}

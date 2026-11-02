@@ -10245,6 +10245,201 @@ function openChannelOnboardingModal(action, accounts = [], spaces = [], initialA
   openModal('modal-channel-onboarding');
 }
 
+// 2.8b Jarvis channel card: create (token shown once), rotate token, delete.
+function jarvisDaemonsJsonExample() {
+  const port = (window.location && window.location.port) ? window.location.port : "<port>";
+  return JSON.stringify({
+    daemons: [{
+      id: "enkeep",
+      name: "Enkeep",
+      agent: "dsh",
+      launcher: "enkeep",
+      url: "ws://127.0.0.1:" + port + "/api/jarvis/runtime",
+      token_file: "<token-file>",
+    }],
+  }, null, 2);
+}
+
+function renderJarvisTokenPanel(token) {
+  const panel = document.createElement("div");
+  panel.className = "jarvis-token-panel";
+
+  const warn = document.createElement("p");
+  warn.className = "jarvis-token-warning";
+  warn.textContent = "这个 token 只显示这一次。请把它保存到本机的一个文件里（下面示例中的 <token-file>，建议权限 600），不要发给别人。";
+  panel.appendChild(warn);
+
+  const row = document.createElement("div");
+  row.className = "jarvis-token-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.readOnly = true;
+  input.className = "form-control form-control-sm jarvis-token-value";
+  input.value = token;
+  input.addEventListener("focus", () => input.select());
+  row.appendChild(input);
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "btn btn-secondary btn-sm jarvis-token-copy";
+  copyBtn.textContent = "复制";
+  copyBtn.addEventListener("click", () => {
+    const done = () => showToast("已复制 token", "success");
+    if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(token).then(done).catch(() => {
+        input.select();
+        showToast("复制失败，请手动复制", "error");
+      });
+    } else {
+      input.select();
+      try {
+        document.execCommand("copy");
+        done();
+      } catch (err) {
+        showToast("复制失败，请手动复制", "error");
+      }
+    }
+  });
+  row.appendChild(copyBtn);
+  panel.appendChild(row);
+
+  const hint = document.createElement("p");
+  hint.className = "jarvis-token-hint";
+  hint.textContent = "在运行 jarvisd 的同一台电脑上，把下面这段加入 ~/.jarvis/daemons.json，然后重启 jarvisd node：";
+  panel.appendChild(hint);
+
+  const pre = document.createElement("pre");
+  pre.className = "jarvis-daemons-example";
+  pre.textContent = jarvisDaemonsJsonExample();
+  panel.appendChild(pre);
+  return panel;
+}
+
+function renderJarvisChannelCard(account, isAdminUser) {
+  const card = document.createElement("div");
+  card.className = "channel-account-card jarvis-channel-card";
+
+  const header = document.createElement("div");
+  header.className = "channel-account-header";
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "channel-account-title";
+  const name = document.createElement("span");
+  name.className = "channel-provider-name";
+  name.textContent = "Jarvis";
+  titleWrap.appendChild(name);
+  header.appendChild(titleWrap);
+  if (account) {
+    const active = account.status === "active";
+    header.appendChild(createBadgeElement(active ? "已启用" : "已停用", active ? "success" : "neutral"));
+  }
+  card.appendChild(header);
+
+  const body = document.createElement("div");
+  body.className = "channel-account-body";
+  const desc = document.createElement("p");
+  desc.className = "channel-trigger-hint";
+  desc.textContent = account
+    ? "本机的 jarvisd 用 token 连接 enkeep，在手机和手表上查看你的会话、发消息、批准工具调用。重新生成 token 后，旧 token 立即失效，已有连接会断开。"
+    : "启用后会生成一个 token，本机的 jarvisd 用它连接 enkeep，在手机和手表上查看你的会话、发消息、批准工具调用。";
+  body.appendChild(desc);
+
+  const tokenSlot = document.createElement("div");
+  tokenSlot.className = "jarvis-token-slot";
+
+  const actions = document.createElement("div");
+  actions.className = "channel-acc-actions";
+
+  const showToken = (token) => {
+    tokenSlot.replaceChildren(renderJarvisTokenPanel(token));
+    const doneBtn = document.createElement("button");
+    doneBtn.type = "button";
+    doneBtn.className = "btn btn-primary btn-sm jarvis-token-done";
+    doneBtn.textContent = "我已保存";
+    doneBtn.addEventListener("click", () => renderManagementView("management/workspaces/channels"));
+    tokenSlot.appendChild(doneBtn);
+  };
+
+  if (!account) {
+    if (isAdminUser) {
+      const createBtn = document.createElement("button");
+      createBtn.type = "button";
+      createBtn.className = "btn btn-primary btn-sm jarvis-create-btn";
+      createBtn.textContent = "启用 Jarvis";
+      createBtn.addEventListener("click", async () => {
+        createBtn.disabled = true;
+        try {
+          const res = await apiRequest("/api/manage/channels/accounts", { method: "POST", body: { type: "jarvis" } });
+          const token = res && res.data ? res.data.token : null;
+          if (!token) throw new Error("没有收到 token");
+          showToast("Jarvis 已启用", "success");
+          actions.replaceChildren();
+          showToken(token);
+        } catch (err) {
+          createBtn.disabled = false;
+          showToast(err.message || "启用 Jarvis 失败", "error");
+        }
+      });
+      actions.appendChild(createBtn);
+    }
+  } else {
+    if (isAdminUser) {
+      const rotateBtn = document.createElement("button");
+      rotateBtn.type = "button";
+      rotateBtn.className = "btn btn-secondary btn-sm jarvis-rotate-btn";
+      rotateBtn.textContent = "重新生成 token";
+      rotateBtn.addEventListener("click", async () => {
+        const ok = await showConfirmDialog("重新生成 Jarvis token", "旧 token 会立即失效，正在连接的 jarvisd 会断开。确定继续吗？");
+        if (!ok) return;
+        rotateBtn.disabled = true;
+        try {
+          const res = await apiRequest("/api/manage/channels/accounts/" + encodeURIComponent(account.id) + "/token", { method: "POST", body: {} });
+          const token = res && res.data ? res.data.token : null;
+          if (!token) throw new Error("没有收到 token");
+          showToast("已生成新 token", "success");
+          showToken(token);
+        } catch (err) {
+          showToast(err.message || "重新生成 token 失败", "error");
+        } finally {
+          rotateBtn.disabled = false;
+        }
+      });
+      actions.appendChild(rotateBtn);
+    }
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "btn btn-secondary btn-sm jarvis-delete-btn";
+    delBtn.textContent = "删除";
+    delBtn.addEventListener("click", async () => {
+      const ok = await showConfirmDialog("删除 Jarvis", "删除后 token 立即失效，jarvisd 会断开连接。确定删除吗？");
+      if (!ok) return;
+      try {
+        await apiRequest("/api/manage/channels/accounts/" + encodeURIComponent(account.id), { method: "DELETE" });
+        showToast("Jarvis 已删除", "success");
+        await renderManagementView("management/workspaces/channels");
+      } catch (err) {
+        showToast(err.message || "删除 Jarvis 失败", "error");
+      }
+    });
+    actions.appendChild(delBtn);
+  }
+
+  body.appendChild(actions);
+  body.appendChild(tokenSlot);
+  card.appendChild(body);
+
+  const section = document.createElement("div");
+  section.className = "management-section jarvis-channel-section";
+  const sectionHeader = document.createElement("div");
+  sectionHeader.className = "section-header";
+  const sectionTitle = document.createElement("h3");
+  sectionTitle.textContent = "Jarvis";
+  sectionHeader.appendChild(sectionTitle);
+  section.appendChild(sectionHeader);
+  section.appendChild(card);
+  return section;
+}
+
 // 2.9 Channels View (GET/POST/DELETE /api/manage/channels/accounts & bindings)
 async function renderChannelsView(container) {
   let accounts = [];
@@ -10301,6 +10496,14 @@ async function renderChannelsView(container) {
   toolbarSection.appendChild(btnCreateNew);
   container.appendChild(toolbarSection);
 
+  // ──────── Jarvis (admins; one account per user, connected by the local jarvisd) ────────
+  const jarvisAccount = accounts.find((a) => a.type === "jarvis") || null;
+  const isAdminUser = Boolean(state.currentUser && state.currentUser.role === "admin");
+  if (isAdminUser || jarvisAccount) {
+    container.appendChild(renderJarvisChannelCard(jarvisAccount, isAdminUser));
+  }
+  accounts = accounts.filter((a) => a.type !== "jarvis");
+
   // ──────── Accounts Section (Cards) ────────
   const accSection = document.createElement("div");
   accSection.className = "management-section";
@@ -10337,6 +10540,8 @@ async function renderChannelsView(container) {
         providerSpan.textContent = getLocale() === "zh-CN" ? "微信 / WeChat" : "WeChat";
       } else if (acc.type === "dingtalk") {
         providerSpan.textContent = getLocale() === "zh-CN" ? "钉钉 / DingTalk" : "DingTalk";
+      } else if (acc.type === "jarvis") {
+        providerSpan.textContent = "Jarvis";
       } else {
         providerSpan.textContent = acc.type || "Unknown";
       }
@@ -14781,6 +14986,8 @@ const CHAT_I18N_EN = {
   'chat.channelDiscordAria': 'Source: Discord',
   'chat.channelGeneric': 'Channel',
   'chat.channelGenericAria': 'Source: Channel',
+  'chat.channelJarvis': 'Jarvis',
+  'chat.channelJarvisAria': 'Source: Jarvis',
   'chat.channelLark': 'Lark',
   'chat.channelLarkAria': 'Source: Lark',
   'chat.channelQQ': 'QQ',
@@ -15033,6 +15240,8 @@ const CHAT_I18N_ZH = {
   'chat.channelDiscordAria': '来源：Discord',
   'chat.channelGeneric': '渠道',
   'chat.channelGenericAria': '来源：渠道',
+  'chat.channelJarvis': 'Jarvis',
+  'chat.channelJarvisAria': '来源：Jarvis',
   'chat.channelLark': '飞书',
   'chat.channelLarkAria': '来源：飞书',
   'chat.channelQQ': 'QQ',
@@ -17302,6 +17511,13 @@ function getSessionSourceBadgeInfo(session) {
         type: 'wechat',
         label: tr('chat.channelWeChat', null, 'WeChat'),
         ariaLabel: tr('chat.channelWeChatAria', null, 'Source: WeChat'),
+      };
+    }
+    if (rawChannel === 'jarvis') {
+      return {
+        type: 'jarvis',
+        label: tr('chat.channelJarvis', null, 'Jarvis'),
+        ariaLabel: tr('chat.channelJarvisAria', null, 'Source: Jarvis'),
       };
     }
     if (rawChannel === 'qq') {
