@@ -605,6 +605,28 @@ export {
   type PendingApprovalView,
 } from './interactions/approval-bridge.js';
 
+// Live DSH session streams of the user runtimes (turn/event, turn/chunk)
+export {
+  RuntimeSessionEventHub,
+  type RuntimeSessionEventHubOptions,
+  type RuntimeSessionEventListener,
+  type HubSessionEvent,
+  type HubTurnChunk,
+  type HubRuntimeChange,
+  type SessionEventRuntimeTransport,
+} from './runtime/session-event-hub.js';
+export type {
+  RuntimeSessionReader,
+  RuntimeSessionEventsQuery,
+  RuntimeSessionEventsPage,
+  RuntimeSessionEvent,
+  RuntimeAttachmentQuery,
+  RuntimeAttachmentData,
+} from './runtime/delivery-gateway.js';
+
+// Jarvis channel
+export * from './channels/jarvis/index.js';
+
 // Channel Management & Routes
 export {
   ChannelManagementService,
@@ -615,7 +637,9 @@ export {
   ALLOWED_CHANNEL_BINDING_UPDATE_KEYS,
   ALLOWED_ONBOARDING_JOB_CREATE_KEYS,
   BUILTIN_CHANNEL_ACCOUNT_TYPES,
+  isChannelConnectionEndpoint,
   type ChannelAccountLifecycle,
+  type ChannelConnectionEndpoint,
 } from './channels/channel-routes.js';
 export {
   ChannelRuntimeManager,

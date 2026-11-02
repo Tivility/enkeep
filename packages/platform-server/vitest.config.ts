@@ -7,6 +7,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
   resolve: {
     alias: {
+      '@enkeep/channel-jarvis': path.resolve(__dirname, '../channel-jarvis/src/index.ts'),
       '@enkeep/channel-lark': path.resolve(__dirname, '../channel-lark/src/index.ts'),
       '@enkeep/web-channel': path.resolve(__dirname, '../web-channel/src/index.ts'),
     },

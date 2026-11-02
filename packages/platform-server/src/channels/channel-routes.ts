@@ -7,6 +7,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Duplex } from 'node:stream';
 import {
   PlatformError,
   NotFoundError,
@@ -91,6 +92,44 @@ export interface ChannelAccountLifecycle {
   onAccountDeleted(userId: string, accountId: string): Promise<unknown>;
   /** Explicit sync request (`POST /api/manage/channels/accounts/:id/sync`). */
   syncAccount(userId: string, accountId: string): Promise<unknown>;
+  /**
+   * Optional gate run before an account row of this type is written (e.g. admin only, one per
+   * user). Throw a PlatformError (403, 409…) to refuse.
+   */
+  beforeCreateAccount?(userId: string, input: { type: string; status?: string; defaultSpaceId?: string | null }): Promise<void>;
+  /**
+   * Optional provisioning right after the row was written. The returned fields are added to the
+   * creation response once (e.g. a freshly issued bearer token). Throwing removes the account again.
+   */
+  provisionAccount?(userId: string, account: ChannelAccount): Promise<Record<string, unknown> | void>;
+  /**
+   * Optional: issue a new bearer token for the account (`POST /api/manage/channels/accounts/:id/token`),
+   * replacing the old one. The token is returned once.
+   */
+  rotateAccountToken?(userId: string, accountId: string): Promise<{ token: string }>;
+}
+
+/**
+ * A channel whose clients dial into the platform over a WebSocket upgrade (e.g. Jarvis). The
+ * platform server hands it upgrade requests for `upgradePath` after its own Host validation and
+ * starts/stops it with the server.
+ */
+export interface ChannelConnectionEndpoint {
+  readonly upgradePath: string;
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void>;
+  start?(): void | Promise<void>;
+  /** Close every live connection and refuse new ones until started again. */
+  stop(): void | Promise<void>;
+}
+
+export function isChannelConnectionEndpoint(value: unknown): value is ChannelConnectionEndpoint {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as ChannelConnectionEndpoint).upgradePath === 'string' &&
+    typeof (value as ChannelConnectionEndpoint).handleUpgrade === 'function' &&
+    typeof (value as ChannelConnectionEndpoint).stop === 'function'
+  );
 }
 
 /** Channel account types that always have a dedicated manager slot. */
@@ -234,9 +273,10 @@ export class ChannelManagementService {
       defaultSpaceId?: string | null;
       groupActivationMode?: 'mention' | 'always';
     }
-  ): Promise<ChannelAccount> {
+  ): Promise<ChannelAccount & Record<string, unknown>> {
     const type = typeof input.type === 'string' ? input.type.trim() : '';
     this.assertSupportedType(type);
+    const typeLifecycle = this.lifecycleFor(type);
 
     let defaultSpaceId = input.defaultSpaceId;
     if (defaultSpaceId !== undefined && defaultSpaceId !== null) {
@@ -252,6 +292,10 @@ export class ChannelManagementService {
       }
     }
 
+    if (typeLifecycle?.beforeCreateAccount) {
+      await typeLifecycle.beforeCreateAccount(userId, { type, status: input.status, defaultSpaceId });
+    }
+
     const created = await this.storage.forTenant(userId).channels.createAccount({
       type,
       status: input.status,
@@ -259,6 +303,17 @@ export class ChannelManagementService {
       defaultSpaceId,
       groupActivationMode: input.groupActivationMode,
     });
+    let extras: Record<string, unknown> | void = undefined;
+    if (typeLifecycle?.provisionAccount) {
+      try {
+        extras = await typeLifecycle.provisionAccount(userId, created);
+      } catch (err) {
+        try {
+          await this.storage.forTenant(userId).channels.deleteAccount(created.id);
+        } catch {}
+        throw err;
+      }
+    }
     if (created.status === 'active') {
       const lifecycle = this.lifecycleFor(created.type);
       try {
@@ -267,7 +322,21 @@ export class ChannelManagementService {
         }
       } catch {}
     }
-    return created;
+    return (extras ? { ...created, ...extras } : created) as ChannelAccount & Record<string, unknown>;
+  }
+
+  /**
+   * Issues a new bearer token for an account of a type that has tokens (e.g. jarvis), replacing the
+   * old one. The account must belong to the user; the type's manager applies its own policy.
+   */
+  async rotateAccountToken(userId: string, accountId: string): Promise<{ accountId: string; token: string }> {
+    const account = await this.getAccount(userId, accountId);
+    const lifecycle = this.lifecycleFor(account.type);
+    if (!lifecycle?.rotateAccountToken) {
+      throw new ValidationError(`Channel type "${account.type}" has no token`);
+    }
+    const { token } = await lifecycle.rotateAccountToken(userId, account.id);
+    return { accountId: account.id, token };
   }
 
   async updateAccount(
@@ -603,6 +672,21 @@ export class ChannelRoutes {
         });
 
         sendJsonResponse(res, 201, createSuccessEnvelope(created));
+        return true;
+      }
+    }
+
+    // ──────────────── /api/manage/channels/accounts/:id/token ────────────────
+    const accountTokenMatch = pathname.match(/^\/api\/manage\/channels\/accounts\/([^/]+)\/token$/);
+    if (accountTokenMatch) {
+      const accountId = decodeURIComponent(accountTokenMatch[1]);
+      if (method === 'POST') {
+        if (this.expectedCsrfToken) {
+          validateCsrf(req, { csrfToken: this.expectedCsrfToken });
+        }
+        const rotated = await this.service.rotateAccountToken(user.id, accountId);
+        // The token is shown once: never cache this response.
+        sendJsonResponse(res, 200, createSuccessEnvelope(rotated));
         return true;
       }
     }

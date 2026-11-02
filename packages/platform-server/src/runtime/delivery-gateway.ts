@@ -146,7 +146,67 @@ export interface DeliveryTurnExecutor {
     attachments?: readonly any[];
     clientRequestId?: string;
   }): Promise<{ ok: boolean; error?: { code: string; message?: string } }>;
+  /**
+   * Read-only page of a DSH session log in the user's runtime (original DSH seqs). Errors keep the
+   * runtime's code (e.g. `session/not-found`).
+   */
+  readSessionEvents?(userId: string, params: RuntimeSessionEventsQuery): Promise<RuntimeSessionEventsPage>;
+  /** A whole image attachment cited by a session's events (errors keep codes like `attachment/not-found`). */
+  readAttachment?(userId: string, params: RuntimeAttachmentQuery): Promise<RuntimeAttachmentData>;
 }
+
+/** Which page of a DSH session log to read (see the runtime's `readSessionEvents`). */
+export interface RuntimeSessionEventsQuery {
+  /** The space the session runs in (selects the container or host runtime). */
+  readonly platformSpaceId: string;
+  readonly dshSessionId: string;
+  /** Only events with seq > afterSeq. */
+  readonly afterSeq?: number;
+  /** Only events with seq < beforeSeq (the newest such events). */
+  readonly beforeSeq?: number;
+  readonly limit?: number;
+  readonly maxBytes?: number;
+}
+
+/** One DSH session event as persisted (seq counts from 0). */
+export interface RuntimeSessionEvent {
+  readonly seq: number;
+  readonly type: string;
+  readonly [key: string]: unknown;
+}
+
+export interface RuntimeSessionEventsPage {
+  readonly dshSessionId: string;
+  /** Ascending by seq. */
+  readonly events: readonly RuntimeSessionEvent[];
+  /** Newest seq of the whole log; -1 when empty. */
+  readonly lastSeq: number;
+  readonly persistedLastSeq?: number;
+  readonly hasMore: boolean;
+}
+
+export interface RuntimeAttachmentQuery {
+  readonly platformSpaceId: string;
+  readonly dshSessionId: string;
+  /** A DSH image attachment id (`sha256:<hex>`). */
+  readonly attachmentId?: string;
+  /** A workspace path as the session's events cite it. */
+  readonly path?: string;
+}
+
+export interface RuntimeAttachmentData {
+  readonly mime: string;
+  /** Base64 of the whole image. */
+  readonly data: string;
+  readonly bytes?: number;
+  readonly sha256?: string;
+  readonly width?: number;
+  readonly height?: number;
+  readonly name?: string;
+}
+
+/** Read access to the runtime's DSH-native session history (implemented by turn executors). */
+export type RuntimeSessionReader = Required<Pick<DeliveryTurnExecutor, 'readSessionEvents' | 'readAttachment'>>;
 
 export type RuntimeTurnExecutor = DeliveryTurnExecutor;
 

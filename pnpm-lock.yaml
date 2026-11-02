@@ -743,6 +743,9 @@ importers:
       '@enkeep/backup-restore':
         specifier: workspace:*
         version: link:../backup-restore
+      '@enkeep/channel-jarvis':
+        specifier: workspace:*
+        version: link:../channel-jarvis
       '@enkeep/channel-lark':
         specifier: workspace:*
         version: link:../channel-lark

@@ -59,6 +59,13 @@ import {
   mapFileOpError,
   ApprovalBridge,
   type ApprovalRuntimeTransport,
+  RuntimeSessionEventHub,
+  type SessionEventRuntimeTransport,
+  JarvisRuntimeManager,
+  DEFAULT_RUNTIME_SPACES_DIR,
+  type RuntimeSessionReader,
+  type RuntimeSessionEventsPage,
+  type RuntimeAttachmentData,
 } from '@enkeep/platform-server';
 import {
   PlatformError,
@@ -157,6 +164,10 @@ export interface RunningDemoSystem {
   hostRuntimeHandles: Map<string, UserRuntimeHandle>;
   /** Host side of runtime approvals (also `platformServer.approvalBridge`); channels subscribe here. */
   approvalBridge: ApprovalBridge;
+  /** Live DSH session events and text chunks of every bound runtime, per user. */
+  sessionEventHub: RuntimeSessionEventHub;
+  /** The Jarvis channel (`/api/jarvis/runtime`), unless disabled with `jarvisChannel: false`. */
+  jarvisRuntimeManager?: JarvisRuntimeManager;
   managementProvider?: ManagementRuntimeProvider;
   restartRuntime(targetUserId?: string): Promise<RuntimeRestartResult>;
   connectRuntime(userId: string): Promise<UserRuntimeHandle>;
@@ -648,14 +659,21 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     }
     return approvalBridgeInstance;
   }
+  // Live DSH session streams (turn/event, turn/chunk) of every user runtime, attached like the
+  // approval bridge (same slots); channels that show whole sessions (Jarvis) subscribe here.
+  const ownsSessionEventHub = !options.sessionEventHub;
+  const sessionEventHub: RuntimeSessionEventHub = options.sessionEventHub ?? new RuntimeSessionEventHub();
   /** One bridge slot per runtime (a user can have a container and a host runtime). */
   function approvalSlotOf(handle: UserRuntimeHandle): string {
     return `runtime:${handle.userId}`;
   }
-  function detachApprovals(platformUserId: string, handle: UserRuntimeHandle | undefined): void {
-    if (handle && approvalBridgeInstance) {
+  /** Unsubscribes the approval bridge and the session event hub from a runtime that goes away. */
+  function detachRuntimeListeners(platformUserId: string, handle: UserRuntimeHandle | undefined): void {
+    if (!handle) return;
+    if (approvalBridgeInstance) {
       approvalBridgeInstance.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
     }
+    sessionEventHub.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
   }
 
   function getEffectiveTargetRuntimeVersion(): { image: string; daemonCliPath?: string } {
@@ -869,7 +887,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       }
       // Process is not alive, evict stale handle
       console.info('[host-runtime] evicting handle of exited daemon', { userId: rawUserId, pid: pid ?? null });
-      detachApprovals(rawUserId, existing);
+      detachRuntimeListeners(rawUserId, existing);
       hostRuntimeHandles.delete(rawUserId);
     }
 
@@ -1308,6 +1326,35 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     },
     async steerTurn(req) {
       return bgDelegates.steerTurn(req);
+    },
+    // Read-only DSH session history of the runtime the session's space runs in (errors keep the
+    // runtime's codes, e.g. `session/not-found`).
+    async readSessionEvents(userId, params): Promise<RuntimeSessionEventsPage> {
+      const { handle } = await resolveRuntimeForSpace(userId, params.platformSpaceId);
+      const raw = handle.rawHandle;
+      if (!raw || typeof raw.readSessionEvents !== 'function') {
+        throw Object.assign(new Error('Runtime does not support reading session events'), { code: 'unsupported' });
+      }
+      const page = await raw.readSessionEvents({
+        sessionId: params.dshSessionId,
+        ...(params.afterSeq !== undefined ? { afterSeq: params.afterSeq } : {}),
+        ...(params.beforeSeq !== undefined ? { beforeSeq: params.beforeSeq } : {}),
+        ...(params.limit !== undefined ? { limit: params.limit } : {}),
+        ...(params.maxBytes !== undefined ? { maxBytes: params.maxBytes } : {}),
+      });
+      return page as unknown as RuntimeSessionEventsPage;
+    },
+    async readAttachment(userId, params): Promise<RuntimeAttachmentData> {
+      const { handle } = await resolveRuntimeForSpace(userId, params.platformSpaceId);
+      const raw = handle.rawHandle;
+      if (!raw || typeof raw.readAttachment !== 'function') {
+        throw Object.assign(new Error('Runtime does not support reading attachments'), { code: 'unsupported' });
+      }
+      return raw.readAttachment({
+        sessionId: params.dshSessionId,
+        ...(params.attachmentId !== undefined ? { attachmentId: params.attachmentId } : {}),
+        ...(params.path !== undefined ? { path: params.path } : {}),
+      });
     },
   };
 
@@ -1836,7 +1883,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               try {
                 await hostHandle.stop();
               } catch {}
-              detachApprovals(userId, hostHandle);
+              detachRuntimeListeners(userId, hostHandle);
               hostRuntimeHandles.delete(userId);
             }
           }
@@ -1857,7 +1904,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                   pathOptions
                 );
               } catch {}
-              detachApprovals(userId, containerHandle);
+              detachRuntimeListeners(userId, containerHandle);
               runtimeHandles.delete(userId);
 
               // Recreate runtime container mounting same owned volume and updated union mounts
@@ -2020,6 +2067,9 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     const transport = rawHandle.transport ?? (await rawHandle.startTransport?.());
     if (transport && typeof (transport as any).on === 'function') {
       getApprovalBridge().attachTransport(platformUserId, transport as unknown as ApprovalRuntimeTransport, {
+        slot: approvalSlotOf(handle),
+      });
+      sessionEventHub.attachTransport(platformUserId, transport as unknown as SessionEventRuntimeTransport, {
         slot: approvalSlotOf(handle),
       });
     }
@@ -2286,7 +2336,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await hostHandle.teardown(false);
           stopped = true;
         } catch {}
-        detachApprovals(normalizedUserId, hostHandle);
+        detachRuntimeListeners(normalizedUserId, hostHandle);
         hostRuntimeHandles.delete(normalizedUserId);
         hostRuntimeHandles.delete(targetUserId);
       }
@@ -2298,7 +2348,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await handle.teardown(false);
           stopped = true;
         } catch {}
-        detachApprovals(normalizedUserId, handle);
+        detachRuntimeListeners(normalizedUserId, handle);
         runtimeHandles.delete(normalizedUserId);
         runtimeHandles.delete(targetUserId);
       }
@@ -2364,7 +2414,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
             await oldHostHandle.stop();
             await oldHostHandle.teardown(false);
           } catch {}
-          detachApprovals(uid, oldHostHandle);
+          detachRuntimeListeners(uid, oldHostHandle);
           hostRuntimeHandles.delete(uid);
           try {
             const newHostHandle = await ensureUserHostRuntime(uid);
@@ -2395,7 +2445,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           } catch (oldTeardownErr: unknown) {
             // Ignore error during teardown of old container
           }
-          detachApprovals(uid, oldHandle);
+          detachRuntimeListeners(uid, oldHandle);
           runtimeHandles.delete(uid);
 
           try {
@@ -2844,6 +2894,34 @@ fs.appendFileSync(p, corruptData);
   let platformUrl = '';
   let platformActualPort = 0;
 
+  // 8a. Jarvis channel: a jarvisd node dials /api/jarvis/runtime with a per-user token.
+  const jarvisRuntimeManager =
+    options.jarvisChannel === false
+      ? undefined
+      : new JarvisRuntimeManager({
+          db: db!,
+          storage: storage!,
+          gateway: deliveryGateway,
+          // The platform API exists once the server is built; Jarvis calls only arrive after it listens.
+          sessionApi: () => platformServer?.platformApi,
+          approvalBridge: getApprovalBridge(),
+          sessionEvents: sessionEventHub,
+          sessionReader: dockerTurnExecutor as RuntimeSessionReader,
+          fileProvider: demoFileProvider,
+          version: process.env.ENKEEP_VERSION?.trim() || undefined,
+          approvalTimeoutSeconds: () => getApprovalBridge().getApprovalTimeoutMs() / 1000,
+          runtimeSpacesDir: ({ userId, executionMode }) => {
+            if (executionMode !== 'host') return DEFAULT_RUNTIME_SPACES_DIR;
+            const row = db!.prepare('SELECT username FROM users WHERE id = ?').get(userId) as { username?: string } | undefined;
+            return row?.username ? join(paths.dataRoot, 'host-runtimes', row.username, 'spaces') : DEFAULT_RUNTIME_SPACES_DIR;
+          },
+          log: {
+            info: (obj, msg) => console.info(`[jarvis] ${msg ?? ''}`, obj ?? {}),
+            warn: (obj, msg) => console.warn(`[jarvis] ${msg ?? ''}`, obj ?? {}),
+            error: (obj, msg) => console.error(`[jarvis] ${msg ?? ''}`, obj ?? {}),
+          },
+        });
+
   try {
     const firstHandleForRunId = runtimeHandles.values().next().value;
     const demoRunId = firstHandleForRunId?.runId ?? generateRunId();
@@ -2869,6 +2947,7 @@ fs.appendFileSync(p, corruptData);
       spaceMountService: demoSpaceMountService,
       extensionService: demoExtensionService,
       approvalBridge: getApprovalBridge(),
+      ...(jarvisRuntimeManager ? { channelManagers: { jarvis: jarvisRuntimeManager } } : {}),
       cookieSecret: secrets.cookieSecret,
       csrfToken: secrets.csrfToken,
       host,
@@ -2925,6 +3004,8 @@ fs.appendFileSync(p, corruptData);
       } catch {}
     }
     if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
+    jarvisRuntimeManager?.stop();
+    if (ownsSessionEventHub) sessionEventHub.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
     try {
       await storage.close();
@@ -3058,6 +3139,8 @@ fs.appendFileSync(p, corruptData);
       runtimeHandles,
       hostRuntimeHandles,
       approvalBridge: getApprovalBridge(),
+      sessionEventHub,
+      ...(jarvisRuntimeManager ? { jarvisRuntimeManager } : {}),
       connectRuntime: async (userId: string) => {
         const userRecord = await storage!.users.findById(userId);
         if (!userRecord || !userRecord.id) {
@@ -3191,8 +3274,12 @@ fs.appendFileSync(p, corruptData);
         } catch (err: unknown) {
           allErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
+        jarvisRuntimeManager?.stop();
         if (ownsApprovalBridge) {
           approvalBridgeInstance?.dispose();
+        }
+        if (ownsSessionEventHub) {
+          sessionEventHub.dispose();
         }
 
         try {
@@ -3249,6 +3336,8 @@ fs.appendFileSync(p, corruptData);
       postSetupErrors.push(storageErr instanceof Error ? storageErr : new Error(String(storageErr)));
     }
     if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
+    jarvisRuntimeManager?.stop();
+    if (ownsSessionEventHub) sessionEventHub.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
     postSetupErrors.push(...teardownErrs);
     const primary = err instanceof Error ? err : new Error(String(err));
