@@ -208,6 +208,21 @@ export interface RuntimeAttachmentData {
 /** Read access to the runtime's DSH-native session history (implemented by turn executors). */
 export type RuntimeSessionReader = Required<Pick<DeliveryTurnExecutor, 'readSessionEvents' | 'readAttachment'>>;
 
+/** Pending user questions per session (implemented by the platform QuestionBridge). */
+export interface RuntimeQuestionStatusSource {
+  listPending(filter: { userId?: string; sessionId?: string }): ReadonlyArray<unknown>;
+}
+
+/** What getCurrentTurnStatus reports for a session's current turn. */
+export interface CurrentTurnStatus {
+  status: TurnExecutionStatus;
+  code?: PublicEventCode;
+  queuePosition?: number;
+  turnId?: string;
+  /** With `waiting_approval`: set to `question` when the turn waits for the user's answer to a question. */
+  waitingFor?: 'question';
+}
+
 export type RuntimeTurnExecutor = DeliveryTurnExecutor;
 
 export interface BackgroundTaskProgress {
@@ -235,7 +250,7 @@ export interface DrainableRuntimeGateway extends RuntimeGateway {
   drain(timeoutMs?: number): Promise<boolean>;
   redriveHeld(): Promise<number>;
   recoverQueuedTurns?(): Promise<number>;
-  getCurrentTurnStatus(userId: string, sessionId: string): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number; turnId?: string } | null>;
+  getCurrentTurnStatus(userId: string, sessionId: string): Promise<CurrentTurnStatus | null>;
   cancelCurrentTurn(userId: string, sessionId: string): Promise<boolean>;
   getBackgroundTasks?(userId: string, sessionId: string, options?: { chatContextId?: string }): Promise<{ items: BackgroundTask[]; updatedAt: string; available?: boolean }>;
   stopBackgroundTask?(userId: string, sessionId: string, taskId: string): Promise<{ stopped: boolean }>;
@@ -652,6 +667,11 @@ export interface DeliveryRuntimeGatewayOptions {
   externalInteractionService?: {
     listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => ReadonlyArray<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
+  /**
+   * Pending `ask_user_question` questions (the platform QuestionBridge). A session with one reports
+   * `waiting_approval` with `waitingFor: 'question'` from getCurrentTurnStatus.
+   */
+  questionService?: RuntimeQuestionStatusSource;
   mountResolver?: RuntimeMountResolver;
   extensionResolver?: ExtensionPlanResolver;
   quotaTokenFloor?: number;
@@ -714,6 +734,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   private readonly externalInteractionService?: {
     listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => ReadonlyArray<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
+  private questionService?: RuntimeQuestionStatusSource;
   private mountResolver?: RuntimeMountResolver;
   private extensionResolver?: ExtensionPlanResolver;
   private readonly quotaTokenFloor: number;
@@ -836,6 +857,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           })
         : undefined);
     this.externalInteractionService = options.externalInteractionService;
+    this.questionService = options.questionService;
     this.mountResolver = options.mountResolver;
 
     // Initialize turn quota reservation tuning parameters with defaults and environment overrides
@@ -861,6 +883,15 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
 
     // Launch background scheduler loop
     this.startScheduler();
+  }
+
+  /** Pending user questions (the QuestionBridge) behind `waitingFor: 'question'`; set once. */
+  public setQuestionService(service: RuntimeQuestionStatusSource | undefined): void {
+    if (!this.questionService) this.questionService = service;
+  }
+
+  public getQuestionService(): RuntimeQuestionStatusSource | undefined {
+    return this.questionService;
   }
 
   public getMountResolver(): RuntimeMountResolver | undefined {
@@ -3848,7 +3879,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   async getCurrentTurnStatus(
     userId: string,
     sessionId: string
-  ): Promise<{ status: TurnExecutionStatus; code?: PublicEventCode; queuePosition?: number; turnId?: string } | null> {
+  ): Promise<CurrentTurnStatus | null> {
     if (typeof userId !== 'string' || typeof sessionId !== 'string') {
       throw new ValidationError('Invalid arguments for getCurrentTurnStatus');
     }
@@ -3882,6 +3913,21 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
           return {
             status: 'waiting_approval',
             code: 'WAITING_APPROVAL',
+          };
+        }
+      } catch {}
+    }
+
+    // 2b. A pending ask_user_question: the turn waits for the user's answer. TurnExecutionStatus
+    // has no dedicated value; waiting_approval (the human-wait state) is reported with waitingFor.
+    if (this.questionService && typeof this.questionService.listPending === 'function') {
+      try {
+        const questions = this.questionService.listPending({ userId, sessionId });
+        if (Array.isArray(questions) && questions.length > 0) {
+          return {
+            status: 'waiting_approval',
+            code: 'WAITING_APPROVAL',
+            waitingFor: 'question',
           };
         }
       } catch {}

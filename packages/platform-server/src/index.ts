@@ -605,6 +605,25 @@ export {
   type PendingApprovalView,
 } from './interactions/approval-bridge.js';
 
+// Runtime ask_user_question bridge (host side of in-container user questions)
+export {
+  QuestionBridge,
+  toPendingQuestionView,
+  type QuestionBridgeOptions,
+  type QuestionBridgeEventMap,
+  type QuestionBridgeLogger,
+  type QuestionAskedEvent,
+  type QuestionSettledEvent,
+  type QuestionSettledOutcome,
+  type QuestionSettledSource,
+  type QuestionAnswerOptions,
+  type QuestionAnswerResult,
+  type QuestionAnswerStatus,
+  type QuestionRuntimeTransport,
+  type BridgedQuestion,
+  type PendingQuestionView,
+} from './interactions/question-bridge.js';
+
 // Live DSH session streams of the user runtimes (turn/event, turn/chunk)
 export {
   RuntimeSessionEventHub,
@@ -617,6 +636,8 @@ export {
 } from './runtime/session-event-hub.js';
 export type {
   RuntimeSessionReader,
+  RuntimeQuestionStatusSource,
+  CurrentTurnStatus,
   RuntimeSessionEventsQuery,
   RuntimeSessionEventsPage,
   RuntimeSessionEvent,

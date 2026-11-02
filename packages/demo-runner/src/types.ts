@@ -160,6 +160,8 @@ export interface DemoUpOptions extends DemoPathOptions {
   externalInteractionService?: import('@enkeep/dsh-external-interaction').IExternalInteractionService;
   /** Optional pre-built approval bridge (default: one created per demo system, disposed on close). */
   approvalBridge?: import('@enkeep/platform-server').ApprovalBridge;
+  /** Optional pre-built question bridge (default: one created per demo system, disposed on close). */
+  questionBridge?: import('@enkeep/platform-server').QuestionBridge;
   /** Optional pre-built hub of the runtimes' live session events (default: one per demo system). */
   sessionEventHub?: import('@enkeep/platform-server').RuntimeSessionEventHub;
   /** Disable the Jarvis channel (`/api/jarvis/runtime` and `jarvis` channel accounts). Default: enabled. */

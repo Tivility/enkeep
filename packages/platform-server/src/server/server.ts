@@ -95,6 +95,7 @@ import {
 } from '../profiles/profile-service.js';
 import type { IExternalInteractionService } from '@enkeep/dsh-external-interaction';
 import type { ApprovalBridge } from '../interactions/approval-bridge.js';
+import type { QuestionBridge } from '../interactions/question-bridge.js';
 import {
   HappyClawMigrationService,
 } from '../imports/happyclaw-migration-service.js';
@@ -252,6 +253,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'modelSelectionService',
   'externalInteractionService',
   'approvalBridge',
+  'questionBridge',
   'runtimeProviderRegistry',
   'hostProvider',
   'containerProvider',
@@ -420,6 +422,11 @@ export interface PlatformServerOptions {
    * exposed as `server.approvalBridge` for channels (e.g. Jarvis).
    */
   approvalBridge?: ApprovalBridge;
+  /**
+   * Host-side bridge of runtime `ask_user_question` questions. Backs `/api/interactions/questions*`
+   * and the gateway's `waitingFor: 'question'`; exposed as `server.questionBridge` for channels.
+   */
+  questionBridge?: QuestionBridge;
   /** Optional runtime provider registry managing multi-mode execution */
   runtimeProviderRegistry?: RuntimeProviderRegistry;
   /** Optional host runtime provider for host mode execution */
@@ -538,6 +545,7 @@ export class PlatformServer {
   public readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
   public readonly externalInteractionService?: IExternalInteractionService;
   public readonly approvalBridge?: ApprovalBridge;
+  public readonly questionBridge?: QuestionBridge;
   public readonly mountReconciler?: RuntimeMountReconciler;
   public readonly spaceMountService?: SpaceMountService;
   public readonly browserService?: BrowserService;
@@ -836,6 +844,12 @@ export class PlatformServer {
     this.instructionsRoutes = instructionsRoutes;
     this.approvalBridge = options.approvalBridge;
     this.externalInteractionService = options.externalInteractionService ?? options.approvalBridge;
+    this.questionBridge = options.questionBridge;
+    if (this.questionBridge) {
+      // Sessions waiting for an answer report waitingFor: 'question' (unless the gateway has a source).
+      const gateway = this.runtimeGateway as { setQuestionService?: (service: QuestionBridge) => void } | undefined;
+      gateway?.setQuestionService?.(this.questionBridge);
+    }
 
     this.mountReconciler = options.mountReconciler;
     this.spaceMountService =
@@ -1177,6 +1191,7 @@ export class PlatformServer {
       sessionLifecycleService: this.sessionLifecycleService,
       runtimeArtifactPort: this.runtimeArtifactPort,
       externalInteractionService: this.externalInteractionService,
+      questionBridge: this.questionBridge,
       spaceMountService: this.spaceMountService,
       browserService: this.browserService,
       mcpService: this.mcpService,

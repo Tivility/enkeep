@@ -59,6 +59,8 @@ import {
   mapFileOpError,
   ApprovalBridge,
   type ApprovalRuntimeTransport,
+  QuestionBridge,
+  type QuestionRuntimeTransport,
   RuntimeSessionEventHub,
   type SessionEventRuntimeTransport,
   JarvisRuntimeManager,
@@ -164,6 +166,8 @@ export interface RunningDemoSystem {
   hostRuntimeHandles: Map<string, UserRuntimeHandle>;
   /** Host side of runtime approvals (also `platformServer.approvalBridge`); channels subscribe here. */
   approvalBridge: ApprovalBridge;
+  /** Host side of runtime `ask_user_question` questions (also `platformServer.questionBridge`). */
+  questionBridge: QuestionBridge;
   /** Live DSH session events and text chunks of every bound runtime, per user. */
   sessionEventHub: RuntimeSessionEventHub;
   /** The Jarvis channel (`/api/jarvis/runtime`), unless disabled with `jarvisChannel: false`. */
@@ -659,6 +663,32 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     }
     return approvalBridgeInstance;
   }
+  // Host side of in-runtime ask_user_question questions, attached like the approval bridge (same
+  // slots): backs /api/interactions/questions, the waiting status and Jarvis question cards.
+  const ownsQuestionBridge = !options.questionBridge;
+  let questionBridgeInstance: QuestionBridge | null = options.questionBridge ?? null;
+  function getQuestionBridge(): QuestionBridge {
+    if (!questionBridgeInstance) {
+      questionBridgeInstance = new QuestionBridge({ db: db ?? undefined });
+    }
+    return questionBridgeInstance;
+  }
+  /**
+   * The per-user `userQuestions` runtime option: true while the user has an active Jarvis channel
+   * account (the runtime then composes ask_user_question); otherwise unset, so the process-wide
+   * ENKEEP_USER_QUESTIONS stays the deployment default. Read when a runtime spec is built: a change
+   * applies when that user's runtime is next (re)created.
+   */
+  function userQuestionsFor(platformUserId: string): true | undefined {
+    try {
+      const row = db?.prepare(
+        "SELECT 1 AS ok FROM channel_accounts WHERE user_id = ? AND type = 'jarvis' AND status = 'active' LIMIT 1"
+      ).get(platformUserId);
+      return row ? true : undefined;
+    } catch {
+      return undefined;
+    }
+  }
   // Live DSH session streams (turn/event, turn/chunk) of every user runtime, attached like the
   // approval bridge (same slots); channels that show whole sessions (Jarvis) subscribe here.
   const ownsSessionEventHub = !options.sessionEventHub;
@@ -667,11 +697,14 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
   function approvalSlotOf(handle: UserRuntimeHandle): string {
     return `runtime:${handle.userId}`;
   }
-  /** Unsubscribes the approval bridge and the session event hub from a runtime that goes away. */
+  /** Unsubscribes the approval and question bridges and the session event hub from a runtime that goes away. */
   function detachRuntimeListeners(platformUserId: string, handle: UserRuntimeHandle | undefined): void {
     if (!handle) return;
     if (approvalBridgeInstance) {
       approvalBridgeInstance.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
+    }
+    if (questionBridgeInstance) {
+      questionBridgeInstance.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
     }
     sessionEventHub.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
   }
@@ -787,6 +820,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
         llmProvider: options.llmProvider,
         llmModel: options.llmModel,
         networkMode: containerNetworkMode,
+        userQuestions: userQuestionsFor(u.id),
       });
       userHandle.launchedImage = userHandle.meta?.image || targetVer.image;
       newlyCreatedHandles.push(userHandle);
@@ -919,6 +953,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           llmProvider: options.llmProvider,
           llmModel: options.llmModel,
           browserService,
+          userQuestions: userQuestionsFor(userRecord.id),
         });
         handle.launchedDaemonCliPath = targetVer.daemonCliPath || null;
         console.info('[host-runtime] runtime ready', {
@@ -977,6 +1012,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           resourceSuffix: options.resourceSuffix,
           timeoutMs: options.timeoutMs ?? 15000,
           networkMode: containerNetworkMode,
+          userQuestions: userQuestionsFor(userRecord.id),
         });
         handle.launchedImage = handle.meta?.image || targetVer.image;
 
@@ -1921,6 +1957,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                   resourceSuffix: options.resourceSuffix,
                   timeoutMs: options.timeoutMs ?? 15000,
                   mounts: allMounts,
+                  userQuestions: userQuestionsFor(userRecord.id),
                 });
                 newHandle.launchedImage = targetVer.image;
                 await bindRuntimeServices(newHandle, userRecord.id);
@@ -1987,6 +2024,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     mountResolver: demoSpaceMountService,
     extensionResolver: demoExtensionService,
     externalInteractionService: getApprovalBridge(),
+    questionService: getQuestionBridge(),
   });
 
   let platformServer: PlatformServer | undefined;
@@ -2067,6 +2105,9 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     const transport = rawHandle.transport ?? (await rawHandle.startTransport?.());
     if (transport && typeof (transport as any).on === 'function') {
       getApprovalBridge().attachTransport(platformUserId, transport as unknown as ApprovalRuntimeTransport, {
+        slot: approvalSlotOf(handle),
+      });
+      getQuestionBridge().attachTransport(platformUserId, transport as unknown as QuestionRuntimeTransport, {
         slot: approvalSlotOf(handle),
       });
       sessionEventHub.attachTransport(platformUserId, transport as unknown as SessionEventRuntimeTransport, {
@@ -2463,6 +2504,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               mode: options.mode,
               resourceSuffix: options.resourceSuffix,
               timeoutMs: options.timeoutMs ?? 15000,
+              userQuestions: userQuestionsFor(uid),
             });
             newHandle.launchedImage = targetVer.image;
             await bindRuntimeServices(newHandle, uid);
@@ -2905,11 +2947,15 @@ fs.appendFileSync(p, corruptData);
           // The platform API exists once the server is built; Jarvis calls only arrive after it listens.
           sessionApi: () => platformServer?.platformApi,
           approvalBridge: getApprovalBridge(),
+          questionBridge: getQuestionBridge(),
           sessionEvents: sessionEventHub,
           sessionReader: dockerTurnExecutor as RuntimeSessionReader,
           fileProvider: demoFileProvider,
           version: process.env.ENKEEP_VERSION?.trim() || undefined,
-          approvalTimeoutSeconds: () => getApprovalBridge().getApprovalTimeoutMs() / 1000,
+          // The phone's wait per card: long enough for a question (10 min by default); every card
+          // also carries its own expiry, so approval cards still end when their approval does.
+          approvalTimeoutSeconds: () =>
+            Math.max(getApprovalBridge().getApprovalTimeoutMs(), getQuestionBridge().getQuestionTimeoutMs()) / 1000,
           runtimeSpacesDir: ({ userId, executionMode }) => {
             if (executionMode !== 'host') return DEFAULT_RUNTIME_SPACES_DIR;
             const row = db!.prepare('SELECT username FROM users WHERE id = ?').get(userId) as { username?: string } | undefined;
@@ -2947,6 +2993,7 @@ fs.appendFileSync(p, corruptData);
       spaceMountService: demoSpaceMountService,
       extensionService: demoExtensionService,
       approvalBridge: getApprovalBridge(),
+      questionBridge: getQuestionBridge(),
       ...(jarvisRuntimeManager ? { channelManagers: { jarvis: jarvisRuntimeManager } } : {}),
       cookieSecret: secrets.cookieSecret,
       csrfToken: secrets.csrfToken,
@@ -3004,6 +3051,7 @@ fs.appendFileSync(p, corruptData);
       } catch {}
     }
     if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
+    if (ownsQuestionBridge) questionBridgeInstance?.dispose();
     jarvisRuntimeManager?.stop();
     if (ownsSessionEventHub) sessionEventHub.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
@@ -3139,6 +3187,7 @@ fs.appendFileSync(p, corruptData);
       runtimeHandles,
       hostRuntimeHandles,
       approvalBridge: getApprovalBridge(),
+      questionBridge: getQuestionBridge(),
       sessionEventHub,
       ...(jarvisRuntimeManager ? { jarvisRuntimeManager } : {}),
       connectRuntime: async (userId: string) => {
@@ -3156,6 +3205,7 @@ fs.appendFileSync(p, corruptData);
           mode: options.mode,
           resourceSuffix: options.resourceSuffix,
           timeoutMs: options.timeoutMs ?? 15000,
+          userQuestions: userQuestionsFor(userRecord.id),
         };
         const handle = await containerAdapter.startUserRuntime(startOpts);
         handle.launchedImage = handle.meta?.image || targetVer.image;
@@ -3278,6 +3328,9 @@ fs.appendFileSync(p, corruptData);
         if (ownsApprovalBridge) {
           approvalBridgeInstance?.dispose();
         }
+        if (ownsQuestionBridge) {
+          questionBridgeInstance?.dispose();
+        }
         if (ownsSessionEventHub) {
           sessionEventHub.dispose();
         }
@@ -3336,6 +3389,7 @@ fs.appendFileSync(p, corruptData);
       postSetupErrors.push(storageErr instanceof Error ? storageErr : new Error(String(storageErr)));
     }
     if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
+    if (ownsQuestionBridge) questionBridgeInstance?.dispose();
     jarvisRuntimeManager?.stop();
     if (ownsSessionEventHub) sessionEventHub.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
