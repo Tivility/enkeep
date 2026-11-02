@@ -1427,6 +1427,7 @@ const state = {
   filesSpacePaths: {},
   // Approvals & Interactions State
   pendingApprovals: [],
+  pendingQuestions: [],
   approvalsPollTimer: null,
   // Skills / Extensions Governance Filter State
   activeExtensionFilterKind: 'all',
@@ -8812,12 +8813,20 @@ function updateApprovalBadges(approvals) {
   }
   const effectiveApprovals = Array.isArray(approvals) ? approvals : (state.pendingApprovals || []);
   const pendingCount = effectiveApprovals.filter((a) => a.status === 'pending').length;
+  const questionCount = (state.pendingQuestions || []).filter((q) => q.status === 'pending').length;
   const chatApprovalBtn = document.getElementById('btn-chat-approvals');
 
   if (chatApprovalBtn) {
-    if (pendingCount > 0) {
+    if (pendingCount > 0 || questionCount > 0) {
+      const parts = [];
+      if (pendingCount > 0) {
+        parts.push(`⚠️ ${t('approvals.headerPendingCount', { count: pendingCount }, `${pendingCount} Pending Approvals`)}`);
+      }
+      if (questionCount > 0) {
+        parts.push(`❓ ${t('approvals.questionsPendingCount', { count: questionCount }, `${questionCount} questions waiting`)}`);
+      }
       chatApprovalBtn.classList.remove('hidden');
-      chatApprovalBtn.textContent = `⚠️ ${t('approvals.headerPendingCount', { count: pendingCount }, `${pendingCount} Pending Approvals`)}`;
+      chatApprovalBtn.textContent = parts.join(' · ');
     } else {
       chatApprovalBtn.classList.add('hidden');
     }
@@ -8833,6 +8842,7 @@ async function openApprovalsModal(sessionIdFilter) {
   }
   openModal('modal-approvals');
 
+  await fetchPendingQuestions(sessionIdFilter || state.currentSessionId);
   const approvals = await fetchPendingApprovals(sessionIdFilter || state.currentSessionId);
   if (contentEl) {
     renderApprovalsList(contentEl, approvals);
@@ -8843,7 +8853,8 @@ function renderApprovalsList(container, approvals) {
   container.replaceChildren();
 
   const pending = (approvals || []).filter((a) => a.status === 'pending');
-  if (pending.length === 0) {
+  const questions = (state.pendingQuestions || []).filter((q) => q.status === 'pending');
+  if (pending.length === 0 && questions.length === 0) {
     container.appendChild(createStateCard('approvals.emptyTitle', 'approvals.emptyDesc'));
     return;
   }
@@ -8929,6 +8940,9 @@ function renderApprovalsList(container, approvals) {
     card.appendChild(actions);
     container.appendChild(card);
   });
+
+  // Questions the agent asked (ask_user_question) wait here too, after the approvals.
+  questions.forEach((q) => container.appendChild(renderQuestionCard(q, container)));
 }
 
 async function decideApproval(approvalId, outcome, container) {
@@ -8942,7 +8956,7 @@ async function decideApproval(approvalId, outcome, container) {
     showToast(outcome === 'allowed-once' ? t('approvals.allowSuccess', null, 'Tool execution allowed.') : t('approvals.rejectSuccess', null, 'Tool execution rejected.'), 'success');
     const fresh = await fetchPendingApprovals(state.currentSessionId);
     if (container) renderApprovalsList(container, fresh);
-    if (fresh.length === 0) closeModal('modal-approvals');
+    if (fresh.length === 0 && (state.pendingQuestions || []).length === 0) closeModal('modal-approvals');
   } catch (err) {
     showToast(getSafeErrorMessage(err, 'Failed to decide approval.'), 'error');
   }
@@ -8959,10 +8973,159 @@ async function cancelApproval(approvalId, reason, container) {
     showToast(t('approvals.cancelSuccess', null, 'Approval request cancelled.'), 'info');
     const fresh = await fetchPendingApprovals(state.currentSessionId);
     if (container) renderApprovalsList(container, fresh);
-    if (fresh.length === 0) closeModal('modal-approvals');
+    if (fresh.length === 0 && (state.pendingQuestions || []).length === 0) closeModal('modal-approvals');
   } catch (err) {
     showToast(getSafeErrorMessage(err, 'Failed to cancel approval.'), 'error');
   }
+}
+
+/**
+ * ==========================================================================
+ * USER QUESTIONS (GET/POST /api/interactions/questions/*): ask_user_question
+ * ==========================================================================
+ */
+
+async function fetchPendingQuestions(sessionIdFilter) {
+  try {
+    const params = new URLSearchParams();
+    if (sessionIdFilter) params.append('sessionId', sessionIdFilter);
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await apiRequest(`/api/interactions/questions${query}`);
+    const raw = res && res.data;
+    state.pendingQuestions = Array.isArray(raw) ? raw : [];
+  } catch {
+    state.pendingQuestions = [];
+  }
+  return state.pendingQuestions;
+}
+
+/**
+ * The answers of one question card: per question, the chosen option labels and the user's own
+ * words (`{ id, selected, custom? }`); a question with neither is skipped.
+ */
+function buildQuestionAnswers(question, choices) {
+  const answers = [];
+  for (const q of (question && Array.isArray(question.questions) ? question.questions : [])) {
+    const choice = (choices && choices[q.id]) || {};
+    const offered = new Set((q.options || []).map((o) => o.label));
+    let selected = Array.isArray(choice.selected) ? choice.selected.filter((label) => offered.has(label)) : [];
+    if (!q.multiSelect) selected = selected.slice(0, 1);
+    const custom = typeof choice.custom === 'string' ? choice.custom.trim() : '';
+    if (selected.length === 0 && !custom) continue;
+    answers.push(custom ? { id: q.id, selected, custom } : { id: q.id, selected });
+  }
+  return answers;
+}
+
+function renderQuestionCard(question, container) {
+  const card = document.createElement('div');
+  card.className = 'approval-card question-card';
+
+  const header = document.createElement('div');
+  header.className = 'approval-header';
+  const title = document.createElement('span');
+  title.className = 'approval-tool-name';
+  title.textContent = t('approvals.questionCardTitle', null, 'Question from the agent');
+  header.appendChild(title);
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'text-muted text-xs';
+  timeSpan.textContent = question.expiresAt
+    ? t('approvals.questionExpiresAt', { time: formatDate(question.expiresAt) }, `Waits until ${formatDate(question.expiresAt)}`)
+    : '';
+  header.appendChild(timeSpan);
+  card.appendChild(header);
+
+  const choices = {};
+  (question.questions || []).forEach((q) => {
+    const choice = { selected: [], custom: '' };
+    choices[q.id] = choice;
+
+    const block = document.createElement('div');
+    block.className = 'question-block';
+    if (q.header) {
+      const h = document.createElement('div');
+      h.className = 'question-header text-xs text-muted';
+      h.textContent = q.header;
+      block.appendChild(h);
+    }
+    const text = document.createElement('div');
+    text.className = 'approval-summary question-text';
+    text.textContent = q.question;
+    block.appendChild(text);
+
+    if (Array.isArray(q.options) && q.options.length > 0) {
+      const options = document.createElement('div');
+      options.className = 'question-options';
+      q.options.forEach((opt) => {
+        const label = document.createElement('label');
+        label.className = 'question-option';
+        const input = document.createElement('input');
+        input.type = q.multiSelect ? 'checkbox' : 'radio';
+        input.name = `question-${question.id}-${q.id}`;
+        input.value = opt.label;
+        input.addEventListener('change', () => {
+          if (q.multiSelect) {
+            choice.selected = input.checked
+              ? [...choice.selected.filter((l) => l !== opt.label), opt.label]
+              : choice.selected.filter((l) => l !== opt.label);
+          } else if (input.checked) {
+            choice.selected = [opt.label];
+          }
+        });
+        label.appendChild(input);
+        const span = document.createElement('span');
+        span.textContent = opt.description ? `${opt.label} — ${opt.description}` : opt.label;
+        label.appendChild(span);
+        options.appendChild(label);
+      });
+      block.appendChild(options);
+    }
+
+    const custom = document.createElement('textarea');
+    custom.className = 'question-custom';
+    custom.rows = 2;
+    custom.maxLength = 8000;
+    custom.placeholder = t('approvals.questionCustomPlaceholder', null, 'Your own answer (optional)');
+    custom.addEventListener('input', () => {
+      choice.custom = custom.value;
+    });
+    block.appendChild(custom);
+    card.appendChild(block);
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+  const btnSubmit = document.createElement('button');
+  btnSubmit.type = 'button';
+  btnSubmit.className = 'btn btn-primary btn-sm';
+  btnSubmit.textContent = t('approvals.questionBtnSubmit', null, 'Send answer');
+  btnSubmit.addEventListener('click', async () => {
+    btnSubmit.disabled = true;
+    try {
+      await submitQuestionAnswer(question.id, buildQuestionAnswers(question, choices), container);
+    } finally {
+      btnSubmit.disabled = false;
+    }
+  });
+  actions.appendChild(btnSubmit);
+  card.appendChild(actions);
+  return card;
+}
+
+async function submitQuestionAnswer(questionId, answers, container) {
+  try {
+    await apiRequest(`/api/interactions/questions/${encodeURIComponent(questionId)}/answer`, {
+      method: 'POST',
+      body: { answers },
+    });
+    showToast(t('approvals.questionAnswerSuccess', null, 'Answer sent.'), 'success');
+  } catch (err) {
+    showToast(getSafeErrorMessage(err, 'Failed to send the answer.'), 'error');
+  }
+  await fetchPendingQuestions(state.currentSessionId);
+  const fresh = await fetchPendingApprovals(state.currentSessionId);
+  if (container) renderApprovalsList(container, fresh);
+  if (fresh.length === 0 && (state.pendingQuestions || []).length === 0) closeModal('modal-approvals');
 }
 
 /**
@@ -15598,6 +15761,12 @@ function updateTurnStatusBadge(optionalApprovals = null) {
     turnBadge.textContent = t('approvals.chatWaitingBadge', null, 'Waiting Approval');
     return;
   }
+  if ((state.pendingQuestions || []).some((q) => q.status === 'pending')) {
+    turnBadge.classList.remove('hidden');
+    turnBadge.className = 'badge badge-warning';
+    turnBadge.textContent = t('approvals.questionWaitingBadge', null, 'Waiting for your answer');
+    return;
+  }
 
   const st = state.activeTurnStatus;
   if (!st || st === 'completed' || st === 'settled' || !state.currentSessionId) {
@@ -22035,7 +22204,8 @@ async function pollEvents(sessionId) {
     // Synchronize queued turns for session
     await fetchQueuedTurns(sessionId);
 
-    // Synchronize pending approvals for session/turn
+    // Synchronize pending questions and approvals for session/turn (the badges count both)
+    await fetchPendingQuestions(sessionId);
     await fetchPendingApprovals(sessionId);
   } catch (err) {
     state.consecutivePollingFailures += 1;
