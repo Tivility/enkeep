@@ -45,6 +45,17 @@ interface SessionJobRecord {
   createdAt: number;
 }
 
+
+/**
+ * Event id for one outbound frame, in the platform's `evt_<12 hex ms><20 hex>` shape. The time part
+ * comes from the frame's own timestamp, so ids sort like the frames they name.
+ */
+export function outboundFrameId(createdAt: string | undefined): string {
+  const parsed = createdAt ? Date.parse(createdAt) : NaN;
+  const ms = Number.isFinite(parsed) ? parsed : Date.now();
+  return `evt_${ms.toString(16).padStart(12, '0')}${randomBytes(10).toString('hex')}`;
+}
+
 export class EventRelayService implements IEventRelayService {
   readonly consumer: string;
   readonly batchIntervalMs: number;
@@ -1330,6 +1341,9 @@ export class EventRelayService implements IEventRelayService {
 
   private enqueueOutboundFrames(frames: ContainerStreamingEventFrame[]): void {
     for (const frame of frames) {
+      // A stable id lets the platform drop a frame it already stored: a flush that times out after
+      // the platform persisted the batch is re-queued and sent again (see flushOutbound).
+      if (!frame.id) (frame as { id?: string }).id = outboundFrameId(frame.createdAt);
       const estimatedBytes = JSON.stringify(frame).length;
 
       // Backpressure check: if pending bytes exceed maxPendingBytes (256KB),

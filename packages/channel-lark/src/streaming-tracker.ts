@@ -1018,6 +1018,48 @@ export class StreamingReplyTracker {
     return combined;
   }
 
+  /**
+   * No card could be created (e.g. the card API timed out). An inbound reply falls back in the gateway;
+   * a detached continuation has no caller to do that, so it sends the final text as a plain reply
+   * itself instead of dropping it.
+   */
+  private async finalizeWithoutCard(
+    finalText: string,
+    status: 'completed' | 'failed' | 'stopped'
+  ): Promise<{ handled: boolean; messageId?: string; degraded?: boolean }> {
+    const text = finalText.trim();
+    if (!this.detached || status !== 'completed' || text.length === 0 || !this.cardParams?.chatId) {
+      return { handled: false };
+    }
+    try {
+      const sent = await this.transport.sendReply({
+        chatId: this.cardParams.chatId,
+        rootId: this.cardParams.rootId,
+        threadId: this.cardParams.threadId,
+        replyToMessageId: this.cardParams.replyToMessageId,
+        content: text,
+        format: 'markdown',
+      });
+      if (!sent.success) {
+        console.warn('[lark-cont] plain reply fallback failed', { routeId: this.sessionRouteId, error: sent.error });
+        return { handled: false };
+      }
+      console.info('[lark-cont] card unavailable, sent plain reply', { routeId: this.sessionRouteId, messageId: sent.messageId });
+      if (this.onFinalized) {
+        try {
+          await this.onFinalized(text, status, sent.messageId);
+        } catch {}
+      }
+      return { handled: true, messageId: sent.messageId, degraded: true };
+    } catch (err) {
+      console.warn('[lark-cont] plain reply fallback failed', {
+        routeId: this.sessionRouteId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { handled: false };
+    }
+  }
+
   private async doFinalize(
     finalText: string,
     status: 'completed' | 'failed' | 'stopped',
@@ -1040,7 +1082,7 @@ export class StreamingReplyTracker {
 
     if (this.isWaiting || !this.cardSessionPromise) {
       console.info('[lark-cont] createStreamingCard returned null');
-      this.finalizedResult = { handled: false };
+      this.finalizedResult = await this.finalizeWithoutCard(finalText, status);
       return this.finalizedResult;
     }
 
@@ -1049,13 +1091,13 @@ export class StreamingReplyTracker {
       session = await this.cardSessionPromise;
     } catch {
       console.info('[lark-cont] createStreamingCard returned null');
-      this.finalizedResult = { handled: false };
+      this.finalizedResult = await this.finalizeWithoutCard(finalText, status);
       return this.finalizedResult;
     }
 
     if (!session) {
       console.info('[lark-cont] createStreamingCard returned null');
-      this.finalizedResult = { handled: false };
+      this.finalizedResult = await this.finalizeWithoutCard(finalText, status);
       return this.finalizedResult;
     }
 

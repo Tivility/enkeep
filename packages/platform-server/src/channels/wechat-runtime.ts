@@ -864,7 +864,8 @@ export class WeChatRuntimeManager {
       : null);
     if (!orig || orig.channel !== 'wechat' || !orig.accountId || !orig.userId) return;
 
-    const outboxId = causeChildId ? `cont_${originTurnId}_${causeChildId}` : `cont_${originTurnId}_${turnId}`;
+    // One message per autonomous turn: a child can wake its parent more than once with different replies.
+    const outboxId = `cont_${originTurnId}_${turnId || causeChildId}`;
     if (this.db.prepare('SELECT 1 FROM channel_outbox WHERE id = ? LIMIT 1').get(outboxId)) return;
 
     const toUserId = (orig.nativeContextId || '').replace(/^wechat:/, '').split(':')[0].trim();
