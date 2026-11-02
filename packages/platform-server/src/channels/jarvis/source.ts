@@ -8,7 +8,9 @@
  *   events and text deltas from the {@link RuntimeSessionEventHub}.
  * - Sends go through the delivery gateway like any channel (idempotency, queueing, quotas,
  *   `channel_turn_origins` with channel `jarvis`, so Lark/WeChat never reply to these turns).
- * - Approval cards come from the shared {@link ApprovalBridge}; the first answer wins.
+ * - Approval cards come from the shared {@link ApprovalBridge}, question cards from the shared
+ *   {@link QuestionBridge}; the first answer wins. An answer that arrives after its question
+ *   expired is sent as the user's next message to the session.
  *
  * Every call is filtered by the connection's user id: a session id of another user is "not found".
  *
@@ -27,13 +29,16 @@ import {
   type JarvisSessionRow,
   type JarvisSourceListener,
   type PendingApprovalCard,
+  type PendingQuestionCard,
   type QuestionAnswers,
   type ReadEventsQuery,
   type ReadEventsResult,
 } from '@enkeep/channel-jarvis';
 import { PlatformError } from '@enkeep/platform-core';
+import { formatLateQuestionAnswers } from '@enkeep/dsh-external-interaction/user-questions';
 import type { InboundEnvelope, InboundEnvelopeAttachmentItem } from '@enkeep/web-channel';
 import type { ApprovalBridge, BridgedApproval } from '../../interactions/approval-bridge.js';
+import type { BridgedQuestion, QuestionBridge } from '../../interactions/question-bridge.js';
 import type { HubSessionEvent, HubTurnChunk, RuntimeSessionEventHub } from '../../runtime/session-event-hub.js';
 import type { RuntimeSessionReader } from '../../runtime/delivery-gateway.js';
 
@@ -47,6 +52,8 @@ export const JARVIS_START_TITLE_CHARS = 40;
 /** Prefix of a refusal reason queued as the next message of the session. */
 export const JARVIS_REJECT_REASON_PREFIX = '拒绝理由：';
 export const JARVIS_SLASH_REFUSAL = 'Jarvis 里不能使用斜杠命令；停止、新建、改名请用对应的按钮。';
+/** client_msg_id prefix of an answer delivered as a message because its question expired. */
+export const JARVIS_LATE_ANSWER_MSG_PREFIX = 'question-late-';
 const IMAGE_ONLY_CONTENT = '[图片]';
 const SUPPORTED_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp']);
 const TOOL_INPUT_LOOKUP_EVENTS = 200;
@@ -55,6 +62,7 @@ const MAX_CACHED_CALLS_PER_SESSION = 64;
 const MAX_CACHED_SESSIONS = 200;
 const UNMAPPED_TTL_MS = 15_000;
 const MAX_DELTA_CHARS = 256 * 1024;
+const MAX_CACHED_REVS = 2000;
 
 /** The idempotency key of a Jarvis send: `idem_jarvis_` + 32 hex of sha256(accountId:clientMsgId). */
 export function jarvisIdempotencyKey(accountId: string, clientMsgId: string): string {
@@ -95,6 +103,8 @@ export interface PlatformJarvisSourceOptions {
   /** Session create/rename/archive; absent → those calls answer `unavailable`. */
   sessionApi?: JarvisSessionApi | (() => JarvisSessionApi | undefined);
   approvals?: ApprovalBridge;
+  /** `ask_user_question` questions (cards); absent → answering a question is `unavailable`. */
+  questions?: QuestionBridge;
   events?: RuntimeSessionEventHub;
   reader?: Partial<RuntimeSessionReader>;
   imageIngestor?: JarvisImageIngestor;
@@ -231,6 +241,8 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   private readonly dshToRoute = new Map<string, { routeId: string | null; at: number }>();
   private readonly toolCalls = new Map<string, Map<string, Record<string, unknown>>>();
   private readonly deltas = new Map<string, DeltaState>();
+  /** Last rev listed per session: never goes backwards within this connection. */
+  private readonly revs = new Map<string, { base: number; rev: number }>();
   private closed = false;
 
   constructor(options: PlatformJarvisSourceOptions) {
@@ -467,8 +479,35 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     }
   }
 
-  async answerQuestion(_id: string, _answers: QuestionAnswers): Promise<void> {
-    throw new RpcError('Jarvis 暂时不能回答提问，请在 Web 或飞书里回答。', 'unsupported');
+  async answerQuestion(id: string, answers: QuestionAnswers): Promise<void> {
+    const questions = this.options.questions;
+    if (!questions) throw new RpcError('questions are not available', 'unavailable');
+    const result = await questions.answer(id, answers, { userId: this.userId, decidedBy: 'jarvis' });
+    if (result.ok) return;
+    switch (result.status) {
+      case 'expired': {
+        // The tool call already told the model nobody answered: the answer goes to the agent as
+        // the user's next message of the session (once per question).
+        const question = result.question;
+        if (!question?.routeResolved) throw new RpcError('the question has expired', 'conflict');
+        await this.send({
+          sessionId: question.sessionId,
+          text: formatLateQuestionAnswers({ questions: [...question.questions], createdAt: question.createdAt }, result.answers ?? []),
+          images: [],
+          clientMsgId: `${JARVIS_LATE_ANSWER_MSG_PREFIX}${id}`,
+        });
+        return;
+      }
+      case 'invalid':
+        throw new RpcError(result.error ?? 'the answers do not fit the questions', 'invalid_params');
+      case 'not_found':
+        throw new RpcError('no such question', 'not_found');
+      case 'transport_unavailable':
+      case 'failed':
+        throw new RpcError('the runtime could not take the answer', 'unavailable');
+      default:
+        throw new RpcError('already answered', 'conflict');
+    }
   }
 
   // ───────────────────────────── Live ─────────────────────────────
@@ -476,7 +515,10 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   subscribe(listener: JarvisSourceListener): () => void {
     this.listeners.add(listener);
     if (this.listeners.size === 1) this.attachLive();
-    else this.replayApprovals();
+    else {
+      this.replayApprovals();
+      this.replayQuestions();
+    }
     return () => {
       this.listeners.delete(listener);
       if (this.listeners.size === 0) this.detachLive();
@@ -525,6 +567,23 @@ export class PlatformJarvisSource implements JarvisChannelSource {
       );
       this.replayApprovals();
     }
+    const questions = this.options.questions;
+    if (questions) {
+      this.unsubscribers.push(
+        questions.onAsked((e) => {
+          if (e.question.userId === this.userId) this.announceQuestion(e.question);
+        })
+      );
+      this.unsubscribers.push(
+        questions.onSettled((e) => {
+          if (e.question.userId !== this.userId) return;
+          // The engine drops a card it answered itself; anything else takes it off the phone.
+          if (e.decidedBy !== 'jarvis') this.emit((l) => l.questionSettled(e.question.id));
+          this.emit((l) => l.sessionsChanged());
+        })
+      );
+      this.replayQuestions();
+    }
   }
 
   private detachLive(): void {
@@ -540,6 +599,32 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     const approvals = this.options.approvals;
     if (!approvals) return;
     for (const approval of approvals.listPending({ userId: this.userId })) void this.announce(approval);
+  }
+
+  private replayQuestions(): void {
+    const questions = this.options.questions;
+    if (!questions) return;
+    for (const question of questions.listPending({ userId: this.userId })) this.announceQuestion(question);
+  }
+
+  /** A question card for the phone (questions of sessions without a route are not shown). */
+  private announceQuestion(question: BridgedQuestion): void {
+    if (this.closed || !question.routeResolved) return;
+    const card: PendingQuestionCard = {
+      id: question.id,
+      sessionId: question.sessionId,
+      ...(question.callId ? { callId: question.callId } : {}),
+      ...(question.plan !== undefined ? { plan: question.plan } : {}),
+      questions: question.questions.map((q) => ({
+        id: q.id,
+        question: q.question,
+        ...(q.header ? { header: q.header } : {}),
+        options: q.options.map((o) => ({ label: o.label, ...(o.description ? { description: o.description } : {}) })),
+        multiSelect: q.multiSelect,
+      })),
+      expiresAt: question.expiresAt,
+    };
+    this.emit((l) => l.questionAsked(card));
   }
 
   private async announce(approval: BridgedApproval): Promise<void> {
@@ -715,6 +800,9 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     for (const approval of this.options.approvals?.listPending({ userId: this.userId }) ?? []) {
       if (approval.routeResolved) ids.add(approval.sessionId);
     }
+    for (const question of this.options.questions?.listPending({ userId: this.userId }) ?? []) {
+      if (question.routeResolved) ids.add(question.sessionId);
+    }
     return ids;
   }
 
@@ -729,6 +817,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
 
   private async statusOf(routeId: string, hasReply: boolean): Promise<JarvisSessionRow['status']> {
     if ((this.options.approvals?.listPending({ userId: this.userId, sessionId: routeId }) ?? []).length > 0) return 'blocked';
+    if ((this.options.questions?.listPending({ userId: this.userId, sessionId: routeId }) ?? []).length > 0) return 'blocked';
     let turn: { status: string } | null = null;
     try {
       turn = await this.options.gateway.getCurrentTurnStatus(this.userId, routeId);
@@ -760,16 +849,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
       messageAt = row?.last_at ?? undefined;
     }
     const status = await this.statusOf(route.id, last !== undefined);
-    const seq = this.options.events?.lastSeq(this.userId, route.dsh_session_id);
-    let rev: number | undefined = seq !== undefined ? seq + 1 : undefined;
-    if (rev === undefined) {
-      try {
-        const w = this.db
-          .prepare('SELECT MAX(rowid) AS w FROM web_events WHERE user_id = ? AND session_id = ?')
-          .get(this.userId, route.id) as { w: number | bigint | null } | undefined;
-        if (w?.w !== null && w?.w !== undefined) rev = Number(w.w);
-      } catch {}
-    }
+    const rev = this.revOf(route);
     const updatedMs = this.activityMs(route, messageAt) || this.now();
     const lastText = typeof last?.content === 'string' ? truncateChars(last.content.trim(), JARVIS_LAST_TEXT_CHARS) : '';
     return {
@@ -783,6 +863,35 @@ export class PlatformJarvisSource implements JarvisChannelSource {
       space_id: route.space_id,
       ...(route.space_name ? { space_name: route.space_name } : {}),
     };
+  }
+
+  /**
+   * The session's content revision: the web_events watermark plus the newest DSH seq + 1 seen.
+   * Both only grow, so the sum grows whenever either does, including when the seq becomes known
+   * (the watermark alone or the seq alone would jump backwards on that switch). Per connection
+   * it never goes backwards, even when the DSH log is replaced (session reset) or forgotten.
+   */
+  private revOf(route: RouteRow): number | undefined {
+    let watermark: number | undefined;
+    try {
+      const w = this.db
+        .prepare('SELECT MAX(rowid) AS w FROM web_events WHERE user_id = ? AND session_id = ?')
+        .get(this.userId, route.id) as { w: number | bigint | null } | undefined;
+      if (w?.w !== null && w?.w !== undefined) watermark = Number(w.w);
+    } catch {}
+    const seq = this.options.events?.lastSeq(this.userId, route.dsh_session_id);
+    if (watermark === undefined && seq === undefined) return this.revs.get(route.id)?.rev;
+    const base = (watermark ?? 0) + (seq !== undefined ? seq + 1 : 0);
+    const previous = this.revs.get(route.id);
+    let rev = base;
+    if (previous) {
+      if (base === previous.base) rev = previous.rev;
+      else if (base <= previous.rev) rev = previous.rev + 1;
+    }
+    this.revs.delete(route.id);
+    this.revs.set(route.id, { base, rev });
+    if (this.revs.size > MAX_CACHED_REVS) this.revs.delete(this.revs.keys().next().value as string);
+    return rev;
   }
 
   private activeSpaces(): SpaceRow[] {

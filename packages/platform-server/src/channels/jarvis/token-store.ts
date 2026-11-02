@@ -33,6 +33,21 @@ export function isJarvisTokenShape(token: string): boolean {
   return typeof token === 'string' && token.startsWith(JARVIS_TOKEN_PREFIX) && TOKEN_BODY.test(token.slice(JARVIS_TOKEN_PREFIX.length));
 }
 
+/** The user already holds the token of another Jarvis account. */
+export class JarvisTokenOwnerConflictError extends Error {
+  readonly code = 'JARVIS_ACCOUNT_EXISTS';
+  constructor() {
+    super('This user already has a Jarvis channel');
+    this.name = 'JarvisTokenOwnerConflictError';
+  }
+}
+
+/** `UNIQUE constraint failed: channel_account_tokens.user_id` (node:sqlite reports it in the message). */
+function isUserUniqueViolation(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : '';
+  return /UNIQUE constraint failed: channel_account_tokens\.user_id/.test(message);
+}
+
 export class JarvisTokenStore {
   private readonly db: DatabaseSync;
 
@@ -40,21 +55,30 @@ export class JarvisTokenStore {
     this.db = db;
   }
 
-  /** Issues (or replaces) the account's token; returns the plaintext once. */
+  /**
+   * Issues (or replaces) the account's token; returns the plaintext once. Throws
+   * {@link JarvisTokenOwnerConflictError} when the user already holds the token of another account
+   * (one Jarvis account per user; `channel_account_tokens.user_id` is unique).
+   */
   issue(accountId: string, userId: string): string {
     const token = generateJarvisToken();
     const hash = hashJarvisToken(token);
-    this.db
-      .prepare(
-        `INSERT INTO channel_account_tokens (account_id, user_id, token_hash, created_at, last_used_at)
-         VALUES (?, ?, ?, ?, NULL)
-         ON CONFLICT(account_id) DO UPDATE SET
-           user_id = excluded.user_id,
-           token_hash = excluded.token_hash,
-           created_at = excluded.created_at,
-           last_used_at = NULL`
-      )
-      .run(accountId, userId, hash, new Date().toISOString());
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO channel_account_tokens (account_id, user_id, token_hash, created_at, last_used_at)
+           VALUES (?, ?, ?, ?, NULL)
+           ON CONFLICT(account_id) DO UPDATE SET
+             user_id = excluded.user_id,
+             token_hash = excluded.token_hash,
+             created_at = excluded.created_at,
+             last_used_at = NULL`
+        )
+        .run(accountId, userId, hash, new Date().toISOString());
+    } catch (err) {
+      if (isUserUniqueViolation(err)) throw new JarvisTokenOwnerConflictError();
+      throw err;
+    }
     return token;
   }
 

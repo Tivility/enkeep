@@ -4,7 +4,7 @@
  * `/api/jarvis/runtime` upgrade (Host validation, Origin refusal, unknown paths) and a node that
  * receives `runtime.hello` and a `runtime.sessions` push, then sends a message.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createHash, randomBytes } from 'node:crypto';
 import { request } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
@@ -14,7 +14,7 @@ import { PlatformServer, SqliteWebMessageStore } from '../src/index.js';
 import { ApprovalBridge } from '../src/interactions/approval-bridge.js';
 import { RuntimeSessionEventHub } from '../src/runtime/session-event-hub.js';
 import { JarvisRuntimeManager } from '../src/channels/jarvis/manager.js';
-import { JarvisTokenStore, hashJarvisToken } from '../src/channels/jarvis/token-store.js';
+import { JarvisTokenStore, JarvisTokenOwnerConflictError, hashJarvisToken } from '../src/channels/jarvis/token-store.js';
 import { TestOnlyRuntimeGateway } from './test-runtime-gateway.js';
 
 const CSRF = 'test-csrf-token-32-chars-long-secure-12345678!';
@@ -204,6 +204,30 @@ describe('Jarvis channel on platform-server', () => {
     const audit = db.prepare("SELECT action, details FROM auth_audit_log WHERE action LIKE 'jarvis.%'").all() as any[];
     expect(audit.map((a) => a.action)).toEqual(['jarvis.token_issued']);
     expect(JSON.stringify(audit)).not.toContain(token);
+  });
+
+  it('keeps one Jarvis account per user when creations race: the token row decides, the loser gets 409', async () => {
+    // Concurrent requests: whatever the interleaving, exactly one wins.
+    const results = await Promise.all([
+      manage(adminCookie, 'POST', '/api/manage/channels/accounts', { type: 'jarvis' }),
+      manage(adminCookie, 'POST', '/api/manage/channels/accounts', { type: 'jarvis' }),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+    expect(await server.storage.forTenant(adminId).channels.listAccounts('jarvis')).toHaveLength(1);
+
+    // Both passed the pre-check (the race): the UNIQUE(user_id) token row refuses the second one,
+    // which answers 409 and leaves no second account behind.
+    const precheck = vi.spyOn(manager, 'beforeCreateAccount').mockResolvedValue(undefined);
+    const raced = await manage(adminCookie, 'POST', '/api/manage/channels/accounts', { type: 'jarvis' });
+    expect(raced.status).toBe(409);
+    expect(((await raced.json()) as any).error.code).toBe('JARVIS_ACCOUNT_EXISTS');
+    precheck.mockRestore();
+    expect(await server.storage.forTenant(adminId).channels.listAccounts('jarvis')).toHaveLength(1);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM channel_account_tokens WHERE user_id = ?').get(adminId)).toEqual({ n: 1 });
+
+    // The store itself refuses a second token for the same user.
+    const extra = await server.storage.forTenant(adminId).channels.createAccount({ type: 'jarvis', status: 'active' });
+    expect(() => new JarvisTokenStore(db).issue(extra.id, adminId)).toThrow(JarvisTokenOwnerConflictError);
   });
 
   it('authenticates tokens: valid, unknown, rotated, revoked, disabled account, disabled user', async () => {

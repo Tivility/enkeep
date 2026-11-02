@@ -1735,16 +1735,15 @@ PRAGMA foreign_key_check;
 
 export const MIGRATION_046_CHANNEL_ACCOUNT_TOKENS_SQL = `
 -- Migration 46: bearer tokens of channel accounts that clients dial into (Jarvis).
--- Only the sha256 of a token is stored; one token per account (rotation replaces it).
+-- Only the sha256 of a token is stored; one token per account (rotation replaces it) and one
+-- per user (one Jarvis account per user, enforced here so concurrent creations cannot both win).
 CREATE TABLE IF NOT EXISTS channel_account_tokens (
   account_id TEXT PRIMARY KEY REFERENCES channel_accounts(id) ON DELETE CASCADE,
-  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
   token_hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
   last_used_at TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_channel_account_tokens_user ON channel_account_tokens(user_id);
 
 PRAGMA foreign_key_check;
 `;

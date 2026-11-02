@@ -38,11 +38,12 @@ import {
 } from '@enkeep/platform-core';
 import type { ChannelAccountLifecycle, ChannelConnectionEndpoint } from '../channel-routes.js';
 import type { ApprovalBridge } from '../../interactions/approval-bridge.js';
+import type { QuestionBridge } from '../../interactions/question-bridge.js';
 import type { RuntimeSessionEventHub } from '../../runtime/session-event-hub.js';
 import type { RuntimeSessionReader } from '../../runtime/delivery-gateway.js';
 import type { TenantRuntimeFileProvider } from '../../files/runtime-file-api.js';
 import { TenantScopedLarkImageIngestor } from '../lark-image-ingestor.js';
-import { JarvisTokenStore } from './token-store.js';
+import { JarvisTokenOwnerConflictError, JarvisTokenStore } from './token-store.js';
 import {
   PlatformJarvisSource,
   type JarvisDeliveryPort,
@@ -74,6 +75,8 @@ export interface JarvisRuntimeManagerOptions {
   /** Session create/rename/archive (PlatformWebApi); a getter allows binding after server start. */
   sessionApi?: JarvisSessionApi | (() => JarvisSessionApi | undefined);
   approvalBridge?: ApprovalBridge;
+  /** `ask_user_question` questions of the user's runtimes (question cards). */
+  questionBridge?: QuestionBridge;
   sessionEvents?: RuntimeSessionEventHub;
   sessionReader?: Partial<RuntimeSessionReader>;
   /** Defaults to the Lark/WeChat ingestor over `fileProvider` (or the gateway's file provider). */
@@ -188,6 +191,7 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
       gateway: this.options.gateway,
       sessionApi: this.options.sessionApi,
       approvals: this.options.approvalBridge,
+      questions: this.options.questionBridge,
       events: this.options.sessionEvents,
       reader: this.options.sessionReader,
       imageIngestor: this.imageIngestor(),
@@ -266,7 +270,17 @@ export class JarvisRuntimeManager implements ChannelAccountLifecycle, ChannelCon
   }
 
   async provisionAccount(userId: string, account: ChannelAccount): Promise<{ token: string }> {
-    const token = this.tokens.issue(account.id, userId);
+    let token: string;
+    try {
+      token = this.tokens.issue(account.id, userId);
+    } catch (err) {
+      // A concurrent creation won the race for this user's one Jarvis account (the caller
+      // deletes the account it just created).
+      if (err instanceof JarvisTokenOwnerConflictError) {
+        throw new ConflictError('This user already has a Jarvis channel', 'JARVIS_ACCOUNT_EXISTS');
+      }
+      throw err;
+    }
     await this.audit(userId, 'jarvis.token_issued', { accountId: account.id });
     return { token };
   }

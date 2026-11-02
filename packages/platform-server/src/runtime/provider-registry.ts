@@ -40,6 +40,10 @@ import type {
   TurnExecutionResult,
   InspectedTurnResult,
   BackgroundTask,
+  RuntimeSessionEventsQuery,
+  RuntimeSessionEventsPage,
+  RuntimeAttachmentQuery,
+  RuntimeAttachmentData,
 } from './delivery-gateway.js';
 import type {
   TenantRuntimeFileProvider,
@@ -282,6 +286,42 @@ export class CompositeDeliveryTurnExecutor implements DeliveryTurnExecutor {
       }
     }
     return { ok: false, error: { code: 'TURN_NOT_RUNNING' } };
+  }
+
+  /**
+   * Read-only DSH session history from the runtime the session's space runs in (Jarvis history).
+   * Errors keep the runtime's codes (e.g. `session/not-found`).
+   */
+  async readSessionEvents(userId: string, params: RuntimeSessionEventsQuery): Promise<RuntimeSessionEventsPage> {
+    const executor = this.readerFor(userId, params.platformSpaceId);
+    if (typeof executor.readSessionEvents !== 'function') {
+      throw Object.assign(new Error('Runtime does not support reading session events'), { code: 'unsupported' });
+    }
+    return executor.readSessionEvents(userId, params);
+  }
+
+  /** An image attachment of a session, from the runtime the session's space runs in. */
+  async readAttachment(userId: string, params: RuntimeAttachmentQuery): Promise<RuntimeAttachmentData> {
+    const executor = this.readerFor(userId, params.platformSpaceId);
+    if (typeof executor.readAttachment !== 'function') {
+      throw Object.assign(new Error('Runtime does not support reading attachments'), { code: 'unsupported' });
+    }
+    return executor.readAttachment(userId, params);
+  }
+
+  /** The turn executor of the space's execution mode (the space must belong to the user). */
+  private readerFor(userId: string, platformSpaceId: string): DeliveryTurnExecutor {
+    let mode: ExecutionMode = 'container';
+    if (this.db) {
+      const spaceRow = this.db
+        .prepare('SELECT execution_mode FROM spaces WHERE id = ? AND user_id = ?')
+        .get(platformSpaceId, userId) as { execution_mode?: string } | undefined;
+      if (!spaceRow) {
+        throw Object.assign(new Error('Session not found'), { code: 'session/not-found' });
+      }
+      if (spaceRow.execution_mode) mode = spaceRow.execution_mode as ExecutionMode;
+    }
+    return this.registry.requireProvider(mode).turnExecutor;
   }
 }
 

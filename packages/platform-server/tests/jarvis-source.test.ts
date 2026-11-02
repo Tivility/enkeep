@@ -8,16 +8,18 @@ import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
-import type { JarvisSourceListener, PendingApprovalCard } from '@enkeep/channel-jarvis';
+import type { JarvisSourceListener, PendingApprovalCard, PendingQuestionCard } from '@enkeep/channel-jarvis';
 import { PlatformServerMigrationRunner, ALL_PLATFORM_MIGRATIONS } from '../src/storage/migrations.js';
 import { SqliteWebMessageStore } from '../src/storage/web-messages.js';
 import { DeliveryRuntimeGateway, type DeliveryExecutionRequest } from '../src/runtime/delivery-gateway.js';
 import { ApprovalBridge } from '../src/interactions/approval-bridge.js';
+import { QuestionBridge } from '../src/interactions/question-bridge.js';
 import { RuntimeSessionEventHub } from '../src/runtime/session-event-hub.js';
 import { WeChatRuntimeManager } from '../src/channels/wechat-runtime.js';
 import {
   PlatformJarvisSource,
   JARVIS_SLASH_REFUSAL,
+  JARVIS_LATE_ANSWER_MSG_PREFIX,
   jarvisIdempotencyKey,
   type JarvisDeliveryPort,
   type PlatformJarvisSourceOptions,
@@ -69,6 +71,29 @@ class FakeRuntimeTransport extends EventEmitter {
   chunk(dshSessionId: string, text: string) {
     this.emit('stream', { type: 'event', event: 'turn/chunk', sessionId: dshSessionId, turnId: 'turn_test_0001', timestamp: Date.now(), chunk: { type: 'text-delta', index: 0, text } });
   }
+  readonly questionAnswers: Array<{ questionId: string; answers: unknown }> = [];
+  questionError?: Error & { code: string };
+  async answerQuestion(questionId: string, answers: unknown) {
+    if (this.questionError) throw this.questionError;
+    this.questionAnswers.push({ questionId, answers });
+    return { questionId, answered: true, answers };
+  }
+  question(dshSessionId: string, id: string, createdAtMs = Date.now()) {
+    this.emit('stream', {
+      type: 'event', event: 'question/asked', sessionId: dshSessionId, turnId: 'turn_test_0001', timestamp: createdAtMs,
+      question: {
+        id, sessionId: dshSessionId, callId: id, sessionSource: 'web',
+        questions: [
+          { id: 'mode', question: 'Which synthetic mode?', header: 'Mode', options: [{ label: 'Docker', description: 'Isolated.' }, { label: 'Host' }], multiSelect: false },
+          { id: 'notes', question: 'Anything else?', options: [], multiSelect: false },
+        ],
+        createdAt: new Date(createdAtMs).toISOString(), timeoutMs: 600_000, expiresAt: new Date(createdAtMs + 600_000).toISOString(), status: 'pending',
+      },
+    });
+  }
+  questionSettled(dshSessionId: string, id: string, outcome: string) {
+    this.emit('stream', { type: 'event', event: 'question/settled', sessionId: dshSessionId, timestamp: Date.now(), id, outcome });
+  }
   ask(dshSessionId: string, id: string, callId?: string) {
     const now = Date.now();
     this.emit('stream', {
@@ -103,12 +128,14 @@ class FakeReader {
   }
 }
 
-function recorder(): JarvisSourceListener & { log: Array<[string, ...unknown[]]>; cards: PendingApprovalCard[] } {
+function recorder(): JarvisSourceListener & { log: Array<[string, ...unknown[]]>; cards: PendingApprovalCard[]; questionCards: PendingQuestionCard[] } {
   const log: Array<[string, ...unknown[]]> = [];
   const cards: PendingApprovalCard[] = [];
+  const questionCards: PendingQuestionCard[] = [];
   return {
     log,
     cards,
+    questionCards,
     sessionsChanged: () => log.push(['sessionsChanged']),
     sessionEvent: (id, event, history) => log.push(['sessionEvent', id, event, history]),
     delta: (id, text) => log.push(['delta', id, text]),
@@ -117,8 +144,11 @@ function recorder(): JarvisSourceListener & { log: Array<[string, ...unknown[]]>
       log.push(['approvalAsked', card.id]);
     },
     approvalSettled: (id) => log.push(['approvalSettled', id]),
-    questionAsked: () => log.push(['questionAsked']),
-    questionSettled: () => log.push(['questionSettled']),
+    questionAsked: (card) => {
+      questionCards.push(card);
+      log.push(['questionAsked', card.id]);
+    },
+    questionSettled: (id) => log.push(['questionSettled', id]),
   };
 }
 
@@ -128,6 +158,7 @@ describe('PlatformJarvisSource', () => {
   let jarvisAccountId: string;
   let wechatAccountId: string;
   let bridge: ApprovalBridge;
+  let questions: QuestionBridge;
   let hub: RuntimeSessionEventHub;
   let transport: FakeRuntimeTransport;
   let reader: FakeReader;
@@ -142,6 +173,7 @@ describe('PlatformJarvisSource', () => {
       db,
       gateway: fakeGateway,
       approvals: bridge,
+      questions,
       events: hub,
       reader,
       ...overrides,
@@ -186,9 +218,11 @@ describe('PlatformJarvisSource', () => {
     db.prepare(`UPDATE session_routes SET created_at = ?, updated_at = ? WHERE id IN (?, ?)`).run(tenDaysAgo, tenDaysAgo, ROUTE_OLD, ROUTE_OLD_BLOCKED);
 
     bridge = new ApprovalBridge({ db, env: {}, logger: { warn: () => {} } });
+    questions = new QuestionBridge({ db, env: {}, logger: { warn: () => {} } });
     hub = new RuntimeSessionEventHub({ logger: { warn: () => {} } });
     transport = new FakeRuntimeTransport();
     bridge.attachTransport(ALICE, transport as any);
+    questions.attachTransport(ALICE, transport as any);
     hub.attachTransport(ALICE, transport as any);
     reader = new FakeReader();
     statuses = new Map([[ROUTE_WORKING, 'running']]);
@@ -202,6 +236,7 @@ describe('PlatformJarvisSource', () => {
   afterEach(() => {
     for (const s of sources.splice(0)) s.dispose();
     bridge.dispose();
+    questions.dispose();
     hub.dispose();
     db.close();
   });
@@ -446,8 +481,8 @@ describe('PlatformJarvisSource', () => {
       await expect(s.start({ cwd: '/x', prompt: '/new' })).rejects.toMatchObject({ code: 'unsupported' });
     });
 
-    it('answers questions as unsupported for now', async () => {
-      await expect(source().answerQuestion('q1', [])).rejects.toMatchObject({ code: 'unsupported' });
+    it('answers questions as unavailable without a question bridge', async () => {
+      await expect(source({ questions: undefined }).answerQuestion('call_test_q0', [])).rejects.toMatchObject({ code: 'unavailable' });
     });
   });
 
@@ -539,6 +574,106 @@ describe('PlatformJarvisSource', () => {
       await waitFor(() => l.cards.length > 0);
       await new Promise((r) => setTimeout(r, 20));
       expect(l.cards.map((c) => c.id)).toEqual([pendingId]);
+    });
+
+    it('turns questions into cards, answers them and follows settlements', async () => {
+      const replayed = 'call_test_question_0001';
+      transport.question(dsh(ROUTE_IDLE), replayed);
+      transport.question('ses_ffff0000000000000000000000000003', 'call_test_question_0009'); // no route
+      const bobTransport = new FakeRuntimeTransport();
+      questions.attachTransport(BOB, bobTransport as any);
+      bobTransport.question(dsh(ROUTE_BOB), 'call_test_question_0008');
+
+      const s = source();
+      const l = recorder();
+      s.subscribe(l);
+      // Replayed on subscribe: only this user's questions of sessions with a route.
+      expect(l.questionCards).toEqual([
+        {
+          id: replayed,
+          sessionId: ROUTE_IDLE,
+          callId: replayed,
+          questions: [
+            { id: 'mode', question: 'Which synthetic mode?', header: 'Mode', options: [{ label: 'Docker', description: 'Isolated.' }, { label: 'Host' }], multiSelect: false },
+            { id: 'notes', question: 'Anything else?', options: [], multiSelect: false },
+          ],
+          expiresAt: expect.any(String),
+        },
+      ]);
+      // A session with a pending question is blocked.
+      expect((await s.getSession(ROUTE_IDLE))!.status).toBe('blocked');
+      expect((await s.listSessions()).find((r) => r.session_id === ROUTE_IDLE)!.status).toBe('blocked');
+
+      // Answered from Jarvis: through the bridge to the runtime; no cancel for the card.
+      await s.answerQuestion(replayed, [{ id: 'mode', selected: ['Docker'] }, { id: 'notes', selected: [], custom: 'synthetic words' }]);
+      expect(transport.questionAnswers).toEqual([
+        { questionId: replayed, answers: [{ id: 'mode', selected: ['Docker'] }, { id: 'notes', selected: [], custom: 'synthetic words' }] },
+      ]);
+      expect(l.log.some((e) => e[0] === 'questionSettled')).toBe(false);
+      await expect(s.answerQuestion(replayed, [])).rejects.toMatchObject({ code: 'conflict' });
+      await expect(s.answerQuestion('call_test_question_0008', [])).rejects.toMatchObject({ code: 'not_found' });
+
+      // Live: a new question becomes a card; settled elsewhere (cancelled in the runtime) takes it off.
+      const live = 'call_test_question_0002';
+      transport.question(dsh(ROUTE_DONE), live);
+      expect(l.questionCards.map((c) => c.id)).toEqual([replayed, live]);
+      await expect(s.answerQuestion(live, [{ id: 'mode', selected: ['Nope'] }])).rejects.toMatchObject({ code: 'invalid_params' });
+      transport.questionSettled(dsh(ROUTE_DONE), live, 'cancelled');
+      expect(l.log.filter((e) => e[0] === 'questionSettled')).toEqual([['questionSettled', live]]);
+      expect((await s.getSession(ROUTE_DONE))!.status).not.toBe('blocked');
+    });
+
+    it('sends an answer that arrives after its question expired as the next message of the session', async () => {
+      const id = 'call_test_question_0003';
+      transport.question(dsh(ROUTE_DONE), id, Date.now());
+      transport.questionError = Object.assign(new Error('[question/expired] synthetic'), { code: 'question/expired' });
+      const s = source();
+      const l = recorder();
+      s.subscribe(l);
+      // The runtime refuses (expired); the bridge's record keeps the question for wording the answer.
+      await s.answerQuestion(id, [{ id: 'mode', selected: ['Host'] }]);
+      expect(transport.questionAnswers).toEqual([]);
+      const envelope = fakeGateway.dispatchInbound.mock.calls.at(-1)![0];
+      expect(envelope).toMatchObject({
+        id: jarvisIdempotencyKey(jarvisAccountId, `${JARVIS_LATE_ANSWER_MSG_PREFIX}${id}`),
+        sessionId: ROUTE_DONE,
+        channelContext: { channel: 'jarvis', nativeEventId: `question-late-${id}` },
+      });
+      expect(envelope.content).toMatch(/^Answer to the question you asked at .*, which timed out before I answered:\n/);
+      expect(envelope.content).toContain('- mode ("Which synthetic mode?"): Host');
+      expect(envelope.content).toContain('- notes ("Anything else?"): skipped');
+      // The card was taken off when the question expired (not answered by Jarvis).
+      expect(l.log.filter((e) => e[0] === 'questionSettled')).toEqual([['questionSettled', id]]);
+
+      // Answering the same expired question again goes through the same idempotent message.
+      await s.answerQuestion(id, [{ id: 'mode', selected: ['Host'] }]);
+      expect(fakeGateway.dispatchInbound.mock.calls.at(-1)![0].id).toBe(envelope.id);
+    });
+  });
+
+  describe('rev', () => {
+    it('never goes backwards when the DSH seq becomes known, and changes with every new event', async () => {
+      db.prepare(`INSERT INTO web_events (id, session_id, user_id, type, payload) VALUES ('evt_test_0101', ?, ?, 'message', '{}')`).run(ROUTE_IDLE, ALICE);
+      db.prepare(`INSERT INTO web_events (id, session_id, user_id, type, payload) VALUES ('evt_test_0102', ?, ?, 'message', '{}')`).run(ROUTE_DONE, ALICE);
+      const s = source();
+      const revOf = async (route: string) => (await s.getSession(route))!.rev!;
+      const watermarkOnly = await revOf(ROUTE_IDLE);
+      expect(watermarkOnly).toBeGreaterThan(0);
+
+      // The seq becomes known (a small number): the rev still grows.
+      transport.sessionEvent(dsh(ROUTE_IDLE), { seq: 0, type: 'turn/start', data: {} });
+      const withSeq = await revOf(ROUTE_IDLE);
+      expect(withSeq).toBeGreaterThan(watermarkOnly);
+      expect(await revOf(ROUTE_IDLE)).toBe(withSeq); // unchanged content: same rev
+      transport.sessionEvent(dsh(ROUTE_IDLE), { seq: 1, type: 'turn/end', data: {} });
+      const next = await revOf(ROUTE_IDLE);
+      expect(next).toBeGreaterThan(withSeq);
+
+      // The DSH log is replaced (session reset to a new DSH session id): still monotonic.
+      db.prepare('UPDATE session_routes SET dsh_session_id = ? WHERE id = ?').run('ses_eeee0000000000000000000000000002', ROUTE_IDLE);
+      const afterReset = await revOf(ROUTE_IDLE);
+      expect(afterReset).toBeGreaterThan(next);
+      expect(await revOf(ROUTE_IDLE)).toBe(afterReset);
     });
   });
 });

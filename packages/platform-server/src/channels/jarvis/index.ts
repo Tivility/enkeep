@@ -21,6 +21,7 @@ export {
   JARVIS_MAX_IMAGE_BYTES,
   JARVIS_REJECT_REASON_PREFIX,
   JARVIS_SLASH_REFUSAL,
+  JARVIS_LATE_ANSWER_MSG_PREFIX,
   jarvisIdempotencyKey,
   toJarvisRpcError,
   toolCallsOf,
@@ -31,6 +32,7 @@ export {
 } from './source.js';
 export {
   JarvisTokenStore,
+  JarvisTokenOwnerConflictError,
   JARVIS_TOKEN_PREFIX,
   generateJarvisToken,
   hashJarvisToken,
