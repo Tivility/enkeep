@@ -11,6 +11,11 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./approval-policy": {
+      "types": "./src/approval-policy.ts",
+      "import": "./dist/approval-policy.js",
+      "default": "./dist/approval-policy.js"
+    },
     "./invariant": {
       "types": "./src/invariant.ts",
       "import": "./dist/invariant.js",

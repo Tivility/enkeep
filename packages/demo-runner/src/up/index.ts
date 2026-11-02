@@ -57,6 +57,8 @@ import {
   SpaceMountService,
   ExtensionService,
   mapFileOpError,
+  ApprovalBridge,
+  type ApprovalRuntimeTransport,
 } from '@enkeep/platform-server';
 import {
   PlatformError,
@@ -153,6 +155,8 @@ export interface RunningDemoSystem {
   database: DatabaseSync;
   runtimeHandles: Map<string, UserRuntimeHandle>;
   hostRuntimeHandles: Map<string, UserRuntimeHandle>;
+  /** Host side of runtime approvals (also `platformServer.approvalBridge`); channels subscribe here. */
+  approvalBridge: ApprovalBridge;
   managementProvider?: ManagementRuntimeProvider;
   restartRuntime(targetUserId?: string): Promise<RuntimeRestartResult>;
   connectRuntime(userId: string): Promise<UserRuntimeHandle>;
@@ -633,6 +637,27 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
   let targetVersionRepo: RuntimeTargetVersionRepo | null = null;
   let allActiveUsers: Array<{ id: string; username: string; status: string; role: string }> = [];
 
+  // Host side of in-container approvals for every user runtime (container and host): one bridge
+  // backs /api/interactions/approvals and waiting_approval on every startup path (CLI `up` included)
+  // and is shared by the channels (Web, Lark, Jarvis).
+  const ownsApprovalBridge = !options.approvalBridge;
+  let approvalBridgeInstance: ApprovalBridge | null = options.approvalBridge ?? null;
+  function getApprovalBridge(): ApprovalBridge {
+    if (!approvalBridgeInstance) {
+      approvalBridgeInstance = new ApprovalBridge({ db: db ?? undefined });
+    }
+    return approvalBridgeInstance;
+  }
+  /** One bridge slot per runtime (a user can have a container and a host runtime). */
+  function approvalSlotOf(handle: UserRuntimeHandle): string {
+    return `runtime:${handle.userId}`;
+  }
+  function detachApprovals(platformUserId: string, handle: UserRuntimeHandle | undefined): void {
+    if (handle && approvalBridgeInstance) {
+      approvalBridgeInstance.detachTransport(platformUserId, { slot: approvalSlotOf(handle) });
+    }
+  }
+
   function getEffectiveTargetRuntimeVersion(): { image: string; daemonCliPath?: string } {
     const persisted = targetVersionRepo?.getTargetVersion();
     const image = persisted?.image || options.runtimeImage || process.env.ENKEEP_RUNTIME_IMAGE?.trim() || 'enkeep-demo-runtime:acceptance';
@@ -844,6 +869,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       }
       // Process is not alive, evict stale handle
       console.info('[host-runtime] evicting handle of exited daemon', { userId: rawUserId, pid: pid ?? null });
+      detachApprovals(rawUserId, existing);
       hostRuntimeHandles.delete(rawUserId);
     }
 
@@ -1810,6 +1836,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
               try {
                 await hostHandle.stop();
               } catch {}
+              detachApprovals(userId, hostHandle);
               hostRuntimeHandles.delete(userId);
             }
           }
@@ -1830,6 +1857,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
                   pathOptions
                 );
               } catch {}
+              detachApprovals(userId, containerHandle);
               runtimeHandles.delete(userId);
 
               // Recreate runtime container mounting same owned volume and updated union mounts
@@ -1911,7 +1939,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     modelSelectionService,
     mountResolver: demoSpaceMountService,
     extensionResolver: demoExtensionService,
-    externalInteractionService: options.externalInteractionService as any,
+    externalInteractionService: getApprovalBridge(),
   });
 
   let platformServer: PlatformServer | undefined;
@@ -1987,72 +2015,14 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
       (rawHandle as any).setPlatformProxyHandler(platformHandler);
     }
 
-    // Subscribe to daemon transport stream to bridge runtime approval events into ExternalInteractionService
+    // Bridge this runtime's approval events (approval/asked, approval/decided) into the platform
+    // ApprovalBridge; answers go back through the same transport.
     const transport = rawHandle.transport ?? (await rawHandle.startTransport?.());
-    const extService = options.externalInteractionService;
-    if (transport && extService && typeof (transport as any).on === 'function') {
-      const handleAsked = (event: any) => {
-        const app = event?.approval;
-        if (app && app.id) {
-          const pendingApp: any = {
-            id: app.id,
-            toolName: app.toolName ?? 'browser_interact',
-            risk: app.risk ?? 'medium',
-            safeSummary: app.safeSummary ?? 'Browser interaction requires human approval',
-            userId: platformUserId,
-            sessionId: event.sessionId,
-            sessionSource: 'web',
-            createdAt: new Date(event.timestamp || Date.now()).toISOString(),
-            timeoutMs: 60000,
-            status: 'pending',
-            preview: app.parameters
-              ? { toolName: app.toolName ?? 'browser_interact', parameters: app.parameters }
-              : { toolName: app.toolName ?? 'browser_interact' },
-            resolve: (outcome: 'allowed-once' | 'rejected') => {
-              if (typeof (transport as any).answerApproval === 'function') {
-                (transport as any).answerApproval(event.sessionId, app.id, outcome).catch(() => {});
-              }
-            },
-          };
-          if ((extService as any).approvals instanceof Map) {
-            (extService as any).approvals.set(app.id, pendingApp);
-          } else {
-            if (!(extService as any).approvals) {
-              (extService as any).approvals = new Map();
-            }
-            (extService as any).approvals.set(app.id, pendingApp);
-          }
-        }
-      };
-
-      (transport as any).on('stream', (event: any) => {
-        if (event && event.event === 'approval/asked') {
-          handleAsked(event);
-        } else if (event && event.event === 'approval/decided') {
-          const decision = event.decision;
-          if (decision && decision.id && (extService as any).approvals instanceof Map) {
-            (extService as any).approvals.delete(decision.id);
-          }
-        }
+    if (transport && typeof (transport as any).on === 'function') {
+      getApprovalBridge().attachTransport(platformUserId, transport as unknown as ApprovalRuntimeTransport, {
+        slot: approvalSlotOf(handle),
       });
-      (transport as any).on('approval/asked', handleAsked);
     }
-  }
-
-  // Hook extService.answerApproval to broadcast to all container daemon transports
-  const configuredExtService = options.externalInteractionService;
-  if (configuredExtService && typeof configuredExtService.answerApproval === 'function') {
-    const origAnswer = configuredExtService.answerApproval.bind(configuredExtService);
-    configuredExtService.answerApproval = (id: string, outcome: 'allowed-once' | 'rejected') => {
-      const answered = origAnswer(id, outcome);
-      for (const h of runtimeHandles.values()) {
-        const trans = (h.rawHandle as any)?.transport;
-        if (trans && typeof trans.answerApproval === 'function') {
-          trans.answerApproval('', id, outcome).catch(() => {});
-        }
-      }
-      return answered;
-    };
   }
 
   // Phase 2 Binding: Bind full platform and events handlers to all active runtime tunnels
@@ -2316,6 +2286,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await hostHandle.teardown(false);
           stopped = true;
         } catch {}
+        detachApprovals(normalizedUserId, hostHandle);
         hostRuntimeHandles.delete(normalizedUserId);
         hostRuntimeHandles.delete(targetUserId);
       }
@@ -2327,6 +2298,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           await handle.teardown(false);
           stopped = true;
         } catch {}
+        detachApprovals(normalizedUserId, handle);
         runtimeHandles.delete(normalizedUserId);
         runtimeHandles.delete(targetUserId);
       }
@@ -2392,6 +2364,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
             await oldHostHandle.stop();
             await oldHostHandle.teardown(false);
           } catch {}
+          detachApprovals(uid, oldHostHandle);
           hostRuntimeHandles.delete(uid);
           try {
             const newHostHandle = await ensureUserHostRuntime(uid);
@@ -2422,6 +2395,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
           } catch (oldTeardownErr: unknown) {
             // Ignore error during teardown of old container
           }
+          detachApprovals(uid, oldHandle);
           runtimeHandles.delete(uid);
 
           try {
@@ -2894,7 +2868,7 @@ fs.appendFileSync(p, corruptData);
       mountReconciler: defaultMountReconciler,
       spaceMountService: demoSpaceMountService,
       extensionService: demoExtensionService,
-      externalInteractionService: options.externalInteractionService,
+      approvalBridge: getApprovalBridge(),
       cookieSecret: secrets.cookieSecret,
       csrfToken: secrets.csrfToken,
       host,
@@ -2950,6 +2924,7 @@ fs.appendFileSync(p, corruptData);
         await mcpManager.dispose();
       } catch {}
     }
+    if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
     try {
       await storage.close();
@@ -3082,6 +3057,7 @@ fs.appendFileSync(p, corruptData);
       database: db!,
       runtimeHandles,
       hostRuntimeHandles,
+      approvalBridge: getApprovalBridge(),
       connectRuntime: async (userId: string) => {
         const userRecord = await storage!.users.findById(userId);
         if (!userRecord || !userRecord.id) {
@@ -3215,6 +3191,9 @@ fs.appendFileSync(p, corruptData);
         } catch (err: unknown) {
           allErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
+        if (ownsApprovalBridge) {
+          approvalBridgeInstance?.dispose();
+        }
 
         try {
           await storage.close();
@@ -3269,6 +3248,7 @@ fs.appendFileSync(p, corruptData);
     } catch (storageErr: unknown) {
       postSetupErrors.push(storageErr instanceof Error ? storageErr : new Error(String(storageErr)));
     }
+    if (ownsApprovalBridge) approvalBridgeInstance?.dispose();
     const teardownErrs = await cleanupStartupHandles(newlyCreatedHandles);
     postSetupErrors.push(...teardownErrs);
     const primary = err instanceof Error ? err : new Error(String(err));

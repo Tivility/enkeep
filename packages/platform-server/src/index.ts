@@ -587,6 +587,24 @@ export type {
   RuntimeMountResolver,
 } from '@enkeep/platform-core';
 
+// Runtime approvals bridge (host side of in-container approvals)
+export {
+  ApprovalBridge,
+  type ApprovalBridgeOptions,
+  type ApprovalBridgeEventMap,
+  type ApprovalBridgeLogger,
+  type ApprovalAskedEvent,
+  type ApprovalSettledEvent,
+  type ApprovalSettledOutcome,
+  type ApprovalSettledSource,
+  type ApprovalDecision,
+  type ApprovalDecisionOptions,
+  type ApprovalDecisionResult,
+  type ApprovalRuntimeTransport,
+  type BridgedApproval,
+  type PendingApprovalView,
+} from './interactions/approval-bridge.js';
+
 // Channel Management & Routes
 export {
   ChannelManagementService,

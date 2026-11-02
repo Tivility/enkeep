@@ -14,6 +14,7 @@ import { HostOwnershipError } from '../spec/provider.js';
 import type { HostRuntimeSpec } from './types.js';
 import { validateMountSpec, isPathContained } from '../spec/mount-security.js';
 import type { RuntimeMountSpec } from '../spec/types.js';
+import { APPROVAL_TIMEOUT_ENV_KEY, normalizeApprovalTimeoutEnv } from '../spec/validator.js';
 
 export const ALLOWED_HOST_ENV_KEYS = new Set([
   'PATH',
@@ -29,6 +30,7 @@ export const ALLOWED_HOST_ENV_KEYS = new Set([
   'DSH_MOUNTS_JSON',
   'DSH_MOUNTS_FILE',
   'ENKEEP_CONTEXT_WINDOW_DEFAULT',
+  'ENKEEP_APPROVAL_TIMEOUT_MS',
   'DSH_MAX_AGENTS',
   'DSH_IDLE_AGENT_TIMEOUT_MS',
   'DSH_MAX_CONCURRENT_SESSIONS',
@@ -262,6 +264,12 @@ export function filterHostEnvironment(
     env.DSH_MAX_CONCURRENT_SESSIONS = String(spec.maxConcurrentSessions);
   }
 
+  // Approval wait timeout (ms) for @enkeep/dsh-external-interaction, from the platform process.
+  const approvalTimeout = normalizeApprovalTimeoutEnv(process.env[APPROVAL_TIMEOUT_ENV_KEY]);
+  if (approvalTimeout !== undefined) {
+    env[APPROVAL_TIMEOUT_ENV_KEY] = approvalTimeout;
+  }
+
   // LLM and placeholder credentials
   env.ENKEEP_LLM_ENABLED = spec.llmEnabled ? '1' : '0';
   if (spec.llmProvider) {
@@ -311,6 +319,9 @@ export function filterHostEnvironment(
             break;
           }
         }
+        if (key === APPROVAL_TIMEOUT_ENV_KEY && normalizeApprovalTimeoutEnv(val) !== val) {
+          continue;
+        }
         if (!isSensitive) {
           env[key] = val;
         }
@@ -321,6 +332,7 @@ export function filterHostEnvironment(
   if (extraAllowlist) {
     for (const [key, val] of Object.entries(extraAllowlist)) {
       if (ALLOWED_HOST_ENV_KEYS.has(key)) {
+        if (key === APPROVAL_TIMEOUT_ENV_KEY && normalizeApprovalTimeoutEnv(val) !== val) continue;
         env[key] = val;
       }
     }

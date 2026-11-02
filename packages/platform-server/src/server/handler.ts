@@ -113,6 +113,7 @@ import type { InstructionsRoutes } from "../instructions/index.js";
 import type { ChannelRoutes } from "../channels/channel-routes.js";
 import { SpaceMountService } from "../mounts/space-mount-service.js";
 import type { IExternalInteractionService, ApprovalOutcome } from "@enkeep/dsh-external-interaction";
+import { ApprovalBridge } from "../interactions/approval-bridge.js";
 import { DualStorageReconcileService } from "../storage/dual-storage-reconcile.js";
 import { VolumeScanService } from "../storage/volume-scan.js";
 import { createManagementOperationsAdapter } from "../operations/management-adapter.js";
@@ -4117,7 +4118,14 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             throw new ValidationError('Field "outcome" must be "allowed-once" or "rejected"');
           }
 
-          const decided = externalInteractionService ? externalInteractionService.answerApproval(approvalId, outcome) : false;
+          // The ApprovalBridge answers through the user's runtime transport; await it so `decided`
+          // reflects whether this answer won. Plain services answer synchronously.
+          const decided = externalInteractionService instanceof ApprovalBridge
+            ? (await externalInteractionService.decide(approvalId, outcome, {
+                userId: user.role === "admin" ? undefined : user.id,
+                decidedBy: "web",
+              })).ok
+            : externalInteractionService ? externalInteractionService.answerApproval(approvalId, outcome) : false;
           sendJsonResponse(res, 200, createSuccessEnvelope({
             id: approvalId,
             status: outcome,
@@ -4134,7 +4142,12 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           const body = await parseJsonBody(req, maxBodyBytes);
           const reason = typeof body.reason === "string" ? body.reason : undefined;
 
-          const cancelled = externalInteractionService ? externalInteractionService.cancelApproval(approvalId, reason) : false;
+          const cancelled = externalInteractionService instanceof ApprovalBridge
+            ? (await externalInteractionService.cancel(approvalId, {
+                userId: user.role === "admin" ? undefined : user.id,
+                decidedBy: "web",
+              })).ok
+            : externalInteractionService ? externalInteractionService.cancelApproval(approvalId, reason) : false;
           sendJsonResponse(res, 200, createSuccessEnvelope({
             id: approvalId,
             status: "cancelled",

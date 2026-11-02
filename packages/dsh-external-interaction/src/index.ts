@@ -11,9 +11,17 @@ import {
   resolveSessionSource,
   DEFAULT_INTERACTION_TIMEOUT_MS,
 } from './service.js';
+import { resolveApprovalTimeoutMs } from './approval-policy.js';
 
 export * from './types.js';
 export * from './service.js';
+export {
+  APPROVAL_TIMEOUT_ENV,
+  MIN_APPROVAL_TIMEOUT_MS,
+  MAX_APPROVAL_TIMEOUT_MS,
+  parseApprovalTimeoutMs,
+  resolveApprovalTimeoutMs,
+} from './approval-policy.js';
 
 export const name = 'enkeep-external-interaction';
 
@@ -21,10 +29,18 @@ export const inject = [];
 
 export interface Config {
   defaultTimeoutMs?: number;
+  /**
+   * Approval wait in milliseconds. When omitted, `ENKEEP_APPROVAL_TIMEOUT_MS` from the runtime
+   * environment applies, then `defaultTimeoutMs`, then 60 s.
+   */
+  approvalTimeoutMs?: number;
 }
 
 export const Config: Schema<Config> = Schema.object({
   defaultTimeoutMs: Schema.natural().description('Default interaction timeout in milliseconds (default: 60000)'),
+  approvalTimeoutMs: Schema.natural().description(
+    'Approval timeout in milliseconds (default: ENKEEP_APPROVAL_TIMEOUT_MS, else defaultTimeoutMs)'
+  ),
 });
 
 /**
@@ -37,8 +53,14 @@ export const Config: Schema<Config> = Schema.object({
  * All registrations and pending suspensions are revocable effects bound to the plugin lifecycle.
  */
 export function apply(ctx: Context, config: Config = {}): void {
+  const defaultTimeoutMs = config.defaultTimeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
   const service = new ExternalInteractionService(ctx, {
-    defaultTimeoutMs: config.defaultTimeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS,
+    defaultTimeoutMs,
+    approvalTimeoutMs: resolveApprovalTimeoutMs({
+      configured: config.approvalTimeoutMs,
+      env: process.env,
+      fallback: defaultTimeoutMs,
+    }),
   });
 
   // Intercept approval requests as an effect returning its disposer

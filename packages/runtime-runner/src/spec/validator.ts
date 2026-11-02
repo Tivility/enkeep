@@ -144,6 +144,22 @@ export const ALLOWED_LABEL_KEYS = new Set([
   VOLUME_ID_LABEL_KEY,
 ]);
 
+/** Runtime env key read by `@enkeep/dsh-external-interaction` for the approval wait (ms). */
+export const APPROVAL_TIMEOUT_ENV_KEY = 'ENKEEP_APPROVAL_TIMEOUT_MS';
+const POSITIVE_INTEGER_STRING = /^[1-9]\d{0,15}$/;
+
+/**
+ * The approval wait timeout to pass to a runtime process, from a raw env value: a positive
+ * integer string (ms) as given, otherwise `undefined` (the runtime keeps its default; it bounds
+ * the value itself).
+ */
+export function normalizeApprovalTimeoutEnv(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  if (!POSITIVE_INTEGER_STRING.test(value) || !Number.isSafeInteger(Number(value))) return undefined;
+  return value;
+}
+
 export const ALLOWED_ENV_KEYS = new Set([
   'DSH_USER',
   'DSH_HOME',
@@ -152,6 +168,7 @@ export const ALLOWED_ENV_KEYS = new Set([
   'DSH_MAX_AGENTS',
   'DSH_MAX_CONCURRENT_SESSIONS',
   'ENKEEP_CONTEXT_WINDOW_DEFAULT',
+  'ENKEEP_APPROVAL_TIMEOUT_MS',
   'ENKEEP_LLM_ENABLED',
   'ENKEEP_LLM_PROVIDER',
   'ENKEEP_LLM_MODEL',
@@ -342,6 +359,11 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
     if ('DSH_IDLE_AGENT_TIMEOUT_MS' in environment && environment.DSH_IDLE_AGENT_TIMEOUT_MS !== undefined) {
       if (typeof environment.DSH_IDLE_AGENT_TIMEOUT_MS !== 'string' || !/^\d+$/.test(environment.DSH_IDLE_AGENT_TIMEOUT_MS)) {
         errors.push('environment.DSH_IDLE_AGENT_TIMEOUT_MS must be a positive integer string');
+      }
+    }
+    if ('ENKEEP_APPROVAL_TIMEOUT_MS' in environment && environment.ENKEEP_APPROVAL_TIMEOUT_MS !== undefined) {
+      if (normalizeApprovalTimeoutEnv(environment.ENKEEP_APPROVAL_TIMEOUT_MS) !== environment.ENKEEP_APPROVAL_TIMEOUT_MS) {
+        errors.push('environment.ENKEEP_APPROVAL_TIMEOUT_MS must be a positive integer string');
       }
     }
     if ('DSH_MAX_AGENTS' in environment && environment.DSH_MAX_AGENTS !== undefined) {

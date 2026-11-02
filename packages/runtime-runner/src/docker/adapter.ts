@@ -31,6 +31,8 @@ import {
   DockerCollisionError,
   DockerNotFoundError,
   DockerDaemonError,
+  APPROVAL_TIMEOUT_ENV_KEY,
+  normalizeApprovalTimeoutEnv,
 } from '../spec/validator.js';
 import type { RuntimeContainerSpec, ExactContainerIdentity, RuntimeNetworkMode } from '../spec/types.js';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
@@ -471,6 +473,11 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
           : undefined;
     if (idleTimeoutVal !== undefined && !isNaN(idleTimeoutVal)) {
       env.DSH_IDLE_AGENT_TIMEOUT_MS = String(idleTimeoutVal);
+    }
+
+    const approvalTimeout = normalizeApprovalTimeoutEnv(process.env[APPROVAL_TIMEOUT_ENV_KEY]);
+    if (approvalTimeout !== undefined) {
+      env[APPROVAL_TIMEOUT_ENV_KEY] = approvalTimeout;
     }
 
     if (isLlmEnabled) {

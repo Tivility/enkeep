@@ -12,64 +12,17 @@ import type {
   IExternalInteractionService,
 } from './types.js';
 
+import {
+  DEFAULT_INTERACTION_TIMEOUT_MS,
+  classifyToolRiskAndSummary,
+} from './approval-policy.js';
+
+export { DEFAULT_INTERACTION_TIMEOUT_MS, classifyToolRiskAndSummary };
+
 export interface ExternalInteractionConfig {
   defaultTimeoutMs?: number;
-}
-
-export const DEFAULT_INTERACTION_TIMEOUT_MS = 60_000; // 60 seconds
-
-/**
- * Classifies tool execution risk level and produces a safe human-readable summary
- * without leaking raw command arguments, secrets, or internal paths.
- */
-export function classifyToolRiskAndSummary(
-  toolName: string,
-  reason?: string
-): { risk: ApprovalRiskLevel; safeSummary: string } {
-  switch (toolName) {
-    case 'bash':
-      return {
-        risk: 'high',
-        safeSummary: reason ?? 'Execute shell command in space workspace',
-      };
-    case 'write':
-      return {
-        risk: 'medium',
-        safeSummary: reason ?? 'Write or replace file in space workspace',
-      };
-    case 'edit':
-      return {
-        risk: 'medium',
-        safeSummary: reason ?? 'Edit file content in space workspace',
-      };
-    case 'subagent':
-    case 'subagent_fork':
-      return {
-        risk: 'medium',
-        safeSummary: reason ?? `Spawn subagent (${toolName})`,
-      };
-    case 'interrupt_agent':
-      return {
-        risk: 'low',
-        safeSummary: reason ?? 'Interrupt subagent execution',
-      };
-    case 'send_platform_message':
-    case 'send_message':
-      return {
-        risk: 'low',
-        safeSummary: reason ?? 'Send outbound message notification',
-      };
-    case 'create_task':
-      return {
-        risk: 'low',
-        safeSummary: reason ?? 'Create platform task',
-      };
-    default:
-      return {
-        risk: 'medium',
-        safeSummary: reason ?? `Execute tool "${toolName}"`,
-      };
-  }
+  /** Wait for an approval answer; defaults to `defaultTimeoutMs`. Questions keep `defaultTimeoutMs`. */
+  approvalTimeoutMs?: number;
 }
 
 /**
@@ -159,6 +112,11 @@ export class ExternalInteractionService extends Service implements IExternalInte
 
   get timeoutMs(): number {
     return this.interactionConfig.defaultTimeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
+  }
+
+  /** Effective wait for an approval answer before it resolves `unavailable` (expired). */
+  get approvalTimeoutMs(): number {
+    return this.interactionConfig.approvalTimeoutMs ?? this.timeoutMs;
   }
 
   listPendingApprovals(filter?: { userId?: string; sessionId?: string }): readonly PendingApproval[] {
@@ -401,7 +359,7 @@ export class ExternalInteractionService extends Service implements IExternalInte
     const id = askedId || crypto.randomUUID();
     const sessionId = session?.id ?? 'unknown-session';
     const { userId, spaceId } = resolveTenantAndSpace(req.agent);
-    const timeout = this.timeoutMs;
+    const timeout = this.approvalTimeoutMs;
     const createdAt = new Date().toISOString();
     const { risk, safeSummary } = classifyToolRiskAndSummary(req.toolName, req.reason);
 

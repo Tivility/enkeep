@@ -590,7 +590,7 @@ export interface DeliveryRuntimeGatewayOptions {
     userId?: string;
   }) => Promise<boolean> | boolean;
   externalInteractionService?: {
-    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
+    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => ReadonlyArray<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
   mountResolver?: RuntimeMountResolver;
   extensionResolver?: ExtensionPlanResolver;
@@ -652,7 +652,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
   private readonly modelSelectionService?: ModelSelectionService;
   private readonly chatCommandService?: ChatCommandService;
   private readonly externalInteractionService?: {
-    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => Array<{ id: string; status: string; sessionId?: string; userId?: string }>;
+    listPendingApprovals?: (opts?: { userId?: string; sessionId?: string; status?: string }) => ReadonlyArray<{ id: string; status: string; sessionId?: string; userId?: string }>;
   };
   private mountResolver?: RuntimeMountResolver;
   private extensionResolver?: ExtensionPlanResolver;

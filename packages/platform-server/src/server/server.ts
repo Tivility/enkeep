@@ -92,6 +92,7 @@ import {
   createProfileService,
 } from '../profiles/profile-service.js';
 import type { IExternalInteractionService } from '@enkeep/dsh-external-interaction';
+import type { ApprovalBridge } from '../interactions/approval-bridge.js';
 import {
   HappyClawMigrationService,
 } from '../imports/happyclaw-migration-service.js';
@@ -246,6 +247,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'webhookSecurityOptions',
   'modelSelectionService',
   'externalInteractionService',
+  'approvalBridge',
   'runtimeProviderRegistry',
   'hostProvider',
   'containerProvider',
@@ -408,6 +410,12 @@ export interface PlatformServerOptions {
   modelSelectionService?: ModelSelectionService;
   /** Optional external interaction service for approvals and interactive questions */
   externalInteractionService?: IExternalInteractionService;
+  /**
+   * Host-side bridge of runtime approvals (subscribes to every user's runtime transport).
+   * Backs `/api/interactions/approvals*` when `externalInteractionService` is not given and is
+   * exposed as `server.approvalBridge` for channels (e.g. Jarvis).
+   */
+  approvalBridge?: ApprovalBridge;
   /** Optional runtime provider registry managing multi-mode execution */
   runtimeProviderRegistry?: RuntimeProviderRegistry;
   /** Optional host runtime provider for host mode execution */
@@ -525,6 +533,7 @@ export class PlatformServer {
   public readonly wechatOnboardingService?: WeChatOnboardingService;
   public readonly larkScopedConfigProvider?: LarkScopedConfigProvider;
   public readonly externalInteractionService?: IExternalInteractionService;
+  public readonly approvalBridge?: ApprovalBridge;
   public readonly mountReconciler?: RuntimeMountReconciler;
   public readonly spaceMountService?: SpaceMountService;
   public readonly browserService?: BrowserService;
@@ -819,7 +828,8 @@ export class PlatformServer {
     this.skillCatalogService = skillCatalogService;
     this.instructionsService = instructionsService;
     this.instructionsRoutes = instructionsRoutes;
-    this.externalInteractionService = options.externalInteractionService;
+    this.approvalBridge = options.approvalBridge;
+    this.externalInteractionService = options.externalInteractionService ?? options.approvalBridge;
 
     this.mountReconciler = options.mountReconciler;
     this.spaceMountService =
@@ -1157,7 +1167,7 @@ export class PlatformServer {
       modelSelectionService: this.modelSelectionService,
       sessionLifecycleService: this.sessionLifecycleService,
       runtimeArtifactPort: this.runtimeArtifactPort,
-      externalInteractionService: options.externalInteractionService,
+      externalInteractionService: this.externalInteractionService,
       spaceMountService: this.spaceMountService,
       browserService: this.browserService,
       mcpService: this.mcpService,
