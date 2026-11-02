@@ -15,3 +15,4 @@ export * from './host.js';
 export type { StreamMetadata, StreamHandler } from './contract.js';
 export * from './llm-proxy.js';
 export * from './platform-proxy.js';
+export * from './memory-write-dedupe.js';

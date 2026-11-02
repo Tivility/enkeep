@@ -784,7 +784,9 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
     if (mode) {
       const provider = this.registry.getProvider(mode);
       if (provider?.managementProvider?.stopRuntime) {
-        const res = await provider.managementProvider.stopRuntime(userId);
+        // Pass the mode on: one management provider may serve both modes, and a mode-scoped stop
+        // (e.g. the idle auto-upgrader rebuilding a container) must not stop the other runtime.
+        const res = await provider.managementProvider.stopRuntime(userId, mode);
         return { ...res, mode };
       }
       return { stopped: false, userId, mode };

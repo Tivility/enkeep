@@ -50,6 +50,24 @@ export function resolveSafeMemoryPath(
     ? path.join(dshHome, 'memory')
     : path.join(spacePath!, 'memory');
 
+  return resolveSafeMemoryPathInRoot(relOrAbsPath, scope, memoryRoot);
+}
+
+/**
+ * Resolves and validates a target path inside an explicit memory root directory.
+ * Throws on directory escape.
+ */
+export function resolveSafeMemoryPathInRoot(
+  relOrAbsPath: string | undefined,
+  scope: MemoryScope,
+  memoryRoot: string
+): { targetPath: string; relPath: string; memoryRoot: string } {
+  if (relOrAbsPath !== undefined && typeof relOrAbsPath !== 'string') {
+    throw new TypeError('Memory path must be a string');
+  }
+  if (typeof relOrAbsPath === 'string' && relOrAbsPath.includes('\0')) {
+    throw new Error('Security violation: Memory path contains a NUL byte');
+  }
   const normalizedInput = (relOrAbsPath && relOrAbsPath.trim().length > 0)
     ? relOrAbsPath.trim()
     : (scope === 'global' ? 'global.md' : 'space.md');

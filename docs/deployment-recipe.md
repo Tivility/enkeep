@@ -85,7 +85,21 @@ node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env --only
 
 检查项：CSRF 接口 200；平台与代理端口进程 PPID 为 1 且返回 200；容器全部运行（全量模式下要求为新镜像，分层模式下打印各运行时的升级状态）；平台外部长连接数量与切换前一致；部署后空闲检查通过。
 
-### 3.5 清理旧发布工作树
+### 3.5 用户级资产单份副本（一次性收敛）
+
+用户级资产（全局 memory、skills、`AGENTS.md`）只有宿主 `host-runtimes/<username>/.dsh/` 一份，容器只读挂载，详见 [user-assets.md](./user-assets.md)。已有卷的容器在收敛前不会启用挂载。首次发布包含该功能后，在用户空闲时执行：
+
+```bash
+# 只比较、只报告，不做任何修改
+node packages/demo-runner/dist/demo-runner.js user-assets-migrate --data-dir <data-root> --dry-run
+
+# 内容一致的用户：把容器内副本归档到卷内 .enkeep-archive/ 并写收敛标记
+node packages/demo-runner/dist/demo-runner.js user-assets-migrate --data-dir <data-root>
+```
+
+报告为 `divergent` 的用户不会被修改：先按报告列出的相对路径把需要的内容合入宿主副本后重跑；或确认容器副本可丢弃后加 `--archive-divergent`（仅归档，不覆盖宿主）。收敛后容器在空闲时由自动升级路径重建（卷数据保留），重建后生效。应急关闭：平台进程设 `ENKEEP_USER_ASSET_MOUNTS=0` 并重启平台；仍带挂载的容器在重建前继续经平台写宿主副本，空闲重建后改回卷内副本（启动时清理 Docker 留下的 root 空占位，标记置为 `suspended`），重新开启需对该卷再跑一次 `user-assets-migrate`。详见 `docs/user-assets.md`。
+
+### 3.6 清理旧发布工作树
 
 ```bash
 node scripts/prune-release-worktrees.mjs --release-root <release-root> --repo-root <repo-root> \
