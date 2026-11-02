@@ -59,6 +59,7 @@
     "@deepseek-ai/dsh-agent-default-model": "0.2.1-rc.5",
     "@deepseek-ai/dsh-agent-instructions": "0.2.1-rc.5",
     "@deepseek-ai/dsh-agent-loop": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.5",
     "@deepseek-ai/dsh-attachment": "0.2.1-rc.5",
     "@deepseek-ai/dsh-attachment-local": "0.2.1-rc.5",
     "@deepseek-ai/dsh-bash-local": "0.2.1-rc.5",
@@ -139,8 +140,8 @@
     "@enkeep/protocol": "workspace:*",
     "@tivility/dsh-compaction-window": "0.1.0",
     "@tivility/dsh-llm-affinity": "0.1.1",
-    "@tivility/dsh-tool-subagent-memory": "0.1.0",
-    "@tivility/dsh-tool-workflow-memory": "0.1.0",
+    "@tivility/dsh-tool-subagent-memory": "0.2.0",
+    "@tivility/dsh-tool-workflow-memory": "0.2.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
