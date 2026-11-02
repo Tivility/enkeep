@@ -676,6 +676,7 @@ export class WeChatRuntimeManager {
     let nativeEventId: string | undefined;
     let replyToMessageId: string | undefined;
     let nativeContextId: string | undefined;
+    let foreignOrigin = false;
 
     if (this.db) {
       try {
@@ -693,8 +694,14 @@ export class WeChatRuntimeManager {
           nativeEventId = originRow.native_event_id || undefined;
           replyToMessageId = originRow.reply_to_message_id || undefined;
           nativeContextId = originRow.native_context_id || undefined;
+        } else if (originRow && typeof originRow.channel === 'string' && originRow.channel !== 'wechat') {
+          foreignOrigin = true;
         }
       } catch {}
+    }
+    if (foreignOrigin) {
+      // Recorded origin is another channel (Lark, Jarvis, ...): not a WeChat turn.
+      return;
     }
 
     if (!accountId && idempotencyKey) {
@@ -720,10 +727,9 @@ export class WeChatRuntimeManager {
       } catch {}
     }
 
-    if (!accountId && route && route.channel === 'wechat' && route.accountId) {
-      accountId = route.accountId;
-    }
-
+    // No fallback to route.channel: a route bound to WeChat can also receive turns typed in the
+    // Web UI, sent from Jarvis or started by tasks. Only turns attributed to WeChat by
+    // channel_turn_origins or a WeChat idempotency key are forwarded.
     if (!accountId) {
       // Not a WeChat channel turn
       return;
@@ -807,6 +813,7 @@ export class WeChatRuntimeManager {
 
     let accountId: string | undefined;
     let nativeEventId: string | undefined;
+    let foreignOrigin = false;
 
     if (this.db) {
       try {
@@ -816,9 +823,12 @@ export class WeChatRuntimeManager {
         if (originRow && originRow.channel === 'wechat' && originRow.account_id) {
           accountId = originRow.account_id;
           nativeEventId = originRow.native_event_id || undefined;
+        } else if (originRow && typeof originRow.channel === 'string' && originRow.channel !== 'wechat') {
+          foreignOrigin = true;
         }
       } catch {}
     }
+    if (foreignOrigin) return;
 
     if (!accountId && idempotencyKey) {
       const match = idempotencyKey.match(/^idem_wechat_([^_]+)_(.+)$/);
@@ -828,10 +838,7 @@ export class WeChatRuntimeManager {
       }
     }
 
-    if (!accountId && route && route.channel === 'wechat' && route.accountId) {
-      accountId = route.accountId;
-    }
-
+    // No route.channel fallback (see handleTurnCompleted): failures of Web/Jarvis/task turns are not sent to WeChat.
     if (!accountId) return;
 
     let gateway = this.getActiveGateway(userId, accountId);

@@ -121,6 +121,7 @@ import {
 import {
   ChannelManagementService,
   ChannelRoutes,
+  type ChannelAccountLifecycle,
 } from '../channels/channel-routes.js';
 import {
   ChannelRuntimeManager,
@@ -253,6 +254,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'browserService',
   'mcpService',
   'channelService',
+  'channelManagers',
   'channelRoutes',
   'channelRuntimeManager',
   'wechatRuntimeManager',
@@ -424,6 +426,11 @@ export interface PlatformServerOptions {
   runtimeAutoUpgrader?: RuntimeAutoUpgrader;
   /** Optional channel management service */
   channelService?: ChannelManagementService;
+  /**
+   * Optional runtime managers of non-builtin channel types (e.g. `{ jarvis: manager }`).
+   * Registered on the channel management service; accounts of unregistered types are rejected.
+   */
+  channelManagers?: Readonly<Record<string, ChannelAccountLifecycle>>;
   /** Optional channel management routes */
   channelRoutes?: ChannelRoutes;
   /** Optional channel runtime manager */
@@ -872,6 +879,11 @@ export class PlatformServer {
     this.channelService =
       options.channelService ??
       new ChannelManagementService(this.storage, undefined);
+    if (options.channelManagers) {
+      for (const [type, manager] of Object.entries(options.channelManagers)) {
+        this.channelService.registerManager(type, manager);
+      }
+    }
 
     let defaultSpaceResolver = options.larkDefaultSpaceResolver;
 

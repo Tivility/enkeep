@@ -77,19 +77,138 @@ export const ALLOWED_ONBOARDING_JOB_VERIFY_KEYS = Object.freeze([
   'verifyCode',
 ]);
 
+/**
+ * Runtime side of one channel type, as seen by account management.
+ * Every hook receives the owning user and the account id; failures are swallowed by the caller
+ * (account data changes must not fail because a runtime could not be (re)started).
+ */
+export interface ChannelAccountLifecycle {
+  /** Called after an active account was created. Defaults to `onAccountUpdated`. */
+  onAccountCreated?(userId: string, accountId: string): Promise<unknown>;
+  /** Called after an account was updated (status, credentials, default space...). */
+  onAccountUpdated(userId: string, accountId: string): Promise<unknown>;
+  /** Called after an account row was deleted. */
+  onAccountDeleted(userId: string, accountId: string): Promise<unknown>;
+  /** Explicit sync request (`POST /api/manage/channels/accounts/:id/sync`). */
+  syncAccount(userId: string, accountId: string): Promise<unknown>;
+}
+
+/** Channel account types that always have a dedicated manager slot. */
+export const BUILTIN_CHANNEL_ACCOUNT_TYPES = Object.freeze(['lark', 'wechat'] as const);
+
+function larkLifecycle(manager: ChannelRuntimeManager): ChannelAccountLifecycle {
+  return {
+    onAccountCreated: (userId, accountId) => manager.onAccountUpdated(userId, accountId),
+    onAccountUpdated: (userId, accountId) => manager.onAccountUpdated(userId, accountId),
+    onAccountDeleted: (userId, accountId) => manager.onAccountDeleted(userId, accountId),
+    syncAccount: (userId, accountId) => manager.syncAccount(userId, accountId),
+  };
+}
+
+function wechatLifecycle(manager: WeChatRuntimeManager): ChannelAccountLifecycle {
+  // The WeChat manager reconciles every change (create/update/delete) through syncAccount.
+  return {
+    onAccountCreated: (userId, accountId) => manager.syncAccount(userId, accountId),
+    onAccountUpdated: (userId, accountId) => manager.syncAccount(userId, accountId),
+    onAccountDeleted: (userId, accountId) => manager.syncAccount(userId, accountId),
+    syncAccount: (userId, accountId) => manager.syncAccount(userId, accountId),
+  };
+}
+
 export class ChannelManagementService {
   private readonly storage: PlatformStorage;
-  private runtimeManager?: ChannelRuntimeManager;
-  private wechatRuntimeManager?: WeChatRuntimeManager;
+  private larkRuntimeManager?: ChannelRuntimeManager;
+  private wechatManager?: WeChatRuntimeManager;
+  /** Managers of non-builtin channel types (e.g. 'jarvis'), registered by the server wiring. */
+  private readonly extraManagers = new Map<string, ChannelAccountLifecycle>();
 
   constructor(
     storage: PlatformStorage,
     runtimeManager?: ChannelRuntimeManager,
-    wechatRuntimeManager?: WeChatRuntimeManager
+    wechatRuntimeManager?: WeChatRuntimeManager,
+    extraManagers?: Readonly<Record<string, ChannelAccountLifecycle>>
   ) {
     this.storage = storage;
-    this.runtimeManager = runtimeManager;
-    this.wechatRuntimeManager = wechatRuntimeManager;
+    this.larkRuntimeManager = runtimeManager;
+    this.wechatManager = wechatRuntimeManager;
+    if (extraManagers) {
+      for (const [type, manager] of Object.entries(extraManagers)) {
+        this.registerManager(type, manager);
+      }
+    }
+  }
+
+  /** Lark runtime manager (kept as a property for existing late-binding wiring). */
+  get runtimeManager(): ChannelRuntimeManager | undefined {
+    return this.larkRuntimeManager;
+  }
+
+  set runtimeManager(manager: ChannelRuntimeManager | undefined) {
+    this.larkRuntimeManager = manager;
+  }
+
+  /** WeChat runtime manager (kept as a property for existing late-binding wiring). */
+  get wechatRuntimeManager(): WeChatRuntimeManager | undefined {
+    return this.wechatManager;
+  }
+
+  set wechatRuntimeManager(manager: WeChatRuntimeManager | undefined) {
+    this.wechatManager = manager;
+  }
+
+  /**
+   * Registers the runtime manager of a non-builtin channel type (for example `jarvis`).
+   * Accounts of a type are only accepted once the type is builtin or registered.
+   */
+  registerManager(type: string, manager: ChannelAccountLifecycle): void {
+    const normalized = typeof type === 'string' ? type.trim() : '';
+    if (!normalized || !/^[a-z][a-z0-9_-]{0,31}$/.test(normalized)) {
+      throw new ValidationError(`Invalid channel type "${String(type)}"`);
+    }
+    if ((BUILTIN_CHANNEL_ACCOUNT_TYPES as readonly string[]).includes(normalized)) {
+      throw new ValidationError(`Channel type "${normalized}" is builtin and cannot be re-registered`);
+    }
+    this.extraManagers.set(normalized, manager);
+  }
+
+  unregisterManager(type: string): boolean {
+    return this.extraManagers.delete(type);
+  }
+
+  /** Channel account types this server accepts: builtin types plus registered ones. */
+  getSupportedTypes(): string[] {
+    return [...BUILTIN_CHANNEL_ACCOUNT_TYPES, ...this.extraManagers.keys()];
+  }
+
+  isSupportedType(type: string | undefined | null): boolean {
+    if (typeof type !== 'string') return false;
+    return (BUILTIN_CHANNEL_ACCOUNT_TYPES as readonly string[]).includes(type) || this.extraManagers.has(type);
+  }
+
+  /**
+   * Resolves the lifecycle of one channel type. Lark and WeChat each go to their own manager;
+   * registered types go to their registered manager. Unknown types resolve to undefined and are
+   * never handed to another channel's manager.
+   */
+  private lifecycleFor(type: string | undefined | null): ChannelAccountLifecycle | undefined {
+    if (type === 'lark') {
+      return this.larkRuntimeManager ? larkLifecycle(this.larkRuntimeManager) : undefined;
+    }
+    if (type === 'wechat') {
+      return this.wechatManager ? wechatLifecycle(this.wechatManager) : undefined;
+    }
+    if (typeof type === 'string') {
+      return this.extraManagers.get(type);
+    }
+    return undefined;
+  }
+
+  private assertSupportedType(type: string | undefined | null): void {
+    if (!this.isSupportedType(type)) {
+      throw new ValidationError(
+        `Unsupported channel type "${String(type)}". Allowed: ${this.getSupportedTypes().join(', ')}.`
+      );
+    }
   }
 
   // ──────── Account Management ────────
@@ -116,6 +235,9 @@ export class ChannelManagementService {
       groupActivationMode?: 'mention' | 'always';
     }
   ): Promise<ChannelAccount> {
+    const type = typeof input.type === 'string' ? input.type.trim() : '';
+    this.assertSupportedType(type);
+
     let defaultSpaceId = input.defaultSpaceId;
     if (defaultSpaceId !== undefined && defaultSpaceId !== null) {
       const trimmed = typeof defaultSpaceId === 'string' ? defaultSpaceId.trim() : '';
@@ -131,20 +253,17 @@ export class ChannelManagementService {
     }
 
     const created = await this.storage.forTenant(userId).channels.createAccount({
-      type: input.type,
+      type,
       status: input.status,
       credentialRef: input.credentialRef,
       defaultSpaceId,
       groupActivationMode: input.groupActivationMode,
     });
     if (created.status === 'active') {
+      const lifecycle = this.lifecycleFor(created.type);
       try {
-        if (created.type === 'wechat') {
-          if (this.wechatRuntimeManager) {
-            await this.wechatRuntimeManager.syncAccount(userId, created.id);
-          }
-        } else if (this.runtimeManager) {
-          await this.runtimeManager.onAccountUpdated(userId, created.id);
+        if (lifecycle) {
+          await (lifecycle.onAccountCreated ?? lifecycle.onAccountUpdated).call(lifecycle, userId, created.id);
         }
       } catch {}
     }
@@ -183,13 +302,11 @@ export class ChannelManagementService {
     if (input.groupActivationMode !== undefined) {
       await this.storage.forTenant(userId).channels.setGroupActivationModeForAccountBindings(accountId, input.groupActivationMode);
     }
+    // Unknown (e.g. legacy imported) types stay editable but are never handed to another channel's runtime.
+    const lifecycle = this.lifecycleFor(updated.type);
     try {
-      if (updated.type === 'wechat') {
-        if (this.wechatRuntimeManager) {
-          await this.wechatRuntimeManager.syncAccount(userId, accountId);
-        }
-      } else if (this.runtimeManager) {
-        await this.runtimeManager.onAccountUpdated(userId, accountId);
+      if (lifecycle) {
+        await lifecycle.onAccountUpdated(userId, accountId);
       }
     } catch {}
     return updated;
@@ -200,13 +317,10 @@ export class ChannelManagementService {
     const channelType = existing?.type;
     const deleted = await this.storage.forTenant(userId).channels.deleteAccount(accountId);
     if (deleted) {
+      const lifecycle = this.lifecycleFor(channelType);
       try {
-        if (channelType === 'wechat') {
-          if (this.wechatRuntimeManager) {
-            await this.wechatRuntimeManager.syncAccount(userId, accountId);
-          }
-        } else if (this.runtimeManager) {
-          await this.runtimeManager.onAccountDeleted(userId, accountId);
+        if (lifecycle) {
+          await lifecycle.onAccountDeleted(userId, accountId);
         }
       } catch {}
     }
@@ -215,12 +329,10 @@ export class ChannelManagementService {
 
   async syncAccount(userId: string, accountId: string): Promise<ChannelAccount> {
     const account = await this.getAccount(userId, accountId);
-    if (account.type === 'wechat') {
-      if (this.wechatRuntimeManager) {
-        await this.wechatRuntimeManager.syncAccount(userId, accountId);
-      }
-    } else if (this.runtimeManager) {
-      await this.runtimeManager.syncAccount(userId, accountId);
+    this.assertSupportedType(account.type);
+    const lifecycle = this.lifecycleFor(account.type);
+    if (lifecycle) {
+      await lifecycle.syncAccount(userId, accountId);
     }
     return account;
   }

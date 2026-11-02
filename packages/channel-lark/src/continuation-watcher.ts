@@ -9,7 +9,7 @@
 
 import { randomUUID, createHash } from 'node:crypto';
 import type { TenantScopedChannelRepository } from '@enkeep/platform-core';
-import type { LarkTransport, OutboundReplyPayload, StreamEventSource } from './types.js';
+import type { LarkTransport, OutboundReplyPayload, StreamAssistantEvent, StreamEventSource } from './types.js';
 import type { LarkBackgroundPanelManager } from './background-panel.js';
 import { StreamingReplyTracker } from './streaming-tracker.js';
 
@@ -321,6 +321,9 @@ export class ContinuationWatcher {
               }
               return;
             }
+            if (this.skipForeignOrigin(origin, runningEvt, events)) {
+              return;
+            }
             targetCardParams = {
               chatId: origin.chatId,
               replyToMessageId: origin.replyToMessageId || undefined,
@@ -334,6 +337,9 @@ export class ContinuationWatcher {
             origin = await this.streamEventSource.resolveTurnOrigin(runningEvt.turnId, this.sessionRouteId);
           }
           if (origin) {
+            if (this.skipForeignOrigin(origin, runningEvt, events)) {
+              return;
+            }
             targetCardParams = {
               chatId: origin.chatId,
               replyToMessageId: origin.replyToMessageId || undefined,
@@ -455,6 +461,39 @@ export class ContinuationWatcher {
     } finally {
       this.isTicking = false;
     }
+  }
+
+  /**
+   * A route can be shared by several channels (Lark, WeChat, Web, Jarvis). Autonomous turns are
+   * delivered only to the channel their causal origin came from: an origin recorded for another
+   * channel is skipped here (the cursor moves past the turn) instead of being sent to a Lark chat.
+   * Origins without a channel field are treated as Lark for backward compatibility.
+   */
+  private skipForeignOrigin(
+    origin: { channel?: string | null } | null | undefined,
+    runningEvt: StreamAssistantEvent,
+    events: readonly StreamAssistantEvent[]
+  ): boolean {
+    const channel = typeof origin?.channel === 'string' ? origin.channel.trim() : '';
+    if (!channel || channel === 'lark') {
+      return false;
+    }
+    console.info('[lark-cont] autonomous turn originated from another channel, skipping Lark delivery', {
+      routeId: this.sessionRouteId,
+      turnId: runningEvt.turnId,
+      originTurnId: runningEvt.originTurnId,
+      originChannel: channel,
+    });
+    const terminal = runningEvt.turnId
+      ? events.find(
+          (e) => e.turnId === runningEvt.turnId && e.type === 'turn_status' && (e.status === 'completed' || e.status === 'failed')
+        )
+      : undefined;
+    const skipTo = terminal ? terminal.rowId : runningEvt.rowId;
+    if (skipTo > this.cursor) {
+      this.cursor = skipTo;
+    }
+    return true;
   }
 
   private async recordOutboxDelivery(

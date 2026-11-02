@@ -596,6 +596,8 @@ export {
   ALLOWED_CHANNEL_BINDING_CREATE_KEYS,
   ALLOWED_CHANNEL_BINDING_UPDATE_KEYS,
   ALLOWED_ONBOARDING_JOB_CREATE_KEYS,
+  BUILTIN_CHANNEL_ACCOUNT_TYPES,
+  type ChannelAccountLifecycle,
 } from './channels/channel-routes.js';
 export {
   ChannelRuntimeManager,
