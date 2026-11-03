@@ -246,6 +246,12 @@ export class PlatformJarvisSource implements JarvisChannelSource {
   private readonly deltas = new Map<string, DeltaState>();
   /** Last rev listed per session: never goes backwards within this connection. */
   private readonly revs = new Map<string, { base: number; rev: number }>();
+  /** done / idle of a session's latest finished turn, valid while its key (event watermark + latest turn) holds. */
+  private readonly finished = new Map<string, { key: string; status: 'done' | 'idle' }>();
+  /** Where turns came from, once resolved (continuation chains grow one turn at a time: resolve incrementally). */
+  private readonly origins = new Map<string, 'chat' | 'jarvis' | 'task' | 'none'>();
+  /** When this Jarvis account was created (ms); null once looked up and unknown. */
+  private accountCreatedMs: number | null | undefined;
   private closed = false;
 
   constructor(options: PlatformJarvisSourceOptions) {
@@ -834,7 +840,8 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     );
   }
 
-  private async statusOf(routeId: string, hasReply: boolean): Promise<JarvisSessionRow['status']> {
+  private async statusOf(route: RouteRow, watermark: number | undefined): Promise<JarvisSessionRow['status']> {
+    const routeId = route.id;
     if ((this.options.approvals?.listPending({ userId: this.userId, sessionId: routeId }) ?? []).length > 0) return 'blocked';
     if ((this.options.questions?.listPending({ userId: this.userId, sessionId: routeId }) ?? []).length > 0) return 'blocked';
     let turn: { status: string } | null = null;
@@ -845,7 +852,165 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     }
     if (turn?.status === 'waiting_approval' || turn?.status === 'recovery_required') return 'blocked';
     if (turn?.status === 'running' || turn?.status === 'queued') return 'working';
-    return hasReply ? 'done' : 'idle';
+    // A turn the runtime started by itself (a continuation after background work) is in no turn record.
+    if (this.options.events?.activeTurn(this.userId, route.dsh_session_id, this.now())) return 'working';
+    return this.finishedStatus(route, watermark);
+  }
+
+  /**
+   * done or idle (issue #96): `idle` tells Jarvis the result was already seen elsewhere (shown as seen, no "done"
+   * push); `done` leaves it unseen until opened in the app. Decided by the session's latest finished turn:
+   *   - started in a chat channel (Lark, WeChat…), including its continuations and tasks delivered there → idle;
+   *   - started in Jarvis, including its continuations → done;
+   *   - a scheduled task that went to no chat → done;
+   *   - started in the Web UI (no origin record) or unknown → idle;
+   *   - finished before this Jarvis account existed → idle (no flood of unseen sessions on first connect).
+   * No finished turn → idle. Cached per session until its event watermark or latest turn record changes.
+   */
+  private finishedStatus(route: RouteRow, watermark: number | undefined): 'done' | 'idle' {
+    const platform = this.db
+      .prepare(
+        "SELECT turn_id, finished_at FROM turn_runs WHERE route_id = ? AND +user_id = ? AND +status IN ('completed', 'failed', 'interrupted') ORDER BY rowid DESC LIMIT 1"
+      )
+      .get(route.id, this.userId) as { turn_id: string; finished_at: string | null } | undefined;
+    const key = `${watermark ?? ''}|${platform?.turn_id ?? ''}`;
+    const cached = this.finished.get(route.id);
+    if (cached && cached.key === key) return cached.status;
+
+    const status = this.classifyFinished(route, platform);
+    this.finished.delete(route.id);
+    this.finished.set(route.id, { key, status });
+    if (this.finished.size > MAX_CACHED_REVS) this.finished.delete(this.finished.keys().next().value as string);
+    return status;
+  }
+
+  private classifyFinished(route: RouteRow, platform: { turn_id: string; finished_at: string | null } | undefined): 'done' | 'idle' {
+    let latest: { finishedMs: number; originTurnId: string | undefined } | undefined;
+    if (platform) latest = { finishedMs: timestampMs(platform.finished_at) ?? 0, originTurnId: platform.turn_id };
+    const autonomous = this.latestAutonomousTurn(route);
+    if (autonomous && (!latest || autonomous.finishedMs > latest.finishedMs)) {
+      latest = { finishedMs: autonomous.finishedMs, originTurnId: autonomous.originTurnId };
+    }
+    if (!latest) return 'idle';
+    const accountCreated = this.accountCreatedAt();
+    if (accountCreated !== null && latest.finishedMs > 0 && latest.finishedMs < accountCreated) return 'idle';
+    if (!latest.originTurnId) return 'idle';
+    switch (this.originOf(route, latest.originTurnId)) {
+      case 'jarvis':
+      case 'task':
+        return 'done';
+      default:
+        return 'idle';
+    }
+  }
+
+  /**
+   * The newest finished turn of the session that is not one of its turn records: an autonomous turn the runtime
+   * ran by itself, known only from its `turn_status` event (whose `originTurnId` names the turn that started the
+   * background work). Looks at the session's newest 2000 events only, through the session index.
+   */
+  private latestAutonomousTurn(route: RouteRow): { finishedMs: number; originTurnId: string | undefined } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT payload, created_at FROM web_events
+          WHERE session_id = ? AND +user_id = ? AND type = 'turn_status'
+            AND +rowid >= COALESCE((SELECT rowid FROM web_events WHERE session_id = ? ORDER BY rowid DESC LIMIT 1 OFFSET 1999), 0)
+            AND json_extract(payload, '$.status') IN ('completed', 'failed', 'interrupted')
+          ORDER BY rowid DESC LIMIT 1`
+      )
+      .get(route.id, this.userId, route.id) as { payload: string; created_at: string | null } | undefined;
+    if (!row) return undefined;
+    let payload: { turnId?: unknown; originTurnId?: unknown } = {};
+    try {
+      payload = JSON.parse(row.payload) as typeof payload;
+    } catch {
+      return undefined;
+    }
+    const turnId = typeof payload.turnId === 'string' && payload.turnId.length > 0 ? payload.turnId : undefined;
+    if (turnId && this.isTurnRecord(route, turnId)) return undefined; // a platform turn: its record says it all
+    const originTurnId = typeof payload.originTurnId === 'string' && payload.originTurnId.length > 0 ? payload.originTurnId : undefined;
+    return { finishedMs: timestampMs(row.created_at ?? undefined) ?? 0, originTurnId };
+  }
+
+  private isTurnRecord(route: RouteRow, turnId: string): boolean {
+    return (
+      this.db
+        .prepare('SELECT 1 AS x FROM turn_runs WHERE user_id = ? AND route_id = ? AND turn_id = ? LIMIT 1')
+        .get(this.userId, route.id, turnId) !== undefined
+    );
+  }
+
+  /**
+   * Where a turn came from: a chat channel, Jarvis, a scheduled task, or nothing recorded (Web UI, older turns).
+   * A continuation names the turn before it (itself possibly a continuation), so chains are followed up to 50
+   * turns back; every turn on a resolved path is remembered, so a growing chain costs one step per new turn.
+   */
+  private originOf(route: RouteRow, turnId: string): 'chat' | 'jarvis' | 'task' | 'none' {
+    const path: string[] = [];
+    let result: 'chat' | 'jarvis' | 'task' | 'none' | undefined;
+    let current: string | undefined = turnId;
+    for (let hop = 0; current && hop < 50; hop++) {
+      const known = this.origins.get(current);
+      if (known) {
+        result = known;
+        break;
+      }
+      path.push(current);
+      const origin = this.db
+        .prepare('SELECT channel, origin_turn_id FROM channel_turn_origins WHERE turn_id = ? AND +user_id = ? LIMIT 1')
+        .get(current, this.userId) as { channel: string | null; origin_turn_id: string | null } | undefined;
+      if (origin?.channel) {
+        result = origin.channel === 'jarvis' ? 'jarvis' : 'chat';
+        break;
+      }
+      if (this.db.prepare('SELECT 1 AS x FROM task_runs WHERE turn_id = ? AND +user_id = ? LIMIT 1').get(current, this.userId) !== undefined) {
+        result = 'task';
+        break;
+      }
+      // A platform turn with no origin record: the Web UI (or a chat turn from before origins were recorded).
+      if (this.isTurnRecord(route, current)) {
+        result = 'none';
+        break;
+      }
+      // An autonomous turn: follow the turn that started it.
+      const next: string | undefined = origin?.origin_turn_id ?? this.autonomousOriginOf(route, current);
+      if (!next || path.includes(next)) break;
+      current = next;
+    }
+    if (result === undefined) return 'none'; // not resolvable (yet): treat as seen
+    for (const id of path) {
+      this.origins.set(id, result);
+      if (this.origins.size > MAX_CACHED_REVS * 5) this.origins.delete(this.origins.keys().next().value as string);
+    }
+    return result;
+  }
+
+  /** The `originTurnId` of an autonomous turn's own `turn_status` event (newest 2000 events of the session). */
+  private autonomousOriginOf(route: RouteRow, turnId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT json_extract(payload, '$.originTurnId') AS origin FROM web_events
+          WHERE session_id = ? AND +user_id = ? AND type = 'turn_status'
+            AND +rowid >= COALESCE((SELECT rowid FROM web_events WHERE session_id = ? ORDER BY rowid DESC LIMIT 1 OFFSET 1999), 0)
+            AND json_extract(payload, '$.turnId') = ?
+            AND json_extract(payload, '$.originTurnId') IS NOT NULL
+          ORDER BY rowid DESC LIMIT 1`
+      )
+      .get(route.id, this.userId, route.id, turnId) as { origin: string | null } | undefined;
+    return typeof row?.origin === 'string' && row.origin.length > 0 ? row.origin : undefined;
+  }
+
+  private accountCreatedAt(): number | null {
+    if (this.accountCreatedMs !== undefined) return this.accountCreatedMs;
+    try {
+      const row = this.db
+        .prepare('SELECT created_at FROM channel_accounts WHERE id = ? AND user_id = ? LIMIT 1')
+        .get(this.options.accountId, this.userId) as { created_at: string | null } | undefined;
+      this.accountCreatedMs = timestampMs(row?.created_at ?? undefined) ?? null;
+    } catch {
+      this.accountCreatedMs = null;
+    }
+    return this.accountCreatedMs;
   }
 
   private runtimeCwd(folder: string, executionMode: string | null | undefined): string {
@@ -872,8 +1037,9 @@ export class PlatformJarvisSource implements JarvisChannelSource {
       )
       .get(route.id, this.userId) as { content: string | null } | undefined;
     const messageAt = lastMessageAt ?? this.lastMessageAtOf(route.id);
-    const status = await this.statusOf(route.id, last !== undefined);
-    const rev = this.revOf(route);
+    const watermark = this.watermarkOf(route.id);
+    const status = await this.statusOf(route, watermark);
+    const rev = this.revOf(route, watermark);
     const updatedMs = this.activityMs(route, messageAt) || this.now();
     const lastText = typeof last?.content === 'string' ? truncateChars(last.content.trim(), JARVIS_LAST_TEXT_CHARS) : '';
     return {
@@ -895,15 +1061,7 @@ export class PlatformJarvisSource implements JarvisChannelSource {
    * (the watermark alone or the seq alone would jump backwards on that switch). Per connection
    * it never goes backwards, even when the DSH log is replaced (session reset) or forgotten.
    */
-  private revOf(route: RouteRow): number | undefined {
-    let watermark: number | undefined;
-    try {
-      const w = this.db
-        // Through the session index (`+user_id`: not the user index, which scans all the user's events).
-        .prepare('SELECT MAX(rowid) AS w FROM web_events WHERE session_id = ? AND +user_id = ?')
-        .get(route.id, this.userId) as { w: number | bigint | null } | undefined;
-      if (w?.w !== null && w?.w !== undefined) watermark = Number(w.w);
-    } catch {}
+  private revOf(route: RouteRow, watermark: number | undefined): number | undefined {
     const seq = this.options.events?.lastSeq(this.userId, route.dsh_session_id);
     if (watermark === undefined && seq === undefined) return this.revs.get(route.id)?.rev;
     const base = (watermark ?? 0) + (seq !== undefined ? seq + 1 : 0);
@@ -917,6 +1075,17 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     this.revs.set(route.id, { base, rev });
     if (this.revs.size > MAX_CACHED_REVS) this.revs.delete(this.revs.keys().next().value as string);
     return rev;
+  }
+
+  /** The session's newest event row (through the session index; `+user_id` keeps SQLite off the user index). */
+  private watermarkOf(routeId: string): number | undefined {
+    try {
+      const w = this.db
+        .prepare('SELECT MAX(rowid) AS w FROM web_events WHERE session_id = ? AND +user_id = ?')
+        .get(routeId, this.userId) as { w: number | bigint | null } | undefined;
+      if (w?.w !== null && w?.w !== undefined) return Number(w.w);
+    } catch {}
+    return undefined;
   }
 
   private activeSpaces(): SpaceRow[] {
