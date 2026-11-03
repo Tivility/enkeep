@@ -157,6 +157,7 @@ describe('PlatformJarvisSource', () => {
   let storage: SqlitePlatformStorage;
   let jarvisAccountId: string;
   let wechatAccountId: string;
+  let larkAccountId: string;
   let bridge: ApprovalBridge;
   let questions: QuestionBridge;
   let hub: RuntimeSessionEventHub;
@@ -189,6 +190,46 @@ describe('PlatformJarvisSource', () => {
       .run(`msg_${Math.random().toString(16).slice(2)}`, route, ALICE, role, content, createdAt);
   }
 
+  /** The Jarvis account was created a day ago (turns after that count; turns before it are history). */
+  function accountCreatedDaysAgo(days = 1) {
+    db.prepare(`UPDATE channel_accounts SET created_at = ? WHERE id = ?`).run(sqliteTime(days * 24 * 3600 * 1000), jarvisAccountId);
+  }
+
+  const sqliteTime = (msAgo: number) => new Date(Date.now() - msAgo).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+
+  let turnCounter = 0;
+  /** A finished platform turn of the route (turn_runs), optionally attributed to a channel. */
+  function finishTurn(route: string, opts: { msAgo?: number; status?: string; channel?: 'lark' | 'wechat' | 'jarvis'; accountId?: string } = {}): string {
+    const turnId = `turn_seen_${String(++turnCounter).padStart(4, '0')}`;
+    const space = route === ROUTE_IDLE ? SPACE_B : SPACE_A;
+    db.prepare(`INSERT INTO turn_runs (id, user_id, space_id, route_id, turn_id, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(`tr_${turnId}`, ALICE, space, route, turnId, opts.status ?? 'completed', iso((opts.msAgo ?? 1000) + 500), iso(opts.msAgo ?? 1000));
+    if (opts.channel) origin(turnId, route, opts.channel, opts.accountId);
+    return turnId;
+  }
+
+  function origin(turnId: string, route: string, channel: 'lark' | 'wechat' | 'jarvis', accountId?: string) {
+    const account = accountId ?? (channel === 'jarvis' ? jarvisAccountId : channel === 'wechat' ? wechatAccountId : larkAccountId);
+    db.prepare(`INSERT INTO channel_turn_origins (turn_id, user_id, session_id, account_id, channel, chat_id, native_context_id, native_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(turnId, ALICE, route, account, channel, `${channel}:chat-test-01`, `${channel}:ctx-test-01`, `evt_${turnId}`);
+  }
+
+  /** The turn was run for a scheduled task. */
+  function taskTurn(turnId: string, route: string) {
+    const taskId = `task_${turnId}`;
+    db.prepare(`INSERT INTO platform_tasks (id, user_id, title) VALUES (?, ?, 'Synthetic task')`).run(taskId, ALICE);
+    db.prepare(`INSERT INTO task_runs (id, task_id, user_id, status, turn_id, session_id) VALUES (?, ?, ?, 'completed', ?, ?)`)
+      .run(`run_${turnId}`, taskId, ALICE, turnId, route);
+  }
+
+  /** An autonomous continuation turn (no turn record): only its turn_status event, naming the turn that started it. */
+  function autonomousTurn(route: string, originTurnId: string | undefined, opts: { msAgo?: number; status?: string } = {}): string {
+    const turnId = `turn_auto_${String(++turnCounter).padStart(4, '0')}`;
+    db.prepare(`INSERT INTO web_events (id, session_id, user_id, type, payload, created_at) VALUES (?, ?, ?, 'turn_status', ?, ?)`)
+      .run(`evt_${turnId}`, route, ALICE, JSON.stringify({ status: opts.status ?? 'completed', turnId, ...(originTurnId ? { originTurnId } : {}) }), iso(opts.msAgo ?? 500));
+    return turnId;
+  }
+
   beforeEach(async () => {
     db = new DatabaseSync(':memory:');
     await new PlatformServerMigrationRunner(db).migrate(ALL_PLATFORM_MIGRATIONS);
@@ -200,6 +241,7 @@ describe('PlatformJarvisSource', () => {
     storage = new SqlitePlatformStorage({ database: db });
     jarvisAccountId = (await storage.forTenant(ALICE).channels.createAccount({ type: 'jarvis', status: 'active' })).id;
     wechatAccountId = (await storage.forTenant(ALICE).channels.createAccount({ type: 'wechat', status: 'active' })).id;
+    larkAccountId = (await storage.forTenant(ALICE).channels.createAccount({ type: 'lark', status: 'disabled' })).id;
     const routes = storage.forTenant(ALICE).sessionRoutes;
     for (const [id, space, title] of [
       [ROUTE_DONE, SPACE_A, 'Synthetic done'],
@@ -241,10 +283,161 @@ describe('PlatformJarvisSource', () => {
     db.close();
   });
 
+  describe('done or idle: seen elsewhere (issue #96)', () => {
+    const statusOf = async (route: string) => (await source().getSession(route))!.status;
+
+    beforeEach(() => {
+      accountCreatedDaysAgo();
+      addMessage(ROUTE_DONE, 'assistant', 'synthetic answer');
+    });
+
+    it('a turn answered in Lark or WeChat is idle; one started in Jarvis is done', async () => {
+      finishTurn(ROUTE_DONE, { channel: 'lark' });
+      expect(await statusOf(ROUTE_DONE)).toBe('idle');
+      finishTurn(ROUTE_WECHAT, { channel: 'wechat' });
+      expect(await statusOf(ROUTE_WECHAT)).toBe('idle');
+      finishTurn(ROUTE_IDLE, { channel: 'jarvis' });
+      expect(await statusOf(ROUTE_IDLE)).toBe('done');
+    });
+
+    it('a failed or interrupted Lark turn is idle too (Lark showed it)', async () => {
+      finishTurn(ROUTE_DONE, { channel: 'lark', status: 'failed' });
+      expect(await statusOf(ROUTE_DONE)).toBe('idle');
+      finishTurn(ROUTE_IDLE, { channel: 'lark', status: 'interrupted' });
+      expect(await statusOf(ROUTE_IDLE)).toBe('idle');
+    });
+
+    it('a Web UI turn (no origin record) is idle', async () => {
+      finishTurn(ROUTE_DONE);
+      expect(await statusOf(ROUTE_DONE)).toBe('idle');
+    });
+
+    it('a task that went to no chat is done; one delivered to Lark is idle', async () => {
+      taskTurn(finishTurn(ROUTE_DONE), ROUTE_DONE);
+      expect(await statusOf(ROUTE_DONE)).toBe('done');
+      const delivered = finishTurn(ROUTE_IDLE, { channel: 'lark' });
+      taskTurn(delivered, ROUTE_IDLE);
+      expect(await statusOf(ROUTE_IDLE)).toBe('idle');
+    });
+
+    it('an autonomous continuation follows the turn that started it', async () => {
+      const lark = finishTurn(ROUTE_DONE, { channel: 'lark', msAgo: 5000 });
+      autonomousTurn(ROUTE_DONE, lark, { msAgo: 1000 });
+      expect(await statusOf(ROUTE_DONE)).toBe('idle');
+      const jarvis = finishTurn(ROUTE_IDLE, { channel: 'jarvis', msAgo: 5000 });
+      autonomousTurn(ROUTE_IDLE, jarvis, { msAgo: 1000 });
+      expect(await statusOf(ROUTE_IDLE)).toBe('done');
+      // A continuation of a continuation of a Jarvis turn.
+      const j2 = finishTurn(ROUTE_WECHAT, { channel: 'jarvis', msAgo: 9000 });
+      const a1 = autonomousTurn(ROUTE_WECHAT, j2, { msAgo: 5000 });
+      autonomousTurn(ROUTE_WECHAT, a1, { msAgo: 1000 });
+      expect(await statusOf(ROUTE_WECHAT)).toBe('done');
+    });
+
+    it('follows a long chain of continuations back to the turn that started it, and remembers it', async () => {
+      let previous = finishTurn(ROUTE_IDLE, { channel: 'jarvis', msAgo: 60_000 });
+      for (let i = 0; i < 12; i++) previous = autonomousTurn(ROUTE_IDLE, previous, { msAgo: 50_000 - i * 1000 });
+      const s = source();
+      expect((await s.getSession(ROUTE_IDLE))!.status).toBe('done');
+      // One more continuation: resolved in one step from what is remembered.
+      const prepare = db.prepare.bind(db);
+      let originLookups = 0;
+      (db as any).prepare = (sql: string) => {
+        if (sql.includes('channel_turn_origins')) originLookups++;
+        return prepare(sql);
+      };
+      try {
+        autonomousTurn(ROUTE_IDLE, previous, { msAgo: 100 });
+        expect((await s.getSession(ROUTE_IDLE))!.status).toBe('done');
+        expect(originLookups).toBe(1);
+      } finally {
+        (db as any).prepare = prepare;
+      }
+    });
+
+    it('the latest finished turn decides', async () => {
+      finishTurn(ROUTE_DONE, { channel: 'jarvis', msAgo: 5000 });
+      finishTurn(ROUTE_DONE, { channel: 'lark', msAgo: 1000 });
+      expect(await statusOf(ROUTE_DONE)).toBe('idle');
+      finishTurn(ROUTE_IDLE, { channel: 'lark', msAgo: 5000 });
+      finishTurn(ROUTE_IDLE, { channel: 'jarvis', msAgo: 1000 });
+      expect(await statusOf(ROUTE_IDLE)).toBe('done');
+      // An older autonomous turn does not override a newer platform turn.
+      const j = finishTurn(ROUTE_WECHAT, { channel: 'jarvis', msAgo: 9000 });
+      autonomousTurn(ROUTE_WECHAT, j, { msAgo: 5000 });
+      finishTurn(ROUTE_WECHAT, { channel: 'wechat', msAgo: 1000 });
+      expect(await statusOf(ROUTE_WECHAT)).toBe('idle');
+    });
+
+    it('turns that finished before the Jarvis account existed are idle (no flood on first connect)', async () => {
+      accountCreatedDaysAgo(0);
+      finishTurn(ROUTE_DONE, { channel: 'jarvis', msAgo: 60_000 });
+      expect(await statusOf(ROUTE_DONE)).toBe('idle');
+      taskTurn(finishTurn(ROUTE_IDLE, { msAgo: 60_000 }), ROUTE_IDLE);
+      expect(await statusOf(ROUTE_IDLE)).toBe('idle');
+    });
+
+    it('a session without any finished turn is idle, even with a reply', async () => {
+      expect(await statusOf(ROUTE_DONE)).toBe('idle');
+    });
+
+    it('is computed once per event watermark and latest turn', async () => {
+      finishTurn(ROUTE_DONE, { channel: 'jarvis' });
+      const s = source();
+      const prepare = db.prepare.bind(db);
+      const seen: string[] = [];
+      (db as any).prepare = (sql: string) => {
+        seen.push(sql);
+        return prepare(sql);
+      };
+      try {
+        expect((await s.getSession(ROUTE_DONE))!.status).toBe('done');
+        const originLookups = () => seen.filter((q) => q.includes('channel_turn_origins')).length;
+        const first = originLookups();
+        expect(first).toBeGreaterThan(0);
+        expect((await s.getSession(ROUTE_DONE))!.status).toBe('done');
+        expect(originLookups()).toBe(first); // cached
+        finishTurn(ROUTE_DONE, { channel: 'lark' });
+        expect((await s.getSession(ROUTE_DONE))!.status).toBe('idle');
+        expect(originLookups()).toBeGreaterThan(first);
+      } finally {
+        (db as any).prepare = prepare;
+      }
+    });
+
+    it('an autonomous turn in flight is working, until it ends, its runtime goes away or it goes silent', async () => {
+      finishTurn(ROUTE_DONE, { channel: 'lark' });
+      const s = source();
+      const events = recorder();
+      s.subscribe(events);
+      transport.sessionEvent(dsh(ROUTE_DONE), { seq: 10, type: 'turn/start', data: {} });
+      await tick();
+      expect((await s.getSession(ROUTE_DONE))!.status).toBe('working');
+      expect(events.log.some(([kind]) => kind === 'sessionsChanged')).toBe(true);
+      transport.sessionEvent(dsh(ROUTE_DONE), { seq: 11, type: 'turn/end', data: {} });
+      await tick();
+      expect((await s.getSession(ROUTE_DONE))!.status).toBe('idle');
+
+      transport.sessionEvent(dsh(ROUTE_DONE), { seq: 12, type: 'turn/start', data: {} });
+      await tick();
+      expect((await s.getSession(ROUTE_DONE))!.status).toBe('working');
+      hub.detachTransport(ALICE);
+      expect((await s.getSession(ROUTE_DONE))!.status).toBe('idle');
+
+      hub.attachTransport(ALICE, transport as any);
+      transport.sessionEvent(dsh(ROUTE_DONE), { seq: 13, type: 'turn/start', data: {} });
+      await tick();
+      const later = source({ now: () => Date.now() + 3 * 60 * 60 * 1000 });
+      expect((await later.getSession(ROUTE_DONE))!.status).toBe('idle'); // silent for 3 h: not working any more
+    });
+  });
+
   describe('session rows', () => {
     it('lists active, recent or busy sessions of the user with status, rev, last text and cwd', async () => {
+      accountCreatedDaysAgo();
       addMessage(ROUTE_DONE, 'user', 'synthetic question');
       addMessage(ROUTE_DONE, 'assistant', `synthetic answer ${'x'.repeat(300)}`);
+      finishTurn(ROUTE_DONE, { channel: 'jarvis' });
       db.prepare(`INSERT INTO web_events (id, session_id, user_id, type, payload) VALUES ('evt_test_0001', ?, ?, 'message', '{}')`).run(ROUTE_IDLE, ALICE);
       transport.sessionEvent(dsh(ROUTE_DONE), { seq: 41, type: 'turn/end', data: {} });
       transport.ask(dsh(ROUTE_OLD_BLOCKED), '00000000-0000-4000-8000-0000000000b1');
@@ -278,7 +471,11 @@ describe('PlatformJarvisSource', () => {
     });
 
     it('lists through the per-session indexes, never scanning or sorting all of the user\'s rows', async () => {
+      accountCreatedDaysAgo();
       addMessage(ROUTE_DONE, 'assistant', 'synthetic reply');
+      const t = finishTurn(ROUTE_DONE, { msAgo: 5000 });
+      autonomousTurn(ROUTE_DONE, t, { msAgo: 1000 });
+      taskTurn(finishTurn(ROUTE_IDLE), ROUTE_IDLE);
       // Every statement the listing prepares: none may use the per-user indexes (a scan of all the user's events or
       // messages blocked the event loop for seconds on a large database) or sort in a temp b-tree.
       const statements: string[] = [];
@@ -292,12 +489,12 @@ describe('PlatformJarvisSource', () => {
       } finally {
         (db as any).prepare = prepare;
       }
-      const touchingBigTables = [...new Set(statements)].filter((sql) => /\b(web_events|web_messages)\b/.test(sql));
+      const touchingBigTables = [...new Set(statements)].filter((sql) => /\b(web_events|web_messages|turn_runs|channel_turn_origins|task_runs)\b/.test(sql));
       expect(touchingBigTables.length).toBeGreaterThan(0);
       for (const sql of touchingBigTables) {
         const args = (sql.match(/\?/g) ?? []).map(() => 'x');
         const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args) as Array<{ detail: string }>).map((r) => r.detail).join(' | ');
-        expect(plan, sql).not.toMatch(/idx_web_(events|messages)_user_id|TEMP B-TREE|SCAN web_/);
+        expect(plan, sql).not.toMatch(/idx_\w+_user(_id)?\b|TEMP B-TREE|SCAN (web_|turn_runs|channel_turn_origins|task_runs)/);
       }
     });
 

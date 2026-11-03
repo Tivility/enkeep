@@ -79,6 +79,11 @@ export interface SessionEventRuntimeTransport {
 export interface RuntimeSessionEventHubOptions {
   /** Max DSH sessions whose newest seq is remembered. Default 5000. */
   readonly maxTrackedSessions?: number;
+  /**
+   * An agent turn (DSH `turn/start` without its `turn/end`) with no event for this long no longer counts
+   * as running: its runtime may have died without the hub noticing. Default 2 hours.
+   */
+  readonly activeTurnStaleMs?: number;
   readonly logger?: { warn(message: string, meta?: Record<string, unknown>): void };
 }
 
@@ -117,12 +122,16 @@ export class RuntimeSessionEventHub {
   private readonly attachments = new Map<string, Attachment>();
   private readonly listeners = new Map<string, Set<RuntimeSessionEventListener>>();
   private readonly seqs = new Map<string, SeqMark>();
+  /** Agent turns in flight per user + DSH session (seen `turn/start`, not yet `turn/end`): when started, last event. */
+  private readonly turns = new Map<string, { since: number; at: number }>();
+  private readonly activeTurnStaleMs: number;
   private readonly maxTracked: number;
   private readonly logger: { warn(message: string, meta?: Record<string, unknown>): void };
   private disposed = false;
 
   constructor(options: RuntimeSessionEventHubOptions = {}) {
     this.maxTracked = options.maxTrackedSessions ?? 5000;
+    this.activeTurnStaleMs = options.activeTurnStaleMs ?? 2 * 60 * 60 * 1000;
     this.logger = options.logger ?? {
       warn: (message, meta) => console.warn(`[session-event-hub] ${message}`, meta ?? {}),
     };
@@ -199,6 +208,7 @@ export class RuntimeSessionEventHub {
       if (options.slot !== undefined && attachment.slot !== options.slot) continue;
       this.unsubscribe(attachment);
       this.attachments.delete(attachment.key);
+      this.forgetTurns(userId);
       this.emitChange({ userId, slot: attachment.slot, state: 'detached' });
     }
   }
@@ -233,6 +243,20 @@ export class RuntimeSessionEventHub {
     return this.seqs.get(seqKey(userId, dshSessionId))?.seq;
   }
 
+  /**
+   * The agent turn running in a session right now, as seen live: any turn, including the autonomous ones the
+   * runtime starts by itself (continuations after background work) that the platform's turn records never show.
+   * Undefined when none is running, or when the turn has been silent for longer than `activeTurnStaleMs`.
+   * Forgotten when the user's runtime transport detaches; not known across a platform restart until the turn's
+   * next `turn/start`.
+   */
+  activeTurn(userId: string, dshSessionId: string, now: number = Date.now()): { since: number } | undefined {
+    const turn = this.turns.get(seqKey(userId, dshSessionId));
+    if (!turn) return undefined;
+    if (now - turn.at > this.activeTurnStaleMs) return undefined;
+    return { since: turn.since };
+  }
+
   /** When the newest event of a session was seen (ms since epoch). */
   lastActivityAt(userId: string, dshSessionId: string): number | undefined {
     return this.seqs.get(seqKey(userId, dshSessionId))?.at;
@@ -258,6 +282,15 @@ export class RuntimeSessionEventHub {
     this.attachments.clear();
     this.listeners.clear();
     this.seqs.clear();
+    this.turns.clear();
+  }
+
+  /** A runtime of the user went away: its turns in flight are gone with it (or unknown until they say otherwise). */
+  private forgetTurns(userId: string): void {
+    const prefix = seqKey(userId, '');
+    for (const key of Array.from(this.turns.keys())) {
+      if (key.startsWith(prefix)) this.turns.delete(key);
+    }
   }
 
   // ──────────────────────────── Internals ────────────────────────────
@@ -266,8 +299,18 @@ export class RuntimeSessionEventHub {
     if (!dshSessionId || !Number.isSafeInteger(seq) || seq < 0 || !isRecord(raw) || typeof raw.type !== 'string') return;
     const event = (typeof raw.seq === 'number' ? raw : { ...raw, seq }) as HubSessionEvent['event'];
     this.noteSeq(userId, dshSessionId, seq, timestamp);
-    const mark = this.seqs.get(seqKey(userId, dshSessionId));
+    const key = seqKey(userId, dshSessionId);
+    const mark = this.seqs.get(key);
     if (mark && mark.seq === seq) mark.at = timestamp;
+    if (raw.type === 'turn/start') {
+      this.turns.set(key, { since: timestamp, at: timestamp });
+      while (this.turns.size > this.maxTracked) this.turns.delete(this.turns.keys().next().value as string);
+    } else if (raw.type === 'turn/end') {
+      this.turns.delete(key);
+    } else {
+      const turn = this.turns.get(key);
+      if (turn && timestamp > turn.at) turn.at = timestamp;
+    }
     const payload: HubSessionEvent = {
       userId,
       dshSessionId,

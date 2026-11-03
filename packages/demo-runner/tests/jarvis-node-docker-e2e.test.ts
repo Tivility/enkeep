@@ -273,6 +273,82 @@ describe.skipIf(!JARVISD)('Jarvis channel with a real jarvisd node (Docker)', ()
     const b = h.batches(sid);
     expect(b.slice(1).filter((x, i) => x.from_seq !== b[i].to_seq)).toEqual([]);
 
+    // ---- done or idle (issue #96): where the latest turn came from decides whether Jarvis treats it as unseen ----
+    const routeId = sid.slice(`${DAEMON_ID}.`.length);
+    const rowStatus = async () => ((await h.call('sessions.list')).sessions ?? []).find((s: any) => s.session_id === sid)?.status;
+    // The turn sent from the phone above: unseen until opened in the app.
+    await until('a Jarvis-started turn listed as done', async () => (await rowStatus()) === 'done', 60_000);
+
+    // A turn sent from the Web UI: the user was at the computer, so it counts as seen.
+    const webSend = await fetch(`${url}/api/sessions/${routeId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Enkeep-CSRF': admin.csrfToken, 'Idempotency-Key': randomUUID(), Origin: url, Cookie: admin.cookie },
+      body: JSON.stringify({ content: 'sent from the web page' }),
+    });
+    expect(webSend.ok).toBe(true);
+    await until('the web turn reply', () => h.items(sid).some((i) => i.role === 'assistant' && /sent from the web page/.test(i.text ?? '')), 120_000);
+    await until('a Web UI turn listed as idle', async () => (await rowStatus()) === 'idle', 60_000);
+
+    // Back on the phone: done again.
+    await h.call('session.send', { session_id: sid, text: 'back on the phone', client_msg_id: 'm-seen-1' });
+    await until('the phone turn reply', () => h.items(sid).some((i) => i.role === 'assistant' && /back on the phone/.test(i.text ?? '')), 120_000);
+    await until('a Jarvis-started turn listed as done again', async () => (await rowStatus()) === 'done', 60_000);
+
+    // A turn that came from a Lark chat (a synthetic, disabled Lark account: nothing is ever sent to Lark; the inbox
+    // has no event for it, so the Lark manager has nothing to deliver).
+    const adminId = (system.database.prepare('SELECT id FROM users WHERE username = ?').get(reset.credentials.admin.username) as { id: string }).id;
+    const lark = await system.storage.forTenant(adminId).channels.createAccount({ type: 'lark', status: 'disabled' });
+    const nativeEventId = 'om_test0000000000000000000000000001';
+    const chat = 'oc_test0000000000000000000000000001';
+    const dispatched = await (system.platformServer.runtimeGateway as any).dispatchInbound({
+      id: `idem_lark_${lark.id}_${nativeEventId}`,
+      userId: adminId,
+      sessionId: routeId,
+      content: 'asked in a Lark chat',
+      timestamp: new Date().toISOString(),
+      channelContext: { channel: 'lark', accountId: lark.id, chatId: chat, nativeContextId: chat, nativeEventId, senderId: 'ou_test0000000000000000000000000001', chatType: 'p2p' },
+    });
+    expect(dispatched?.turnId).toBeTruthy();
+    const larkOrigin = system.database.prepare('SELECT channel FROM channel_turn_origins WHERE turn_id = ?').get(dispatched.turnId) as { channel: string } | undefined;
+    expect(larkOrigin?.channel).toBe('lark');
+    await until('the Lark turn reply', () => h.items(sid).some((i) => i.role === 'assistant' && /asked in a Lark chat/.test(i.text ?? '')), 120_000);
+    await until('a Lark-started turn listed as idle', async () => (await rowStatus()) === 'idle', 60_000);
+
+    // ---- autonomous continuations (issue #96): the runtime's own turns after background work show as working,
+    // and their result counts as unseen when the chain started in Jarvis. In a second session: the demo model starts
+    // a background job on every turn it reads the marker in, so the chain goes on until the runtime is torn down;
+    // every turn first runs a 3 s command, so a running continuation can be seen.
+    const { session: second } = await h.call('session.start', { launcher: 'enkeep', cwd });
+    const sid2: string = second.session_id;
+    const route2 = sid2.slice(`${DAEMON_ID}.`.length);
+    await h.call('session.send', { session_id: sid2, text: 'start background work [enkeep-test-tool-call=bash:{"command":"sleep 3","description":"e2e foreground"}] [enkeep-test-tool-call=bash:{"command":"sleep 1; echo jarvis-e2e-bg","description":"e2e background","run_in_background":true}]', client_msg_id: 'm-auto-1' });
+    const latestTurnStatus = () => {
+      const r = system!.database.prepare("SELECT payload FROM web_events WHERE session_id = ? AND type = 'turn_status' ORDER BY rowid DESC LIMIT 1").get(route2) as { payload: string } | undefined;
+      return r ? (JSON.parse(r.payload) as { status: string; turnId?: string; originTurnId?: string }) : undefined;
+    };
+    const platformRunning = () => system!.database.prepare("SELECT COUNT(*) AS n FROM turn_runs WHERE route_id = ? AND status IN ('queued', 'running')").get(route2) as { n: number };
+    const autonomousCompleted = () => (system!.database.prepare("SELECT COUNT(*) AS n FROM web_events WHERE session_id = ? AND type = 'turn_status' AND json_extract(payload, '$.status') = 'completed' AND json_extract(payload, '$.turnId') LIKE 'turn_auto_%'").get(route2) as { n: number }).n;
+    let sawAutonomousWorking = false;
+    let sawChainDone = false;
+    const autoEnd = Date.now() + 120_000;
+    while (Date.now() < autoEnd && !(sawAutonomousWorking && sawChainDone)) {
+      const st = ((await h.call('sessions.list')).sessions ?? []).find((x: any) => x.session_id === sid2)?.status;
+      const last = latestTurnStatus();
+      const auto = last?.turnId?.startsWith('turn_auto_') === true;
+      if (st === 'working' && auto && last?.status === 'running' && platformRunning().n === 0) sawAutonomousWorking = true;
+      if (st === 'done' && auto && last?.status === 'completed' && autonomousCompleted() >= 2) sawChainDone = true;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (!(sawAutonomousWorking && sawChainDone)) {
+      console.log('AUTO turn_status', JSON.stringify(system!.database.prepare("SELECT payload, created_at FROM web_events WHERE session_id = ? AND type IN ('turn_status', 'turn_failed', 'turn_cancelled') ORDER BY rowid").all(route2)));
+      console.log('AUTO turn_runs', JSON.stringify(system!.database.prepare('SELECT turn_id, status, error FROM turn_runs WHERE route_id = ?').all(route2)));
+      console.log('AUTO all turn_runs', JSON.stringify(system!.database.prepare("SELECT route_id, turn_id, status, error, started_at, finished_at FROM turn_runs ORDER BY rowid DESC LIMIT 8").all()));
+      console.log('AUTO items', JSON.stringify(h.items(sid2).map((i) => ({ seq: i.seq, role: i.role, kind: i.kind, text: String(i.text ?? '').slice(0, 120) }))));
+    }
+    expect(autonomousCompleted()).toBeGreaterThanOrEqual(2);
+    expect(sawAutonomousWorking).toBe(true); // a continuation in flight: no turn record, still working
+    expect(sawChainDone).toBe(true); // continuation of continuation of a Jarvis turn: unseen
+
     // ---- a slash command is refused, nothing is sent ----
     await expect(h.call('session.send', { session_id: sid, text: '/status', client_msg_id: 'm-2' })).rejects.toThrow();
 
@@ -319,7 +395,7 @@ describe.skipIf(!JARVISD)('Jarvis channel with a real jarvisd node (Docker)', ()
     await until('the answer as a tool result', () => h.items(sid).some((i) => i.kind === 'tool_result' && /sqlite/.test(i.text ?? '')), 120_000);
 
     // ---- a slow reply: live text, then an interrupt from the phone ----
-    await h.call('session.send', { session_id: sid, text: 'say something long [enkeep-test-delay-ms=30000]', client_msg_id: 'm-7' });
+    await h.call('session.send', { session_id: sid, text: 'say something long [enkeep-test-delay-ms=10000]', client_msg_id: 'm-7' });
     await until('working', async () => ((await h.call('sessions.list')).sessions ?? []).find((s: any) => s.session_id === sid)?.status === 'working', 60_000);
     await h.call('session.interrupt', { session_id: sid });
     await until('the interrupt notice', () => h.items(sid).some((i) => i.kind === 'notice' && i.text === '已中断'), 120_000);

@@ -113,11 +113,30 @@ jarvisd node 和 enkeep 在同一台 Mac 上时，走 127.0.0.1 就够了，不�
 | `title` | route 的 title，没有就用 space 名 |
 | `cwd` | 容器里的 `<spacesDir>/<folder>`。新建会话时用它反查 space |
 | `space_id` / `space_name` | space 的 id 和名字。Jarvis 按空间分组，node 会给 space_id 加上前缀 |
-| `status` | 有待审批 → `blocked`；turn 在 running 或 queued → `working`；需要恢复 → `blocked`，并附一条 notice；有过回复 → `done`；否则 `idle` |
+| `status` | 有待审批或待回答的提问、需要恢复 → `blocked`；platform 的轮次在 running / queued，或者 runtime 自己发起的续轮（后台任务完成后接着跑的那一轮）正在跑 → `working`；其余按最近一轮的来源判断 `done` / `idle`，见下面的「已看与未看」 |
 | `updated_at` | 最近一条消息或事件的时间 |
 | `rev` | 最新的 DSH seq（取 `turn/event` 里看到的最大值，冷启动时由 `readSessionEvents` 给出） |
 | `last_text` | 最后一条助手消息（web_messages） |
 | 列哪些 | 正在跑的、在等审批的、手机碰过的一定列；其余按最近 N 天补到 M 个 |
+
+#### 已看与未看（issue #96）
+
+Jarvis 只根据 runtime 报的状态来决定「完成未看」和「做完了」的推送：报 `done` 的会话，要等你在 App 里打开过才算已看；报 `idle` 的，直接算已看，也不推送。enkeep 按会话**最近一轮结束的轮次**是从哪里发起的来决定报哪个：
+
+| 最近一轮 | 报 |
+| --- | --- |
+| 飞书 / 微信发起的（不论成功、失败还是被中断；也包括由它派生的续轮，以及投递到聊天里的定时任务） | `idle`：结果已经发到那个聊天里 |
+| Jarvis 发起的（包括由它派生的续轮） | `done` |
+| 没有投递到任何聊天的定时任务 | `done` |
+| Web 页面发起的，或者来源没有记录 | `idle`：当时人在电脑前 |
+| 在这个 Jarvis 账户创建之前就结束了 | `idle`：第一次连上时不会冒出一堆未看 |
+| 一轮都还没结束过 | `idle` |
+
+- **怎么取最近一轮**：platform 的轮次看 `turn_runs` 里最近一条已结束的；runtime 自己发起的续轮不在 `turn_runs` 里，从会话最新 2000 条事件中找最近一条已结束的 `turn_status`。两者取结束得较晚的那个。
+- **续轮的来源**：每个续轮的 `originTurnId` 指向前一轮，沿着这条链最多往回找 50 轮，直到找到有来源记录（`channel_turn_origins`）的那一轮。找到过的结果会记下来，链再变长时只多查一步。
+- **缓存**：每个会话的判断结果按「事件水位 + 最近一条轮次记录」缓存，水位和轮次都没变就不重算。所有查询都走按会话、按轮次的索引，有单测检查执行计划。
+- **一个已知的取舍**：只看最近一轮。如果 Jarvis 发起的一轮你还没在 App 里看，接着同一个会话又在飞书完成了一轮，这个会话会显示为已看。
+- **续轮的「工作中」**：根据 runtime 推过来的 DSH `turn/start` / `turn/end` 事件，在内存里跟踪正在跑的续轮。runtime 断开时清掉；超过 2 小时没有任何事件也不再算工作中。平台重启时如果有续轮正在跑，要等它下一个事件到了才会重新显示为工作中。
 
 ### 3.5 各项操作
 
