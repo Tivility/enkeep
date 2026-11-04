@@ -49,7 +49,7 @@ export interface RuntimeBindMountSpec {
 }
 
 export interface RuntimeVolumeSpec {
-  /** Docker volume name (must match ^enkeep-demo-dsh-[a-z0-9][a-z0-9_-]{0,60}$) */
+  /** Docker volume name: `enkeep-demo-dsh-<id>` (test) or `enkeep-home-<id>` (production) */
   volumeName: string;
   /** Mandatory immutable unique volume identifier (must match ^vol_[0-9a-f]{32}$) */
   volumeId: string;
@@ -64,7 +64,7 @@ export interface RuntimeContainerSpec {
   userId: RuntimeUserId;
   /** Mandatory random unique run identifier (must match ^run_[a-zA-Z0-9_-]{1,64}$) */
   runId: string;
-  /** Container name (must match ^enkeep-demo-[a-z0-9][a-z0-9_-]{0,60}$) */
+  /** Container name: `enkeep-demo-<id>` (test) or `enkeep-runtime-<id>` (production) */
   containerName: string;
   /** Container image name (e.g. 'enkeep-demo-runtime:latest') */
   image: string;
@@ -80,7 +80,7 @@ export interface RuntimeContainerSpec {
   bindMounts?: RuntimeBindMountSpec[];
   /** Container network isolation mode (strictly 'none') */
   networkMode: RuntimeNetworkMode;
-  /** Required container metadata labels (MUST include app: enkeep-demo, enkeep.user, enkeep.run-id, enkeep.volume-id) */
+  /** Required container metadata labels: app (namespace label), enkeep.user, enkeep.run-id, enkeep.volume-id, optional enkeep.env */
   labels: Record<string, string>;
   /** Container environment variables */
   environment: Record<string, string>;

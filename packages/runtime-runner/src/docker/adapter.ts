@@ -37,6 +37,9 @@ import {
   normalizeUserQuestionsEnv,
   QUESTION_TIMEOUT_ENV_KEY,
   normalizeQuestionTimeoutEnv,
+  TEST_RESOURCE_NAMESPACE,
+  ENV_LABEL_KEY,
+  type RuntimeResourceNamespace,
 } from '../spec/validator.js';
 import type { RuntimeContainerSpec, ExactContainerIdentity, RuntimeNetworkMode } from '../spec/types.js';
 import type { ExecCliEnvelope } from '../runtime/exec-cli.js';
@@ -90,6 +93,11 @@ export interface UserSpecOptions {
   containerName?: string;
   volumeName?: string;
   nameSuffix?: string;
+  /**
+   * Naming namespace for the derived container and volume names and the ownership labels
+   * (default: the test namespace, `enkeep-demo-*`). Production uses `PRODUCTION_RESOURCE_NAMESPACE`.
+   */
+  namespace?: RuntimeResourceNamespace;
   /** Container network isolation mode ('none' | 'bridge', default 'none') */
   networkMode?: RuntimeNetworkMode;
   /** Whether real LLM is enabled (injects ENKEEP_LLM_ENABLED=1) */
@@ -441,8 +449,9 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       throw new DockerOwnershipError('Invalid caller-supplied userId');
     }
     const suffix = options.nameSuffix ? `-${options.nameSuffix}` : '';
-    const containerName = options.containerName ?? `enkeep-demo-${userId}${suffix}`;
-    const volumeName = options.volumeName ?? `enkeep-demo-dsh-${userId}${suffix}`;
+    const namespace = options.namespace ?? TEST_RESOURCE_NAMESPACE;
+    const containerName = options.containerName ?? `${namespace.containerPrefix}${userId}${suffix}`;
+    const volumeName = options.volumeName ?? `${namespace.volumePrefix}${userId}${suffix}`;
     const image = options.image ?? 'enkeep-demo-runtime:acceptance';
     const runId = options.runId ?? `run_${crypto.randomBytes(16).toString('hex')}`;
     const volumeId = options.volumeId ?? `vol_${crypto.randomBytes(16).toString('hex')}`;
@@ -543,7 +552,8 @@ export class DockerRuntimeAdapter implements RuntimeExecutionProvider<RuntimeCon
       },
       networkMode,
       labels: {
-        app: 'enkeep-demo',
+        app: namespace.appLabel,
+        [ENV_LABEL_KEY]: namespace.env,
         'enkeep.user': userId,
         'enkeep.run-id': runId,
         'enkeep.volume-id': volumeId,

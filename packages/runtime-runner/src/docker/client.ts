@@ -26,6 +26,11 @@ import {
   DEMO_VOLUME_PREFIX,
   DEMO_LABEL_KEY,
   DEMO_LABEL_VALUE,
+  ENV_LABEL_KEY,
+  namespaceOfContainerName,
+  namespaceOfVolumeName,
+  isNameScopedToUser,
+  labelsMatchNamespace,
   USER_LABEL_KEY,
   RUN_ID_LABEL_KEY,
   VOLUME_ID_LABEL_KEY,
@@ -1144,15 +1149,13 @@ export class SafeDockerClient {
       throw new DockerOwnershipError('Volume name mismatch');
     }
 
-    const isExactUserVolume =
-      info.name === `enkeep-demo-dsh-${expectation.userId}` ||
-      info.name.startsWith(`enkeep-demo-dsh-${expectation.userId}-`);
-    if (!isExactUserVolume) {
+    const volumeNamespace = namespaceOfVolumeName(info.name);
+    if (!volumeNamespace || !isNameScopedToUser(info.name, volumeNamespace.volumePrefix, expectation.userId)) {
       throw new DockerOwnershipError('Volume is not scoped to user');
     }
 
-    if (info.labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
-      throw new DockerOwnershipError('Volume lacks mandatory ownership label app=enkeep-demo');
+    if (!labelsMatchNamespace(info.labels, volumeNamespace)) {
+      throw new DockerOwnershipError(`Volume lacks mandatory ownership label app=${volumeNamespace.appLabel}`);
     }
 
     if (info.labels[USER_LABEL_KEY] !== expectation.userId) {
@@ -1181,11 +1184,14 @@ export class SafeDockerClient {
       throw new DockerCollisionError('Volume already exists on host. Creation refused.');
     }
 
+    const volumeNamespace = namespaceOfVolumeName(volumeName)!;
     const args = [
       'volume',
       'create',
       '--label',
-      `${DEMO_LABEL_KEY}=${DEMO_LABEL_VALUE}`,
+      `${DEMO_LABEL_KEY}=${volumeNamespace.appLabel}`,
+      '--label',
+      `${ENV_LABEL_KEY}=${volumeNamespace.env}`,
       '--label',
       `${USER_LABEL_KEY}=${expectation.userId}`,
       '--label',
@@ -1590,10 +1596,8 @@ export class SafeDockerClient {
       throw new DockerOwnershipError('Container name mismatch');
     }
 
-    const isExactUserContainer =
-      info.name === `enkeep-demo-${expectation.userId}` ||
-      info.name.startsWith(`enkeep-demo-${expectation.userId}-`);
-    if (!isExactUserContainer) {
+    const containerNamespace = namespaceOfContainerName(info.name);
+    if (!containerNamespace || !isNameScopedToUser(info.name, containerNamespace.containerPrefix, expectation.userId)) {
       throw new DockerOwnershipError('Container is not scoped to user');
     }
 
@@ -1606,8 +1610,8 @@ export class SafeDockerClient {
     }
 
     // Mandatory ownership labels
-    if (info.labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
-      throw new DockerOwnershipError('Container lacks mandatory label app=enkeep-demo');
+    if (!labelsMatchNamespace(info.labels, containerNamespace)) {
+      throw new DockerOwnershipError(`Container lacks mandatory label app=${containerNamespace.appLabel}`);
     }
 
     if (info.labels[USER_LABEL_KEY] !== expectation.userId) {
@@ -2593,7 +2597,8 @@ try {
       throw new DockerOwnershipError('cleanupFreshlyCreatedContainer refused: container name mismatch');
     }
 
-    if (info.labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
+    const freshNamespace = namespaceOfContainerName(info.name);
+    if (!freshNamespace || !labelsMatchNamespace(info.labels, freshNamespace)) {
       throw new DockerOwnershipError('cleanupFreshlyCreatedContainer refused: missing or invalid app label');
     }
 
