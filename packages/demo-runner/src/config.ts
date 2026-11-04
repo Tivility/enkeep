@@ -8,9 +8,21 @@
  */
 
 import { resolve, join, normalize, relative, isAbsolute, dirname } from 'node:path';
-import { existsSync, readFileSync, lstatSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, lstatSync, realpathSync, writeFileSync, renameSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import type { DemoPathConfig, DemoPathOptions, DemoUserConfig } from './types.js';
+
+export {
+  PRODUCTION_RESOURCE_NAMESPACE,
+  TEST_RESOURCE_NAMESPACE,
+  RUNTIME_RESOURCE_NAMESPACES,
+  ENV_LABEL_KEY,
+  namespaceOfContainerName,
+  namespaceOfVolumeName,
+  isNameScopedToUser,
+  labelsMatchNamespace,
+  type RuntimeResourceNamespace,
+} from '@enkeep/runtime-runner/spec';
 
 export const DEMO_OWNERSHIP_TAG = 'enkeep-demo' as const;
 export const DEMO_CONTAINER_PREFIX = 'enkeep-demo-' as const;
@@ -80,6 +92,51 @@ export function getDefaultUsers(resourceSuffix?: string): readonly DemoUserConfi
 export const DEFAULT_USERS: readonly DemoUserConfig[] = getDefaultUsers();
 
 /**
+ * Marker file that identifies a deployment's data directory. Commands that create, reset or tear down
+ * demo environments refuse a directory carrying it; only `enkeep-server` operates on it.
+ */
+export const PRODUCTION_MARKER_FILE = 'enkeep-production.json';
+
+/** Whether `dataDir` is a production data directory (has a readable production marker). */
+export function isProductionDataDir(dataDir: string | undefined): boolean {
+  if (!dataDir) return false;
+  const marker = join(resolve(dataDir), PRODUCTION_MARKER_FILE);
+  if (!existsSync(marker)) return false;
+  try {
+    const parsed = JSON.parse(readFileSync(marker, 'utf-8'));
+    return Boolean(parsed && typeof parsed === 'object' && parsed.kind === 'enkeep-production');
+  } catch {
+    // An unreadable marker still marks the directory: fail closed.
+    return true;
+  }
+}
+
+/**
+ * Refuses `action` on a production data directory. Demo/test commands call this before touching any
+ * file, process, container or volume.
+ */
+export function assertNotProductionDataDir(dataDir: string | undefined, action: string): void {
+  if (isProductionDataDir(dataDir)) {
+    throw new Error(
+      `Safety Violation: "${dataDir}" is a production data directory (${PRODUCTION_MARKER_FILE}). ` +
+        `Refusing ${action}. Production is managed by enkeep-server and scripts/deploy-release.mjs only.`
+    );
+  }
+}
+
+/** Writes (or keeps) the production marker of `dataDir`. Idempotent; atomic replace. */
+export function writeProductionMarker(dataDir: string): string {
+  const marker = join(resolve(dataDir), PRODUCTION_MARKER_FILE);
+  if (isProductionDataDir(dataDir) && existsSync(marker)) return marker;
+  const tmp = `${marker}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify({ kind: 'enkeep-production', markedAt: new Date().toISOString() }, null, 2) + '\n', {
+    mode: 0o600,
+  });
+  renameSync(tmp, marker);
+  return marker;
+}
+
+/**
  * Finds the Enkeep repository root safely by traversing upward looking for enkeep-root package.json.
  */
 export function findRepoRoot(startDir: string = process.cwd()): string {
@@ -131,9 +188,11 @@ export function getDemoPathConfig(options?: DemoPathOptions | string): DemoPathC
     const rawDataRoot = resolve(opts.dataRoot);
     if (mode === 'production') {
       const canonicalProdData = resolve(root, DEMO_DATA_DIR_NAME);
-      if (rawDataRoot !== canonicalProdData && !rawDataRoot.startsWith(canonicalProdData + '/')) {
+      const insideRepoData = rawDataRoot === canonicalProdData || rawDataRoot.startsWith(canonicalProdData + '/');
+      // A deployment's data directory lives outside any checkout; it is accepted by its marker.
+      if (!insideRepoData && !(isAbsolute(opts.dataRoot) && isProductionDataDir(rawDataRoot))) {
         throw new Error(
-          `Safety Violation: In production mode, dataRoot must resolve inside "${canonicalProdData}". Received "${rawDataRoot}".`
+          `Safety Violation: In production mode, dataRoot must resolve inside "${canonicalProdData}" or be a marked production data directory (${PRODUCTION_MARKER_FILE}). Received "${rawDataRoot}".`
         );
       }
       demoDataDir = rawDataRoot;

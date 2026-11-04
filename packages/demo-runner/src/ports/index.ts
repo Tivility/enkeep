@@ -76,6 +76,8 @@ import {
   VOLUME_ID_LABEL_KEY,
   validateResourceSuffix,
   getDemoPathConfig,
+  TEST_RESOURCE_NAMESPACE,
+  type RuntimeResourceNamespace,
 } from '../config.js';
 
 export const MAX_TURN_PROMPT_BYTES = 64 * 1024; // 65,536 bytes (64KiB)
@@ -679,12 +681,18 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
   private readonly adapter: DockerRuntimeAdapter;
   private readonly client: SafeDockerClient;
   private readonly defaultNetworkMode: import('@enkeep/runtime-runner').RuntimeNetworkMode;
+  /** Names and labels of the containers and volumes this adapter creates (test unless production). */
+  readonly namespace: RuntimeResourceNamespace;
 
   constructor(
     client: SafeDockerClient = new SafeDockerClient(),
-    options?: { defaultNetworkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode }
+    options?: {
+      defaultNetworkMode?: import('@enkeep/runtime-runner').RuntimeNetworkMode;
+      namespace?: RuntimeResourceNamespace;
+    }
   ) {
     this.client = client;
+    this.namespace = options?.namespace ?? TEST_RESOURCE_NAMESPACE;
     this.defaultNetworkMode = options?.defaultNetworkMode ?? 'none';
     this.adapter = new DockerRuntimeAdapter(client, {
       defaultNetworkMode: this.defaultNetworkMode,
@@ -727,6 +735,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
     const networkMode = options.networkMode ?? this.defaultNetworkMode;
     const tempSpec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
+      namespace: this.namespace,
       image: options.image ?? 'enkeep-demo-runtime:latest',
       nameSuffix: options.resourceSuffix,
       runId: tempRunId,
@@ -901,6 +910,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
 
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
+      namespace: this.namespace,
       image: options.image ?? 'enkeep-demo-runtime:latest',
       nameSuffix: options.resourceSuffix,
       runId: finalRunId,
@@ -1114,7 +1124,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
     }
 
     const suffix = options.resourceSuffix ? `-${options.resourceSuffix}` : '';
-    const containerName = `enkeep-demo-${options.userId}${suffix}`;
+    const containerName = `${this.namespace.containerPrefix}${options.userId}${suffix}`;
 
     // Read verified signed container metadata
     const meta = readSignedContainerMeta(containerName, pathOptions);
@@ -1132,6 +1142,7 @@ export class DockerRuntimeContainerAdapter implements RuntimeContainerPort {
 
     const spec = this.adapter.createDefaultUserSpec({
       userId: options.userId,
+      namespace: this.namespace,
       image: options.image ?? meta.image ?? 'enkeep-demo-runtime:latest',
       nameSuffix: options.resourceSuffix,
       runId: meta.runId,

@@ -36,6 +36,7 @@ import {
   getDemoPathConfig,
   assertPathInDemoData,
   findRepoRoot,
+  assertNotProductionDataDir,
 } from '../config.js';
 import {
   generateAndSaveSecrets,
@@ -234,6 +235,8 @@ export async function resetDemo(options: DemoResetOptions = {}): Promise<DemoRes
     resourceSuffix: options.resourceSuffix,
   };
   const paths = getDemoPathConfig(pathOptions);
+  // 0. Never reset a deployment: it would stop the platform and wipe its database and volumes.
+  assertNotProductionDataDir(paths.dataRoot, 'demo:reset');
 
   // 1. Invariant: Target directory MUST resolve inside dataRoot
   assertPathInDemoData(paths.dataRoot, pathOptions);
