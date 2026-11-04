@@ -22,8 +22,9 @@ import {
   loadLarkTestCredentials,
   LARK_TEST_SPACE_FOLDER,
 } from './utils/lark-credentials.js';
-import { findRepoRoot, getDemoPathConfig, validateResourceSuffix } from './config.js';
+import { findRepoRoot, getDemoPathConfig, validateResourceSuffix, assertNotProductionDataDir } from './config.js';
 import { loadDshDeploymentConfig } from '@enkeep/runtime-runner';
+import { reapTestResources, type ReapResult } from './reap/index.js';
 import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
 import { DatabaseSync } from 'node:sqlite';
 import type {
@@ -50,6 +51,10 @@ COMMANDS:
   status     Show current status of demo services, processes, and containers
   preflight  Verify platform and all host/container runtimes quiescence before deploy or stop
   bind-lark  Explicitly bind a Lark chatId to the dedicated test space
+  reap       Remove leftover test runtimes (enkeep-demo-* with enkeep.env=test): stopped containers,
+             containers running longer than --max-age-hours (24), unused volumes older than that.
+             Production (enkeep-runtime-*, enkeep-home-*) and other projects are never touched.
+             Runs automatically before "up" and "test".  [--dry-run] [--max-age-hours <N>]
   jarvis-token issue|revoke  Issue (create or rotate) or revoke a user's Jarvis token without the Web UI:
              jarvis-token issue  --data-dir <data-dir> --user <username> [--token-file <token-file>]
              jarvis-token revoke --data-dir <data-dir> --user <username>
@@ -70,6 +75,9 @@ OPTIONS:
   --json                      Output results as JSON (errors omit stack trace)
   --remove-vols               Remove demo Docker volumes on teardown
   --repo-root                 Explicit repository root path (default: auto-detected)
+
+A production data directory (with enkeep-production.json) is refused by reset, up, down, test and
+bind-lark; deployments are run by enkeep-server and scripts/deploy-release.mjs only.
   --help, -h                  Show help
 `);
 }
@@ -476,6 +484,40 @@ export async function getStatus(options?: DemoStatusOptions | string): Promise<D
   };
 }
 
+/** Best-effort removal of leftover test runtimes before a demo run; never fails the run. */
+async function reapBeforeRun(isJson: boolean): Promise<void> {
+  try {
+    const result = await reapTestResources();
+    const removed = result.resources.filter((r) => r.removed);
+    if (removed.length > 0 && !isJson) {
+      console.log(`[reap] removed ${removed.length} leftover test resource(s): ${removed.map((r) => r.name).join(', ')}`);
+    }
+  } catch (err: unknown) {
+    if (!isJson) console.warn(`[reap] skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function parseMaxAgeHours(args: string[]): number | undefined {
+  const idx = args.indexOf('--max-age-hours');
+  if (idx === -1) return undefined;
+  const value = Number(args[idx + 1]);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error('Safety Violation: --max-age-hours requires a non-negative number.');
+  }
+  return value;
+}
+
+function printReapResult(result: ReapResult): void {
+  if (result.resources.length === 0) {
+    console.log('No leftover test runtimes.');
+    return;
+  }
+  for (const r of result.resources) {
+    const state = result.dryRun ? 'would remove' : r.removed ? 'removed' : `FAILED (${r.error ?? 'unknown'})`;
+    console.log(`  ${state.padEnd(14)} ${r.kind.padEnd(9)} ${r.name}  — ${r.reason}`);
+  }
+}
+
 export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): Promise<void> {
   const command = args[0] || 'help';
   const isJson = args.includes('--json');
@@ -516,12 +558,27 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         break;
       }
 
+      case 'reap': {
+        const result = await reapTestResources({ dryRun: args.includes('--dry-run'), maxAgeHours: parseMaxAgeHours(args) });
+        if (isJson) console.log(JSON.stringify(result, null, 2));
+        else printReapResult(result);
+        if (!result.ok) process.exit(1);
+        break;
+      }
+
       case 'up': {
+        if (!args.includes('--production')) await reapBeforeRun(isJson);
         const platformPort = parsePlatformPort(args);
         const larkTestCredentialsFile = parseLarkTestCredentialsPath(args);
         const containerNetworkMode = parseContainerNetworkMode(args);
         const resourceSuffix = parseResourceSuffix(args);
         const dshHome = parseDshHome(args);
+        // --production is passed by enkeep-server serve only, always with an explicit --data-dir.
+        const production = args.includes('--production');
+        const dataRoot = production ? parseDataDir(args, {}) : undefined;
+        if (production && !dataRoot) {
+          throw new Error('Safety Violation: --production requires an explicit --data-dir.');
+        }
         const system = await launchDemoSystem({
           repoRoot,
           allowHostRuntime,
@@ -530,6 +587,7 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
           containerNetworkMode,
           resourceSuffix,
           dshHome,
+          ...(production ? { production: true, dataRoot, mode: 'production' as const } : {}),
         });
         const dshConfig = loadDshDeploymentConfig(dshHome);
         const isLlmConfigured = Boolean(
@@ -543,7 +601,7 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         if (isJson) {
           console.log(JSON.stringify(system.result, null, 2));
         } else {
-          console.log('\n🚀 Enkeep Demo Environment Running');
+          console.log(production ? '\n🚀 Enkeep server running' : '\n🚀 Enkeep Demo Environment Running');
           console.log(`  Platform Server: ${system.result.platform.endpoint}`);
           if (system.result.users && system.result.users.length > 0) {
             for (const u of system.result.users) {
@@ -606,7 +664,17 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
       }
 
       case 'down': {
-        const result = await downDemo({ repoRoot, removeVolumes });
+        // --production --data-dir: enkeep-server stopping a deployment (never removes volumes).
+        const production = args.includes('--production');
+        const dataRoot = production ? parseDataDir(args, {}) : undefined;
+        if (production && !dataRoot) {
+          throw new Error('Safety Violation: --production requires an explicit --data-dir.');
+        }
+        const result = await downDemo({
+          repoRoot,
+          removeVolumes: production ? false : removeVolumes,
+          ...(production ? { production: true, dataRoot, mode: 'production' as const } : {}),
+        });
         if (isJson) {
           console.log(JSON.stringify(result, null, 2));
         } else {
@@ -621,6 +689,7 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
       }
 
       case 'test': {
+        await reapBeforeRun(isJson);
         const result = await runDemoTestSuite({ repoRoot });
         if (isJson) {
           console.log(JSON.stringify(result, null, 2));
@@ -784,6 +853,7 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         }
 
         const paths = getDemoPathConfig({ repoRoot });
+        assertNotProductionDataDir(paths.dataRoot, 'bind-lark');
         const db = new DatabaseSync(paths.dbPath);
         const storage = new SqlitePlatformStorage(db);
         const alice = await storage.users.findByUsername('alice');

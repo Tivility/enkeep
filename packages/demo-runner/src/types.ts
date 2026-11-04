@@ -130,6 +130,11 @@ export interface DemoResetResult {
 }
 
 export interface DemoUpOptions extends DemoPathOptions {
+  /**
+   * Run as a deployment (enkeep-server serve): requires a marked production data directory and names
+   * runtime containers and volumes in the production namespace. Demo runs leave it unset.
+   */
+  production?: boolean;
   platformPort?: number; // 0 or explicit safe loopback port
   runtimeImage?: string;
   timeoutMs?: number;
@@ -226,6 +231,11 @@ export interface ProcessKiller {
 }
 
 export interface DemoDownOptions extends DemoPathOptions {
+  /**
+   * Set only by enkeep-server: the data directory is a production one. Without it a production data
+   * directory is refused; with it a non-production one is refused. Volumes are never removed then.
+   */
+  production?: boolean;
   removeVolumes?: boolean;
   graceTimeoutMs?: number;
   dockerClient?: SafeDockerClient;

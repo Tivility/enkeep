@@ -24,6 +24,75 @@ export const USER_LABEL_KEY = 'enkeep.user';
 export const RUN_ID_LABEL_KEY = 'enkeep.run-id';
 export const RUN_LABEL_KEY = 'enkeep.run-id'; // Unified to enkeep.run-id
 export const VOLUME_ID_LABEL_KEY = 'enkeep.volume-id';
+/** Which deployment a runtime container or volume belongs to: `production` or `test`. */
+export const ENV_LABEL_KEY = 'enkeep.env';
+
+/**
+ * Naming of runtime containers and home volumes. A production deployment and test/demo runs use
+ * disjoint prefixes and `app` labels, so test cleanup can never match a production resource and a
+ * production resource never reads as a demo. The namespace of a resource follows from its name.
+ */
+export interface RuntimeResourceNamespace {
+  readonly env: 'production' | 'test';
+  readonly containerPrefix: string;
+  readonly volumePrefix: string;
+  /** Value of the `app` label. */
+  readonly appLabel: string;
+}
+
+/** Test, demo and e2e runs (the original `enkeep-demo-*` names). */
+export const TEST_RESOURCE_NAMESPACE: RuntimeResourceNamespace = Object.freeze({
+  env: 'test',
+  containerPrefix: DEMO_CONTAINER_PREFIX,
+  volumePrefix: DEMO_VOLUME_PREFIX,
+  appLabel: DEMO_LABEL_VALUE,
+});
+
+/** A production deployment started with `enkeep-server serve`. */
+export const PRODUCTION_RESOURCE_NAMESPACE: RuntimeResourceNamespace = Object.freeze({
+  env: 'production',
+  containerPrefix: 'enkeep-runtime-',
+  volumePrefix: 'enkeep-home-',
+  appLabel: 'enkeep',
+});
+
+export const RUNTIME_RESOURCE_NAMESPACES: readonly RuntimeResourceNamespace[] = Object.freeze([
+  TEST_RESOURCE_NAMESPACE,
+  PRODUCTION_RESOURCE_NAMESPACE,
+]);
+
+const RESOURCE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,60}$/;
+
+/** Namespace of a container name, or undefined when the name is in none. */
+export function namespaceOfContainerName(name: unknown): RuntimeResourceNamespace | undefined {
+  if (typeof name !== 'string') return undefined;
+  return RUNTIME_RESOURCE_NAMESPACES.find(
+    (ns) => name.startsWith(ns.containerPrefix) && RESOURCE_ID_PATTERN.test(name.slice(ns.containerPrefix.length))
+  );
+}
+
+/** Namespace of a volume name, or undefined when the name is in none. */
+export function namespaceOfVolumeName(name: unknown): RuntimeResourceNamespace | undefined {
+  if (typeof name !== 'string') return undefined;
+  return RUNTIME_RESOURCE_NAMESPACES.find(
+    (ns) => name.startsWith(ns.volumePrefix) && RESOURCE_ID_PATTERN.test(name.slice(ns.volumePrefix.length))
+  );
+}
+
+/** Whether `name` is `<prefix><userId>` or `<prefix><userId>-<suffix>` for the given prefix. */
+export function isNameScopedToUser(name: string, prefix: string, userId: string): boolean {
+  return name === `${prefix}${userId}` || name.startsWith(`${prefix}${userId}-`);
+}
+
+/**
+ * Whether labels carry the ownership marks of `ns`: its `app` value, and, when present, a matching
+ * `enkeep.env`.
+ */
+export function labelsMatchNamespace(labels: Readonly<Record<string, string>> | undefined, ns: RuntimeResourceNamespace): boolean {
+  if (!labels || labels[DEMO_LABEL_KEY] !== ns.appLabel) return false;
+  const env = labels[ENV_LABEL_KEY];
+  return env === undefined || env === ns.env;
+}
 
 export const FORBIDDEN_HOST_PATTERNS = Object.freeze([
   '0.0.0.0',
@@ -33,8 +102,8 @@ export const FORBIDDEN_HOST_PATTERNS = Object.freeze([
   '*',
 ]);
 
-export const CONTAINER_NAME_REGEX = /^enkeep-demo-[a-z0-9][a-z0-9_-]{0,60}$/;
-export const VOLUME_NAME_REGEX = /^enkeep-demo-dsh-[a-z0-9][a-z0-9_-]{0,60}$/;
+export const CONTAINER_NAME_REGEX = /^(?:enkeep-demo-|enkeep-runtime-)[a-z0-9][a-z0-9_-]{0,60}$/;
+export const VOLUME_NAME_REGEX = /^(?:enkeep-demo-dsh-|enkeep-home-)[a-z0-9][a-z0-9_-]{0,60}$/;
 export const USER_ID_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 export const RUN_ID_REGEX = /^run_[a-zA-Z0-9_-]{1,64}$/;
 export const VOLUME_ID_REGEX = /^vol_[0-9a-f]{32}$/;
@@ -142,6 +211,7 @@ export const ALLOWED_LABEL_KEYS = new Set([
   USER_LABEL_KEY,
   RUN_ID_LABEL_KEY,
   VOLUME_ID_LABEL_KEY,
+  ENV_LABEL_KEY,
 ]);
 
 /** Runtime env key read by `@enkeep/dsh-external-interaction` for the approval wait (ms). */
@@ -242,16 +312,15 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
   const containerName = rawSpec.containerName;
   if (!containerName || typeof containerName !== 'string') {
     errors.push('containerName must be a non-empty string');
-  } else if (!CONTAINER_NAME_REGEX.test(containerName)) {
-    errors.push('containerName must match pattern ^enkeep-demo-[a-z0-9][a-z0-9_-]{0,60}$');
+  } else if (!CONTAINER_NAME_REGEX.test(containerName) || !namespaceOfContainerName(containerName)) {
+    errors.push('containerName must match pattern ^(enkeep-demo-|enkeep-runtime-)[a-z0-9][a-z0-9_-]{0,60}$');
   } else if (typeof userId === 'string' && USER_ID_REGEX.test(userId)) {
-    const isExactUserContainer =
-      containerName === `enkeep-demo-${userId}` ||
-      containerName.startsWith(`enkeep-demo-${userId}-`);
-    if (!isExactUserContainer) {
+    const ns = namespaceOfContainerName(containerName)!;
+    if (!isNameScopedToUser(containerName, ns.containerPrefix, userId)) {
       errors.push('containerName must be scoped to userId');
     }
   }
+  const containerNamespace = namespaceOfContainerName(containerName);
 
   // 4. Image validation (strict bounded, no whitespace/control characters, no leading dash)
   const image = rawSpec.image;
@@ -327,6 +396,11 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
   const volumeValidation = validateVolumeSpec(rawSpec.volume, expectedUserId);
   if (!volumeValidation.valid) {
     errors.push(...volumeValidation.errors);
+  } else if (containerNamespace && isRecord(rawSpec.volume)) {
+    const volumeNamespace = namespaceOfVolumeName(rawSpec.volume['volumeName']);
+    if (volumeNamespace && volumeNamespace !== containerNamespace) {
+      errors.push(`volume.volumeName must be a ${containerNamespace.env} volume (${containerNamespace.volumePrefix}*) for this container`);
+    }
   }
 
   // 11. Required metadata labels: only allowed keys and exact values
@@ -336,10 +410,12 @@ export function validateContainerSpec(rawSpec: unknown): SpecValidationResult {
   } else {
     for (const key of Object.keys(labels)) {
       if (!ALLOWED_LABEL_KEYS.has(key)) {
-        errors.push('Forbidden extra label. Only app, enkeep.user, enkeep.run-id, enkeep.volume-id are allowed.');
+        errors.push('Forbidden extra label. Only app, enkeep.user, enkeep.run-id, enkeep.volume-id, enkeep.env are allowed.');
       }
     }
-    if (labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
+    if (containerNamespace && !labelsMatchNamespace(labels as Record<string, string>, containerNamespace)) {
+      errors.push(`labels must contain app: ${containerNamespace.appLabel} (and enkeep.env: ${containerNamespace.env} when set)`);
+    } else if (!containerNamespace && labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
       errors.push('labels must contain app: enkeep-demo');
     }
     if (typeof userId === 'string' && labels[USER_LABEL_KEY] !== userId) {
@@ -475,13 +551,11 @@ export function validateVolumeSpec(volume: unknown, expectedUserId?: string): Sp
   const volumeName = volume.volumeName;
   if (!volumeName || typeof volumeName !== 'string') {
     errors.push('volume.volumeName must be a non-empty string');
-  } else if (!VOLUME_NAME_REGEX.test(volumeName)) {
-    errors.push('volume.volumeName must match pattern ^enkeep-demo-dsh-[a-z0-9][a-z0-9_-]{0,60}$');
+  } else if (!VOLUME_NAME_REGEX.test(volumeName) || !namespaceOfVolumeName(volumeName)) {
+    errors.push('volume.volumeName must match pattern ^(enkeep-demo-dsh-|enkeep-home-)[a-z0-9][a-z0-9_-]{0,60}$');
   } else if (expectedUserId && USER_ID_REGEX.test(expectedUserId)) {
-    const isExactUserVolume =
-      volumeName === `enkeep-demo-dsh-${expectedUserId}` ||
-      volumeName.startsWith(`enkeep-demo-dsh-${expectedUserId}-`);
-    if (!isExactUserVolume) {
+    const ns = namespaceOfVolumeName(volumeName)!;
+    if (!isNameScopedToUser(volumeName, ns.volumePrefix, expectedUserId)) {
       errors.push('volume.volumeName must be scoped to user');
     }
   }

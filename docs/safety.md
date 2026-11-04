@@ -84,6 +84,11 @@ Before starting demo components (such as in `demo:up`), preflight checks verify:
   - Performs live command line and start time verification to prevent killing recycled PIDs.
   - Rejects any operation targeting unverified or foreign PIDs.
 
+#### Production Data Directory & Resource Namespaces
+- A deployment's data directory carries `enkeep-production.json` and may live outside the checkout; `reset`, `up`, `down`, `test` and `bind-lark` of `demo-runner` refuse it, and only `enkeep-server` (`serve`, `stop`, `preflight`, `migrate-data-dir`) operates on it.
+- Runtime names and labels come in two disjoint namespaces, decided by the name prefix: test/demo `enkeep-demo-<id>` + `enkeep-demo-dsh-<id>` (`app=enkeep-demo`, `enkeep.env=test`), production `enkeep-runtime-<id>` + `enkeep-home-<id>` (`app=enkeep`, `enkeep.env=production`). A container and its volume must be in the same namespace; labels must match the namespace of the name.
+- `demo-runner reap` removes only resources whose name is in the test namespace and that carry both test labels.
+
 #### Docker Container & Volume Ownership
 - **Multi-Attribute Verification (Not Prefix-Only)**:
   - Container name must match `enkeep-demo-<userId>[-<suffix>]` (e.g. `enkeep-demo-alice[-<suffix>]`, `enkeep-demo-bob[-<suffix>]`).

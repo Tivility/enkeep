@@ -31,6 +31,10 @@ import {
   RUN_ID_LABEL_KEY,
   VOLUME_ID_LABEL_KEY,
   validateResourceSuffix,
+  isProductionDataDir,
+  labelsMatchNamespace,
+  PRODUCTION_RESOURCE_NAMESPACE,
+  TEST_RESOURCE_NAMESPACE,
 } from '../config.js';
 import {
   readSignedProcessMeta,
@@ -61,7 +65,19 @@ export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownR
   validateResourceSuffix(options.resourceSuffix);
 
   const paths = getDemoPathConfig(pathOptions);
-  const removeVolumes = options.removeVolumes ?? false;
+  // A production data directory is only ever torn down by enkeep-server (production: true), and then
+  // only its own production-named resources; a demo run only ever touches demo-named ones.
+  const isProduction = isProductionDataDir(paths.dataRoot);
+  if (isProduction && options.production !== true) {
+    throw new Error(
+      `Safety Violation: "${paths.dataRoot}" is a production data directory. Refusing demo:down; production is stopped through scripts/deploy-release.mjs.`
+    );
+  }
+  if (!isProduction && options.production === true) {
+    throw new Error(`Safety Violation: "${paths.dataRoot}" is not a production data directory.`);
+  }
+  const namespace = isProduction ? PRODUCTION_RESOURCE_NAMESPACE : TEST_RESOURCE_NAMESPACE;
+  const removeVolumes = isProduction ? false : (options.removeVolumes ?? false);
   const graceTimeoutMs = options.graceTimeoutMs ?? 500;
   const inspector = options.processInspector ?? defaultProcessInspector;
   const killer = options.processKiller ?? defaultProcessKiller;
@@ -177,25 +193,25 @@ export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownR
       }
 
       // Strict metadata safety assertions
-      if (!c.containerName.startsWith(DEMO_CONTAINER_PREFIX)) {
+      if (!c.containerName.startsWith(namespace.containerPrefix)) {
         terminatedContainers.push({
           type: 'container',
           name: c.containerName,
           id: c.containerId,
           status: 'failed',
-          error: `Safety violation: Container name "${c.containerName}" does not start with demo prefix "${DEMO_CONTAINER_PREFIX}"`,
+          error: `Safety violation: Container name "${c.containerName}" does not start with prefix "${namespace.containerPrefix}"`,
         });
         allSucceeded = false;
         continue;
       }
 
-      if (c.labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
+      if (!labelsMatchNamespace(c.labels, namespace)) {
         terminatedContainers.push({
           type: 'container',
           name: c.containerName,
           id: c.containerId,
           status: 'failed',
-          error: `Safety violation: Missing mandatory label "${DEMO_LABEL_KEY}=${DEMO_LABEL_VALUE}"`,
+          error: `Safety violation: Missing mandatory label "${DEMO_LABEL_KEY}=${namespace.appLabel}"`,
         });
         allSucceeded = false;
         continue;
@@ -260,12 +276,12 @@ export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownR
         // Explicit notfound: container does not exist in Docker
         let volumeCleaned = true;
         if (removeVolumes && c.volumeName) {
-          if (!c.volumeName.startsWith(DEMO_VOLUME_PREFIX)) {
+          if (!c.volumeName.startsWith(namespace.volumePrefix)) {
             removedVolumes.push({
               type: 'volume',
               name: c.volumeName,
               status: 'failed',
-              error: `Safety violation: Volume "${c.volumeName}" does not start with demo volume prefix "${DEMO_VOLUME_PREFIX}"`,
+              error: `Safety violation: Volume "${c.volumeName}" does not start with volume prefix "${namespace.volumePrefix}"`,
             });
             volumeCleaned = false;
             allSucceeded = false;
@@ -338,7 +354,7 @@ export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownR
         continue;
       }
 
-      if (liveInfo.labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE || liveInfo.labels[USER_LABEL_KEY] !== c.userId || liveInfo.labels[RUN_ID_LABEL_KEY] !== c.runId) {
+      if (!labelsMatchNamespace(liveInfo.labels, namespace) || liveInfo.labels[USER_LABEL_KEY] !== c.userId || liveInfo.labels[RUN_ID_LABEL_KEY] !== c.runId) {
         terminatedContainers.push({
           type: 'container',
           name: c.containerName,
@@ -381,12 +397,12 @@ export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownR
       if (containerRemoved) {
         let volumeSuccess = true;
         if (removeVolumes && c.volumeName) {
-          if (!c.volumeName.startsWith(DEMO_VOLUME_PREFIX)) {
+          if (!c.volumeName.startsWith(namespace.volumePrefix)) {
             removedVolumes.push({
               type: 'volume',
               name: c.volumeName,
               status: 'failed',
-              error: `Safety violation: Volume "${c.volumeName}" does not start with demo volume prefix "${DEMO_VOLUME_PREFIX}"`,
+              error: `Safety violation: Volume "${c.volumeName}" does not start with volume prefix "${namespace.volumePrefix}"`,
             });
             volumeSuccess = false;
             allSucceeded = false;

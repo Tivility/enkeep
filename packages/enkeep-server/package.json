@@ -1,0 +1,33 @@
+{
+  "name": "@enkeep/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Production entry point of an Enkeep deployment (serve, preflight, stop, data-directory migration).",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "enkeep-server": "./dist/enkeep-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@enkeep/demo-runner": "workspace:*",
+    "@enkeep/runtime-runner": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.8"
+  }
+}

@@ -205,6 +205,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     else if (a === '--repo-root' && cliArgs[i + 1]) cliOpts.repoRoot = cliArgs[++i];
     else if (a === '--release-root' && cliArgs[i + 1]) cliOpts.releaseRoot = cliArgs[++i];
     else if (a === '--data-dir' && cliArgs[i + 1]) cliOpts.dataDir = cliArgs[++i];
+    else if (a === '--new-data-dir' && cliArgs[i + 1]) cliOpts.newDataDir = cliArgs[++i];
     else if (a === '--config-dir' && cliArgs[i + 1]) cliOpts.configDir = cliArgs[++i];
     else if (a === '--plist-path' && cliArgs[i + 1]) cliOpts.plistPath = cliArgs[++i];
     else if (a === '--launchd-label' && cliArgs[i + 1]) cliOpts.launchdLabel = cliArgs[++i];
@@ -258,6 +259,7 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     repoRoot,
     releaseRoot: getVal('RELEASE_ROOT', cliOpts.releaseRoot),
     dataDir: getVal('DATA_DIR', cliOpts.dataDir),
+    newDataDir: getVal('NEW_DATA_DIR', cliOpts.newDataDir),
     configDir: getVal('CONFIG_DIR', cliOpts.configDir),
     plistPath: getVal('PLIST_PATH', cliOpts.plistPath),
     launchdLabel: getVal('LAUNCHD_LABEL', cliOpts.launchdLabel),
@@ -370,6 +372,15 @@ export function validateConfig(config) {
     }
   }
 
+  if (config.only === 'migrate-data-dir') {
+    if (!config.newDataDir) {
+      throw new Error('Missing required configuration: newDataDir (Set via --new-data-dir or NEW_DATA_DIR in env file)');
+    }
+    const check = isSafePath(config.newDataDir);
+    if (!check.safe) throw new Error(`Safety violation for newDataDir: ${check.reason}`);
+    if (resolve(config.newDataDir) === resolve(config.dataDir)) throw new Error('newDataDir must differ from dataDir');
+  }
+
   // Safety path check
   const pathProps = ['repoRoot', 'releaseRoot', 'dataDir', 'configDir', 'plistPath'];
   for (const p of pathProps) {
@@ -398,12 +409,66 @@ export function sanitizePlistForLog(plistContent) {
   );
 }
 
+/**
+ * Platform entry points a LaunchAgent can run: `enkeep-server serve` (a deployment with an explicit
+ * production data directory) or the legacy `demo-runner up` (data directory inside the checkout).
+ */
+export const PLATFORM_ENTRIES = [
+  { kind: 'enkeep-server', rel: 'packages/enkeep-server/dist/enkeep-server.js', re: /<string>([^<]*?\/packages\/enkeep-server\/dist\/enkeep-server\.js)<\/string>/ },
+  { kind: 'demo-runner', rel: 'packages/demo-runner/dist/demo-runner.js', re: /<string>([^<]*?\/packages\/demo-runner\/dist\/demo-runner\.js)<\/string>/ },
+];
+
+/** The platform entry of a LaunchAgent plist: `{ kind, rel, path }`, or null. */
+export function findPlistEntry(plistContent) {
+  for (const entry of PLATFORM_ENTRIES) {
+    const match = entry.re.exec(plistContent || '');
+    if (match && match[1]) return { kind: entry.kind, rel: entry.rel, path: match[1] };
+  }
+  return null;
+}
+
+/** ProgramArguments strings of a plist, in order. */
+export function extractProgramArguments(plistContent) {
+  const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plistContent || '');
+  if (!block) return [];
+  return [...block[1].matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1]);
+}
+
+/**
+ * Rewrites ProgramArguments to run `enkeep-server serve` from `worktreePath` on `dataDir`, keeping the
+ * node binary and the remaining options (port, network mode, host runtimes). `--repo-root` points at
+ * the release worktree; a previous `--data-dir` is replaced.
+ */
+export function convertPlistToEnkeepServer(plistContent, worktreePath, dataDir) {
+  const args = extractProgramArguments(plistContent);
+  const entryIndex = args.findIndex((a) => PLATFORM_ENTRIES.some((e) => a.endsWith(`/${e.rel}`)));
+  if (entryIndex < 1) throw new Error('Cannot locate the platform entry in ProgramArguments');
+  const options = [];
+  for (let i = entryIndex + 2; i < args.length; i++) {
+    if (args[i] === '--repo-root' || args[i] === '--data-dir') { i++; continue; }
+    options.push(args[i]);
+  }
+  const next = [
+    ...args.slice(0, entryIndex),
+    join(worktreePath, 'packages/enkeep-server/dist/enkeep-server.js'),
+    'serve',
+    '--data-dir', dataDir,
+    ...options,
+    '--repo-root', worktreePath,
+  ];
+  const escape = (v) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const body = next.map((v) => `\n\t\t<string>${escape(v)}</string>`).join('') + '\n\t';
+  return plistContent.replace(/(<key>ProgramArguments<\/key>\s*<array>)([\s\S]*?)(<\/array>)/, `$1${body}$3`);
+}
+
 export function updatePlistContent(plistContent, newWorktreePath, newImageTag) {
-  // Replace ProgramArguments demo-runner path
-  let updated = plistContent.replace(
-    /(<string>)(.*?\/packages\/demo-runner\/dist\/demo-runner\.js)(<\/string>)/,
-    `$1${join(newWorktreePath, 'packages/demo-runner/dist/demo-runner.js')}$3`
-  );
+  // Point the platform entry (whichever kind the plist runs) at the new worktree
+  const entry = findPlistEntry(plistContent);
+  let updated = plistContent;
+  if (entry) {
+    const pattern = PLATFORM_ENTRIES.find((e) => e.kind === entry.kind).re;
+    updated = updated.replace(pattern, `<string>${join(newWorktreePath, entry.rel)}</string>`);
+  }
 
   // Replace ENKEEP_RUNTIME_IMAGE in EnvironmentVariables
   updated = updated.replace(
@@ -415,9 +480,9 @@ export function updatePlistContent(plistContent, newWorktreePath, newImageTag) {
 }
 
 export function extractWorktreePathFromPlist(plistContent) {
-  const match = /<string>(.*?\/packages\/demo-runner\/dist\/demo-runner\.js)<\/string>/.exec(plistContent);
-  if (match && match[1]) {
-    return resolve(match[1], '..', '..', '..', '..');
+  const entry = findPlistEntry(plistContent);
+  if (entry) {
+    return resolve(entry.path, '..', '..', '..', '..');
   }
   return null;
 }
@@ -836,9 +901,8 @@ export async function executeVerify(config, expectedImageTag = null, preSwitchCo
     if (dataDir && existsSync(dataDir)) {
       let runnerJs = null;
       if (existsSync(plistPath)) {
-        const plistContent = readFileSync(plistPath, 'utf8');
-        const match = /<string>(.*?\/packages\/demo-runner\/dist\/demo-runner\.js)<\/string>/.exec(plistContent);
-        if (match) runnerJs = match[1];
+        const entry = findPlistEntry(readFileSync(plistPath, 'utf8'));
+        if (entry) runnerJs = entry.path;
       }
       if (runnerJs && existsSync(runnerJs)) {
         const preflightCheckCmd = `node "${runnerJs}" preflight --data-dir "${dataDir}" --port ${port} --due-within-minutes ${preflightDueMinutes}`;
@@ -1352,6 +1416,11 @@ export async function executePlatformDeploy(config, options = {}) {
 
   let preSwitchConnCount = 0;
 
+  if (options.migration && dryRun) {
+    console.log(`[DRY-RUN] After quiescence and bootout: enkeep-server migrate-data-dir --from "${dataDir}" --to "${options.migration.newDataDir}" --copy-image <new image> --link-old`);
+    console.log('[DRY-RUN] Then the plist runs: enkeep-server serve --data-dir <new data dir> (other options kept)');
+  }
+
   runDeployStep('Quiescent Preflight & Atomic Switchover', () => {
     console.log('Verifying quiescence before stopping service...');
     execSync(preflightCmd, { cwd: worktreePath, stdio: 'inherit' });
@@ -1376,17 +1445,36 @@ export async function executePlatformDeploy(config, options = {}) {
     }
 
     // From this point onward, any failure triggers automatic rollback
+    const serverJs = join(worktreePath, 'packages/enkeep-server/dist/enkeep-server.js');
+    let migrated = false;
     try {
       if (options.mode === 'full') {
         console.log('[Full Mode] Tearing down active containers (preserving volumes)...');
-        execSync(`node "${join(worktreePath, 'packages/demo-runner/dist/demo-runner.js')}" down --repo-root "${repoRoot}"`, { cwd: worktreePath, stdio: 'inherit' });
+        const onlineEntry = findPlistEntry(readFileSync(plistPath, 'utf8'));
+        if (onlineEntry && onlineEntry.kind === 'enkeep-server') {
+          execSync(`node "${serverJs}" stop --data-dir "${dataDir}"`, { cwd: worktreePath, stdio: 'inherit' });
+        } else {
+          execSync(`node "${join(worktreePath, 'packages/demo-runner/dist/demo-runner.js')}" down --repo-root "${repoRoot}"`, { cwd: worktreePath, stdio: 'inherit' });
+        }
       } else {
         console.log('[Platform Upgrade] Retaining active runtime containers and daemons without down/rebuild.');
       }
 
+      if (options.migration) {
+        console.log(`Migrating the data directory to ${options.migration.newDataDir} and renaming runtimes...`);
+        execSync(
+          `node "${serverJs}" migrate-data-dir --from "${dataDir}" --to "${options.migration.newDataDir}" --copy-image "${imageTag}" --link-old`,
+          { cwd: worktreePath, stdio: 'inherit' }
+        );
+        migrated = true;
+      }
+
       console.log('Updating LaunchAgent plist with new worktree and default container image...');
       const currentPlist = readFileSync(plistPath, 'utf8');
-      const updatedPlist = updatePlistContent(currentPlist, worktreePath, imageTag);
+      let updatedPlist = updatePlistContent(currentPlist, worktreePath, imageTag);
+      if (options.migration) {
+        updatedPlist = convertPlistToEnkeepServer(updatedPlist, worktreePath, options.migration.newDataDir);
+      }
       writeFileSync(plistPath, updatedPlist, 'utf8');
 
       console.log('Bootstrapping LaunchAgent...');
@@ -1394,6 +1482,20 @@ export async function executePlatformDeploy(config, options = {}) {
     } catch (switchErr) {
       console.error(`\n❌ Error during switchover: ${switchErr.message}`);
       console.error('Triggering automatic rollback...');
+      if (migrated) {
+        try {
+          execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null || true`, { stdio: 'inherit' });
+          execSync(
+            `node "${serverJs}" migrate-data-dir --revert --from "${dataDir}" --to "${options.migration.newDataDir}"`,
+            { cwd: worktreePath, stdio: 'inherit' }
+          );
+          console.log('✓ Data directory migration reverted.');
+        } catch (revertErr) {
+          console.error(`❌ Reverting the data directory migration failed: ${revertErr.message}`);
+          console.error('   Do not start the old release before the data directory is back at its old path.');
+          throw switchErr;
+        }
+      }
       try {
         if (existsSync(plistBackup)) {
           const backupPlist = readFileSync(plistBackup, 'utf8');
@@ -1409,7 +1511,22 @@ export async function executePlatformDeploy(config, options = {}) {
   }, dryRun);
 
   // Step 6: Post-Deployment Verification
-  await executeVerify({ ...config, mode: options.mode === 'full' ? 'full' : 'split' }, imageTag, preSwitchConnCount);
+  const verifyDataDir = options.migration ? options.migration.newDataDir : dataDir;
+  try {
+    await executeVerify({ ...config, dataDir: verifyDataDir, mode: options.mode === 'full' ? 'full' : 'split' }, imageTag, preSwitchConnCount);
+  } catch (verifyErr) {
+    if (options.migration && !dryRun) {
+      console.error('\nThe data directory was migrated. Do NOT use --only rollback alone: the previous release');
+      console.error('expects the data directory at its old path. To return to the previous state:');
+      console.error(`  launchctl bootout gui/$(id -u) "${plistPath}"`);
+      console.error(`  node "${join(worktreePath, 'packages/enkeep-server/dist/enkeep-server.js')}" migrate-data-dir --revert --from "${dataDir}" --to "${options.migration.newDataDir}"`);
+      console.error(`  cp "${plistBackup}" "${plistPath}" && launchctl bootstrap gui/$(id -u) "${plistPath}"`);
+    }
+    throw verifyErr;
+  }
+  if (options.migration && !dryRun) {
+    console.log(`\nData directory is now ${options.migration.newDataDir}. Set DATA_DIR to it in your deploy env file.`);
+  }
 
   console.log('\n================================================================');
   console.log(`✓ Release ${releaseId} deployed and verified successfully!`);
@@ -1446,12 +1563,11 @@ export function buildRestartPlatformCommands(config, runnerJs) {
  * @param config - resolved deploy configuration.
  */
 export async function executeRestartPlatform(config) {
-  const plistContent = readFileSync(config.plistPath, 'utf8');
-  const match = /<string>(.*?\/packages\/demo-runner\/dist\/demo-runner\.js)<\/string>/.exec(plistContent);
-  if (!match || !existsSync(match[1])) {
-    throw new Error('Cannot locate the online demo-runner entry from the LaunchAgent plist');
+  const entry = findPlistEntry(readFileSync(config.plistPath, 'utf8'));
+  if (!entry || !existsSync(entry.path)) {
+    throw new Error('Cannot locate the online platform entry from the LaunchAgent plist');
   }
-  const { preflightCmd, restartCmd } = buildRestartPlatformCommands(config, match[1]);
+  const { preflightCmd, restartCmd } = buildRestartPlatformCommands(config, entry.path);
   console.log('================================================================');
   console.log('  Enkeep Platform Restart (no deploy, runtimes retained)          ');
   console.log('================================================================');
@@ -1491,6 +1607,12 @@ export async function executeDeploy(config, options = {}) {
 
   if (config.only === 'runtime') {
     return executeRuntimeDeploy(config);
+  }
+
+  if (config.only === 'migrate-data-dir') {
+    // A full platform release from the target ref whose switch also moves the data directory out of
+    // the checkout and renames the runtimes (enkeep-server migrate-data-dir); runtimes are recreated.
+    return executePlatformDeploy(config, { mode: 'platform', migration: { newDataDir: config.newDataDir } });
   }
 
   if (config.mode === 'full') {
@@ -1582,7 +1704,7 @@ Usage:
 Required Options (or via env file):
   --repo-root <path>               Git repository root path
   --release-root <path>            Directory where release worktrees are kept
-  --data-dir <path>                Path to .demo-data
+  --data-dir <path>                Platform data directory (DATA_DIR)
   --config-dir <path>              Path to external config dir (e.g. ~/.config/enkeep)
   --plist-path <path>              Path to LaunchAgent plist file
   --launchd-label <label>          LaunchAgent label name
@@ -1601,7 +1723,10 @@ Optional Options:
   --skip-tests                     Skip unit test run
   --reuse                          Reuse existing release/batchNN branch without failing
   --mode <full|split>              Deployment mode ('full' forces container teardown; default is split)
-  --only <frontend|runtime|verify|rollback|restart-platform> Run only one step; restart-platform waits for quiescence then restarts the online platform in place
+  --only <frontend|runtime|verify|rollback|restart-platform|migrate-data-dir> Run only one step; restart-platform waits for quiescence then restarts the online platform in place;
+                                   migrate-data-dir releases the target ref and, at the switch, moves the data directory to
+                                   --new-data-dir (NEW_DATA_DIR), renames runtimes to enkeep-runtime-*/enkeep-home-* and runs enkeep-server serve
+  --new-data-dir <path>            Target data directory for --only migrate-data-dir (same filesystem, must not exist)
   --prune-old                      Prune historical release worktrees after deploy
   --dry-run                        Simulate actions without modifying system
   -h, --help                       Show this help message

@@ -38,8 +38,11 @@ import {
   USER_LABEL_KEY,
   RUN_ID_LABEL_KEY,
   VOLUME_ID_LABEL_KEY,
+  ENV_LABEL_KEY,
   getDemoPathConfig,
   assertPathInDemoData,
+  namespaceOfContainerName,
+  namespaceOfVolumeName,
 } from '../config.js';
 import type {
   SignedProcessMetadata,
@@ -80,6 +83,15 @@ function getErrnoCode(err: unknown): string | undefined {
  * Verified cleanup of a temporary file by exact expected device and inode.
  * Returns Error if verification or unlinking fails with a non-ENOENT error; returns null on clean removal or absent file.
  */
+/**
+ * Ownership labels of signed metadata: the `app` label of the resource's namespace and, when present,
+ * the matching `enkeep.env`. Names outside every namespace fail.
+ */
+function labelsMatchExpected(labels: Record<string, string>, app: string | undefined, env: string | undefined): boolean {
+  if (!app || labels[DEMO_LABEL_KEY] !== app) return false;
+  return labels[ENV_LABEL_KEY] === undefined || labels[ENV_LABEL_KEY] === env;
+}
+
 export function cleanupExactTemp(tmpPath: string, tmpDev?: number, tmpIno?: number): Error | null {
   if (tmpDev === undefined || tmpIno === undefined) {
     return null;
@@ -1085,15 +1097,16 @@ export function writeSignedContainerMeta(
     throw new Error(`Safety Violation: volumeId "${volumeId}" must match pattern ${VOLUME_ID_REGEX.source}`);
   }
 
-  if (!meta.containerName.startsWith(DEMO_CONTAINER_PREFIX)) {
+  const containerNamespace = namespaceOfContainerName(meta.containerName);
+  if (!containerNamespace) {
     throw new Error(
-      `Safety Violation: Container name "${meta.containerName}" must start with prefix "${DEMO_CONTAINER_PREFIX}"`
+      `Safety Violation: Container name "${meta.containerName}" must start with prefix "${DEMO_CONTAINER_PREFIX}" or "enkeep-runtime-"`
     );
   }
 
-  if (!meta.volumeName.startsWith(DEMO_VOLUME_PREFIX)) {
+  if (namespaceOfVolumeName(meta.volumeName) !== containerNamespace) {
     throw new Error(
-      `Safety Violation: Volume name "${meta.volumeName}" does not start with mandatory prefix "${DEMO_VOLUME_PREFIX}"`
+      `Safety Violation: Volume name "${meta.volumeName}" does not start with mandatory prefix "${containerNamespace.volumePrefix}"`
     );
   }
 
@@ -1121,7 +1134,8 @@ export function writeSignedContainerMeta(
     volumeId,
     labels: {
       ...meta.labels,
-      [DEMO_LABEL_KEY]: DEMO_LABEL_VALUE,
+      [DEMO_LABEL_KEY]: containerNamespace.appLabel,
+      [ENV_LABEL_KEY]: containerNamespace.env,
       [USER_LABEL_KEY]: meta.userId,
       [VOLUME_ID_LABEL_KEY]: volumeId,
       [RUN_ID_LABEL_KEY]: runId,
@@ -1162,8 +1176,9 @@ export function readSignedContainerMeta(containerName: string, options?: DemoPat
   }
 
   const labels = raw['labels'] as Record<string, string> | undefined;
-  if (!labels || typeof labels !== 'object' || labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
-    throw new Error(`Missing mandatory ownership label: app=${DEMO_LABEL_VALUE}`);
+  const labelNamespace = namespaceOfContainerName(raw['containerName']);
+  if (!labels || typeof labels !== 'object' || !labelsMatchExpected(labels, labelNamespace?.appLabel, labelNamespace?.env)) {
+    throw new Error(`Missing mandatory ownership label: app=${labelNamespace?.appLabel ?? DEMO_LABEL_VALUE}`);
   }
 
   const userId = raw['userId'];
@@ -1202,7 +1217,8 @@ export function readSignedContainerMeta(containerName: string, options?: DemoPat
     throw new Error(`Invalid volumeId in container metadata "${containerName}": must match pattern ${VOLUME_ID_REGEX.source}`);
   }
 
-  if (!cName.startsWith(DEMO_CONTAINER_PREFIX) || !volumeName.startsWith(DEMO_VOLUME_PREFIX)) {
+  const cNamespace = namespaceOfContainerName(cName);
+  if (!cNamespace || namespaceOfVolumeName(volumeName) !== cNamespace) {
     throw new Error(`Cryptographic signature verification failed for container metadata "${containerName}": prefix mismatch`);
   }
 
@@ -1331,9 +1347,10 @@ export function writeSignedVolumeMeta(
     throw new Error(`Safety Violation: volumeId "${volumeId}" must match pattern ${VOLUME_ID_REGEX.source}`);
   }
 
-  if (!meta.volumeName.startsWith(DEMO_VOLUME_PREFIX)) {
+  const volumeNamespace = namespaceOfVolumeName(meta.volumeName);
+  if (!volumeNamespace) {
     throw new Error(
-      `Safety Violation: Volume name "${meta.volumeName}" does not start with mandatory prefix "${DEMO_VOLUME_PREFIX}"`
+      `Safety Violation: Volume name "${meta.volumeName}" does not start with mandatory prefix "${DEMO_VOLUME_PREFIX}" or "enkeep-home-"`
     );
   }
 
@@ -1356,7 +1373,8 @@ export function writeSignedVolumeMeta(
     volumeId,
     labels: {
       ...meta.labels,
-      [DEMO_LABEL_KEY]: DEMO_LABEL_VALUE,
+      [DEMO_LABEL_KEY]: volumeNamespace.appLabel,
+      [ENV_LABEL_KEY]: volumeNamespace.env,
       [USER_LABEL_KEY]: meta.userId,
       [VOLUME_ID_LABEL_KEY]: volumeId,
       [RUN_ID_LABEL_KEY]: runId,
@@ -1396,8 +1414,9 @@ export function readSignedVolumeMeta(volumeName: string, options?: DemoPathOptio
   }
 
   const labels = raw['labels'] as Record<string, string> | undefined;
-  if (!labels || typeof labels !== 'object' || labels[DEMO_LABEL_KEY] !== DEMO_LABEL_VALUE) {
-    throw new Error(`Missing mandatory ownership label: app=${DEMO_LABEL_VALUE}`);
+  const labelNamespace = namespaceOfVolumeName(raw['volumeName']);
+  if (!labels || typeof labels !== 'object' || !labelsMatchExpected(labels, labelNamespace?.appLabel, labelNamespace?.env)) {
+    throw new Error(`Missing mandatory ownership label: app=${labelNamespace?.appLabel ?? DEMO_LABEL_VALUE}`);
   }
 
   const userId = raw['userId'];
@@ -1428,7 +1447,7 @@ export function readSignedVolumeMeta(volumeName: string, options?: DemoPathOptio
     throw new Error(`Invalid volumeId in volume metadata "${volumeName}": must match pattern ${VOLUME_ID_REGEX.source}`);
   }
 
-  if (!vName.startsWith(DEMO_VOLUME_PREFIX)) {
+  if (!namespaceOfVolumeName(vName)) {
     throw new Error(`Cryptographic signature verification failed for volume metadata "${volumeName}": prefix mismatch`);
   }
 

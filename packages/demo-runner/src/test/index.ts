@@ -34,6 +34,7 @@ import {
   findRepoRoot,
   getDemoPathConfig,
   validateResourceSuffix,
+  assertNotProductionDataDir,
 } from '../config.js';
 import {
   getDemoSecrets,
@@ -121,6 +122,7 @@ export async function runDemoTestSuite(options: DemoTestOptions = {}): Promise<D
   validateResourceSuffix(options.resourceSuffix);
 
   const paths = getDemoPathConfig(pathOptions);
+  assertNotProductionDataDir(paths.dataRoot, 'demo:test');
   const steps: StepResult[] = [];
 
   let credentials: DemoCredentials | null = null;

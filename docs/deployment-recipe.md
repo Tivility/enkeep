@@ -9,9 +9,10 @@
 ## 1. 拓扑与路径
 
 - **平台服务**：`http://127.0.0.1:<port>`，由 macOS LaunchAgent `<launchd-label>` 托管（PPID 为 1）；反向代理 `http://127.0.0.1:<proxy-port>`。
-- **运行时**：每个用户一个运行时，分宿主模式（宿主 daemon 进程）和容器模式（Docker 容器 `<container-prefix>*`，网络 `none`，数据卷 `enkeep-demo-dsh-*`）。
+- **平台进程**：`node <release-worktree>/packages/enkeep-server/dist/enkeep-server.js serve --data-dir <data-dir> ...`（进程名 `enkeep-server`）。旧部署是 `demo-runner.js up`，用 3.6 迁移。
+- **运行时**：每个用户一个运行时，分宿主模式（宿主 daemon 进程）和容器模式（Docker 容器 `enkeep-runtime-<用户>`，网络 `none`，数据卷 `enkeep-home-<用户>`，标签 `app=enkeep`、`enkeep.env=production`）。`enkeep-demo-*` / `enkeep-demo-dsh-*` / `app=enkeep-demo` 只属于测试和演示。
 - **其他本地服务**：同机其他服务的端口（例如 DSH Web、HappyClaw）不得停止或干扰。
-- **数据目录**：`<data-dir>`（含 `platform.db`）。
+- **数据目录**：`<data-dir>`（含 `platform.db`），放在任何代码检出之外（例如 `~/.local/share/enkeep/data`），根目录有标记文件 `enkeep-production.json`。带标记的目录会被 `demo-runner reset|up|down|test|bind-lark` 拒绝，只能由 `enkeep-server` 和本脚本操作。
 - **私有配置目录**：`<enkeep-config-dir>`，其中 `deploy.env` 保存本机部署参数，`snapshots/` 保存数据库快照与 plist 备份。
 - **发布工作树**：`<release-root>/release-worktree-<batchId>`，每次发布由脚本创建并检出 `release/<batchId>` 分支。
 - **日志**：LaunchAgent 的 stdout/stderr 文件（见 plist 的 `StandardOutPath` / `StandardErrorPath`）。
@@ -85,7 +86,38 @@ node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env --only
 
 检查项：CSRF 接口 200；平台与代理端口进程 PPID 为 1 且返回 200；容器全部运行（全量模式下要求为新镜像，分层模式下打印各运行时的升级状态）；平台外部长连接数量与切换前一致；部署后空闲检查通过。
 
-### 3.5 清理旧发布工作树
+### 3.5 迁移旧部署：数据目录搬出仓库、运行时改名
+
+旧部署的数据目录在仓库检出里（`<repo-root>/.demo-data`），容器和卷叫 `enkeep-demo-*`，平台由 `demo-runner up` 启动。一次性迁移：
+
+```bash
+# 预演（不改动任何东西）
+node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env \
+  --only migrate-data-dir --new-data-dir <new-data-dir> --dry-run
+
+# 执行：发布目标提交，等整体空闲后停平台，然后迁移并以 enkeep-server serve 启动
+node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env \
+  --only migrate-data-dir --new-data-dir <new-data-dir> --test-cmd "<定向测试>"
+```
+
+切换时 `enkeep-server migrate-data-dir` 依次执行：
+
+1. 给旧目录写入生产标记。
+2. 把每个 `enkeep-demo-dsh-<id>` 卷复制到新卷 `enkeep-home-<id>`，并按文件列表和大小校验。旧卷原样保留作备份，不删除。
+3. 全部校验通过后才开始切换：删除旧容器（数据在卷里），签发新卷元数据，旧元数据移到 `volumes-retired/`、`containers-retired/`。
+4. 同一文件系统内重命名目录，并在旧路径留一个指向新目录的符号链接，这样旧会话里记录的绝对路径仍然有效。
+
+之后 plist 改为 `enkeep-server serve --data-dir <new-data-dir>`，平台启动时以新名字重建容器。完成后把 deploy env 的 `DATA_DIR` 改为 `<new-data-dir>`。
+
+切换中途出错时，脚本会自动还原迁移和 plist。部署后检查失败时脚本会打印还原命令；迁移之后**不要单独用 `--only rollback`**，因为旧版本要求数据目录在原路径：
+
+```bash
+launchctl bootout gui/$(id -u) <plist-path>
+node <release-worktree>/packages/enkeep-server/dist/enkeep-server.js migrate-data-dir --revert --from <old-data-dir> --to <new-data-dir>
+cp <迁移前的 plist 备份> <plist-path> && launchctl bootstrap gui/$(id -u) <plist-path>
+```
+
+### 3.6 清理旧发布工作树
 
 ```bash
 node scripts/prune-release-worktrees.mjs --release-root <release-root> --repo-root <repo-root> \
@@ -102,7 +134,7 @@ node scripts/prune-release-worktrees.mjs --release-root <release-root> --repo-ro
 
 ```bash
 # 空闲检查（不空闲时等待；超时非零退出）
-node <release-worktree>/packages/demo-runner/dist/demo-runner.js preflight \
+node <release-worktree>/packages/enkeep-server/dist/enkeep-server.js preflight \
   --data-dir <data-dir> --port <port> --due-within-minutes 10 \
   --wait --timeout-seconds 86400 --interval-seconds 120
 
@@ -113,4 +145,4 @@ launchctl kickstart -k gui/$(id -u)/<launchd-label>
 curl -s http://127.0.0.1:<port>/api/auth/csrf
 ```
 
-LaunchAgent plist 中与发布相关的字段：`ProgramArguments` 里的发布工作树 `demo-runner.js` 路径，以及 `EnvironmentVariables.ENKEEP_RUNTIME_IMAGE`（运行时镜像的默认值；实际目标版本以平台数据库中的目标运行时版本为准）。其余环境变量（如 `ENKEEP_DSH_HOME`、执行预算、`PTHREAD_MUTEX_USE_ULOCK` 等）随发布保持不变。`PTHREAD_MUTEX_USE_ULOCK=1` 仅用于 macOS，需在进程启动时存在，用于规避 libuv 线程池卡死在 `__psynch_cvwait` 的内核缺陷（见 [libuv#5280](https://github.com/libuv/libuv/issues/5280)）。
+LaunchAgent plist 中与发布相关的字段：`ProgramArguments` 里的发布工作树入口路径（`enkeep-server.js`，旧部署为 `demo-runner.js`），以及 `EnvironmentVariables.ENKEEP_RUNTIME_IMAGE`（运行时镜像的默认值；实际目标版本以平台数据库中的目标运行时版本为准）。其余环境变量（如 `ENKEEP_DSH_HOME`、执行预算、`PTHREAD_MUTEX_USE_ULOCK` 等）随发布保持不变。`PTHREAD_MUTEX_USE_ULOCK=1` 仅用于 macOS，需在进程启动时存在，用于规避 libuv 线程池卡死在 `__psynch_cvwait` 的内核缺陷（见 [libuv#5280](https://github.com/libuv/libuv/issues/5280)）。

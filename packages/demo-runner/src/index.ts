@@ -17,4 +17,5 @@ export * from './down/index.js';
 export * from './test/index.js';
 export * from './preflight/index.js';
 export * from './jarvis-token/index.js';
+export * from './reap/index.js';
 export * from './demo-runner.js';

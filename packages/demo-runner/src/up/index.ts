@@ -105,6 +105,9 @@ import {
   findRepoRoot,
   validateResourceSuffix,
   assertPathInDemoData,
+  isProductionDataDir,
+  PRODUCTION_RESOURCE_NAMESPACE,
+  TEST_RESOURCE_NAMESPACE,
 } from '../config.js';
 import {
   writeSignedProcessMeta,
@@ -541,6 +544,20 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
 
   const paths = getDemoPathConfig(pathOptions);
 
+  // 0. A production data directory runs only as production (enkeep-server serve), and production
+  //    only on a production data directory: a demo `up` must never adopt a deployment's runtimes.
+  const productionDataDir = isProductionDataDir(paths.dataRoot);
+  if (productionDataDir && options.production !== true) {
+    throw new Error(
+      `Safety Violation: "${paths.dataRoot}" is a production data directory. Start it with "enkeep-server serve", not demo:up.`
+    );
+  }
+  if (options.production === true && !productionDataDir) {
+    throw new Error(
+      `Safety Violation: "${paths.dataRoot}" is not a production data directory (enkeep-production.json missing).`
+    );
+  }
+
   // 1. Invariant: Demo database MUST exist. Never auto-reset to avoid credential loss!
   if (!existsSync(paths.dbPath)) {
     throw new Error(
@@ -580,6 +597,7 @@ export async function launchDemoSystem(options: DemoUpOptions = {}): Promise<Run
     options.runtimeAdapter ??
     new DockerRuntimeContainerAdapter(new SafeDockerClient(), {
       defaultNetworkMode: containerNetworkMode,
+      namespace: options.production === true ? PRODUCTION_RESOURCE_NAMESPACE : TEST_RESOURCE_NAMESPACE,
     });
   const hostAdapter: RuntimeContainerPort =
     options.hostRuntimeAdapter ?? new HostRuntimePortAdapter();
