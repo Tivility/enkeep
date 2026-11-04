@@ -22,6 +22,21 @@ import {
   type ParsedDshSession,
 } from './session-event-parser.js';
 
+
+/** Container name prefixes of runtimes: demo/test data dirs and deployments. */
+const RUNTIME_CONTAINER_PREFIXES = ['enkeep-demo-', 'enkeep-runtime-'] as const;
+/** Home volume name prefixes of runtimes: demo/test data dirs and deployments. */
+const RUNTIME_VOLUME_PREFIXES = ['enkeep-demo-dsh-', 'enkeep-home-'] as const;
+
+/** Whether `name` is the home volume of runtime identity `ident` (`<prefix><ident>[-<suffix>]`). */
+function isRuntimeVolumeOfIdent(name: string, ident: string): boolean {
+  return RUNTIME_VOLUME_PREFIXES.some(
+    (prefix) =>
+      new RegExp(`^${prefix}[a-z0-9][a-z0-9_-]{0,60}$`).test(name) &&
+      (name === `${prefix}${ident}` || name.startsWith(`${prefix}${ident}-`))
+  );
+}
+
 export type ReconciliationStatus =
   | 'matched'
   | 'drift'
@@ -659,7 +674,8 @@ export class DualStorageReconcileService {
 
       for (const ident of runtimeIdentities) {
         // A. Inspect container metadata for this exact tenant identity (authoritative mapping)
-        const cPath = path.join(containersDir, `enkeep-demo-${ident}.json`);
+        // Runtime metadata of a demo/test data dir (enkeep-demo-*) or a deployment (enkeep-runtime-*).
+        for (const cPath of RUNTIME_CONTAINER_PREFIXES.map((prefix) => path.join(containersDir, `${prefix}${ident}.json`))) {
         if (fs.existsSync(cPath)) {
           try {
             const cMeta = JSON.parse(fs.readFileSync(cPath, 'utf8'));
@@ -671,8 +687,7 @@ export class DualStorageReconcileService {
               !vName.includes('/') &&
               !vName.includes('\\') &&
               !vName.includes('..') &&
-              /^enkeep-demo-dsh-[a-z0-9][a-z0-9_-]{0,60}$/.test(vName) &&
-              (vName === `enkeep-demo-dsh-${ident}` || vName.startsWith(`enkeep-demo-dsh-${ident}-`))
+              isRuntimeVolumeOfIdent(vName, ident)
             ) {
               const vPath = path.join(volumesManifestDir, `${vName}.json`);
               if (fs.existsSync(vPath)) {
@@ -690,8 +705,10 @@ export class DualStorageReconcileService {
           } catch {}
         }
 
+        }
+
         // B. Inspect direct signed volume metadata for this exact tenant identity (authoritative mapping)
-        const directVPath = path.join(volumesManifestDir, `enkeep-demo-dsh-${ident}.json`);
+        for (const directVPath of RUNTIME_VOLUME_PREFIXES.map((prefix) => path.join(volumesManifestDir, `${prefix}${ident}.json`))) {
         if (fs.existsSync(directVPath)) {
           try {
             const vMeta = JSON.parse(fs.readFileSync(directVPath, 'utf8'));
@@ -703,12 +720,12 @@ export class DualStorageReconcileService {
               !vName.includes('/') &&
               !vName.includes('\\') &&
               !vName.includes('..') &&
-              /^enkeep-demo-dsh-[a-z0-9][a-z0-9_-]{0,60}$/.test(vName) &&
-              (vName === `enkeep-demo-dsh-${ident}` || vName.startsWith(`enkeep-demo-dsh-${ident}-`))
+              isRuntimeVolumeOfIdent(vName, ident)
             ) {
               verifiedTenantVolumes.add(vName);
             }
           } catch {}
+        }
         }
       }
 

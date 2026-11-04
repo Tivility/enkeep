@@ -888,5 +888,97 @@ describe('Dual Storage Reconciliation & Typed DSH Parser (P0 Direct Tests)', () 
       expect(bobRep.dshReadStatus).toBe('FOUND');
       expect(bobRep.dshMessageCount).toBeGreaterThan(0);
     });
+
+    it('applies the same isolation to production-named runtimes (enkeep-runtime-* / enkeep-home-*)', async () => {
+      // Alice and Bob share identical dshSessionId and identical spaceFolder name
+      const overlappingDshSessionId = 'ses_shared_overlap_456';
+      const overlappingSpaceFolder = 'common-space-folder-prod';
+
+      // 1. Create a space for Alice with space_folder = overlappingSpaceFolder
+      const aliceSpace2 = 'spc_alice_overlap_prod';
+      const aliceRoute2 = 'sr_alice_overlap_route_prod';
+      db.prepare(`
+        INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, created_at, updated_at)
+        VALUES (?, ?, 'Alice Overlap Space', ?, 'container', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(aliceSpace2, aliceId, overlappingSpaceFolder);
+
+      db.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id, dsh_session_id, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'web', 'acc_alice_overlap_prod', 'ctx_alice_overlap_prod', ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(aliceRoute2, aliceSpace2, aliceId, overlappingDshSessionId);
+
+      // 2. Create a space for Bob with the exact same space_folder
+      const bobSpace2 = 'spc_bob_overlap_prod';
+      const bobRoute2 = 'sr_bob_overlap_route_prod';
+      db.prepare(`
+        INSERT INTO spaces (id, user_id, name, folder, execution_mode, status, created_at, updated_at)
+        VALUES (?, ?, 'Bob Overlap Space', ?, 'container', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(bobSpace2, bobId, overlappingSpaceFolder);
+
+      db.prepare(`
+        INSERT INTO session_routes (id, space_id, user_id, channel, account_id, native_context_id, dsh_session_id, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'web', 'acc_bob_overlap_prod', 'ctx_bob_overlap_prod', ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(bobRoute2, bobSpace2, bobId, overlappingDshSessionId);
+
+      // 3. Setup mock filesystem under tempDir mimicking dshHome:
+      // Create Bob's volume containing Bob's private session log
+      const volumesDir = path.join(tempDir, 'volumes');
+      const containersDir = path.join(tempDir, 'containers');
+      fs.mkdirSync(volumesDir, { recursive: true });
+      fs.mkdirSync(containersDir, { recursive: true });
+
+      const bobVolName = 'enkeep-home-bob';
+      const bobVolDir = path.join(volumesDir, bobVolName, 'sessions', overlappingDshSessionId);
+      fs.mkdirSync(bobVolDir, { recursive: true });
+      const { jsonlContent: bobLogContent } = createFullDshSessionLog(overlappingDshSessionId);
+      fs.writeFileSync(path.join(bobVolDir, 'session.jsonl'), bobLogContent);
+
+      // Write Bob's valid volume metadata
+      fs.writeFileSync(
+        path.join(volumesDir, `${bobVolName}.json`),
+        JSON.stringify({
+          schemaVersion: 1,
+          userId: bobId,
+          volumeName: bobVolName,
+          labels: { 'enkeep.user': bobId },
+        })
+      );
+
+      // Service instance configured with dshHome pointing to tempDir
+      const isolatedService = new DualStorageReconcileService({ db, dshHome: tempDir });
+
+      // 4. Test A: Alice has NO volume mapping -> MUST FAIL CLOSED with UNAVAILABLE
+      // Alice MUST NOT read Bob's volume session.jsonl despite overlapping dshSessionId and space folder!
+      const aliceRepMissingMapping = await isolatedService.reconcileSession(aliceId, aliceRoute2);
+      expect(aliceRepMissingMapping.status).toBe('unavailable');
+      expect(aliceRepMissingMapping.dshReadStatus).toBe('UNAVAILABLE');
+      expect(aliceRepMissingMapping.dshMessageCount).toBe(0);
+
+      // 5. Test B: Alice has INVALID / spoofed volume mapping pointing to Bob's volume -> FAIL CLOSED
+      fs.writeFileSync(
+        path.join(containersDir, 'enkeep-runtime-alice.json'),
+        JSON.stringify({
+          userId: aliceId,
+          volumeName: bobVolName, // Maliciously points to Bob's volume
+          labels: { 'enkeep.user': aliceId },
+        })
+      );
+
+      const aliceRepSpoofed = await isolatedService.reconcileSession(aliceId, aliceRoute2);
+      expect(aliceRepSpoofed.status).toBe('unavailable');
+      expect(aliceRepSpoofed.dshReadStatus).toBe('UNAVAILABLE');
+      expect(aliceRepSpoofed.dshMessageCount).toBe(0);
+
+      // 6. Test C: Bob reconciles his own session -> Succeeds because mapping is authentic and matching
+      // Seed matching sqlite message for Bob so it matches
+      db.prepare(`
+        INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, created_at)
+        VALUES ('msg_bob_02', ?, ?, 'user', 'Please list files and summarize them.', 'delivered', ?, CURRENT_TIMESTAMP)
+      `).run(bobRoute2, bobId, bobRoute2);
+
+      const bobRep = await isolatedService.reconcileSession(bobId, bobRoute2);
+      expect(bobRep.dshReadStatus).toBe('FOUND');
+      expect(bobRep.dshMessageCount).toBeGreaterThan(0);
+    });
   });
 });
