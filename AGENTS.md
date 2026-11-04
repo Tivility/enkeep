@@ -62,6 +62,12 @@ Do not `git add -f` anything under these paths. Do not weaken `.gitignore` or `.
 - Tests must run offline. Never call real Feishu/Lark, WeChat, or model provider endpoints from tests; use local fake servers or in-memory transports.
 - Services bind to `127.0.0.1` only. Do not start, stop, or bind to ports used by other local services (see `docs/safety.md`).
 
+## 6a. Production is not a demo
+
+- A deployment runs as `enkeep-server serve` on a data directory outside the checkout, marked by `enkeep-production.json`. Its runtimes are `enkeep-runtime-*` containers on `enkeep-home-*` volumes (`app=enkeep`, `enkeep.env=production`). Never stop, remove, prune, or "clean up" these, or any process started from a release worktree, as if they were test leftovers.
+- `demo-runner reset|up|down|test|bind-lark` refuse a production data directory. Do not work around that refusal.
+- Test and demo runs use the `enkeep-demo-*` / `enkeep-demo-dsh-*` names with `app=enkeep-demo`, `enkeep.env=test`, and their own `--resource-suffix` and data directory. Tear down what you start. `node packages/demo-runner/dist/demo-runner.js reap` (also run automatically before `up` and `test`) removes leftover test runtimes and nothing else.
+
 ## 7. From change to production
 
 Every change follows the same path; do not skip or reorder steps.
