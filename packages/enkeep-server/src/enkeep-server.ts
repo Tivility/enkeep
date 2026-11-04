@@ -74,7 +74,7 @@ export async function runEnkeepServerCli(argv: string[] = process.argv.slice(2))
       const to = flag(rest, '--to');
       if (rest.includes('--revert')) {
         if (!from || !to) throw new Error('migrate-data-dir --revert requires --from and --to (as given to the migration)');
-        revertDataDirMigration({ original: from, migrated: to });
+        await revertDataDirMigration({ original: from, migrated: to });
         console.log('Reverted.');
         return;
       }

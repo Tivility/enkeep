@@ -278,6 +278,7 @@ export interface RevertDataDirOptions {
   original: string;
   /** The data directory the migration moved to. */
   migrated: string;
+  docker?: DockerExec;
   log?: (line: string) => void;
 }
 
@@ -287,15 +288,32 @@ export interface RevertDataDirOptions {
  * volumes were never modified and the production copies stay for inspection. The old platform
  * recreates its runtime containers from the restored metadata.
  */
-export function revertDataDirMigration(options: RevertDataDirOptions): void {
+export async function revertDataDirMigration(options: RevertDataDirOptions): Promise<void> {
   const log = options.log ?? ((line: string) => console.log(line));
+  const docker = options.docker ?? defaultDocker;
   const original = resolve(options.original);
   const migrated = resolve(options.migrated);
   if (!existsSync(original) || !lstatSync(original).isSymbolicLink()) throw new Error(`${original} is not the symlink left by the migration`);
   if (resolve(dirname(original), readlinkSync(original)) !== migrated) throw new Error(`${original} does not point to ${migrated}`);
   if (!lstatSync(migrated).isDirectory()) throw new Error(`${migrated} is not a directory`);
-  const live = listSignedProcesses({ repoRoot: dirname(migrated), dataRoot: migrated, mode: 'production' }).filter((p) => isProcessAlive(p.pid));
+  const migratedOptions: DemoPathOptions = { repoRoot: dirname(migrated), dataRoot: migrated, mode: 'production' };
+  const live = listSignedProcesses(migratedOptions).filter((p) => isProcessAlive(p.pid));
   if (live.length > 0) throw new Error('Platform processes are still running; stop the platform first');
+
+  // Runtime containers the production platform created are stopped; their volumes stay.
+  for (const c of listSignedContainers(migratedOptions)) {
+    if (namespaceOfContainerName(c.containerName) !== PRODUCTION_RESOURCE_NAMESPACE) continue;
+    let id: string | undefined;
+    try {
+      id = (JSON.parse(await docker(['inspect', '--type', 'container', c.containerName])) as Array<{ Id?: string }>)[0]?.Id;
+    } catch {
+      id = undefined;
+    }
+    if (id && id === c.containerId) {
+      await docker(['rm', '-f', id]);
+      log(`  container ${c.containerName}: removed`);
+    }
+  }
 
   unlinkSync(original);
   renameSync(migrated, original);

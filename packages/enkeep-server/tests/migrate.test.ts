@@ -170,13 +170,22 @@ describe('migrateDataDir', () => {
   });
 
   it('reverts a migration: directory and demo metadata back, production metadata retired', async () => {
-    const { docker } = liveDocker();
+    const { docker, containers } = liveDocker();
     await migrateDataDir({ from, to, copyImage: 'enkeep-runtime:test', linkOld: true, docker, log: () => {} });
-    revertDataDirMigration({ original: from, migrated: to, log: () => {} });
+    // The production platform ran and created its runtime container.
+    const prodId = randomBytes(32).toString('hex');
+    writeSignedContainerMeta(
+      { userId: 'alice', containerName: 'enkeep-runtime-alice', containerId: prodId, volumeName: 'enkeep-home-alice', volumeId, runId: 'run_test_003' },
+      { repoRoot: root, dataRoot: to, mode: 'production' }
+    );
+    containers.set('enkeep-runtime-alice', prodId);
+    await revertDataDirMigration({ original: from, migrated: to, docker, log: () => {} });
+    expect(containers.has('enkeep-runtime-alice')).toBe(false);
     expect(lstatSync(from).isDirectory()).toBe(true);
     expect(existsSync(to)).toBe(false);
     expect(readdirSync(join(from, 'containers'))).toEqual(['enkeep-demo-alice.json']);
     expect(readdirSync(join(from, 'volumes')).sort()).toEqual(['enkeep-demo-dsh-alice.json', 'enkeep-demo-dsh-bob-old.json']);
     expect(readdirSync(join(from, 'volumes-retired-production'))).toEqual(['enkeep-home-alice.json']);
+    expect(readdirSync(join(from, 'containers-retired-production'))).toEqual(['enkeep-runtime-alice.json']);
   });
 });
