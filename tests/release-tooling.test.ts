@@ -22,6 +22,9 @@ import {
   findLatestPlistBackup,
   verifyContainers,
   buildRestartPlatformCommands,
+  findPlistEntry,
+  extractProgramArguments,
+  convertPlistToEnkeepServer,
   DEFAULT_PREFLIGHT_TIMEOUT_SECONDS,
   DEFAULT_PREFLIGHT_INTERVAL_SECONDS,
 } from '../scripts/deploy-release.mjs';
@@ -149,6 +152,61 @@ describe('Deploy Tooling Enhancements', () => {
       expect(updated).toContain('<key>SECRET_KEY</key>');
       expect(updated).toContain('<string>super-secret-token</string>');
       expect(updated).not.toContain('batch54');
+    });
+
+    const legacyPlist = samplePlist.replace(
+      '<string>up</string>',
+      '<string>up</string>\n    <string>--port</string>\n    <string>39001</string>\n    <string>--allow-host</string>\n    <string>--repo-root</string>\n    <string>/tmp/checkout</string>'
+    );
+
+    it('finds the legacy demo-runner entry and the enkeep-server entry', () => {
+      expect(findPlistEntry(legacyPlist)).toEqual({
+        kind: 'demo-runner',
+        rel: 'packages/demo-runner/dist/demo-runner.js',
+        path: '/tmp/worktrees/release-worktree-batch54/packages/demo-runner/dist/demo-runner.js',
+      });
+      const converted = convertPlistToEnkeepServer(legacyPlist, '/tmp/worktrees/release-worktree-batch60', '/tmp/enkeep-data');
+      expect(findPlistEntry(converted)?.kind).toBe('enkeep-server');
+      expect(extractWorktreePathFromPlist(converted)).toBe('/tmp/worktrees/release-worktree-batch60');
+    });
+
+    it('converts ProgramArguments to enkeep-server serve, keeping options and the environment', () => {
+      const converted = convertPlistToEnkeepServer(legacyPlist, '/tmp/worktrees/release-worktree-batch60', '/tmp/enkeep-data');
+      expect(extractProgramArguments(converted)).toEqual([
+        '/opt/homebrew/bin/node',
+        '/tmp/worktrees/release-worktree-batch60/packages/enkeep-server/dist/enkeep-server.js',
+        'serve',
+        '--data-dir', '/tmp/enkeep-data',
+        '--port', '39001',
+        '--allow-host',
+        '--repo-root', '/tmp/worktrees/release-worktree-batch60',
+      ]);
+      expect(converted).toContain('<string>super-secret-token</string>');
+      expect(converted).not.toContain('demo-runner');
+    });
+
+    it('keeps the entry kind when a later release updates an enkeep-server plist', () => {
+      const converted = convertPlistToEnkeepServer(legacyPlist, '/tmp/worktrees/release-worktree-batch60', '/tmp/enkeep-data');
+      const next = updatePlistContent(converted, '/tmp/worktrees/release-worktree-batch61', 'enkeep-runtime:gap-batch61-sha');
+      expect(extractProgramArguments(next).slice(0, 5)).toEqual([
+        '/opt/homebrew/bin/node',
+        '/tmp/worktrees/release-worktree-batch61/packages/enkeep-server/dist/enkeep-server.js',
+        'serve',
+        '--data-dir', '/tmp/enkeep-data',
+      ]);
+      expect(next).toContain('enkeep-runtime:gap-batch61-sha');
+    });
+
+    it('requires a distinct new data directory for --only migrate-data-dir', () => {
+      const base = {
+        releaseId: 'batch60', repoRoot: '/tmp/r', releaseRoot: '/tmp/rel', dataDir: '/tmp/d', configDir: '/tmp/c',
+        plistPath: '/tmp/p.plist', launchdLabel: 'test.label', port: 39001, proxyPort: 39002,
+        runtimeImagePrefix: 'enkeep-runtime:gap-', containerNamePrefix: 'enkeep-', only: 'migrate-data-dir',
+      };
+      expect(() => validateConfig(base)).toThrow(/newDataDir/);
+      expect(() => validateConfig({ ...base, newDataDir: '/tmp/d' })).toThrow(/must differ/);
+      expect(() => validateConfig({ ...base, newDataDir: '/etc/enkeep' })).toThrow(/forbidden/);
+      expect(() => validateConfig({ ...base, newDataDir: '/tmp/new-data' })).not.toThrow();
     });
 
     it('sanitizes EnvironmentVariables when preparing logs', () => {
