@@ -112,6 +112,10 @@ node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env \
 
 之后 plist 改为 `enkeep-server serve --data-dir <new-data-dir>`，平台启动时以新名字重建容器。完成后把 deploy env 的 `DATA_DIR` 改为 `<new-data-dir>`。
 
+迁移开始复制前会先停掉旧的运行时容器（数据都在卷里，容器根文件系统只读），保证复制期间没有写入；宿主 daemon 或平台进程仍在运行时直接拒绝。
+
+还原（`--revert`）后旧版本使用迁移前的 `enkeep-demo-dsh-*` 卷：迁移后容器用户新写入的内容只在 `enkeep-home-*` 卷里，如需保留要手工拷回；宿主模式的数据在数据目录里，随目录一起还原。
+
 旧的 `enkeep-demo-dsh-*` 卷是回滚用的备份，至少保留到确认新部署稳定（建议 7 天）后再手工删除。它们没有 `enkeep.env=test` 标签，`demo-runner reap` 不会碰。
 
 切换中途出错时，脚本会自动还原迁移和 plist。部署后检查失败时脚本会打印还原命令；迁移之后**不要单独用 `--only rollback`**，因为旧版本要求数据目录在原路径：

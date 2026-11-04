@@ -25,6 +25,7 @@ interface FakeVolume {
 
 function fakeDocker(volumes: Map<string, FakeVolume>, containers: Map<string, string>, options: { corruptCopy?: boolean } = {}) {
   const calls: string[][] = [];
+  const stopped = new Set<string>();
   const docker: DockerExec = async (args) => {
     calls.push([...args]);
     const [cmd, sub] = args;
@@ -46,19 +47,32 @@ function fakeDocker(volumes: Map<string, FakeVolume>, containers: Map<string, st
     if (cmd === 'run') {
       const mounts = args.filter((a, i) => args[i - 1] === '-v');
       const script = args[args.length - 1]!;
+      if (script.startsWith('find /to')) {
+        volumes.get(mounts[0]!.split(':')[0]!)!.files = '';
+        return '';
+      }
       if (script.startsWith('cp -a')) {
+        // Copies happen only with every old runtime stopped.
+        if ([...containers.values()].some((id) => !stopped.has(id))) throw new Error('copy while a runtime container is running');
         const src = mounts[0]!.split(':')[0]!;
         const dst = mounts[1]!.split(':')[0]!;
         volumes.get(dst)!.files = options.corruptCopy ? 'truncated' : volumes.get(src)!.files;
         return '';
       }
-      return `digest:${volumes.get(mounts[0]!.split(':')[0]!)!.files}`;
+      const files = volumes.get(mounts[0]!.split(':')[0]!)!.files;
+      // Disk usage differs between a volume and its copy; only digest and file count must match.
+      return `digest:${files}\n${files.length}\n${mounts[0]!.startsWith('enkeep-home-') ? 999 : 100}`;
     }
     if (cmd === 'inspect') {
       const id = containers.get(args[args.length - 1]!);
       if (!id) throw new Error('no such container');
-      return JSON.stringify([{ Id: id }]);
+      return JSON.stringify([{ Id: id, State: { Running: !stopped.has(id) } }]);
     }
+    if (cmd === 'stop') {
+      stopped.add(args[args.length - 1]!);
+      return '';
+    }
+    if (cmd === 'ps') return '';
     if (cmd === 'rm') {
       for (const [name, id] of containers) if (id === args[2]) containers.delete(name);
       return '';
@@ -211,6 +225,25 @@ describe('migrateDataDir', () => {
     mkdirSync(backupDir, { recursive: true });
     await expect(migrateDataDir({ from, to, copyImage: 'enkeep-runtime:test', backupDir, docker, log: () => {} })).rejects.toThrow(/already exists/);
     expect(isProductionDataDir(from)).toBe(false);
+    expect(existsSync(to)).toBe(false);
+  });
+
+  it('refreshes an outdated copy left by an earlier attempt', async () => {
+    const { docker, volumes } = liveDocker();
+    volumes.set('enkeep-home-alice', {
+      labels: { app: 'enkeep', 'enkeep.env': 'production', 'enkeep.user': 'alice', 'enkeep.volume-id': volumeId },
+      files: 'half-copied',
+    });
+    const result = await migrateDataDir({ from, to, copyImage: 'enkeep-runtime:test', docker, log: () => {} });
+    expect(result.volumes.find((v) => v.from === 'enkeep-demo-dsh-alice')?.status).toBe('copied');
+    expect(volumes.get('enkeep-home-alice')?.files).toBe('alice-home');
+  });
+
+  it('refuses while a host runtime daemon of the directory is alive', async () => {
+    const { docker } = liveDocker();
+    mkdirSync(join(from, 'host-runtimes', 'alice', 'run'), { recursive: true });
+    writeFileSync(join(from, 'host-runtimes', 'alice', 'run', 'process.meta.json'), JSON.stringify({ pid: process.pid }));
+    await expect(migrateDataDir({ from, to, copyImage: 'enkeep-runtime:test', docker, log: () => {} })).rejects.toThrow(/daemons are still running/);
     expect(existsSync(to)).toBe(false);
   });
 });
