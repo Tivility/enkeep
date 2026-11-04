@@ -206,6 +206,8 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     else if (a === '--release-root' && cliArgs[i + 1]) cliOpts.releaseRoot = cliArgs[++i];
     else if (a === '--data-dir' && cliArgs[i + 1]) cliOpts.dataDir = cliArgs[++i];
     else if (a === '--new-data-dir' && cliArgs[i + 1]) cliOpts.newDataDir = cliArgs[++i];
+    else if (a === '--backup-dir' && cliArgs[i + 1]) cliOpts.backupDir = cliArgs[++i];
+    else if (a === '--before-start' && cliArgs[i + 1]) cliOpts.beforeStart = cliArgs[++i];
     else if (a === '--config-dir' && cliArgs[i + 1]) cliOpts.configDir = cliArgs[++i];
     else if (a === '--plist-path' && cliArgs[i + 1]) cliOpts.plistPath = cliArgs[++i];
     else if (a === '--launchd-label' && cliArgs[i + 1]) cliOpts.launchdLabel = cliArgs[++i];
@@ -260,6 +262,8 @@ export function resolveDeployConfig(cliArgs = process.argv.slice(2)) {
     releaseRoot: getVal('RELEASE_ROOT', cliOpts.releaseRoot),
     dataDir: getVal('DATA_DIR', cliOpts.dataDir),
     newDataDir: getVal('NEW_DATA_DIR', cliOpts.newDataDir),
+    backupDir: getVal('BACKUP_DIR', cliOpts.backupDir),
+    beforeStart: getVal('BEFORE_START_CMD', cliOpts.beforeStart),
     configDir: getVal('CONFIG_DIR', cliOpts.configDir),
     plistPath: getVal('PLIST_PATH', cliOpts.plistPath),
     launchdLabel: getVal('LAUNCHD_LABEL', cliOpts.launchdLabel),
@@ -379,6 +383,10 @@ export function validateConfig(config) {
     const check = isSafePath(config.newDataDir);
     if (!check.safe) throw new Error(`Safety violation for newDataDir: ${check.reason}`);
     if (resolve(config.newDataDir) === resolve(config.dataDir)) throw new Error('newDataDir must differ from dataDir');
+    if (config.backupDir) {
+      const backupCheck = isSafePath(config.backupDir);
+      if (!backupCheck.safe) throw new Error(`Safety violation for backupDir: ${backupCheck.reason}`);
+    }
   }
 
   // Safety path check
@@ -1417,7 +1425,8 @@ export async function executePlatformDeploy(config, options = {}) {
   let preSwitchConnCount = 0;
 
   if (options.migration && dryRun) {
-    console.log(`[DRY-RUN] After quiescence and bootout: enkeep-server migrate-data-dir --from "${dataDir}" --to "${options.migration.newDataDir}" --copy-image <new image> --link-old`);
+    console.log(`[DRY-RUN] After quiescence and bootout: enkeep-server migrate-data-dir --from "${dataDir}" --to "${options.migration.newDataDir}" --copy-image <new image> --link-old${options.migration.backupDir ? ` --backup-dir "${options.migration.backupDir}"` : ''}`);
+    if (options.beforeStart) console.log(`[DRY-RUN] Then the before-start hook: ${options.beforeStart}`);
     console.log('[DRY-RUN] Then the plist runs: enkeep-server serve --data-dir <new data dir> (other options kept)');
   }
 
@@ -1462,11 +1471,18 @@ export async function executePlatformDeploy(config, options = {}) {
 
       if (options.migration) {
         console.log(`Migrating the data directory to ${options.migration.newDataDir} and renaming runtimes...`);
+        const backupArg = options.migration.backupDir ? ` --backup-dir "${options.migration.backupDir}"` : '';
         execSync(
-          `node "${serverJs}" migrate-data-dir --from "${dataDir}" --to "${options.migration.newDataDir}" --copy-image "${imageTag}" --link-old`,
+          `node "${serverJs}" migrate-data-dir --from "${dataDir}" --to "${options.migration.newDataDir}" --copy-image "${imageTag}" --link-old${backupArg}`,
           { cwd: worktreePath, stdio: 'inherit' }
         );
         migrated = true;
+      }
+
+      if (options.beforeStart) {
+        // Operator hook inside the stopped window (e.g. restarting the Docker VM with new limits).
+        console.log(`Running before-start hook: ${options.beforeStart}`);
+        execSync(options.beforeStart, { stdio: 'inherit', shell: '/bin/bash' });
       }
 
       console.log('Updating LaunchAgent plist with new worktree and default container image...');
@@ -1612,7 +1628,11 @@ export async function executeDeploy(config, options = {}) {
   if (config.only === 'migrate-data-dir') {
     // A full platform release from the target ref whose switch also moves the data directory out of
     // the checkout and renames the runtimes (enkeep-server migrate-data-dir); runtimes are recreated.
-    return executePlatformDeploy(config, { mode: 'platform', migration: { newDataDir: config.newDataDir } });
+    return executePlatformDeploy(config, {
+      mode: 'platform',
+      migration: { newDataDir: config.newDataDir, ...(config.backupDir ? { backupDir: config.backupDir } : {}) },
+      ...(config.beforeStart ? { beforeStart: config.beforeStart } : {}),
+    });
   }
 
   if (config.mode === 'full') {
@@ -1727,6 +1747,8 @@ Optional Options:
                                    migrate-data-dir releases the target ref and, at the switch, moves the data directory to
                                    --new-data-dir (NEW_DATA_DIR), renames runtimes to enkeep-runtime-*/enkeep-home-* and runs enkeep-server serve
   --new-data-dir <path>            Target data directory for --only migrate-data-dir (same filesystem, must not exist)
+  --backup-dir <path>              migrate-data-dir: back up platform.db and clone the data directory here first (must not exist)
+  --before-start <cmd>             migrate-data-dir: command run after the migration, before the platform starts again
   --prune-old                      Prune historical release worktrees after deploy
   --dry-run                        Simulate actions without modifying system
   -h, --help                       Show this help message

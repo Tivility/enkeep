@@ -95,10 +95,13 @@ node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env --only
 node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env \
   --only migrate-data-dir --new-data-dir <new-data-dir> --dry-run
 
-# 执行：发布目标提交，等整体空闲后停平台，然后迁移并以 enkeep-server serve 启动
+# 执行：发布目标提交，等整体空闲后停平台，先做独立备份，再迁移并以 enkeep-server serve 启动
 node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env \
-  --only migrate-data-dir --new-data-dir <new-data-dir> --test-cmd "<定向测试>"
+  --only migrate-data-dir --new-data-dir <new-data-dir> \
+  --backup-dir <backup-dir> [--before-start "<停机窗口内要执行的命令>"] --test-cmd "<定向测试>"
 ```
+
+`--backup-dir` 在停机后、任何改动之前，把 `platform.db` 用 SQLite 在线备份写到 `<backup-dir>/platform.db.backup` 并做完整性检查，再把整个数据目录克隆到 `<backup-dir>/data`（APFS 上为写时复制克隆）。`--before-start` 在迁移完成后、平台重新启动前执行，用于同一停机窗口内的其他操作，例如重启 Docker 虚拟机使新的内存上限生效。卷的复制按内容校验：逐个文件比对路径、类型与权限、属主、大小、符号链接目标和内容 md5。
 
 切换时 `enkeep-server migrate-data-dir` 依次执行：
 
@@ -108,6 +111,12 @@ node scripts/deploy-release.mjs --env-file <enkeep-config-dir>/deploy.env \
 4. 同一文件系统内重命名目录，并在旧路径留一个指向新目录的符号链接，这样旧会话里记录的绝对路径仍然有效。
 
 之后 plist 改为 `enkeep-server serve --data-dir <new-data-dir>`，平台启动时以新名字重建容器。完成后把 deploy env 的 `DATA_DIR` 改为 `<new-data-dir>`。
+
+迁移开始复制前会先停掉旧的运行时容器（数据都在卷里，容器根文件系统只读），保证复制期间没有写入；宿主 daemon 或平台进程仍在运行时直接拒绝。
+
+还原（`--revert`）后旧版本使用迁移前的 `enkeep-demo-dsh-*` 卷：迁移后容器用户新写入的内容只在 `enkeep-home-*` 卷里，如需保留要手工拷回；宿主模式的数据在数据目录里，随目录一起还原。
+
+旧的 `enkeep-demo-dsh-*` 卷是回滚用的备份，至少保留到确认新部署稳定（建议 7 天）后再手工删除。它们没有 `enkeep.env=test` 标签，`demo-runner reap` 不会碰。
 
 切换中途出错时，脚本会自动还原迁移和 plist。部署后检查失败时脚本会打印还原命令；迁移之后**不要单独用 `--only rollback`**，因为旧版本要求数据目录在原路径：
 

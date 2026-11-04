@@ -17,7 +17,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, renameSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   PRODUCTION_RESOURCE_NAMESPACE,
@@ -52,8 +52,73 @@ export interface MigrateDataDirOptions {
   linkOld?: boolean;
   /** Only report the plan. */
   dryRun?: boolean;
+  /**
+   * Independent backup taken with the platform stopped and before any change: a SQLite online
+   * backup of platform.db (`<backupDir>/platform.db.backup`) and a clone of the whole data
+   * directory (`<backupDir>/data`, APFS clone where supported). Must not exist; same filesystem.
+   */
+  backupDir?: string;
   docker?: DockerExec;
+  /** Copies a directory tree (default: `cp -cR`, falling back to `cp -a`). */
+  cloneDir?: (from: string, to: string) => Promise<void>;
   log?: (line: string) => void;
+}
+
+const defaultCloneDir = (from: string, to: string): Promise<void> =>
+  new Promise((resolvePromise, reject) => {
+    execFile('cp', ['-cR', from, to], { timeout: 6 * 60 * 60 * 1000 }, (error) => {
+      if (!error) return resolvePromise();
+      execFile('cp', ['-a', from, to], { timeout: 6 * 60 * 60 * 1000 }, (fallbackError, _stdout, stderr) => {
+        if (fallbackError) reject(new Error(`copying ${from} failed: ${String(stderr || fallbackError.message).trim()}`));
+        else resolvePromise();
+      });
+    });
+  });
+
+/** Online-backup `dbPath` into `dest` and check the copy. */
+async function backupDatabase(dbPath: string, dest: string): Promise<void> {
+  const sqlite = (await import('node:sqlite')) as typeof import('node:sqlite') & {
+    backup?: (db: import('node:sqlite').DatabaseSync, path: string) => Promise<number>;
+  };
+  const source = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+  try {
+    if (typeof sqlite.backup === 'function') await sqlite.backup(source, dest);
+    else source.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+  } finally {
+    source.close();
+  }
+  const copy = new sqlite.DatabaseSync(dest, { readOnly: true });
+  try {
+    const row = copy.prepare('PRAGMA quick_check').get() as Record<string, unknown> | undefined;
+    const verdict = row ? String(Object.values(row)[0]) : 'no result';
+    if (verdict !== 'ok') throw new Error(`database backup failed its check: ${verdict}`);
+  } finally {
+    copy.close();
+  }
+}
+
+function nearestExistingDev(path: string): number {
+  let cur = path;
+  while (!existsSync(cur) && dirname(cur) !== cur) cur = dirname(cur);
+  return statSync(cur).dev;
+}
+
+/** Host runtime daemons of a data directory that are still alive (`host-runtimes/<user>/run/process.meta.json`). */
+export function liveHostDaemons(dataDir: string): Array<{ user: string; pid: number }> {
+  const root = join(dataDir, 'host-runtimes');
+  if (!existsSync(root)) return [];
+  const live: Array<{ user: string; pid: number }> = [];
+  for (const user of readdirSync(root)) {
+    const meta = join(root, user, 'run', 'process.meta.json');
+    if (!existsSync(meta)) continue;
+    try {
+      const pid = Number((JSON.parse(readFileSync(meta, 'utf8')) as { pid?: unknown }).pid);
+      if (Number.isSafeInteger(pid) && pid > 0 && isProcessAlive(pid)) live.push({ user, pid });
+    } catch {
+      // unreadable metadata: not a running daemon we can identify
+    }
+  }
+  return live;
 }
 
 export interface VolumeMove {
@@ -96,13 +161,35 @@ async function inspectVolumeLabels(docker: DockerExec, name: string): Promise<Re
   }
 }
 
-/** Digest of a volume's tree: every path, and every regular file's size. */
-async function volumeDigest(docker: DockerExec, image: string, volume: string): Promise<string> {
-  const script =
-    'cd /v && find . -print | LC_ALL=C sort | md5sum && find . -type f -exec stat -c "%s %n" {} + | LC_ALL=C sort | md5sum';
-  return (
-    await docker(['run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', 'sh', '-v', `${volume}:/v:ro`, image, '-c', script])
+/**
+ * Digest of a volume's whole tree: every entry's path, type and mode, owner and size, every symlink
+ * target, and the md5 of every regular file's content (reads all data).
+ */
+export const VOLUME_DIGEST_SCRIPT =
+  'cd /v && { ' +
+  'find . -exec stat -c "%n|%f|%u|%g|%s" {} + | LC_ALL=C sort; ' +
+  'find . -type l -exec sh -c \'for l; do printf "%s -> %s\\n" "$l" "$(readlink "$l")"; done\' sh {} + | LC_ALL=C sort; ' +
+  'find . -type f -exec md5sum {} + | LC_ALL=C sort -k2; ' +
+  '} | md5sum && find . -type f | wc -l && du -sk . | cut -f1';
+
+/** Tree digest plus file count and disk usage; only `digest` and `files` take part in comparisons. */
+interface VolumeDigest {
+  digest: string;
+  files: string;
+  kib: string;
+}
+
+async function volumeDigest(docker: DockerExec, image: string, volume: string): Promise<VolumeDigest> {
+  const out = (
+    await docker(['run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', 'sh', '-v', `${volume}:/v:ro`, image, '-c', VOLUME_DIGEST_SCRIPT])
   ).trim();
+  const [digest = '', files = '', kib = ''] = out.split('\n').map((line) => line.trim());
+  return { digest, files, kib };
+}
+
+/** Same tree and content. Disk usage is not compared: a copy may allocate blocks differently. */
+function sameTree(a: VolumeDigest, b: VolumeDigest): boolean {
+  return a.digest.length > 0 && a.digest === b.digest && a.files === b.files;
 }
 
 /**
@@ -135,15 +222,39 @@ export async function migrateDataDir(options: MigrateDataDirOptions): Promise<Mi
   // 1. The platform must be stopped.
   const pathOptions: DemoPathOptions = { repoRoot: dirname(from), dataRoot: from, mode: 'production' };
   const wasMarked = isProductionDataDir(from);
-  if (!options.dryRun && !wasMarked) writeProductionMarker(from);
-  const readOptions: DemoPathOptions = options.dryRun && !wasMarked ? { repoRoot: dirname(from) } : pathOptions;
-  if (options.dryRun && !wasMarked && resolve(dirname(from), '.demo-data') !== from) {
-    throw new Error(`Dry run needs ${from} to be marked or to be <repo>/.demo-data`);
+  if (!wasMarked && resolve(dirname(from), '.demo-data') !== from) {
+    throw new Error(`${from} must be marked as production or be <repo>/.demo-data`);
   }
+  const readOptions: DemoPathOptions = wasMarked ? pathOptions : { repoRoot: dirname(from) };
   const live = listSignedProcesses(readOptions).filter((p) => isProcessAlive(p.pid));
   if (live.length > 0) {
     throw new Error(`Platform processes are still running (${live.map((p) => `${p.service}:${p.pid}`).join(', ')}); stop the platform first`);
   }
+  const daemons = liveHostDaemons(from);
+  if (daemons.length > 0) {
+    throw new Error(`Host runtime daemons are still running (${daemons.map((d) => `${d.user}:${d.pid}`).join(', ')}); stop them first`);
+  }
+
+  // 1b. Independent backup before anything changes.
+  if (options.backupDir) {
+    const backupDir = resolve(options.backupDir);
+    if (!isAbsolute(options.backupDir)) throw new Error('--backup-dir must be an absolute path');
+    if (existsSync(backupDir)) throw new Error(`Backup directory already exists: ${backupDir}`);
+    if (isInside(backupDir, from) || isInside(backupDir, to)) throw new Error('--backup-dir must be outside --from and --to');
+    if (nearestExistingDev(backupDir) !== fromStat.dev) throw new Error(`${backupDir} is on a different filesystem than ${from}`);
+    if (options.dryRun) {
+      log(`  backup: platform.db -> ${join(backupDir, 'platform.db.backup')}, ${from} -> ${join(backupDir, 'data')}`);
+    } else {
+      mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+      await backupDatabase(join(from, 'platform.db'), join(backupDir, 'platform.db.backup'));
+      log(`  backup: ${join(backupDir, 'platform.db.backup')} written and checked`);
+      await (options.cloneDir ?? defaultCloneDir)(from, join(backupDir, 'data'));
+      if (!existsSync(join(backupDir, 'data', 'platform.db'))) throw new Error('data directory backup is incomplete');
+      log(`  backup: ${join(backupDir, 'data')} cloned`);
+    }
+  }
+
+  if (!options.dryRun && !wasMarked) writeProductionMarker(from);
 
   // 2. Plan: every demo-named home volume referenced by signed metadata.
   const containers = listSignedContainers(readOptions).filter((c) => namespaceOfContainerName(c.containerName) === TEST_RESOURCE_NAMESPACE);
@@ -192,10 +303,30 @@ export async function migrateDataDir(options: MigrateDataDirOptions): Promise<Mi
     return { dryRun: true, from, to, volumes, removedContainers: [], linkedOld: false };
   }
 
-  // 3. Copy and verify every volume before changing anything.
+  // 3. Stop the old runtime containers so nothing writes to a volume while it is copied. Their data
+  //    is in the volumes; if the migration stops before the switch, the platform starts them again.
+  const containerIds = new Map<string, string>();
+  for (const c of containers) {
+    let info: { Id?: string; State?: { Running?: boolean } } | undefined;
+    try {
+      info = (JSON.parse(await docker(['inspect', '--type', 'container', c.containerName])) as Array<{ Id?: string; State?: { Running?: boolean } }>)[0];
+    } catch {
+      info = undefined;
+    }
+    if (!info?.Id) continue;
+    if (info.Id !== c.containerId) throw new Error(`Container ${c.containerName} is not the one in its signed metadata; refusing`);
+    containerIds.set(c.containerName, info.Id);
+    if (info.State?.Running) {
+      await docker(['stop', '--time', '30', info.Id]);
+      log(`  container ${c.containerName}: stopped for the copy`);
+    }
+  }
+
+  // 4. Copy and verify every volume before changing anything.
   for (const v of volumes) {
     if (v.status === 'retired-missing') continue;
     const existing = await inspectVolumeLabels(docker, v.to);
+    let reuse = false;
     if (existing !== null) {
       const ownedByUs =
         existing[DEMO_LABEL_KEY] === PRODUCTION_RESOURCE_NAMESPACE.appLabel &&
@@ -203,14 +334,22 @@ export async function migrateDataDir(options: MigrateDataDirOptions): Promise<Mi
         existing[USER_LABEL_KEY] === v.userId &&
         existing[VOLUME_ID_LABEL_KEY] === v.volumeId;
       if (!ownedByUs) throw new Error(`Volume ${v.to} already exists and is not this deployment's copy; refusing`);
-      if ((await volumeDigest(docker, options.copyImage, v.from)) === (await volumeDigest(docker, options.copyImage, v.to))) {
+      if (sameTree(await volumeDigest(docker, options.copyImage, v.from), await volumeDigest(docker, options.copyImage, v.to))) {
         v.status = 'already-copied';
         log(`  volume ${v.to}: already copied and verified`);
         continue;
       }
-      throw new Error(`Volume ${v.to} exists but differs from ${v.from}; inspect it before retrying`);
+      // An unfinished or outdated copy from an earlier attempt: refresh it, unless something uses it.
+      const users = (await docker(['ps', '-a', '-q', '--filter', `volume=${v.to}`])).trim();
+      if (users) throw new Error(`Volume ${v.to} differs from ${v.from} and is used by a container; inspect it before retrying`);
+      await docker([
+        'run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', 'sh', '-v', `${v.to}:/to`, options.copyImage,
+        '-c', 'find /to -mindepth 1 -delete',
+      ]);
+      reuse = true;
+      log(`  volume ${v.to}: outdated copy from an earlier attempt cleared`);
     }
-    await docker([
+    if (!reuse) await docker([
       'volume', 'create',
       '--label', `${DEMO_LABEL_KEY}=${PRODUCTION_RESOURCE_NAMESPACE.appLabel}`,
       '--label', `${ENV_LABEL_KEY}=${PRODUCTION_RESOURCE_NAMESPACE.env}`,
@@ -225,22 +364,15 @@ export async function migrateDataDir(options: MigrateDataDirOptions): Promise<Mi
     ]);
     const a = await volumeDigest(docker, options.copyImage, v.from);
     const b = await volumeDigest(docker, options.copyImage, v.to);
-    if (a !== b) throw new Error(`Copy of ${v.from} to ${v.to} does not verify; nothing was switched`);
+    if (!sameTree(a, b)) throw new Error(`Copy of ${v.from} to ${v.to} does not verify; nothing was switched`);
     v.status = 'copied';
-    log(`  volume ${v.to}: copied and verified`);
+    log(`  volume ${v.to}: copied and verified (content hash ${a.digest.slice(0, 12)}; ${a.files} files, ${a.kib} KiB source / ${b.kib} KiB copy)`);
   }
 
-  // 4. Switch.
+  // 5. Switch.
   const removedContainers: string[] = [];
   for (const c of containers) {
-    let id: string | undefined;
-    try {
-      const raw = JSON.parse(await docker(['inspect', '--type', 'container', c.containerName])) as Array<{ Id?: string }>;
-      id = raw[0]?.Id;
-    } catch {
-      id = undefined;
-    }
-    if (id && id !== c.containerId) throw new Error(`Container ${c.containerName} is not the one in its signed metadata; refusing`);
+    const id = containerIds.get(c.containerName);
     if (id) {
       await docker(['rm', '-f', id]);
       removedContainers.push(c.containerName);
@@ -299,6 +431,7 @@ export async function revertDataDirMigration(options: RevertDataDirOptions): Pro
   const migratedOptions: DemoPathOptions = { repoRoot: dirname(migrated), dataRoot: migrated, mode: 'production' };
   const live = listSignedProcesses(migratedOptions).filter((p) => isProcessAlive(p.pid));
   if (live.length > 0) throw new Error('Platform processes are still running; stop the platform first');
+  if (liveHostDaemons(migrated).length > 0) throw new Error('Host runtime daemons are still running; stop them first');
 
   // Runtime containers the production platform created are stopped; their volumes stay.
   for (const c of listSignedContainers(migratedOptions)) {
