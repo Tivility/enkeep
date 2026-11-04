@@ -207,6 +207,14 @@ describe('Deploy Tooling Enhancements', () => {
       expect(() => validateConfig({ ...base, newDataDir: '/tmp/d' })).toThrow(/must differ/);
       expect(() => validateConfig({ ...base, newDataDir: '/etc/enkeep' })).toThrow(/forbidden/);
       expect(() => validateConfig({ ...base, newDataDir: '/tmp/new-data' })).not.toThrow();
+      expect(() => validateConfig({ ...base, newDataDir: '/tmp/new-data', backupDir: '/usr/backup' })).toThrow(/backupDir/);
+    });
+
+    it('reads the backup directory and before-start hook for a migration', () => {
+      const config = resolveDeployConfig(['--only', 'migrate-data-dir', '--new-data-dir', '/tmp/n', '--backup-dir', '/tmp/b', '--before-start', 'echo hook']);
+      expect(config.newDataDir).toBe('/tmp/n');
+      expect(config.backupDir).toBe('/tmp/b');
+      expect(config.beforeStart).toBe('echo hook');
     });
 
     it('sanitizes EnvironmentVariables when preparing logs', () => {

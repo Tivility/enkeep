@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import {
   writeSignedContainerMeta,
@@ -79,7 +80,9 @@ describe('migrateDataDir', () => {
     from = join(root, 'checkout', '.demo-data');
     to = join(root, 'share', 'enkeep', 'data');
     mkdirSync(from, { recursive: true, mode: 0o700 });
-    writeFileSync(join(from, 'platform.db'), 'synthetic-db');
+    const db = new DatabaseSync(join(from, 'platform.db'));
+    db.exec("CREATE TABLE users (id TEXT PRIMARY KEY); INSERT INTO users VALUES ('user-alice');");
+    db.close();
     mkdirSync(join(from, 'host-runtimes', 'alice'), { recursive: true });
     writeFileSync(join(from, 'host-runtimes', 'alice', 'note.txt'), 'hello');
     const opts = { repoRoot: join(root, 'checkout') };
@@ -187,5 +190,27 @@ describe('migrateDataDir', () => {
     expect(readdirSync(join(from, 'volumes')).sort()).toEqual(['enkeep-demo-dsh-alice.json', 'enkeep-demo-dsh-bob-old.json']);
     expect(readdirSync(join(from, 'volumes-retired-production'))).toEqual(['enkeep-home-alice.json']);
     expect(readdirSync(join(from, 'containers-retired-production'))).toEqual(['enkeep-runtime-alice.json']);
+  });
+
+  it('backs up the database and clones the directory before changing anything', async () => {
+    const { docker } = liveDocker();
+    const backupDir = join(root, 'backups', 'pre-migrate');
+    await migrateDataDir({ from, to, copyImage: 'enkeep-runtime:test', linkOld: true, backupDir, docker, log: () => {} });
+    const copy = new DatabaseSync(join(backupDir, 'platform.db.backup'), { readOnly: true });
+    expect((copy.prepare('SELECT id FROM users').get() as { id: string }).id).toBe('user-alice');
+    copy.close();
+    expect(existsSync(join(backupDir, 'data', 'host-runtimes', 'alice', 'note.txt'))).toBe(true);
+    // Taken before the switch: demo metadata still in place, no production marker.
+    expect(existsSync(join(backupDir, 'data', 'containers', 'enkeep-demo-alice.json'))).toBe(true);
+    expect(isProductionDataDir(join(backupDir, 'data'))).toBe(false);
+  });
+
+  it('refuses an existing backup directory without changing anything', async () => {
+    const { docker } = liveDocker();
+    const backupDir = join(root, 'backups', 'exists');
+    mkdirSync(backupDir, { recursive: true });
+    await expect(migrateDataDir({ from, to, copyImage: 'enkeep-runtime:test', backupDir, docker, log: () => {} })).rejects.toThrow(/already exists/);
+    expect(isProductionDataDir(from)).toBe(false);
+    expect(existsSync(to)).toBe(false);
   });
 });

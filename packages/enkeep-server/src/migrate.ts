@@ -52,8 +52,55 @@ export interface MigrateDataDirOptions {
   linkOld?: boolean;
   /** Only report the plan. */
   dryRun?: boolean;
+  /**
+   * Independent backup taken with the platform stopped and before any change: a SQLite online
+   * backup of platform.db (`<backupDir>/platform.db.backup`) and a clone of the whole data
+   * directory (`<backupDir>/data`, APFS clone where supported). Must not exist; same filesystem.
+   */
+  backupDir?: string;
   docker?: DockerExec;
+  /** Copies a directory tree (default: `cp -cR`, falling back to `cp -a`). */
+  cloneDir?: (from: string, to: string) => Promise<void>;
   log?: (line: string) => void;
+}
+
+const defaultCloneDir = (from: string, to: string): Promise<void> =>
+  new Promise((resolvePromise, reject) => {
+    execFile('cp', ['-cR', from, to], { timeout: 6 * 60 * 60 * 1000 }, (error) => {
+      if (!error) return resolvePromise();
+      execFile('cp', ['-a', from, to], { timeout: 6 * 60 * 60 * 1000 }, (fallbackError, _stdout, stderr) => {
+        if (fallbackError) reject(new Error(`copying ${from} failed: ${String(stderr || fallbackError.message).trim()}`));
+        else resolvePromise();
+      });
+    });
+  });
+
+/** Online-backup `dbPath` into `dest` and check the copy. */
+async function backupDatabase(dbPath: string, dest: string): Promise<void> {
+  const sqlite = (await import('node:sqlite')) as typeof import('node:sqlite') & {
+    backup?: (db: import('node:sqlite').DatabaseSync, path: string) => Promise<number>;
+  };
+  const source = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+  try {
+    if (typeof sqlite.backup === 'function') await sqlite.backup(source, dest);
+    else source.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+  } finally {
+    source.close();
+  }
+  const copy = new sqlite.DatabaseSync(dest, { readOnly: true });
+  try {
+    const row = copy.prepare('PRAGMA quick_check').get() as Record<string, unknown> | undefined;
+    const verdict = row ? String(Object.values(row)[0]) : 'no result';
+    if (verdict !== 'ok') throw new Error(`database backup failed its check: ${verdict}`);
+  } finally {
+    copy.close();
+  }
+}
+
+function nearestExistingDev(path: string): number {
+  let cur = path;
+  while (!existsSync(cur) && dirname(cur) !== cur) cur = dirname(cur);
+  return statSync(cur).dev;
 }
 
 export interface VolumeMove {
@@ -96,10 +143,19 @@ async function inspectVolumeLabels(docker: DockerExec, name: string): Promise<Re
   }
 }
 
-/** Digest of a volume's tree: every path, and every regular file's size. */
+/**
+ * Digest of a volume's whole tree: every entry's path, type and mode, owner and size, every symlink
+ * target, and the md5 of every regular file's content (reads all data).
+ */
+export const VOLUME_DIGEST_SCRIPT =
+  'cd /v && { ' +
+  'find . -exec stat -c "%n|%f|%u|%g|%s" {} + | LC_ALL=C sort; ' +
+  'find . -type l -exec sh -c \'for l; do printf "%s -> %s\\n" "$l" "$(readlink "$l")"; done\' sh {} + | LC_ALL=C sort; ' +
+  'find . -type f -exec md5sum {} + | LC_ALL=C sort -k2; ' +
+  '} | md5sum && find . -type f | wc -l && du -sk . | cut -f1';
+
 async function volumeDigest(docker: DockerExec, image: string, volume: string): Promise<string> {
-  const script =
-    'cd /v && find . -print | LC_ALL=C sort | md5sum && find . -type f -exec stat -c "%s %n" {} + | LC_ALL=C sort | md5sum';
+  const script = VOLUME_DIGEST_SCRIPT;
   return (
     await docker(['run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', 'sh', '-v', `${volume}:/v:ro`, image, '-c', script])
   ).trim();
@@ -135,15 +191,35 @@ export async function migrateDataDir(options: MigrateDataDirOptions): Promise<Mi
   // 1. The platform must be stopped.
   const pathOptions: DemoPathOptions = { repoRoot: dirname(from), dataRoot: from, mode: 'production' };
   const wasMarked = isProductionDataDir(from);
-  if (!options.dryRun && !wasMarked) writeProductionMarker(from);
-  const readOptions: DemoPathOptions = options.dryRun && !wasMarked ? { repoRoot: dirname(from) } : pathOptions;
-  if (options.dryRun && !wasMarked && resolve(dirname(from), '.demo-data') !== from) {
-    throw new Error(`Dry run needs ${from} to be marked or to be <repo>/.demo-data`);
+  if (!wasMarked && resolve(dirname(from), '.demo-data') !== from) {
+    throw new Error(`${from} must be marked as production or be <repo>/.demo-data`);
   }
+  const readOptions: DemoPathOptions = wasMarked ? pathOptions : { repoRoot: dirname(from) };
   const live = listSignedProcesses(readOptions).filter((p) => isProcessAlive(p.pid));
   if (live.length > 0) {
     throw new Error(`Platform processes are still running (${live.map((p) => `${p.service}:${p.pid}`).join(', ')}); stop the platform first`);
   }
+
+  // 1b. Independent backup before anything changes.
+  if (options.backupDir) {
+    const backupDir = resolve(options.backupDir);
+    if (!isAbsolute(options.backupDir)) throw new Error('--backup-dir must be an absolute path');
+    if (existsSync(backupDir)) throw new Error(`Backup directory already exists: ${backupDir}`);
+    if (isInside(backupDir, from) || isInside(backupDir, to)) throw new Error('--backup-dir must be outside --from and --to');
+    if (nearestExistingDev(backupDir) !== fromStat.dev) throw new Error(`${backupDir} is on a different filesystem than ${from}`);
+    if (options.dryRun) {
+      log(`  backup: platform.db -> ${join(backupDir, 'platform.db.backup')}, ${from} -> ${join(backupDir, 'data')}`);
+    } else {
+      mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+      await backupDatabase(join(from, 'platform.db'), join(backupDir, 'platform.db.backup'));
+      log(`  backup: ${join(backupDir, 'platform.db.backup')} written and checked`);
+      await (options.cloneDir ?? defaultCloneDir)(from, join(backupDir, 'data'));
+      if (!existsSync(join(backupDir, 'data', 'platform.db'))) throw new Error('data directory backup is incomplete');
+      log(`  backup: ${join(backupDir, 'data')} cloned`);
+    }
+  }
+
+  if (!options.dryRun && !wasMarked) writeProductionMarker(from);
 
   // 2. Plan: every demo-named home volume referenced by signed metadata.
   const containers = listSignedContainers(readOptions).filter((c) => namespaceOfContainerName(c.containerName) === TEST_RESOURCE_NAMESPACE);
@@ -227,7 +303,8 @@ export async function migrateDataDir(options: MigrateDataDirOptions): Promise<Mi
     const b = await volumeDigest(docker, options.copyImage, v.to);
     if (a !== b) throw new Error(`Copy of ${v.from} to ${v.to} does not verify; nothing was switched`);
     v.status = 'copied';
-    log(`  volume ${v.to}: copied and verified`);
+    const [, files, kib] = a.split('\n').map((line) => line.trim());
+    log(`  volume ${v.to}: copied and verified (content hash; ${files ?? '?'} files, ${kib ?? '?'} KiB)`);
   }
 
   // 4. Switch.

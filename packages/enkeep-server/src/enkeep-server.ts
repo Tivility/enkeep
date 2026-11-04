@@ -28,7 +28,8 @@ const USAGE = `enkeep-server <command> [options]
   jarvis-token      Issue or revoke a user's Jarvis token (same options as demo-runner jarvis-token)
   mark-production   Mark --data-dir as a production data directory
   migrate-data-dir  Move a data directory (--from) to --to and rename its runtimes to the production names;
-                    --copy-image <image> copies home volumes, --link-old leaves a symlink, --dry-run plans only;
+                    --copy-image <image> copies home volumes, --link-old leaves a symlink, --dry-run plans only,
+                    --backup-dir <dir> first backs up platform.db and clones the whole directory there;
                     --revert (same --from/--to) moves it back and restores the demo runtime metadata
 `;
 
@@ -82,7 +83,8 @@ export async function runEnkeepServerCli(argv: string[] = process.argv.slice(2))
       if (!from || !to || !copyImage) throw new Error('migrate-data-dir requires --from, --to and --copy-image');
       const dryRun = rest.includes('--dry-run');
       console.log(dryRun ? 'Migration plan:' : 'Migrating:');
-      const result = await migrateDataDir({ from, to, copyImage, linkOld: rest.includes('--link-old'), dryRun });
+      const backupDir = flag(rest, '--backup-dir');
+      const result = await migrateDataDir({ from, to, copyImage, linkOld: rest.includes('--link-old'), dryRun, ...(backupDir ? { backupDir } : {}) });
       if (rest.includes('--json')) console.log(JSON.stringify(result, null, 2));
       console.log(dryRun ? 'Dry run: nothing changed.' : `Done. Start the platform with: enkeep-server serve --data-dir ${result.to}`);
       return;
