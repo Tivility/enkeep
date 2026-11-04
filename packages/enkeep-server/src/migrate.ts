@@ -17,7 +17,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   PRODUCTION_RESOURCE_NAMESPACE,
@@ -95,6 +95,8 @@ async function backupDatabase(dbPath: string, dest: string): Promise<void> {
   } finally {
     copy.close();
   }
+  // The database holds credentials: owner-only, like the original.
+  for (const file of [dest, `${dest}-shm`, `${dest}-wal`]) if (existsSync(file)) chmodSync(file, 0o600);
 }
 
 function nearestExistingDev(path: string): number {

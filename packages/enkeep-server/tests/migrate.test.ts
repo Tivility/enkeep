@@ -4,7 +4,7 @@
  * Synthetic data only.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -210,6 +210,8 @@ describe('migrateDataDir', () => {
     const { docker } = liveDocker();
     const backupDir = join(root, 'backups', 'pre-migrate');
     await migrateDataDir({ from, to, copyImage: 'enkeep-runtime:test', linkOld: true, backupDir, docker, log: () => {} });
+    expect(statSync(join(backupDir, 'platform.db.backup')).mode & 0o777).toBe(0o600);
+    expect(statSync(backupDir).mode & 0o777).toBe(0o700);
     const copy = new DatabaseSync(join(backupDir, 'platform.db.backup'), { readOnly: true });
     expect((copy.prepare('SELECT id FROM users').get() as { id: string }).id).toBe('user-alice');
     copy.close();
