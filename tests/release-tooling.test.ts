@@ -197,6 +197,78 @@ describe('Deploy Tooling Enhancements', () => {
       expect(next).toContain('enkeep-runtime:gap-batch61-sha');
     });
 
+    const serverPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>EnvironmentVariables</key>
+\t<dict>
+\t\t<key>ENKEEP_RUNTIME_IMAGE</key>
+\t\t<string>enkeep-runtime:gap-batch70-oldsha</string>
+\t\t<key>SECRET_KEY</key>
+\t\t<string>super-secret-token</string>
+\t</dict>
+\t<key>Label</key>
+\t<string>test.enkeep.label</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>/opt/homebrew/bin/node</string>
+\t\t<string>/tmp/enkeep-test/research/release-worktree-batch70/packages/enkeep-server/dist/enkeep-server.js</string>
+\t\t<string>serve</string>
+\t\t<string>--data-dir</string>
+\t\t<string>/tmp/enkeep-test/data</string>
+\t\t<string>--port</string>
+\t\t<string>39001</string>
+\t\t<string>--repo-root</string>
+\t\t<string>/tmp/enkeep-test/research/release-worktree-batch70</string>
+\t</array>
+\t<key>WorkingDirectory</key>
+\t<string>/tmp/enkeep-test/dev-checkout</string>
+</dict>
+</plist>`;
+
+    it('moves --repo-root and WorkingDirectory of an enkeep-server plist to the new release worktree', () => {
+      const next = updatePlistContent(serverPlist, '/tmp/enkeep-test/releases/release-worktree-batch71', 'enkeep-runtime:gap-batch71-newsha');
+      expect(extractProgramArguments(next)).toEqual([
+        '/opt/homebrew/bin/node',
+        '/tmp/enkeep-test/releases/release-worktree-batch71/packages/enkeep-server/dist/enkeep-server.js',
+        'serve',
+        '--data-dir', '/tmp/enkeep-test/data',
+        '--port', '39001',
+        '--repo-root', '/tmp/enkeep-test/releases/release-worktree-batch71',
+      ]);
+      expect(next).toContain('<key>WorkingDirectory</key>\n\t<string>/tmp/enkeep-test/releases/release-worktree-batch71</string>');
+      expect(next).not.toContain('/tmp/enkeep-test/research');
+      expect(next).not.toContain('/tmp/enkeep-test/dev-checkout');
+      expect(next).toContain('enkeep-runtime:gap-batch71-newsha');
+      expect(next).toContain('<string>super-secret-token</string>');
+      expect(next).toContain('<string>test.enkeep.label</string>');
+      expect(next.match(/<key>WorkingDirectory<\/key>/g)).toHaveLength(1);
+    });
+
+    it('adds a WorkingDirectory to an enkeep-server plist that has none', () => {
+      const withoutCwd = serverPlist.replace('\t<key>WorkingDirectory</key>\n\t<string>/tmp/enkeep-test/dev-checkout</string>\n', '');
+      expect(withoutCwd).not.toContain('WorkingDirectory');
+      const next = updatePlistContent(withoutCwd, '/tmp/enkeep-test/releases/release-worktree-batch71', 'enkeep-runtime:gap-batch71-newsha');
+      expect(next).toContain('\t<key>WorkingDirectory</key>\n\t<string>/tmp/enkeep-test/releases/release-worktree-batch71</string>\n\t<key>ProgramArguments</key>');
+      expect(extractProgramArguments(next)).toContain('/tmp/enkeep-test/releases/release-worktree-batch71');
+    });
+
+    it('leaves the plist alone when an enkeep-server plist has no --repo-root', () => {
+      const withoutRepoRoot = serverPlist.replace('\t\t<string>--repo-root</string>\n\t\t<string>/tmp/enkeep-test/research/release-worktree-batch70</string>\n', '');
+      const next = updatePlistContent(withoutRepoRoot, '/tmp/enkeep-test/releases/release-worktree-batch71', 'enkeep-runtime:gap-batch71-newsha');
+      expect(extractProgramArguments(next)).not.toContain('--repo-root');
+      expect(extractProgramArguments(next)).toHaveLength(7);
+    });
+
+    it('keeps --repo-root and WorkingDirectory of a legacy demo-runner plist', () => {
+      const legacyWithCwd = legacyPlist.replace('</dict>\n</plist>', '  <key>WorkingDirectory</key>\n  <string>/tmp/checkout</string>\n</dict>\n</plist>');
+      const next = updatePlistContent(legacyWithCwd, '/tmp/worktrees/release-worktree-batch55', 'enkeep-runtime:gap-batch55-newsha');
+      expect(extractProgramArguments(next)).toContain('/tmp/checkout');
+      expect(next).toContain('<key>WorkingDirectory</key>\n  <string>/tmp/checkout</string>');
+      expect(next).toContain('/tmp/worktrees/release-worktree-batch55/packages/demo-runner/dist/demo-runner.js');
+    });
+
     it('requires a distinct new data directory for --only migrate-data-dir', () => {
       const base = {
         releaseId: 'batch60', repoRoot: '/tmp/r', releaseRoot: '/tmp/rel', dataDir: '/tmp/d', configDir: '/tmp/c',

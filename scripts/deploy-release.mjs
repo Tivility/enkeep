@@ -469,6 +469,47 @@ export function convertPlistToEnkeepServer(plistContent, worktreePath, dataDir) 
   return plistContent.replace(/(<key>ProgramArguments<\/key>\s*<array>)([\s\S]*?)(<\/array>)/, `$1${body}$3`);
 }
 
+function escapePlistString(value) {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Sets the value after `--repo-root` in ProgramArguments; unchanged when the flag is absent. */
+export function setPlistRepoRootArgument(plistContent, repoRootPath) {
+  return plistContent.replace(
+    /(<key>ProgramArguments<\/key>\s*<array>)([\s\S]*?)(<\/array>)/,
+    (_match, open, body, close) => {
+      const next = body.replace(
+        /(<string>--repo-root<\/string>\s*<string>)([^<]*)(<\/string>)/,
+        (_m, before, _old, after) => `${before}${escapePlistString(repoRootPath)}${after}`
+      );
+      return `${open}${next}${close}`;
+    }
+  );
+}
+
+/**
+ * Sets the top-level `WorkingDirectory` of a LaunchAgent plist, inserting the key in front of
+ * `ProgramArguments` when the plist has none.
+ */
+export function setPlistWorkingDirectory(plistContent, workingDir) {
+  const value = escapePlistString(workingDir);
+  const existing = /(<key>WorkingDirectory<\/key>\s*<string>)([^<]*)(<\/string>)/;
+  if (existing.test(plistContent)) {
+    return plistContent.replace(existing, (_m, before, _old, after) => `${before}${value}${after}`);
+  }
+  const anchor = /([ \t]*)<key>ProgramArguments<\/key>/.exec(plistContent);
+  if (!anchor) throw new Error('Cannot locate ProgramArguments in the LaunchAgent plist');
+  const indent = anchor[1];
+  const insert = `${indent}<key>WorkingDirectory</key>\n${indent}<string>${value}</string>\n`;
+  return plistContent.slice(0, anchor.index) + insert + plistContent.slice(anchor.index);
+}
+
+/**
+ * Points a LaunchAgent plist at a new release: the platform entry and the default runtime image.
+ * For `enkeep-server serve` plists, `--repo-root` and `WorkingDirectory` also move to the release
+ * worktree, so the service references nothing outside the release it runs. Legacy `demo-runner up`
+ * plists keep both, because their data directory is resolved from the repo root.
+ */
 export function updatePlistContent(plistContent, newWorktreePath, newImageTag) {
   // Point the platform entry (whichever kind the plist runs) at the new worktree
   const entry = findPlistEntry(plistContent);
@@ -476,6 +517,11 @@ export function updatePlistContent(plistContent, newWorktreePath, newImageTag) {
   if (entry) {
     const pattern = PLATFORM_ENTRIES.find((e) => e.kind === entry.kind).re;
     updated = updated.replace(pattern, `<string>${join(newWorktreePath, entry.rel)}</string>`);
+  }
+
+  if (entry && entry.kind === 'enkeep-server') {
+    updated = setPlistRepoRootArgument(updated, newWorktreePath);
+    updated = setPlistWorkingDirectory(updated, newWorktreePath);
   }
 
   // Replace ENKEEP_RUNTIME_IMAGE in EnvironmentVariables
@@ -1492,6 +1538,11 @@ export async function executePlatformDeploy(config, options = {}) {
         updatedPlist = convertPlistToEnkeepServer(updatedPlist, worktreePath, options.migration.newDataDir);
       }
       writeFileSync(plistPath, updatedPlist, 'utf8');
+      const writtenArgs = extractProgramArguments(updatedPlist);
+      const repoRootIndex = writtenArgs.indexOf('--repo-root');
+      const writtenCwd = /<key>WorkingDirectory<\/key>\s*<string>([^<]*)<\/string>/.exec(updatedPlist);
+      console.log(`  --repo-root:             ${repoRootIndex >= 0 ? writtenArgs[repoRootIndex + 1] : '(not set)'}`);
+      console.log(`  WorkingDirectory:        ${writtenCwd ? writtenCwd[1] : '(not set)'}`);
 
       console.log('Bootstrapping LaunchAgent...');
       execSync(`launchctl bootstrap gui/$(id -u) "${plistPath}"`, { stdio: 'inherit' });
