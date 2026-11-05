@@ -154,4 +154,4 @@ launchctl kickstart -k gui/$(id -u)/<launchd-label>
 curl -s http://127.0.0.1:<port>/api/auth/csrf
 ```
 
-LaunchAgent plist 中与发布相关的字段：`ProgramArguments` 里的发布工作树入口路径（`enkeep-server.js`，旧部署为 `demo-runner.js`），以及 `EnvironmentVariables.ENKEEP_RUNTIME_IMAGE`（运行时镜像的默认值；实际目标版本以平台数据库中的目标运行时版本为准）。其余环境变量（如 `ENKEEP_DSH_HOME`、执行预算、`PTHREAD_MUTEX_USE_ULOCK` 等）随发布保持不变。`PTHREAD_MUTEX_USE_ULOCK=1` 仅用于 macOS，需在进程启动时存在，用于规避 libuv 线程池卡死在 `__psynch_cvwait` 的内核缺陷（见 [libuv#5280](https://github.com/libuv/libuv/issues/5280)）。
+LaunchAgent plist 中与发布相关的字段：`ProgramArguments` 里的发布工作树入口路径（`enkeep-server.js`，旧部署为 `demo-runner.js`），以及 `EnvironmentVariables.ENKEEP_RUNTIME_IMAGE`（运行时镜像的默认值；实际目标版本以平台数据库中的目标运行时版本为准）。`enkeep-server serve` 部署每次发布还会把 `ProgramArguments` 里的 `--repo-root` 和顶层的 `WorkingDirectory` 改成 `<release-worktree>`（plist 没有 `WorkingDirectory` 时补上），让服务只引用它正在运行的发布工作树；旧的 `demo-runner up` 部署靠这两项定位 `<repo-root>/.demo-data`，所以保持不变。回滚恢复整份 plist 备份，这两项一并还原。其余环境变量（如 `ENKEEP_DSH_HOME`、执行预算、`PTHREAD_MUTEX_USE_ULOCK` 等）随发布保持不变。`PTHREAD_MUTEX_USE_ULOCK=1` 仅用于 macOS，需在进程启动时存在，用于规避 libuv 线程池卡死在 `__psynch_cvwait` 的内核缺陷（见 [libuv#5280](https://github.com/libuv/libuv/issues/5280)）。
