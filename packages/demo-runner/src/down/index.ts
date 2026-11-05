@@ -54,6 +54,42 @@ import {
 } from '../utils/process-guard.js';
 import type { DemoDownOptions, DemoDownResult, TerminatedResource, DemoPathOptions } from '../types.js';
 
+const RUNTIME_NETWORK_MODES = ['none', 'bridge'] as const;
+type RuntimeNetworkMode = (typeof RUNTIME_NETWORK_MODES)[number];
+
+function isRuntimeNetworkMode(value: string | undefined): value is RuntimeNetworkMode {
+  return value !== undefined && (RUNTIME_NETWORK_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Human-readable teardown summary. Counts only resources that were actually stopped or removed;
+ * failures are counted separately and each one is listed with its reason.
+ */
+export function formatDownSummary(result: DemoDownResult): string {
+  const count = (items: TerminatedResource[], status: TerminatedResource['status']) =>
+    items.filter((r) => r.status === status).length;
+  const groups: Array<[string, TerminatedResource[]]> = [
+    ['Processes', result.terminatedProcesses],
+    ['Containers', result.terminatedContainers],
+    ['Volumes', result.removedVolumes],
+  ];
+  const failures = groups.flatMap(([, items]) => items.filter((r) => r.status === 'failed'));
+  const lines = [
+    result.ok ? '🛑 Enkeep Demo Environment Teardown Complete' : '✖ Enkeep Demo Environment Teardown Failed',
+    `  Terminated Processes:  ${count(result.terminatedProcesses, 'terminated')} (already stopped: ${count(result.terminatedProcesses, 'already_stopped')}, failed: ${count(result.terminatedProcesses, 'failed')})`,
+    `  Terminated Containers: ${count(result.terminatedContainers, 'terminated')} (already stopped: ${count(result.terminatedContainers, 'already_stopped')}, failed: ${count(result.terminatedContainers, 'failed')})`,
+    `  Removed Volumes:       ${count(result.removedVolumes, 'terminated')} (failed: ${count(result.removedVolumes, 'failed')})`,
+    `  Cleaned Metadata:      ${result.cleanedMetadataCount}`,
+  ];
+  if (failures.length > 0) {
+    lines.push('  Failures:');
+    for (const f of failures) {
+      lines.push(`    ✖ ${f.type} ${f.name}${f.id !== undefined ? ` (${f.id})` : ''}: ${f.error ?? 'unknown error'}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownResult> {
   const repoRoot = options.repoRoot ?? findRepoRoot();
   const pathOptions: DemoPathOptions = {
@@ -366,6 +402,23 @@ export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownR
         continue;
       }
 
+      // A runtime may run with network mode 'none' or 'bridge' (the platform's --network-mode). The
+      // ownership check compares against the expectation, which otherwise defaults to 'none', so pass
+      // the container's own mode, accepting only the two modes a runtime can be created with. When the
+      // inspect result carries no mode, the client's own check (which requires one) decides.
+      const liveNetworkMode = liveInfo.networkMode?.trim() || undefined;
+      if (liveNetworkMode !== undefined && !isRuntimeNetworkMode(liveNetworkMode)) {
+        terminatedContainers.push({
+          type: 'container',
+          name: c.containerName,
+          id: c.containerId,
+          status: 'failed',
+          error: `Safety violation: Live container NetworkMode "${liveNetworkMode}" is not one of ${RUNTIME_NETWORK_MODES.join(', ')}`,
+        });
+        allSucceeded = false;
+        continue;
+      }
+
       const expectation = {
         containerName: c.containerName,
         userId: c.userId,
@@ -374,6 +427,7 @@ export async function downDemo(options: DemoDownOptions = {}): Promise<DemoDownR
         volumeName: c.volumeName,
         volumeId: c.volumeId,
         containerPath: '/home/dsh',
+        ...(liveNetworkMode ? { networkMode: liveNetworkMode as RuntimeNetworkMode } : {}),
       };
 
       let containerRemoved = false;
