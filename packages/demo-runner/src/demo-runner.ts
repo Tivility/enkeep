@@ -9,7 +9,7 @@
 
 import { resetDemo } from './reset/index.js';
 import { launchDemoSystem } from './up/index.js';
-import { downDemo } from './down/index.js';
+import { downDemo, formatDownSummary } from './down/index.js';
 import { runDemoTestSuite } from './test/index.js';
 import { runPreflight } from './preflight/index.js';
 import { runJarvisTokenCli } from './jarvis-token/index.js';
@@ -678,11 +678,7 @@ export async function runDemoRunnerCli(args: string[] = process.argv.slice(2)): 
         if (isJson) {
           console.log(JSON.stringify(result, null, 2));
         } else {
-          console.log('\n🛑 Enkeep Demo Environment Teardown Complete');
-          console.log(`  Terminated Processes:  ${result.terminatedProcesses.length}`);
-          console.log(`  Terminated Containers: ${result.terminatedContainers.length}`);
-          console.log(`  Removed Volumes:       ${result.removedVolumes.length}`);
-          console.log(`  Cleaned Metadata:      ${result.cleanedMetadataCount}\n`);
+          console.log(`\n${formatDownSummary(result)}\n`);
         }
         if (!result.ok) process.exit(1);
         break;
