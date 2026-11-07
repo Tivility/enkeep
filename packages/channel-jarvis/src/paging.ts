@@ -73,9 +73,16 @@ export function estimateItemSize(item: JarvisItem): number {
   return size;
 }
 
+/**
+ * Read an optional integer field. `null` is absent. For fields whose smallest valid value is 1
+ * (`before_seq`, `turns`, `limit`), 0 is also absent: the hub sends 0 for "not set" (e.g.
+ * `before_seq: 0` for the newest page). Where 0 is a valid position (`after_seq`, `from_seq`,
+ * `through_seq`), it keeps its meaning.
+ */
 function optionalSeq(params: Record<string, unknown>, key: keyof ItemsQuery, min: number): number | undefined {
   const value = params[key];
   if (value === undefined || value === null) return undefined;
+  if (value === 0 && min > 0) return undefined;
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min) {
     throw new RpcError(`${key} must be an integer ≥ ${min}`, 'invalid_params');
   }
