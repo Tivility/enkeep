@@ -121,4 +121,30 @@ describe('readItems', () => {
     expect(() => parseItemsQuery({ turns: 'two' })).toThrowError(expect.objectContaining({ code: 'invalid_params' }));
     expect(parseItemsQuery({ after_seq: 0, limit: 10 })).toEqual({ after_seq: 0, limit: 10 });
   });
+
+  it('treats before_seq 0 as not set and returns the newest page', async () => {
+    const s = source(5);
+    expect(parseItemsQuery({ before_seq: 0 })).toEqual({});
+    expect(parseItemsQuery({ before_seq: null })).toEqual({});
+    const newest = (await readItems(s, SESSION_A, {})) as ItemsPage;
+    const zero = (await readItems(s, SESSION_A, parseItemsQuery({ before_seq: 0 }))) as ItemsPage;
+    expect(zero).toEqual(newest);
+    expect(texts(zero)).toEqual(['question 4', 'answer 4', 'question 5', 'answer 5']);
+    expect(zero.to_seq).toBe(20);
+  });
+
+  it('treats turns 0 and limit 0 as not set', async () => {
+    const s = source(5);
+    expect(parseItemsQuery({ turns: 0, limit: 0 })).toEqual({});
+    expect(parseItemsQuery({ turns: null, limit: null })).toEqual({});
+    expect(parseItemsQuery({ before_seq: 0, turns: 0, limit: 0 })).toEqual({});
+    const newest = (await readItems(s, SESSION_A, {})) as ItemsPage;
+    const zero = (await readItems(s, SESSION_A, parseItemsQuery({ before_seq: 0, turns: 0, limit: 0 }))) as ItemsPage;
+    expect(zero).toEqual(newest);
+    // 0 still means a position where 0 is valid.
+    expect(parseItemsQuery({ after_seq: 0, turns: 0 })).toEqual({ after_seq: 0 });
+    expect(parseItemsQuery({ from_seq: 0, through_seq: 0, limit: 0 })).toEqual({ from_seq: 0, through_seq: 0 });
+    // Negative values are still rejected.
+    expect(() => parseItemsQuery({ limit: -1 })).toThrowError(expect.objectContaining({ code: 'invalid_params' }));
+  });
 });
