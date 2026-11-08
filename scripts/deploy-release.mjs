@@ -789,7 +789,7 @@ export function verifyContainers(psOutput, containerNamePrefix, targetImageTag, 
         throw new Error(`Container ${c.name} is not in running state (status: ${c.status})`);
       }
     }
-    // The runtime upgrade status (an admin API that needs a login) is checked by executeVerify.
+    // Runtime versions and health are checked by executeVerify through GET /api/selfcheck.
   } else {
     // full mode: strict check matching targetImageTag
     for (const c of matchingContainers) {
@@ -1010,7 +1010,7 @@ export function setRuntimeTargetVersionInDb(dbPath, imageTag = null, daemonCliPa
 
 /**
  * Raised when the platform's deployment self-check cannot be read. `kind` is one of
- * 'no-token', 'insecure-token-file', 'unreachable', 'not-supported', 'unauthorized', 'bad-response'.
+ * 'no-token', 'insecure-token-file', 'unreachable', 'timeout', 'not-supported', 'unauthorized', 'bad-response'.
  * Messages carry paths, HTTP statuses and error codes only, never the token.
  */
 export class SelfCheckError extends Error {
@@ -1090,6 +1090,9 @@ export async function fetchSelfCheck({ port, dataDir, fetchImpl = globalThis.fet
       signal: AbortSignal.timeout(SELF_CHECK_TIMEOUT_MS),
     });
   } catch (err) {
+    if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      throw new SelfCheckError('timeout', `Platform on port ${port} did not answer ${SELF_CHECK_PATH} within ${SELF_CHECK_TIMEOUT_MS / 1000}s`);
+    }
     const reason = (err && err.cause && err.cause.code) || (err && err.name) || 'error';
     throw new SelfCheckError('unreachable', `Platform on port ${port} is not reachable (${reason})`);
   }
@@ -1124,6 +1127,9 @@ export function selfCheckProblems(report) {
   }
   if (!report.health.operations || report.health.operations.producerAvailable !== true) {
     problems.push('operations producer unavailable');
+  }
+  if (Array.isArray(report.health.errors)) {
+    for (const e of report.health.errors) problems.push(String(e));
   }
   if (problems.length === 0 && report.status !== 'ok') problems.push(`status ${report.status}`);
   return problems;

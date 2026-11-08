@@ -731,7 +731,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
         }
         const remote = req.socket.remoteAddress;
-        if (remote !== "127.0.0.1" && remote !== "::ffff:127.0.0.1") {
+        if (remote !== "127.0.0.1" && remote !== "::ffff:127.0.0.1" && remote !== "::1") {
           throw new ForbiddenError("Self-check is only served to loopback clients");
         }
         if (!verifySelfCheckToken(req.headers[SELF_CHECK_TOKEN_HEADER], tokenHash)) {
@@ -742,6 +742,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
         let runtimeStatus = "unavailable";
         let runtimes: SelfCheckRuntime[] = [];
         let runtimeTarget: { image: string | null; daemonCliPath: string | null } | null = null;
+        const errors: string[] = [];
         if (managementProvider) {
           try {
             const list = await managementProvider.listRuntimes();
@@ -751,17 +752,25 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             runtimeStatus = "error";
           }
           if (typeof managementProvider.getUpgradeStatus === "function") {
-            runtimes = (await managementProvider.getUpgradeStatus()).map(toSelfCheckRuntime);
+            try {
+              runtimes = (await managementProvider.getUpgradeStatus()).map(toSelfCheckRuntime);
+            } catch {
+              errors.push("upgrade_status_unavailable");
+            }
           }
           if (typeof managementProvider.getTargetVersion === "function") {
-            const tv = await managementProvider.getTargetVersion();
-            runtimeTarget = tv ? { image: tv.image, daemonCliPath: tv.daemonCliPath } : null;
+            try {
+              const tv = await managementProvider.getTargetVersion();
+              runtimeTarget = tv ? { image: tv.image, daemonCliPath: tv.daemonCliPath } : null;
+            } catch {
+              errors.push("target_version_unavailable");
+            }
           }
         }
         const migrations = selfCheck.getMigrationStatus();
         const producerAvailable = Boolean(operations);
         const workerRunning = Boolean(operations && taskWorker);
-        const healthy = runtimeAvailable && producerAvailable && migrations.upToDate;
+        const healthy = runtimeAvailable && producerAvailable && migrations.upToDate && errors.length === 0;
         sendJsonResponse(res, 200, createSuccessEnvelope({
           status: healthy ? "ok" : "degraded",
           startedAt: selfCheck.getStartedAt(),
@@ -769,6 +778,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           health: {
             runtime: { available: runtimeAvailable, status: runtimeStatus },
             operations: { producerAvailable, workerRunning },
+            errors,
           },
           migrations,
           runtimeTarget,

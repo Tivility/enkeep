@@ -1485,12 +1485,6 @@ export class PlatformServer {
         this.runtimeAutoUpgrader.start();
       }
 
-      // 5.8 Issue a fresh deployment self-check token before accepting requests.
-      if (this.selfCheckTokenFile) {
-        this.selfCheckTokenHash = issueSelfCheckToken(this.selfCheckTokenFile);
-        this.selfCheckStartedAt = new Date().toISOString();
-      }
-
       // 6. Bind listener
       await new Promise<void>((resolve, reject) => {
         server.once('error', reject);
@@ -1507,6 +1501,12 @@ export class PlatformServer {
         throw new PlatformConfigurationError('Server started but failed to obtain a valid TCP port address.');
       }
       validateServerBinding(addr.address, addr.port);
+
+      // 8. Issue a fresh deployment self-check token only once this instance owns the listener,
+      // so an instance that fails to bind never replaces the token of the one that is serving.
+      // A token that cannot be written leaves the route at 404 (the deploy check then fails);
+      // it never stops the platform.
+      this.issueSelfCheckTokenSafely();
 
       this.isRunning = true;
 
@@ -1644,7 +1644,20 @@ export class PlatformServer {
    * 5. Await server close promise
    * 6. Collect all errors with fixed messages and throw AggregateError if multiple
    */
+  private issueSelfCheckTokenSafely(): void {
+    if (!this.selfCheckTokenFile) return;
+    try {
+      this.selfCheckTokenHash = issueSelfCheckToken(this.selfCheckTokenFile);
+      this.selfCheckStartedAt = new Date().toISOString();
+    } catch (err) {
+      this.selfCheckTokenHash = null;
+      const code = (err as NodeJS.ErrnoException | undefined)?.code ?? 'error';
+      console.error(`[selfcheck] could not write the self-check token file (${code}); GET /api/selfcheck stays unavailable`);
+    }
+  }
+
   async stop(options?: { abrupt?: boolean }): Promise<void> {
+    this.selfCheckTokenHash = null;
     if (!this.server && !this.isRunning) {
       return;
     }

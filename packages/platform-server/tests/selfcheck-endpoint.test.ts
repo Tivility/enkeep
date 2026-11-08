@@ -24,7 +24,7 @@ function newTmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-selfcheck-'));
 }
 
-function newServer(db: DatabaseSync, tokenFile?: string): PlatformServer {
+function newServer(db: DatabaseSync, tokenFile?: string, extra: Record<string, unknown> = {}): PlatformServer {
   const storage = new SqlitePlatformStorage(db);
   const messageStore = new SqliteWebMessageStore(db);
   const runtimeGateway = new TestOnlyRuntimeGateway({ storage, messageStore, autoReply: false });
@@ -36,6 +36,7 @@ function newServer(db: DatabaseSync, tokenFile?: string): PlatformServer {
     csrfToken: CSRF,
     runtimeGateway,
     ...(tokenFile ? { selfCheckTokenFile: tokenFile } : {}),
+    ...extra,
   });
 }
 
@@ -132,6 +133,54 @@ describe('GET /api/selfcheck (deployment self-check)', () => {
       const fresh = await fetch(`${baseUrl}/api/selfcheck`, { headers: { [SELF_CHECK_TOKEN_HEADER]: newToken } });
       expect(fresh.status).toBe(200);
     });
+
+    it('a second instance that cannot bind the port does not replace the serving token', async () => {
+      const token = readToken(tokenFile);
+      const port = Number(new URL(baseUrl).port);
+      const db2 = new DatabaseSync(':memory:');
+      const second = newServer(db2, tokenFile, { port });
+      try {
+        await expect(second.start()).rejects.toThrow();
+      } finally {
+        try { await second.stop(); } catch {}
+        db2.close();
+      }
+      expect(readToken(tokenFile)).toBe(token);
+      const res = await fetch(`${baseUrl}/api/selfcheck`, { headers: { [SELF_CHECK_TOKEN_HEADER]: token } });
+      expect(res.status).toBe(200);
+    });
+
+    it('stops accepting the token once the server is stopped', async () => {
+      const token = readToken(tokenFile);
+      const handlerHashBefore = verifySelfCheckToken(token, (server as any).selfCheckTokenHash);
+      expect(handlerHashBefore).toBe(true);
+      await server!.stop();
+      expect((server as any).selfCheckTokenHash).toBeNull();
+      server = null;
+    });
+  });
+
+  it('starts normally when the token file cannot be written; the route then answers 404', async () => {
+    const tmp = newTmpDir();
+    const tokenDir = path.join(tmp, SELF_CHECK_TOKEN_FILE_NAME);
+    fs.mkdirSync(tokenDir); // a directory where the token file should be
+    const db = new DatabaseSync(':memory:');
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => { errors.push(a.join(' ')); };
+    const server = newServer(db, tokenDir);
+    try {
+      const { url } = await server.start();
+      const res = await fetch(`${url}/api/selfcheck`, { headers: { [SELF_CHECK_TOKEN_HEADER]: 'anything' } });
+      expect(res.status).toBe(404);
+      expect(errors.join('\n')).toMatch(/could not write the self-check token file/);
+      expect(fs.readdirSync(tmp)).toEqual([SELF_CHECK_TOKEN_FILE_NAME]);
+    } finally {
+      console.error = origError;
+      await server.stop();
+      db.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it('answers 404 when the server was started without a token file', async () => {
@@ -218,6 +267,24 @@ describe('GET /api/selfcheck (deployment self-check)', () => {
       });
       expect(json.data.runtimes.items[1].current).toBe('/tmp/enkeep-test/new/daemon-cli.js');
       expect(json.data.health.runtime.available).toBe(true);
+    });
+
+    it('reports provider failures as degraded with reasons instead of a 500', async () => {
+      const managementProvider = {
+        listRuntimes: vi.fn().mockResolvedValue([]),
+        getTargetVersion: vi.fn().mockRejectedValue(new Error('boom')),
+        getUpgradeStatus: vi.fn().mockRejectedValue(new Error('boom')),
+      };
+      const { status, json } = await call('127.0.0.1', TOKEN, managementProvider);
+      expect(status).toBe(200);
+      expect(json.data.status).toBe('degraded');
+      expect(json.data.health.errors).toEqual(['upgrade_status_unavailable', 'target_version_unavailable']);
+      expect(JSON.stringify(json)).not.toContain('boom');
+    });
+
+    it('accepts the IPv6 loopback peer', async () => {
+      const { status } = await call('::1', TOKEN);
+      expect(status).toBe(200);
     });
 
     it('refuses non-loopback peers even with the right token', async () => {

@@ -985,7 +985,7 @@ describe('Deploy Tooling Enhancements', () => {
             .toThrow(/is not in running state/);
         });
 
-        it('split mode container check makes no HTTP call (upgrade status is checked by executeVerify with a login)', () => {
+        it('split mode container check makes no HTTP call (runtime status is checked by executeVerify via the self-check)', () => {
           const psOut = 'enkeep-test-user1\tenkeep-runtime:old-img\tUp 3 hours';
           expect(() => verifyContainers(psOut, 'enkeep-test-', 'enkeep-runtime:target-img', true)).not.toThrow();
         });
@@ -1169,6 +1169,17 @@ describe('Deploy Tooling Enhancements', () => {
       const link = path.join(dataDir, 'selfcheck.token');
       fs.symlinkSync(real, link);
       expect(() => readSelfCheckToken(link)).toThrow(/not a regular file/);
+    });
+
+    it('reports a platform that does not answer in time as "timeout", not "unreachable"', async () => {
+      writeToken();
+      const fetchImpl = async () => { const e = new Error('timed out'); e.name = 'TimeoutError'; throw e; };
+      await expectSelfCheckError(fetchSelfCheck({ port: 1, dataDir, fetchImpl: fetchImpl as any }), 'timeout');
+    });
+
+    it('selfCheckProblems lists health errors reported by the platform', () => {
+      const withErrors = { ...REPORT, status: 'degraded', health: { ...REPORT.health, errors: ['upgrade_status_unavailable'] } };
+      expect(selfCheckProblems(withErrors)).toEqual(['upgrade_status_unavailable']);
     });
 
     it('reports an unreachable platform as "unreachable"', async () => {
