@@ -142,6 +142,19 @@ export {
   DEFAULT_QUOTA_RESERVATION_GRACE_SECONDS,
 } from './runtime/delivery-gateway.js';
 
+// Deployment self-check (GET /api/selfcheck)
+export {
+  SELF_CHECK_TOKEN_FILE_NAME,
+  SELF_CHECK_TOKEN_HEADER,
+  issueSelfCheckToken,
+  verifySelfCheckToken,
+  readMigrationStatus,
+  toSelfCheckRuntime,
+  type SelfCheckMigrationStatus,
+  type SelfCheckRuntime,
+  type SelfCheckSource,
+} from './server/selfcheck.js';
+
 // Handler and HTTP Server
 export {
   createPlatformServerHandler,

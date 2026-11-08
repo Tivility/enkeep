@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   parseEnvFile,
   resolveDeployConfig,
@@ -27,7 +27,14 @@ import {
   convertPlistToEnkeepServer,
   DEFAULT_PREFLIGHT_TIMEOUT_SECONDS,
   DEFAULT_PREFLIGHT_INTERVAL_SECONDS,
+  fetchSelfCheck,
+  printSelfCheckSummary,
+  readSelfCheckToken,
+  selfCheckProblems,
+  SelfCheckError,
 } from '../scripts/deploy-release.mjs';
+import * as http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { planPruneWorktrees, executePrune } from '../scripts/prune-release-worktrees.mjs';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -978,10 +985,9 @@ describe('Deploy Tooling Enhancements', () => {
             .toThrow(/is not in running state/);
         });
 
-        it('split mode gracefully handles upgrade-status endpoint query', () => {
+        it('split mode container check makes no HTTP call (upgrade status is checked by executeVerify with a login)', () => {
           const psOut = 'enkeep-test-user1\tenkeep-runtime:old-img\tUp 3 hours';
-          // With non-existent port, should skip gracefully and not throw
-          expect(() => verifyContainers(psOut, 'enkeep-test-', 'enkeep-runtime:target-img', true, 59999)).not.toThrow();
+          expect(() => verifyContainers(psOut, 'enkeep-test-', 'enkeep-runtime:target-img', true)).not.toThrow();
         });
       });
     });
@@ -1011,6 +1017,211 @@ describe('Deploy Tooling Enhancements', () => {
       expect(preflightCmd).toContain('--wait');
       expect(preflightCmd).toContain('--timeout-seconds 86400');
       expect(restartCmd).toBe('launchctl kickstart -k gui/$(id -u)/com.example.enkeep');
+    });
+  });
+
+  describe('Platform self-check (GET /api/selfcheck with the data-dir token)', () => {
+    const TOKEN = 'selfcheck-test-token-000000000000000000001';
+    const REPORT = {
+      status: 'ok',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      uptimeSeconds: 5,
+      health: { runtime: { available: true, status: 'available' }, operations: { producerAvailable: true, workerRunning: true } },
+      migrations: { currentVersion: 45, latestVersion: 45, pendingVersions: [], upToDate: true },
+      runtimeTarget: { image: 'enkeep-runtime:test-new', daemonCliPath: '/tmp/enkeep-test/new/daemon-cli.js' },
+      runtimes: {
+        total: 1,
+        outdated: 1,
+        items: [{ mode: 'container', current: 'enkeep-runtime:test-old', target: 'enkeep-runtime:test-new', isOutdated: true, isIdle: false, pendingReason: 'busy' }],
+      },
+    };
+
+    type FakeOptions = { status?: number; body?: unknown };
+    type Seen = { path: string; method: string; token?: string; cookie?: string };
+
+    async function startFakePlatform(opts: FakeOptions = {}) {
+      const seen: Seen[] = [];
+      const server = http.createServer((req, res) => {
+        const p = (req.url || '').split('?')[0];
+        seen.push({ path: p, method: req.method || 'GET', token: req.headers['x-enkeep-selfcheck-token'] as string | undefined, cookie: req.headers.cookie });
+        const send = (code: number, payload: unknown) => {
+          res.writeHead(code, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(payload));
+        };
+        if (p !== '/api/selfcheck') return send(404, { success: false, error: { code: 'NOT_FOUND' } });
+        if (opts.status && opts.status !== 200) {
+          return send(opts.status, { success: false, error: { code: opts.status === 401 ? 'UNAUTHORIZED' : opts.status === 403 ? 'FORBIDDEN' : 'NOT_FOUND' } });
+        }
+        if (req.headers['x-enkeep-selfcheck-token'] !== TOKEN) return send(401, { success: false, error: { code: 'UNAUTHORIZED' } });
+        send(200, opts.body ?? { success: true, data: REPORT });
+      });
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+      const port = (server.address() as AddressInfo).port;
+      return { port, seen, close: () => new Promise<void>((r) => server.close(() => r())) };
+    }
+
+    let dataDir: string;
+    beforeEach(() => {
+      dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-selfcheck-data-'));
+    });
+    afterEach(() => {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    });
+
+    function writeToken(value = TOKEN, mode = 0o600) {
+      const file = path.join(dataDir, 'selfcheck.token');
+      fs.writeFileSync(file, `${value}\n`, { mode });
+      fs.chmodSync(file, mode);
+      return file;
+    }
+
+    async function expectSelfCheckError(promise: Promise<unknown>, kind: string) {
+      const err = await promise.then(() => null, (e) => e);
+      expect(err).toBeInstanceOf(SelfCheckError);
+      expect(err.kind).toBe(kind);
+      expect(String(err.message)).not.toContain(TOKEN);
+      return err;
+    }
+
+    it('sends the token from <DATA_DIR>/selfcheck.token and no cookie or login', async () => {
+      writeToken();
+      const fake = await startFakePlatform();
+      try {
+        const report = await fetchSelfCheck({ port: fake.port, dataDir });
+        expect(report).toEqual(REPORT);
+        expect(fake.seen).toHaveLength(1);
+        expect(fake.seen[0]).toMatchObject({ path: '/api/selfcheck', method: 'GET', token: TOKEN });
+        expect(fake.seen[0].cookie).toBeUndefined();
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it('treats 401 as a failure, not as "no runtimes"', async () => {
+      writeToken();
+      const fake = await startFakePlatform({ status: 401 });
+      try {
+        const err = await expectSelfCheckError(fetchSelfCheck({ port: fake.port, dataDir }), 'unauthorized');
+        expect(err.message).toContain('HTTP 401 UNAUTHORIZED');
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it('treats a stale token (token file from another start) as unauthorized', async () => {
+      writeToken('selfcheck-test-token-000000000000000000002');
+      const fake = await startFakePlatform();
+      try {
+        await expectSelfCheckError(fetchSelfCheck({ port: fake.port, dataDir }), 'unauthorized');
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it('treats 403 as a failure', async () => {
+      writeToken();
+      const fake = await startFakePlatform({ status: 403 });
+      try {
+        await expectSelfCheckError(fetchSelfCheck({ port: fake.port, dataDir }), 'unauthorized');
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it('reports a platform without the endpoint (404) as not-supported', async () => {
+      writeToken();
+      const fake = await startFakePlatform({ status: 404 });
+      try {
+        await expectSelfCheckError(fetchSelfCheck({ port: fake.port, dataDir }), 'not-supported');
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it('fails on an unexpected response format', async () => {
+      writeToken();
+      const fake = await startFakePlatform({ body: { success: true, data: { status: 'ok' } } });
+      try {
+        await expectSelfCheckError(fetchSelfCheck({ port: fake.port, dataDir }), 'bad-response');
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it('fails without a token file and sends no request', async () => {
+      const fake = await startFakePlatform();
+      try {
+        await expectSelfCheckError(fetchSelfCheck({ port: fake.port, dataDir }), 'no-token');
+        expect(fake.seen).toHaveLength(0);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it('refuses a token file readable by group or others', () => {
+      const file = writeToken(TOKEN, 0o644);
+      expect(() => readSelfCheckToken(file)).toThrow(/must have mode 0600/);
+    });
+
+    it('refuses a symlinked token file', () => {
+      const real = path.join(dataDir, 'real.token');
+      fs.writeFileSync(real, TOKEN, { mode: 0o600 });
+      const link = path.join(dataDir, 'selfcheck.token');
+      fs.symlinkSync(real, link);
+      expect(() => readSelfCheckToken(link)).toThrow(/not a regular file/);
+    });
+
+    it('reports an unreachable platform as "unreachable"', async () => {
+      writeToken();
+      const fake = await startFakePlatform();
+      const port = fake.port;
+      await fake.close();
+      await expectSelfCheckError(fetchSelfCheck({ port, dataDir }), 'unreachable');
+    });
+
+    it('selfCheckProblems flags pending migrations, unavailable runtime and operations', () => {
+      expect(selfCheckProblems(REPORT)).toEqual([]);
+      const bad = {
+        ...REPORT,
+        status: 'degraded',
+        migrations: { currentVersion: 44, latestVersion: 45, pendingVersions: [45], upToDate: false },
+        health: { runtime: { available: false, status: 'error' }, operations: { producerAvailable: false, workerRunning: false } },
+      };
+      const problems = selfCheckProblems(bad);
+      expect(problems).toContain('pending migrations [45]');
+      expect(problems).toContain('runtime provider error');
+      expect(problems).toContain('operations producer unavailable');
+    });
+
+    it('printSelfCheckSummary prints runtimes without user ids and throws on 401 instead of printing a summary', async () => {
+      writeToken();
+      const ok = await startFakePlatform();
+      const denied = await startFakePlatform({ status: 401 });
+      const logs: string[] = [];
+      const origLog = console.log;
+      console.log = (...a: unknown[]) => { logs.push(a.join(' ')); };
+      try {
+        const { problems } = await printSelfCheckSummary({ port: ok.port, dataDir });
+        expect(problems).toEqual([]);
+        const out = logs.join('\n');
+        expect(out).toContain('migrations 45/45 (up to date)');
+        expect(out).toContain('- Runtime #1 (container): current=enkeep-runtime:test-old, target=enkeep-runtime:test-new, outdated=true');
+        expect(out).not.toContain(TOKEN);
+        logs.length = 0;
+        await expect(printSelfCheckSummary({ port: denied.port, dataDir })).rejects.toThrow(/refused \(HTTP 401/);
+        expect(logs.join('\n')).not.toMatch(/no active user runtimes/i);
+      } finally {
+        console.log = origLog;
+        await ok.close();
+        await denied.close();
+      }
+    });
+
+    it('no longer reads admin credentials from the env file', () => {
+      const envPath = path.join(dataDir, 'deploy.env');
+      fs.writeFileSync(envPath, 'ADMIN_USERNAME=admin-test\nADMIN_PASSWORD=synthetic-password-0001\n');
+      const config = resolveDeployConfig(['--env-file', envPath]) as Record<string, unknown>;
+      expect(JSON.stringify(config)).not.toContain('synthetic-password-0001');
     });
   });
 });

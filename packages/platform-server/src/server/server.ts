@@ -194,6 +194,7 @@ import {
 import type { RuntimeMountReconciler, BrowserService, PlatformProxyMcpService } from '@enkeep/platform-core';
 import { SpaceMountService } from '../mounts/space-mount-service.js';
 import { RuntimeAutoUpgrader } from '../runtime/auto-upgrader.js';
+import { issueSelfCheckToken, readMigrationStatus } from './selfcheck.js';
 
 export class PlatformConfigurationError extends PlatformError {
   constructor(message: string, code = 'CONFIGURATION_ERROR') {
@@ -281,6 +282,7 @@ const ALLOWED_PLATFORM_SERVER_OPTIONS = new Set([
   'wechatOnboardingService',
   'streamEventSource',
   'dataRoot',
+  'selfCheckTokenFile',
   'pipelineManifestPath',
   'pipelineTaskPreparer',
   'prepareTaskInput',
@@ -394,6 +396,12 @@ export interface PlatformServerOptions {
   dshHome?: string;
   /** Optional data root directory containing host-runtimes and tenant memory */
   dataRoot?: string;
+  /**
+   * Where to write the deployment self-check token (normally `<data-dir>/selfcheck.token`).
+   * A new token is issued at every start, before the listener binds. Without it,
+   * GET /api/selfcheck answers 404.
+   */
+  selfCheckTokenFile?: string;
   /** Optional spaces directory for skill resolution */
   spacesDir?: string;
   /** Optional bundled skills directory */
@@ -554,6 +562,10 @@ export class PlatformServer {
   public readonly dshHome: string;
   public readonly dataRoot?: string;
 
+  private readonly selfCheckTokenFile?: string;
+  private selfCheckTokenHash: Buffer | null = null;
+  private selfCheckStartedAt: string | null = null;
+
   private activeSockets = new Set<import('node:net').Socket>();
   /** Channels whose clients dial in over a WebSocket upgrade (e.g. Jarvis), by upgrade path. */
   private readonly connectionEndpoints: ChannelConnectionEndpoint[] = [];
@@ -638,6 +650,7 @@ export class PlatformServer {
     const effectiveDshHome = resolvePlatformDshHome(options.dshHome);
     this.dshHome = effectiveDshHome ?? '';
     this.dataRoot = options.dataRoot ?? (options.dshHome ?? (effectiveDshHome || undefined));
+    this.selfCheckTokenFile = options.selfCheckTokenFile;
 
     this.modelSelectionService =
       options.modelSelectionService ??
@@ -1196,6 +1209,11 @@ export class PlatformServer {
       browserService: this.browserService,
       mcpService: this.mcpService,
       dshHome: this.dshHome,
+      selfCheck: {
+        getTokenHash: () => this.selfCheckTokenHash,
+        getMigrationStatus: () => readMigrationStatus(this.db, ALL_PLATFORM_MIGRATIONS),
+        getStartedAt: () => this.selfCheckStartedAt,
+      },
     });
   }
 
@@ -1465,6 +1483,12 @@ export class PlatformServer {
       // 5.7 Start Runtime Auto-Upgrader
       if (this.runtimeAutoUpgrader) {
         this.runtimeAutoUpgrader.start();
+      }
+
+      // 5.8 Issue a fresh deployment self-check token before accepting requests.
+      if (this.selfCheckTokenFile) {
+        this.selfCheckTokenHash = issueSelfCheckToken(this.selfCheckTokenFile);
+        this.selfCheckStartedAt = new Date().toISOString();
       }
 
       // 6. Bind listener
