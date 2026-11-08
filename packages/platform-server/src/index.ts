@@ -556,7 +556,9 @@ export {
   WebhookSecurityError,
   isPrivateOrBlockedIPv4,
   isPrivateOrBlockedIPv6,
+  resolveWebhookPolicyFlags,
   type WebhookSecurityOptions,
+  type WebhookPolicyFlags,
 } from './notifications/webhook-security-policy.js';
 
 export {

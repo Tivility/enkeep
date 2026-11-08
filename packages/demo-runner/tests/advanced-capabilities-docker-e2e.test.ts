@@ -1014,6 +1014,8 @@ description: Professional automated code auditing skill v2 - enhanced
       resourceSuffix: activeResourceSuffix,
       runtimeImage: 'enkeep-demo-runtime:acceptance',
       timeoutMs: 30000,
+      // The fake webhook receiver listens on loopback; production data dirs refuse that by default.
+      webhookSecurityOptions: { allowTestLoopback: true, enforceHttps: false },
     });
     expect(runningSystem.result.ok).toBe(true);
     runGeneratedMetadata = true;

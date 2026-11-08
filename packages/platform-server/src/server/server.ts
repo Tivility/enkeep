@@ -195,6 +195,7 @@ import type { RuntimeMountReconciler, BrowserService, PlatformProxyMcpService } 
 import { SpaceMountService } from '../mounts/space-mount-service.js';
 import { RuntimeAutoUpgrader } from '../runtime/auto-upgrader.js';
 import { issueSelfCheckToken, readMigrationStatus } from './selfcheck.js';
+import { resolveWebhookPolicyFlags } from '../notifications/webhook-security-policy.js';
 
 export class PlatformConfigurationError extends PlatformError {
   constructor(message: string, code = 'CONFIGURATION_ERROR') {
@@ -1213,6 +1214,7 @@ export class PlatformServer {
         getTokenHash: () => this.selfCheckTokenHash,
         getMigrationStatus: () => readMigrationStatus(this.db, ALL_PLATFORM_MIGRATIONS),
         getStartedAt: () => this.selfCheckStartedAt,
+        getWebhookPolicy: () => resolveWebhookPolicyFlags(options.webhookSecurityOptions),
       },
     });
   }

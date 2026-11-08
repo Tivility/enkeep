@@ -33,6 +33,24 @@ export class WebhookSecurityError extends Error {
   }
 }
 
+/** The effective switches of a webhook security policy (no URLs, no secrets). */
+export interface WebhookPolicyFlags {
+  /** Loopback and private/reserved destinations and plain HTTP are allowed. */
+  readonly allowLoopback: boolean;
+  /** Only https destinations are accepted. */
+  readonly enforceHttps: boolean;
+}
+
+/**
+ * Resolves the switches validateWebhookUrl applies for `options`, including the
+ * ALLOW_TEST_WEBHOOK_LOOPBACK environment override.
+ */
+export function resolveWebhookPolicyFlags(options: WebhookSecurityOptions = {}): WebhookPolicyFlags {
+  const allowLoopback = options.allowTestLoopback === true || process.env.ALLOW_TEST_WEBHOOK_LOOPBACK === '1';
+  const enforceHttps = options.enforceHttps !== false && !allowLoopback;
+  return { allowLoopback, enforceHttps };
+}
+
 const SENSITIVE_QUERY_PARAM_REGEX = /^(?:token|key|secret|password|auth|sig|signature|bearer|apikey|api_key|access_token|credential|private)$/i;
 
 /**
@@ -151,8 +169,7 @@ export async function validateWebhookUrl(
     }
   }
 
-  const allowLoopback = options.allowTestLoopback === true || process.env.ALLOW_TEST_WEBHOOK_LOOPBACK === '1';
-  const enforceHttps = options.enforceHttps !== false && !allowLoopback;
+  const { allowLoopback, enforceHttps } = resolveWebhookPolicyFlags(options);
 
   if (enforceHttps && parsed.protocol !== 'https:') {
     throw new WebhookSecurityError(`Webhook URL must use HTTPS protocol, got "${parsed.protocol}"`, 'INSECURE_PROTOCOL');
