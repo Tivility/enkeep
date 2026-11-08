@@ -127,6 +127,13 @@ import { ModelSelectionService } from "../models/model-selection-service.js";
 import { SessionLifecycleService } from "../sessions/session-lifecycle-service.js";
 import type { RuntimeArtifactPort } from "../sessions/runtime-artifact-port.js";
 import { generate32HexId } from "../storage/web-messages.js";
+import {
+  SELF_CHECK_TOKEN_HEADER,
+  toSelfCheckRuntime,
+  verifySelfCheckToken,
+  type SelfCheckRuntime,
+  type SelfCheckSource,
+} from "./selfcheck.js";
 
 export type HttpRequestHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 
@@ -315,6 +322,8 @@ export interface PlatformServerHandlerOptions {
   browserService?: BrowserService;
   mcpService?: PlatformProxyMcpService;
   dshHome?: string;
+  /** Deployment self-check source (GET /api/selfcheck). Without it the endpoint answers 404. */
+  selfCheck?: SelfCheckSource;
 }
 
 function isValidIsoDate(raw: unknown): boolean {
@@ -708,6 +717,78 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
         if (Number.isFinite(parsedContentLength) && parsedContentLength > effectiveMaxBytes) {
           throw new PayloadTooLargeError(`Request payload size ${parsedContentLength} bytes exceeds limit of ${effectiveMaxBytes} bytes`);
         }
+      }
+
+      // 0b. Deployment self-check: read-only status for the release script, guarded by the
+      // self-check token only (no session). See server/selfcheck.ts for why not loopback-only.
+      if (pathname === "/api/selfcheck") {
+        const selfCheck = options.selfCheck;
+        const tokenHash = selfCheck ? selfCheck.getTokenHash() : null;
+        if (!selfCheck || !tokenHash) {
+          throw new PlatformError("Not Found", "NOT_FOUND", 404);
+        }
+        if (method !== "GET") {
+          throw new PlatformError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+        }
+        const remote = req.socket.remoteAddress;
+        if (remote !== "127.0.0.1" && remote !== "::ffff:127.0.0.1" && remote !== "::1") {
+          throw new ForbiddenError("Self-check is only served to loopback clients");
+        }
+        if (!verifySelfCheckToken(req.headers[SELF_CHECK_TOKEN_HEADER], tokenHash)) {
+          throw new UnauthorizedError("Valid self-check token required");
+        }
+
+        let runtimeAvailable = false;
+        let runtimeStatus = "unavailable";
+        let runtimes: SelfCheckRuntime[] = [];
+        let runtimeTarget: { image: string | null; daemonCliPath: string | null } | null = null;
+        const errors: string[] = [];
+        if (managementProvider) {
+          try {
+            const list = await managementProvider.listRuntimes();
+            runtimeAvailable = Array.isArray(list);
+            runtimeStatus = runtimeAvailable ? "available" : "unavailable";
+          } catch {
+            runtimeStatus = "error";
+          }
+          if (typeof managementProvider.getUpgradeStatus === "function") {
+            try {
+              runtimes = (await managementProvider.getUpgradeStatus()).map(toSelfCheckRuntime);
+            } catch {
+              errors.push("upgrade_status_unavailable");
+            }
+          }
+          if (typeof managementProvider.getTargetVersion === "function") {
+            try {
+              const tv = await managementProvider.getTargetVersion();
+              runtimeTarget = tv ? { image: tv.image, daemonCliPath: tv.daemonCliPath } : null;
+            } catch {
+              errors.push("target_version_unavailable");
+            }
+          }
+        }
+        const migrations = selfCheck.getMigrationStatus();
+        const producerAvailable = Boolean(operations);
+        const workerRunning = Boolean(operations && taskWorker);
+        const healthy = runtimeAvailable && producerAvailable && migrations.upToDate && errors.length === 0;
+        sendJsonResponse(res, 200, createSuccessEnvelope({
+          status: healthy ? "ok" : "degraded",
+          startedAt: selfCheck.getStartedAt(),
+          uptimeSeconds: Math.round(process.uptime()),
+          health: {
+            runtime: { available: runtimeAvailable, status: runtimeStatus },
+            operations: { producerAvailable, workerRunning },
+            errors,
+          },
+          migrations,
+          runtimeTarget,
+          runtimes: {
+            total: runtimes.length,
+            outdated: runtimes.filter((r) => r.isOutdated).length,
+            items: runtimes,
+          },
+        }));
+        return;
       }
 
       // 1. Health & CSRF Bootstrap

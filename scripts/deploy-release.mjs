@@ -14,7 +14,7 @@
  * - Does not leak or print EnvironmentVariables values from plist files.
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { execSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
@@ -771,7 +771,7 @@ export async function executeRollback(config) {
   console.log('✓ Rollback completed successfully.');
 }
 
-export function verifyContainers(psOutput, containerNamePrefix, targetImageTag, isSplitMode = false, port = null) {
+export function verifyContainers(psOutput, containerNamePrefix, targetImageTag, isSplitMode = false) {
   const lines = (psOutput || '').split('\n').filter(Boolean);
   const matchingContainers = [];
   for (const line of lines) {
@@ -789,30 +789,7 @@ export function verifyContainers(psOutput, containerNamePrefix, targetImageTag, 
         throw new Error(`Container ${c.name} is not in running state (status: ${c.status})`);
       }
     }
-    // Query GET /api/admin/runtime/upgrade-status if port is provided
-    if (port) {
-      try {
-        const out = execSync(`curl -s -f "http://127.0.0.1:${port}/api/admin/runtime/upgrade-status"`, { encoding: 'utf8' });
-        const json = JSON.parse(out);
-        if (json && json.success && Array.isArray(json.data)) {
-          console.log('\n--- Runtime Upgrade Status Summary ---');
-          if (json.data.length === 0) {
-            console.log('No active user runtimes reported.');
-          } else {
-            for (const st of json.data) {
-              const current = st.currentImage || st.currentDaemonCliPath || 'unknown';
-              const target = st.targetImage || st.targetDaemonCliPath || 'unknown';
-              const pendingReason = st.pendingReason !== undefined ? st.pendingReason : 'none';
-              console.log(`- Runtime [${st.userId || 'unknown'}] (${st.mode || 'container'}): current=${current}, target=${target}, pendingReason=${pendingReason}`);
-            }
-          }
-        } else {
-          console.log('Notice: /api/admin/runtime/upgrade-status returned unexpected format, skipping status summary.');
-        }
-      } catch {
-        console.log('Notice: /api/admin/runtime/upgrade-status endpoint unavailable, skipping runtime status summary.');
-      }
-    }
+    // Runtime versions and health are checked by executeVerify through GET /api/selfcheck.
   } else {
     // full mode: strict check matching targetImageTag
     for (const c of matchingContainers) {
@@ -824,7 +801,7 @@ export function verifyContainers(psOutput, containerNamePrefix, targetImageTag, 
   }
 }
 
-export async function executeVerify(config, expectedImageTag = null, preSwitchConnCounts = null) {
+export async function executeVerify(config, expectedImageTag = null, preSwitchConnCounts = null, options = {}) {
   const {
     port,
     proxyPort,
@@ -853,6 +830,7 @@ export async function executeVerify(config, expectedImageTag = null, preSwitchCo
     } else {
       console.log(`  - Docker containers matching prefix "${containerNamePrefix}" match expected image`);
     }
+    console.log(`  - Platform self-check (GET /api/selfcheck, token ${dataDir ? selfCheckTokenPath(dataDir) : '<DATA_DIR>/selfcheck.token'}): migrations up to date, runtime and operations available`);
     console.log(`  - Established external connections match pre-switch counts within 120s`);
     console.log(`  - Single-shot preflight check is quiescent`);
     return;
@@ -925,8 +903,17 @@ export async function executeVerify(config, expectedImageTag = null, preSwitchCo
     // 4. Check docker containers matching prefix CONTAINER_NAME_PREFIX
     console.log(`\n[Verify 4/6] Checking containers starting with prefix "${containerNamePrefix}" (mode: ${isSplitMode ? 'split' : 'full'})...`);
     const psOut = execSync(`docker ps --format "{{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null || true`, { encoding: 'utf8' }).trim();
-    verifyContainers(psOut, containerNamePrefix, targetImageTag, isSplitMode, port);
+    verifyContainers(psOut, containerNamePrefix, targetImageTag, isSplitMode);
     console.log('✓ Docker container verification completed.');
+
+    // 4b. Platform self-check (read-only, token from the data directory). Any failure — missing
+    // token, 401/403, 404, bad response — or an unhealthy report fails verification.
+    console.log(`\n[Verify 4b/6] Reading platform self-check (versions, migrations, health)...`);
+    const { problems } = await printSelfCheckSummary(config, { fetchImpl: options.fetchImpl });
+    if (problems.length > 0) {
+      throw new Error(`Platform self-check is not healthy: ${problems.join('; ')}`);
+    }
+    console.log('✓ Platform self-check passed.');
 
     // 5. Connection counts check
     console.log(`\n[Verify 5/6] Checking established connection count (waiting up to 120s for match)...`);
@@ -1021,15 +1008,157 @@ export function setRuntimeTargetVersionInDb(dbPath, imageTag = null, daemonCliPa
   }
 }
 
-export async function fetchUpgradeStatusSummary(port) {
+/**
+ * Raised when the platform's deployment self-check cannot be read. `kind` is one of
+ * 'no-token', 'insecure-token-file', 'unreachable', 'timeout', 'not-supported', 'unauthorized', 'bad-response'.
+ * Messages carry paths, HTTP statuses and error codes only, never the token.
+ */
+export class SelfCheckError extends Error {
+  constructor(kind, message) {
+    super(message);
+    this.name = 'SelfCheckError';
+    this.kind = kind;
+  }
+}
+
+/** Token file the platform writes into its data directory at every start (mode 0600). */
+export const SELF_CHECK_TOKEN_FILE_NAME = 'selfcheck.token';
+const SELF_CHECK_PATH = '/api/selfcheck';
+const SELF_CHECK_TOKEN_HEADER = 'X-Enkeep-Selfcheck-Token';
+const SELF_CHECK_TIMEOUT_MS = 15000;
+
+/** Path of the self-check token for a data directory. */
+export function selfCheckTokenPath(dataDir) {
+  return join(dataDir, SELF_CHECK_TOKEN_FILE_NAME);
+}
+
+/**
+ * Reads the self-check token. Refuses a symlink, a non-regular file, a file owned by another
+ * user, or one readable by group/others. The token is returned, never printed.
+ * @param tokenFile - path of the token file.
+ */
+export function readSelfCheckToken(tokenFile) {
+  let st;
   try {
-    const out = execSync(`curl -s -f "http://127.0.0.1:${port}/api/admin/runtime/upgrade-status"`, { encoding: 'utf8' });
-    const json = JSON.parse(out);
-    if (json && json.success && Array.isArray(json.data)) {
-      return json.data;
+    st = lstatSync(tokenFile);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      throw new SelfCheckError('no-token', `Self-check token file not found: ${tokenFile} (the platform writes it at start)`);
     }
+    throw new SelfCheckError('no-token', `Cannot read self-check token file ${tokenFile} (${(err && err.code) || 'error'})`);
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new SelfCheckError('insecure-token-file', `Self-check token file ${tokenFile} is not a regular file`);
+  }
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+    throw new SelfCheckError('insecure-token-file', `Self-check token file ${tokenFile} is owned by another user`);
+  }
+  if ((st.mode & 0o077) !== 0) {
+    throw new SelfCheckError('insecure-token-file', `Self-check token file ${tokenFile} must have mode 0600 (found ${(st.mode & 0o777).toString(8)})`);
+  }
+  const token = readFileSync(tokenFile, 'utf8').trim();
+  if (!token) throw new SelfCheckError('no-token', `Self-check token file ${tokenFile} is empty`);
+  return token;
+}
+
+async function describeHttpFailure(res) {
+  let code = '';
+  try {
+    const json = await res.json();
+    code = (json && json.error && json.error.code) || (json && json.code) || '';
   } catch {}
-  return [];
+  return code ? `HTTP ${res.status} ${code}` : `HTTP ${res.status}`;
+}
+
+/**
+ * Reads GET /api/selfcheck from the local platform with the self-check token from the data
+ * directory. The endpoint is read-only and the token grants nothing else; no admin login is used.
+ * @param options.port - platform port on 127.0.0.1.
+ * @param options.dataDir - platform data directory (holds selfcheck.token).
+ * @param options.fetchImpl - fetch implementation (tests).
+ * @returns the self-check report ({ status, startedAt, health, migrations, runtimeTarget, runtimes }).
+ * @throws SelfCheckError on any failure, including 401/403 — a failure is never reported as "no runtimes".
+ */
+export async function fetchSelfCheck({ port, dataDir, fetchImpl = globalThis.fetch }) {
+  if (!dataDir) throw new SelfCheckError('no-token', 'DATA_DIR is required to locate the self-check token');
+  const token = readSelfCheckToken(selfCheckTokenPath(dataDir));
+  let res;
+  try {
+    res = await fetchImpl(`http://127.0.0.1:${port}${SELF_CHECK_PATH}`, {
+      headers: { [SELF_CHECK_TOKEN_HEADER]: token },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(SELF_CHECK_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      throw new SelfCheckError('timeout', `Platform on port ${port} did not answer ${SELF_CHECK_PATH} within ${SELF_CHECK_TIMEOUT_MS / 1000}s`);
+    }
+    const reason = (err && err.cause && err.cause.code) || (err && err.name) || 'error';
+    throw new SelfCheckError('unreachable', `Platform on port ${port} is not reachable (${reason})`);
+  }
+  if (res.status === 404) {
+    throw new SelfCheckError('not-supported', `GET ${SELF_CHECK_PATH} is not available (HTTP 404); the running platform predates the self-check endpoint`);
+  }
+  if (res.status === 401 || res.status === 403) {
+    throw new SelfCheckError('unauthorized', `GET ${SELF_CHECK_PATH} was refused (${await describeHttpFailure(res)}); the token file does not match the running platform`);
+  }
+  if (!res.ok) {
+    throw new SelfCheckError('bad-response', `GET ${SELF_CHECK_PATH} failed: ${await describeHttpFailure(res)}`);
+  }
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {}
+  const data = json && json.success === true ? json.data : null;
+  if (!data || typeof data.status !== 'string' || !data.migrations || !data.health || !data.runtimes || !Array.isArray(data.runtimes.items)) {
+    throw new SelfCheckError('bad-response', `GET ${SELF_CHECK_PATH} returned an unexpected format`);
+  }
+  return data;
+}
+
+/** Reasons a self-check report is not healthy (empty when healthy). */
+export function selfCheckProblems(report) {
+  const problems = [];
+  if (!report.migrations.upToDate) {
+    problems.push(`pending migrations ${JSON.stringify(report.migrations.pendingVersions)}`);
+  }
+  if (!report.health.runtime || report.health.runtime.available !== true) {
+    problems.push(`runtime provider ${report.health.runtime ? report.health.runtime.status : 'unknown'}`);
+  }
+  if (!report.health.operations || report.health.operations.producerAvailable !== true) {
+    problems.push('operations producer unavailable');
+  }
+  if (Array.isArray(report.health.errors)) {
+    for (const e of report.health.errors) problems.push(String(e));
+  }
+  if (problems.length === 0 && report.status !== 'ok') problems.push(`status ${report.status}`);
+  return problems;
+}
+
+/** One log line per runtime in the self-check report. */
+export function formatSelfCheckRuntimeLine(rt, index) {
+  return `- Runtime #${index + 1} (${rt.mode || 'container'}): current=${rt.current || 'unknown'}, target=${rt.target || 'unknown'}, outdated=${rt.isOutdated}, idle=${rt.isIdle}, pendingReason=${rt.pendingReason ?? 'none'}`;
+}
+
+/**
+ * Reads and prints the self-check. Throws SelfCheckError when it cannot be read.
+ * @returns { report, problems }.
+ */
+export async function printSelfCheckSummary(config, options = {}) {
+  const report = await fetchSelfCheck({ port: config.port, dataDir: config.dataDir, fetchImpl: options.fetchImpl });
+  const problems = selfCheckProblems(report);
+  console.log('\n--- Platform Self-Check ---');
+  console.log(`Status: ${report.status}; started ${report.startedAt || 'unknown'}; migrations ${report.migrations.currentVersion}/${report.migrations.latestVersion}${report.migrations.upToDate ? ' (up to date)' : ` (pending ${JSON.stringify(report.migrations.pendingVersions)})`}`);
+  if (report.runtimeTarget) {
+    console.log(`Runtime target: image=${report.runtimeTarget.image || 'none'}, daemonCliPath=${report.runtimeTarget.daemonCliPath || 'none'}`);
+  }
+  if (report.runtimes.items.length === 0) {
+    console.log('The platform reported no active user runtimes.');
+  } else {
+    console.log(`Runtimes: ${report.runtimes.total} (outdated ${report.runtimes.outdated})`);
+    report.runtimes.items.forEach((rt, i) => console.log(formatSelfCheckRuntimeLine(rt, i)));
+  }
+  return { report, problems };
 }
 
 export async function executeRuntimeDeploy(config, options = {}) {
@@ -1081,7 +1210,7 @@ export async function executeRuntimeDeploy(config, options = {}) {
     console.log(`  2. Install dependencies and build worktree`);
     console.log(`  3. Build docker runtime image with tag`);
     console.log(`  4. Set target runtime version in DB (${dbPath}) or via admin API`);
-    console.log(`  5. Print upgrade status summary and exit without waiting`);
+    console.log(`  5. Print the platform self-check (GET /api/selfcheck with ${selfCheckTokenPath(dataDir)})`);
     return { success: true, dryRun: true };
   }
 
@@ -1158,13 +1287,16 @@ export async function executeRuntimeDeploy(config, options = {}) {
     console.log('✓ Target runtime version persisted.');
   });
 
-  console.log('\n--- Runtime Upgrade Status Summary ---');
-  const statuses = await fetchUpgradeStatusSummary(port);
-  if (statuses.length === 0) {
-    console.log('No active user runtimes detected (target version configured for next boot).');
-  } else {
-    for (const st of statuses) {
-      console.log(`- User [${st.userId}] (${st.mode}): current=${st.currentImage || st.currentDaemonCliPath || 'unknown'}, target=${st.targetImage || st.targetDaemonCliPath || 'unknown'}, outdated=${st.isOutdated}, idle=${st.isIdle}, pendingReason=${st.pendingReason}`);
+  try {
+    const { problems } = await printSelfCheckSummary(config, { fetchImpl: options.fetchImpl });
+    if (problems.length > 0) console.warn(`WARNING: running platform self-check is degraded: ${problems.join('; ')}`);
+  } catch (err) {
+    if (err instanceof SelfCheckError && (err.kind === 'unreachable' || err.kind === 'not-supported' || err.kind === 'no-token')) {
+      // No platform listening, or one that predates the self-check: the status cannot be read
+      // from it; the target applies when the (new) platform starts and is verified there.
+      console.warn(`\nWARNING: ${err.message}. Runtime status was NOT checked; the target version applies when the platform (re)starts.`);
+    } else {
+      throw new Error(`Platform self-check failed: ${err.message} (the target version ${imageTag} is already persisted)`);
     }
   }
 
@@ -1783,6 +1915,9 @@ Required Options (or via env file):
   --proxy-port <port>              Proxy port (required, no default)
   --runtime-image-prefix <prefix>  Docker runtime image prefix (required, no default)
   --container-name-prefix <prefix> Docker container name prefix (required, no default)
+
+Post-deploy self-check: verification reads GET /api/selfcheck with the token the platform writes
+to <DATA_DIR>/selfcheck.token (mode 0600) at every start. No admin login is needed.
 
 Optional Options:
   --release-id <id>                Release batch ID (e.g. batch56; defaults to max git release/batch* + 1)

@@ -68,6 +68,7 @@ import {
   type RuntimeSessionReader,
   type RuntimeSessionEventsPage,
   type RuntimeAttachmentData,
+  SELF_CHECK_TOKEN_FILE_NAME,
 } from '@enkeep/platform-server';
 import {
   PlatformError,
@@ -3049,6 +3050,8 @@ fs.appendFileSync(p, corruptData);
       spacesDir: options.spacesDir ?? paths.spacesDir,
       dshHome: options.dshHome ?? paths.dataRoot,
       dataRoot: paths.dataRoot,
+      // Deployment self-check token for scripts/deploy-release.mjs (mode 0600, rotated each start).
+      selfCheckTokenFile: join(paths.dataRoot, SELF_CHECK_TOKEN_FILE_NAME),
       bundledSkillDir: options.bundledSkillDir,
       enableWorker: true,
       runId: demoRunId,
