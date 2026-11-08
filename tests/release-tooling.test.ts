@@ -39,6 +39,7 @@ import { planPruneWorktrees, executePrune } from '../scripts/prune-release-workt
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 
 describe('Deploy Tooling Enhancements', () => {
   describe('Parameterization & Validation', () => {
@@ -438,12 +439,282 @@ describe('Deploy Tooling Enhancements', () => {
   });
 
   describe('P-03: Worktree Pruning & Protection', () => {
+    const DAEMON_CLI = 'packages/runtime-runner/dist/runtime/daemon-cli.js';
+    const tmpRoots: string[] = [];
+    afterEach(() => {
+      for (const dir of tmpRoots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+    });
+    function mkTmp(prefix: string) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+      tmpRoots.push(dir);
+      return dir;
+    }
+
+    /** Synthetic data dir whose platform.db holds the given runtime target (undefined = no row). */
+    function makeDataDir(root: string, target?: { image: string | null; daemonCliPath: string | null }) {
+      const { DatabaseSync } = require('node:sqlite');
+      const dataDir = path.join(root, 'data');
+      fs.mkdirSync(dataDir, { recursive: true });
+      const db = new DatabaseSync(path.join(dataDir, 'platform.db'));
+      db.exec(`
+        CREATE TABLE runtime_target_version (
+          id TEXT PRIMARY KEY DEFAULT 'default',
+          image TEXT,
+          daemon_cli_path TEXT,
+          updated_by TEXT,
+          updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        );
+      `);
+      if (target) {
+        db.prepare("INSERT INTO runtime_target_version (id, image, daemon_cli_path) VALUES ('default', ?, ?)")
+          .run(target.image, target.daemonCliPath);
+      }
+      db.close();
+      return dataDir;
+    }
+
+    /** Worktrees release-worktree-<name> in the given order, the last one the most recent. */
+    function makeReleases(root: string, names: string[] = ['batch1', 'batch2', 'batch3', 'batch4', 'batch5']) {
+      const repoDir = path.join(root, 'repo');
+      const releaseDir = path.join(root, 'releases');
+      fs.mkdirSync(repoDir);
+      fs.mkdirSync(releaseDir);
+      const now = Date.now() / 1000;
+      const wts = names.map((n) => {
+        const wt = path.join(releaseDir, `release-worktree-${n}`);
+        fs.mkdirSync(path.join(wt, path.dirname(DAEMON_CLI)), { recursive: true });
+        fs.writeFileSync(path.join(wt, DAEMON_CLI), '// synthetic\n');
+        return wt;
+      });
+      // Set mtimes after creating the children (creating them updates the parent's mtime).
+      wts.forEach((wt, i) => fs.utimesSync(wt, now - 1000 + i * 100, now - 1000 + i * 100));
+      return { repoDir, releaseDir, wts };
+    }
+
+    function isCaseInsensitiveTmp() {
+      const dir = mkTmp('enkeep-test-case-');
+      fs.mkdirSync(path.join(dir, 'Probe'));
+      return fs.existsSync(path.join(dir, 'probe'));
+    }
+
+    it('always keeps the worktree the runtime target points to, outside --keep', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-');
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot);
+      const dataDir = makeDataDir(tmpRoot, {
+        image: 'enkeep-runtime:gap-batch2-0000002',
+        daemonCliPath: path.join(wts[1], DAEMON_CLI),
+      });
+
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 1, activeWorktree: wts[4], dataDir });
+
+      expect(plan.runtimeTarget.worktreeName).toBe('release-worktree-batch2');
+      expect(plan.runtimeTarget.image).toBe('enkeep-runtime:gap-batch2-0000002');
+      expect(plan.runtimeTarget.warning).toBe(false);
+      expect(plan.kept.map((k) => [k.name, k.reason])).toEqual([
+        ['release-worktree-batch5', 'within-most-recent-1'],
+        ['release-worktree-batch2', 'protected-as-runtime-target'],
+      ]);
+      expect(plan.pruned.map((p) => p.name).sort()).toEqual([
+        'release-worktree-batch1',
+        'release-worktree-batch3',
+        'release-worktree-batch4',
+      ]);
+      const dry = executePrune(plan, true);
+      expect(dry.actions.map((a) => a.path)).not.toContain(wts[1]);
+    });
+
+    it('does not count a runtime target inside the most recent N twice', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-recent-');
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot);
+      const dataDir = makeDataDir(tmpRoot, { image: 'enkeep-runtime:gap-batch4-0000004', daemonCliPath: path.join(wts[3], DAEMON_CLI) });
+
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 2, dataDir });
+
+      expect(plan.runtimeTarget.worktreeName).toBe('release-worktree-batch4');
+      expect(plan.kept.map((k) => k.name)).toEqual(['release-worktree-batch5', 'release-worktree-batch4']);
+      expect(plan.pruned).toHaveLength(3);
+    });
+
+    it('does not confuse worktrees whose names share a prefix', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-prefix-');
+      // batch10 is the oldest, batch1 (a prefix of batch10) is newer, batch2 the newest.
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot, ['batch10', 'batch1', 'batch2']);
+      const dataDir = makeDataDir(tmpRoot, { image: null, daemonCliPath: path.join(wts[0], DAEMON_CLI) });
+
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 1, dataDir });
+
+      expect(plan.runtimeTarget.worktreeName).toBe('release-worktree-batch10');
+      expect(plan.kept.map((k) => k.name)).toEqual(['release-worktree-batch2', 'release-worktree-batch10']);
+      expect(plan.pruned.map((p) => p.name)).toEqual(['release-worktree-batch1']);
+    });
+
+    it('matches the runtime target through a symlinked release root', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-link-');
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot);
+      const linkedRoot = path.join(tmpRoot, 'releases-link');
+      fs.symlinkSync(releaseDir, linkedRoot);
+
+      // Stored through the link, pruned through the real path ...
+      const viaLink = makeDataDir(path.join(tmpRoot, 'a'), {
+        image: null,
+        daemonCliPath: path.join(linkedRoot, 'release-worktree-batch1', DAEMON_CLI),
+      });
+      const plan1 = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 1, dataDir: viaLink });
+      expect(plan1.runtimeTarget.worktreeName).toBe('release-worktree-batch1');
+      expect(plan1.pruned.map((p) => p.name)).not.toContain('release-worktree-batch1');
+
+      // ... and stored as the real path, pruned through the link, with the daemon file gone.
+      fs.rmSync(path.join(wts[0], DAEMON_CLI));
+      const viaReal = makeDataDir(path.join(tmpRoot, 'b'), { image: null, daemonCliPath: path.join(wts[0], DAEMON_CLI) });
+      const plan2 = planPruneWorktrees({ releaseRoot: linkedRoot, repoRoot: repoDir, keep: 1, dataDir: viaReal });
+      expect(plan2.runtimeTarget.worktreeName).toBe('release-worktree-batch1');
+      expect(plan2.pruned.map((p) => p.name)).not.toContain('release-worktree-batch1');
+    });
+
+    it('matches a stored path that leaves the worktree through a symlink inside it', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-inner-link-');
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot);
+      const elsewhere = path.join(tmpRoot, 'elsewhere');
+      fs.mkdirSync(path.join(elsewhere, 'dist', 'runtime'), { recursive: true });
+      fs.rmSync(path.join(wts[0], 'packages', 'runtime-runner'), { recursive: true });
+      fs.symlinkSync(elsewhere, path.join(wts[0], 'packages', 'runtime-runner'));
+      fs.utimesSync(wts[0], Date.now() / 1000 - 1000, Date.now() / 1000 - 1000);
+      const dataDir = makeDataDir(tmpRoot, { image: null, daemonCliPath: path.join(wts[0], DAEMON_CLI) });
+
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 1, dataDir });
+
+      expect(plan.runtimeTarget.worktreeName).toBe('release-worktree-batch1');
+      expect(plan.pruned.map((p) => p.name)).not.toContain('release-worktree-batch1');
+    });
+
+    it.skipIf(!isCaseInsensitiveTmp())('matches a stored path that differs only in letter case', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-case-');
+      const { repoDir, releaseDir } = makeReleases(tmpRoot);
+      const dataDir = makeDataDir(tmpRoot, {
+        image: null,
+        daemonCliPath: path.join(releaseDir, 'RELEASE-WORKTREE-BATCH1', DAEMON_CLI),
+      });
+
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 1, dataDir });
+
+      expect(plan.runtimeTarget.worktreeName).toBe('release-worktree-batch1');
+      expect(plan.pruned.map((p) => p.name)).not.toContain('release-worktree-batch1');
+    });
+
+    it('protects nothing extra when no target row or no daemon path is set, and warns', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-none-');
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot);
+
+      const noRow = makeDataDir(path.join(tmpRoot, 'a'));
+      const plan1 = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 2, dataDir: noRow });
+      expect(plan1.runtimeTarget.worktreeName).toBeNull();
+      expect(plan1.runtimeTarget.note).toBe('no daemon path in runtime_target_version');
+      // Host runtimes then use the platform's own worktree; without --active-worktree nothing protects it.
+      expect(plan1.runtimeTarget.warning).toBe(true);
+      expect(plan1.pruned).toHaveLength(3);
+
+      const nullPath = makeDataDir(path.join(tmpRoot, 'b'), { image: 'enkeep-runtime:gap-batch1-0000001', daemonCliPath: null });
+      const plan2 = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 2, activeWorktree: wts[4], dataDir: nullPath });
+      expect(plan2.runtimeTarget.worktreeName).toBeNull();
+      expect(plan2.runtimeTarget.warning).toBe(false);
+      expect(plan2.pruned).toHaveLength(3);
+
+      const outside = makeDataDir(path.join(tmpRoot, 'c'), { image: null, daemonCliPath: '/tmp/enkeep-test/elsewhere/daemon-cli.js' });
+      const plan3 = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 2, dataDir: outside });
+      expect(plan3.runtimeTarget.worktreeName).toBeNull();
+      expect(plan3.runtimeTarget.warning).toBe(true);
+      expect(plan3.runtimeTarget.note).toMatch(/^daemon path is outside the release root/);
+    });
+
+    it('warns when the runtime target worktree is already gone', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-gone-');
+      const { repoDir, releaseDir } = makeReleases(tmpRoot);
+      const dataDir = makeDataDir(tmpRoot, {
+        image: null,
+        daemonCliPath: path.join(releaseDir, 'release-worktree-batch0', DAEMON_CLI),
+      });
+
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 2, dataDir });
+
+      expect(plan.runtimeTarget.worktreeName).toBeNull();
+      expect(plan.runtimeTarget.warning).toBe(true);
+      expect(plan.runtimeTarget.note).toBe('runtime target worktree release-worktree-batch0 is missing; host runtime starts will fail');
+    });
+
+    it('refuses to plan when the data dir is missing, the database cannot be read, or the path is relative', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-db-');
+      const { repoDir, releaseDir } = makeReleases(tmpRoot);
+      const base = { releaseRoot: releaseDir, repoRoot: repoDir, keep: 1 };
+
+      expect(() => planPruneWorktrees({ ...base, dataDir: '' })).toThrow(/--data-dir/);
+      expect(() => planPruneWorktrees({ ...base, dataDir: path.join(tmpRoot, 'missing') })).toThrow(/Platform database not found/);
+
+      const { DatabaseSync } = require('node:sqlite');
+      const noTable = path.join(tmpRoot, 'no-table');
+      fs.mkdirSync(noTable);
+      const db = new DatabaseSync(path.join(noTable, 'platform.db'));
+      db.exec('CREATE TABLE unrelated (x INTEGER);');
+      db.close();
+      expect(() => planPruneWorktrees({ ...base, dataDir: noTable })).toThrow(/Cannot read runtime_target_version/);
+
+      const relative = makeDataDir(path.join(tmpRoot, 'rel'), {
+        image: null,
+        daemonCliPath: path.join('releases', 'release-worktree-batch1', DAEMON_CLI),
+      });
+      expect(() => planPruneWorktrees({ ...base, dataDir: relative })).toThrow(/is not absolute/);
+    });
+
+    it('reads a WAL database left by a killed writer without checkpointing or writing it', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-wal-');
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot);
+      const dataDir = path.join(tmpRoot, 'data');
+      fs.mkdirSync(dataDir);
+      const dbFile = path.join(dataDir, 'platform.db');
+      // A writer that commits the target into the WAL and dies without a checkpoint.
+      const writer = `
+        const { DatabaseSync } = require('node:sqlite');
+        const db = new DatabaseSync(${JSON.stringify(dbFile)});
+        db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;");
+        db.exec("CREATE TABLE runtime_target_version (id TEXT PRIMARY KEY DEFAULT 'default', image TEXT, daemon_cli_path TEXT, updated_by TEXT, updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));");
+        db.prepare("INSERT INTO runtime_target_version (id, image, daemon_cli_path) VALUES ('default', NULL, ?)").run(${JSON.stringify(path.join(wts[0], DAEMON_CLI))});
+        process.kill(process.pid, 'SIGKILL');
+      `;
+      spawnSync(process.execPath, ['-e', writer]);
+      expect(fs.existsSync(`${dbFile}-wal`)).toBe(true);
+      const before = fs.readFileSync(dbFile);
+
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 1, dataDir });
+
+      expect(plan.runtimeTarget.worktreeName).toBe('release-worktree-batch1');
+      expect(fs.readFileSync(dbFile).equals(before)).toBe(true);
+      expect(fs.existsSync(`${dbFile}-wal`)).toBe(true);
+    });
+
+    it('executePrune refuses to remove the runtime target even from a hand-built plan', () => {
+      const tmpRoot = mkTmp('enkeep-test-prune-target-guard-');
+      const { repoDir, releaseDir, wts } = makeReleases(tmpRoot);
+      const dataDir = makeDataDir(tmpRoot, { image: null, daemonCliPath: path.join(wts[0], DAEMON_CLI) });
+      const plan = planPruneWorktrees({ releaseRoot: releaseDir, repoRoot: repoDir, keep: 5, dataDir });
+      const target = plan.kept.find((k) => k.name === 'release-worktree-batch1')!;
+      // Same worktree spelled differently (trailing slash), as a hand-built plan might.
+      const tampered = { ...plan, pruned: [target, { ...target, path: `${target.path}/` }] };
+
+      const result = executePrune(tampered, false);
+      expect(result.prunedCount).toBe(0);
+      expect(result.errors.map((e) => e.error)).toEqual([
+        'refusing to remove the runtime target worktree',
+        'refusing to remove the runtime target worktree',
+      ]);
+      expect(fs.existsSync(path.join(wts[0], DAEMON_CLI))).toBe(true);
+    });
+
     it('prunes older worktrees while protecting the top N and active worktree', () => {
       const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'enkeep-test-prune-'));
       const repoDir = path.join(tmpRoot, 'repo');
       const releaseDir = path.join(tmpRoot, 'releases');
       fs.mkdirSync(repoDir);
       fs.mkdirSync(releaseDir);
+      const dataDir = makeDataDir(tmpRoot);
 
       const wt1 = path.join(releaseDir, 'release-worktree-batch1');
       const wt2 = path.join(releaseDir, 'release-worktree-batch2');
@@ -469,6 +740,7 @@ describe('Deploy Tooling Enhancements', () => {
         repoRoot: repoDir,
         keep: 2,
         activeWorktree: wt1,
+        dataDir,
       });
 
       expect(plan.totalFound).toBe(5);
