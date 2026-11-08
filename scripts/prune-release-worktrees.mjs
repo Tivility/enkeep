@@ -8,7 +8,8 @@
  * The worktree the platform's runtime target points to (runtime_target_version.daemon_cli_path
  * in <data-dir>/platform.db, read-only) is always kept, whatever --keep says: host runtimes are
  * started from it, and a platform-only release does not move the target. If the database cannot
- * be read, nothing is pruned.
+ * be read or the stored path is not absolute, nothing is pruned. Only the current target is
+ * protected: run it after every runtime has switched to that target.
  *
  * Fully parameterized with zero machine defaults (AGENTS.md §3).
  *
@@ -17,7 +18,7 @@
  */
 
 import { existsSync, readdirSync, statSync, realpathSync } from 'node:fs';
-import { resolve, join, dirname, basename, sep } from 'node:path';
+import { resolve, join, dirname, basename, sep, isAbsolute, relative } from 'node:path';
 import { execSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -26,6 +27,8 @@ const FORBIDDEN_ROOTS = ['/etc', '/usr', '/System', '/root', '/bin', '/sbin'];
 /**
  * Canonical form of a path that may not exist: the realpath of its deepest existing ancestor
  * with the remaining segments appended. Lets a symlinked release root match a stored real path.
+ * Uses the native realpath, which returns the on-disk letter case, so paths that differ only in
+ * case still match on a case-insensitive filesystem.
  */
 function canonicalize(p) {
   const absolute = resolve(p);
@@ -33,7 +36,8 @@ function canonicalize(p) {
   let current = absolute;
   for (;;) {
     try {
-      return rest.length > 0 ? join(realpathSync(current), ...rest) : realpathSync(current);
+      const real = realpathSync.native(current);
+      return rest.length > 0 ? join(real, ...rest) : real;
     } catch {
       const parent = dirname(current);
       if (parent === current) return absolute;
@@ -150,17 +154,7 @@ export function planPruneWorktrees(options) {
   }
 
   // Active worktree canonical path resolution
-  let resolvedActive = '';
-  if (activeWorktree) {
-    try {
-      resolvedActive = resolve(activeWorktree);
-      if (existsSync(resolvedActive)) {
-        resolvedActive = realpathSync(resolvedActive);
-      }
-    } catch {
-      resolvedActive = resolve(activeWorktree);
-    }
-  }
+  const resolvedActive = activeWorktree ? canonicalize(activeWorktree) : '';
 
   const entries = readdirSync(resolvedReleaseRoot, { withFileTypes: true });
   const candidates = [];
@@ -171,12 +165,7 @@ export function planPruneWorktrees(options) {
     if (!entry.name.startsWith('release-worktree-')) continue;
 
     const fullPath = join(resolvedReleaseRoot, entry.name);
-    let realCandidatePath = fullPath;
-    try {
-      realCandidatePath = realpathSync(fullPath);
-    } catch {
-      // Keep fullPath
-    }
+    const realCandidatePath = canonicalize(fullPath);
 
     try {
       const st = statSync(fullPath);
@@ -199,20 +188,40 @@ export function planPruneWorktrees(options) {
   const target = readRuntimeTarget(dataDir);
   let targetWorktree = null;
   let targetNote = '';
+  let targetWarning = false;
   if (target.daemonCliPath) {
+    if (!isAbsolute(target.daemonCliPath)) {
+      // A relative path would be resolved against the operator's cwd; refuse instead of guessing.
+      throw new Error(
+        `runtime_target_version.daemon_cli_path is not absolute (${target.daemonCliPath}). Refusing to prune.`,
+      );
+    }
     const literal = resolve(target.daemonCliPath);
     const canonical = canonicalize(target.daemonCliPath);
+    // Canonical match covers symlinked release roots and letter case; the literal match covers a
+    // stored path that goes through the worktree but leaves it via a symlink inside it.
     targetWorktree =
       candidates.find(
         (c) => isInside(canonical, c.canonicalPath) || isInside(literal, c.path),
       ) || null;
     if (!targetWorktree) {
-      targetNote = isInside(canonical, canonicalize(resolvedReleaseRoot)) || isInside(literal, resolvedReleaseRoot)
-        ? 'daemon path is under the release root but not inside any release-worktree-* directory'
-        : 'daemon path is outside the release root';
+      targetWarning = true;
+      const canonicalRoot = canonicalize(resolvedReleaseRoot);
+      const underRoot = isInside(canonical, canonicalRoot);
+      const firstSegment = underRoot ? relative(canonicalRoot, canonical).split(sep)[0] : '';
+      if (underRoot && firstSegment.startsWith('release-worktree-') && !existsSync(join(canonicalRoot, firstSegment))) {
+        targetNote = `runtime target worktree ${firstSegment} is missing; host runtime starts will fail`;
+      } else if (underRoot) {
+        targetNote = 'daemon path is under the release root but not inside any release-worktree-* directory';
+      } else {
+        targetNote = 'daemon path is outside the release root (check --data-dir and --release-root)';
+      }
     }
   } else {
+    // In host mode the platform then falls back to the daemon of its own worktree, which only
+    // --active-worktree protects.
     targetNote = 'no daemon path in runtime_target_version';
+    targetWarning = !resolvedActive;
   }
 
   const kept = [];
@@ -248,6 +257,7 @@ export function planPruneWorktrees(options) {
       worktreeName: targetWorktree ? targetWorktree.name : null,
       worktreePath: targetWorktree ? targetWorktree.path : null,
       note: targetNote,
+      warning: targetWarning,
     },
     keepCount: keep,
     totalFound: candidates.length,
@@ -263,11 +273,11 @@ export function executePrune(plan, dryRun = false) {
     actions: [],
   };
 
-  const targetPath = plan.runtimeTarget?.worktreePath || null;
+  const targetPath = plan.runtimeTarget?.worktreePath ? canonicalize(plan.runtimeTarget.worktreePath) : null;
 
   for (const item of plan.pruned) {
     // Defensive: a plan built by hand must not remove the runtime target either.
-    if (targetPath && item.path === targetPath) {
+    if (targetPath && canonicalize(item.path) === targetPath) {
       results.errors.push({ path: item.path, error: 'refusing to remove the runtime target worktree' });
       continue;
     }
@@ -322,6 +332,8 @@ Options:
   --data-dir <path>        Platform data directory holding platform.db (Required, or ENKEEP_DATA_DIR).
                            The worktree its runtime target points to is always kept, outside --keep;
                            if the database cannot be read, nothing is pruned.
+                           Prune only after all runtimes run the current target (deploy-release
+                           --only verify shows "outdated 0").
   --keep <n>               Number of recent worktrees to retain (Default: 3)
   --active-worktree <path> Path to actively running release worktree to protect
   --dry-run                Print planned removals without deleting
@@ -343,6 +355,13 @@ Options:
     console.log(`Runtime Target:   ${rt.worktreeName ? `${rt.worktreeName} (always kept)` : `(no worktree: ${rt.note})`}`);
     console.log(`  image:          ${rt.image || '(not set)'}`);
     console.log(`  daemon path:    ${rt.daemonCliPath || '(not set)'}`);
+    if (rt.warning) {
+      console.error(
+        rt.daemonCliPath
+          ? `WARNING: ${rt.note}`
+          : 'WARNING: no daemon path in runtime_target_version and no --active-worktree: host runtimes fall back to the platform\'s own worktree, which is not protected',
+      );
+    }
     console.log(`Keep Policy:      Keep ${plan.keepCount} most recent`);
     console.log(`Total Found:      ${plan.totalFound}`);
     console.log(`To Keep:          ${plan.kept.length}`);
