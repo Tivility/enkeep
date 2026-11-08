@@ -141,10 +141,12 @@ cp <迁移前的 plist 备份> <plist-path> && launchctl bootstrap gui/$(id -u) 
 
 ```bash
 node scripts/prune-release-worktrees.mjs --release-root <release-root> --repo-root <repo-root> \
-  --keep 3 --active-worktree <线上发布工作树> --dry-run
+  --data-dir <data-dir> --keep 3 --active-worktree <线上发布工作树> --dry-run
 ```
 
 用 `--active-worktree` 保护线上正在使用的工作树；确认预演结果后去掉 `--dry-run` 执行。
+
+`--data-dir` 必填。脚本只读打开 `<data-dir>/platform.db`，查 `runtime_target_version` 的 `daemon_cli_path`，它所在的发布工作树（宿主 daemon 从这里启动）**始终保留，不计入 `--keep`**。纯平台发布不改运行时目标，所以这个工作树可能比最近几次发布都旧。数据库或该表读不到时，脚本报错退出，不删除任何工作树。
 
 ---
 
