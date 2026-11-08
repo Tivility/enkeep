@@ -1149,6 +1149,9 @@ export async function printSelfCheckSummary(config, options = {}) {
   const problems = selfCheckProblems(report);
   console.log('\n--- Platform Self-Check ---');
   console.log(`Status: ${report.status}; started ${report.startedAt || 'unknown'}; migrations ${report.migrations.currentVersion}/${report.migrations.latestVersion}${report.migrations.upToDate ? ' (up to date)' : ` (pending ${JSON.stringify(report.migrations.pendingVersions)})`}`);
+  if (report.webhookPolicy) {
+    console.log(`Webhook policy: allowLoopback=${report.webhookPolicy.allowLoopback}, enforceHttps=${report.webhookPolicy.enforceHttps}`);
+  }
   if (report.runtimeTarget) {
     console.log(`Runtime target: image=${report.runtimeTarget.image || 'none'}, daemonCliPath=${report.runtimeTarget.daemonCliPath || 'none'}`);
   }

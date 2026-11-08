@@ -781,6 +781,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             errors,
           },
           migrations,
+          webhookPolicy: typeof selfCheck.getWebhookPolicy === "function" ? selfCheck.getWebhookPolicy() : null,
           runtimeTarget,
           runtimes: {
             total: runtimes.length,

@@ -82,7 +82,7 @@ describe('GET /api/selfcheck (deployment self-check)', () => {
       expect(json.success).toBe(true);
       const data = json.data;
       expect(Object.keys(data).sort()).toEqual(
-        ['health', 'migrations', 'runtimeTarget', 'runtimes', 'startedAt', 'status', 'uptimeSeconds'].sort()
+        ['health', 'migrations', 'runtimeTarget', 'runtimes', 'startedAt', 'status', 'uptimeSeconds', 'webhookPolicy'].sort()
       );
       expect(data.migrations.upToDate).toBe(true);
       expect(data.migrations.pendingVersions).toEqual([]);
@@ -180,6 +180,35 @@ describe('GET /api/selfcheck (deployment self-check)', () => {
       await server.stop();
       db.close();
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the effective webhook policy switches', async () => {
+    const saved = process.env.ALLOW_TEST_WEBHOOK_LOOPBACK;
+    delete process.env.ALLOW_TEST_WEBHOOK_LOOPBACK;
+    const cases: Array<[Record<string, unknown>, { allowLoopback: boolean; enforceHttps: boolean }]> = [
+      [{ webhookSecurityOptions: { allowTestLoopback: false, enforceHttps: true } }, { allowLoopback: false, enforceHttps: true }],
+      [{ webhookSecurityOptions: { allowTestLoopback: true, enforceHttps: false } }, { allowLoopback: true, enforceHttps: false }],
+      [{}, { allowLoopback: false, enforceHttps: true }],
+    ];
+    try {
+      for (const [extra, expected] of cases) {
+        const tmp = newTmpDir();
+        const tokenFile = path.join(tmp, SELF_CHECK_TOKEN_FILE_NAME);
+        const db = new DatabaseSync(':memory:');
+        const server = newServer(db, tokenFile, extra);
+        const { url } = await server.start();
+        try {
+          const res = await fetch(`${url}/api/selfcheck`, { headers: { [SELF_CHECK_TOKEN_HEADER]: readToken(tokenFile) } });
+          expect((await res.json()).data.webhookPolicy).toEqual(expected);
+        } finally {
+          await server.stop();
+          db.close();
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      if (saved !== undefined) process.env.ALLOW_TEST_WEBHOOK_LOOPBACK = saved;
     }
   });
 

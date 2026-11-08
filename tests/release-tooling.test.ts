@@ -1028,6 +1028,7 @@ describe('Deploy Tooling Enhancements', () => {
       uptimeSeconds: 5,
       health: { runtime: { available: true, status: 'available' }, operations: { producerAvailable: true, workerRunning: true } },
       migrations: { currentVersion: 45, latestVersion: 45, pendingVersions: [], upToDate: true },
+      webhookPolicy: { allowLoopback: false, enforceHttps: true },
       runtimeTarget: { image: 'enkeep-runtime:test-new', daemonCliPath: '/tmp/enkeep-test/new/daemon-cli.js' },
       runtimes: {
         total: 1,
@@ -1216,6 +1217,7 @@ describe('Deploy Tooling Enhancements', () => {
         expect(problems).toEqual([]);
         const out = logs.join('\n');
         expect(out).toContain('migrations 45/45 (up to date)');
+        expect(out).toContain('Webhook policy: allowLoopback=false, enforceHttps=true');
         expect(out).toContain('- Runtime #1 (container): current=enkeep-runtime:test-old, target=enkeep-runtime:test-new, outdated=true');
         expect(out).not.toContain(TOKEN);
         logs.length = 0;

@@ -69,6 +69,7 @@ import {
   type RuntimeSessionEventsPage,
   type RuntimeAttachmentData,
   SELF_CHECK_TOKEN_FILE_NAME,
+  type WebhookSecurityOptions,
 } from '@enkeep/platform-server';
 import {
   PlatformError,
@@ -192,6 +193,18 @@ export {
   type BackgroundTaskDelegates,
   type RuntimeSpaceResolver,
 };
+
+/**
+ * Webhook destination policy when the caller passes none. A production data directory refuses
+ * loopback, private and reserved destinations and plain HTTP; isolated test runs keep the
+ * loopback allowance their local fake receivers need.
+ * @param mode - data directory mode (undefined means production, as in getDemoPathConfig).
+ */
+export function defaultWebhookSecurityOptions(mode: 'production' | 'test' | undefined): WebhookSecurityOptions {
+  return mode === 'test'
+    ? { allowTestLoopback: true, enforceHttps: false }
+    : { allowTestLoopback: false, enforceHttps: true };
+}
 
 export async function upDemo(options: DemoUpOptions = {}): Promise<RunningDemoSystem> {
   return launchDemoSystem(options);
@@ -3046,7 +3059,7 @@ fs.appendFileSync(p, corruptData);
       wechatCredentialKeyFilePath: options.wechatCredentialKeyFilePath ?? (pathOptions.mode === 'test'
         ? join(paths.dataRoot, 'credentials', 'lark-vault.key')
         : join(homedir(), '.config', 'enkeep', 'keys', `${createHash('sha256').update(paths.dbPath).digest('hex').slice(0, 16)}-lark-vault.key`)),
-      webhookSecurityOptions: options.webhookSecurityOptions ?? { allowTestLoopback: true, enforceHttps: false },
+      webhookSecurityOptions: options.webhookSecurityOptions ?? defaultWebhookSecurityOptions(pathOptions.mode),
       spacesDir: options.spacesDir ?? paths.spacesDir,
       dshHome: options.dshHome ?? paths.dataRoot,
       dataRoot: paths.dataRoot,

@@ -9,8 +9,8 @@
  * 0600; only processes that can read the data directory (which already holds platform.db) can use
  * it. The platform keeps only its SHA-256 hash in memory and compares in constant time.
  *
- * The report carries runtime versions, migration state and health only: no user ids, names,
- * spaces, sessions, messages or configuration.
+ * The report carries runtime versions, migration state, health and the two webhook policy
+ * switches only: no user ids, names, spaces, sessions, messages, URLs or other configuration.
  *
  * @module @enkeep/platform-server/server/selfcheck
  */
@@ -29,6 +29,7 @@ import {
 import { basename, dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { MigrationDefinition, UserRuntimeUpgradeStatus } from '@enkeep/platform-core';
+import type { WebhookPolicyFlags } from '../notifications/webhook-security-policy.js';
 
 /** File name of the self-check token inside the platform data directory. */
 export const SELF_CHECK_TOKEN_FILE_NAME = 'selfcheck.token';
@@ -135,4 +136,6 @@ export interface SelfCheckSource {
   getMigrationStatus(): SelfCheckMigrationStatus;
   /** ISO time the platform started serving. */
   getStartedAt(): string | null;
+  /** Effective webhook destination policy switches (optional). */
+  getWebhookPolicy?(): WebhookPolicyFlags;
 }
