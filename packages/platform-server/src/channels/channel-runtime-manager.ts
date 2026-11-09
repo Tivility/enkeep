@@ -24,6 +24,9 @@ import {
   type LarkTransport,
   type StreamEventSource,
   type LarkImageAttachmentIngestor,
+  type LarkQuestionCardState,
+  type LarkQuestionService,
+  type LarkQuestionView,
 } from '@enkeep/channel-lark';
 import { SqliteStreamEventSource } from './sqlite-stream-event-source.js';
 import { TenantScopedLarkImageIngestor } from './lark-image-ingestor.js';
@@ -49,6 +52,18 @@ export interface ChannelRuntimeManagerOptions {
   imageAttachmentIngestor?: LarkImageAttachmentIngestor;
   autoStart?: boolean;
   workerIntervalMs?: number;
+  /**
+   * Pending ask_user_question questions (the platform QuestionBridge), for question card
+   * callbacks. Defaults to the delivery gateway's question service.
+   */
+  questionService?: LarkQuestionService;
+}
+
+/** Whether a question service offers what Lark question cards need. */
+function asLarkQuestionService(service: unknown): LarkQuestionService | undefined {
+  if (!service || typeof service !== 'object') return undefined;
+  const s = service as Partial<LarkQuestionService>;
+  return typeof s.getPending === 'function' && typeof s.answer === 'function' ? (service as LarkQuestionService) : undefined;
 }
 
 export class ChannelRuntimeManager {
@@ -61,6 +76,7 @@ export class ChannelRuntimeManager {
   private readonly streamEventSource?: StreamEventSource;
   private readonly imageAttachmentIngestor?: LarkImageAttachmentIngestor;
   private readonly workerIntervalMs: number;
+  private readonly questionService?: LarkQuestionService;
   private readonly activeGateways = new Map<string, LarkChannelGateway>(); // key: `${userId}:${accountId}`
   private readonly activeAccounts = new Map<string, ChannelAccount>(); // key: `${userId}:${accountId}`
   private readonly inFlightSyncs = new Map<string, Promise<LarkChannelGateway | null>>();
@@ -101,6 +117,7 @@ export class ChannelRuntimeManager {
     this.defaultSpaceResolver = options.defaultSpaceResolver;
     this.streamEventSource = options.streamEventSource;
     this.workerIntervalMs = options.workerIntervalMs ?? 2500;
+    this.questionService = options.questionService;
     if (options.imageAttachmentIngestor) {
       this.imageAttachmentIngestor = options.imageAttachmentIngestor;
     } else {
@@ -1094,6 +1111,78 @@ export class ChannelRuntimeManager {
     throw new Error('Active Lark gateway does not support sendProactiveMessage');
   }
 
+  /** The question service handed to Lark gateways (explicit option, else the delivery gateway's). */
+  private resolveQuestionService(): LarkQuestionService | undefined {
+    if (this.questionService) return this.questionService;
+    const fromGateway =
+      typeof (this.deliveryGateway as { getQuestionService?: () => unknown }).getQuestionService === 'function'
+        ? this.deliveryGateway.getQuestionService()
+        : undefined;
+    return asLarkQuestionService(fromGateway);
+  }
+
+  private async requireGateway(userId: string, accountId: string): Promise<LarkChannelGateway> {
+    let gateway = this.getActiveGateway(userId, accountId);
+    if (!gateway) {
+      gateway = (await this.syncAccount(userId, accountId)) ?? undefined;
+    }
+    if (!gateway) {
+      throw new Error(`Lark account "${accountId}" not active or gateway unavailable for user "${userId}"`);
+    }
+    return gateway;
+  }
+
+  /** Sends an ask_user_question card in the asking turn's thread. */
+  async sendQuestionCard(params: {
+    userId: string;
+    accountId: string;
+    question: LarkQuestionView;
+    chatId: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    senderId?: string;
+    uuid?: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const gateway = await this.requireGateway(params.userId, params.accountId);
+    return gateway.sendQuestionCard(params);
+  }
+
+  /** Replaces a sent question card with its settled state. */
+  async updateQuestionCard(params: {
+    userId: string;
+    accountId: string;
+    messageId: string;
+    question: LarkQuestionView;
+    state: LarkQuestionCardState;
+  }): Promise<{ success: boolean; error?: string }> {
+    const gateway = await this.requireGateway(params.userId, params.accountId);
+    return gateway.updateQuestionCard(params);
+  }
+
+  /** Sends a plain text message in the asking turn's thread (question text fallback). */
+  async sendThreadText(params: {
+    userId: string;
+    accountId: string;
+    chatId: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    text: string;
+    uuid?: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const gateway = await this.requireGateway(params.userId, params.accountId);
+    return gateway.transport.sendReply({
+      chatId: params.chatId,
+      rootId: params.rootId,
+      threadId: params.threadId,
+      replyToMessageId: params.replyToMessageId,
+      content: params.text,
+      format: 'plain',
+      uuid: params.uuid,
+    });
+  }
+
   /**
    * Reconciles all accounts across all tenants.
    */
@@ -1248,6 +1337,7 @@ export class ChannelRuntimeManager {
       groupActivationMode: (account as ChannelAccount).groupActivationMode,
       streamEventSource,
       imageAttachmentIngestor: this.imageAttachmentIngestor,
+      questionService: this.resolveQuestionService(),
     });
 
     // 3. Start transport AFTER gateway listeners are registered

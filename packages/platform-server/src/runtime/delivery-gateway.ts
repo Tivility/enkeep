@@ -40,6 +40,8 @@ import type { ModelSelectionService } from '../models/model-selection-service.js
 import { ModelSelectionService as ModelSelectionServiceImpl } from '../models/model-selection-service.js';
 import { parseChatCommand, ChatCommandService } from '../chat/chat-command-service.js';
 import { DELIVERY_ID_REGEX } from '@enkeep/platform-operations';
+import type { UserQuestion } from '@enkeep/dsh-external-interaction/user-questions';
+import { parseQuestionReply } from '../interactions/question-text.js';
 
 export interface TurnExecutionResult {
   replyText: string;
@@ -211,6 +213,35 @@ export type RuntimeSessionReader = Required<Pick<DeliveryTurnExecutor, 'readSess
 /** Pending user questions per session (implemented by the platform QuestionBridge). */
 export interface RuntimeQuestionStatusSource {
   listPending(filter: { userId?: string; sessionId?: string }): ReadonlyArray<unknown>;
+  /**
+   * Answers a pending question (QuestionBridge.answer). With it, a typed IM reply from the
+   * asking user while a question waits becomes that question's answer instead of a new turn.
+   */
+  answer?(
+    id: string,
+    answers: unknown,
+    options?: { userId?: string; decidedBy?: string }
+  ): Promise<{ ok: boolean; status: string }>;
+}
+
+/** IM channels whose typed replies answer a pending ask_user_question question. */
+const TEXT_ANSWER_CHANNELS = new Set(['lark', 'wechat']);
+
+/** Receipt sent back when a typed reply answered a pending question. */
+export const QUESTION_ANSWER_RECEIPT = '收到，继续处理。';
+
+/** A pending question as the interception reads it (structural subset of BridgedQuestion). */
+interface PendingQuestionLike {
+  readonly id: string;
+  readonly turnId?: string;
+  readonly routeResolved?: boolean;
+  readonly questions: ReadonlyArray<UserQuestion>;
+}
+
+function isPendingQuestionLike(value: unknown): value is PendingQuestionLike {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.id === 'string' && Array.isArray(v.questions);
 }
 
 /** What getCurrentTurnStatus reports for a session's current turn. */
@@ -1304,6 +1335,20 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     const authoritativeSpaceId = route.space_id;
     const currentGen = typeof route.current_generation === 'number' ? route.current_generation : 1;
 
+    // A typed IM reply while an ask_user_question question waits answers that question
+    // (before chat commands, so `/steer <text>` can answer too; other commands pass through).
+    const answeredQuestion = await this.tryAnswerPendingQuestion({
+      envelope,
+      userId,
+      sessionId,
+      spaceId: authoritativeSpaceId,
+      idempotencyKey,
+      timestamp,
+    });
+    if (answeredQuestion) {
+      return answeredQuestion;
+    }
+
     // Chat command interception hook (before profile resolution, attachments, idempotency, and runtime dispatch)
     const chatCmd = parseChatCommand(envelope.content, { allowUnknown: true });
     if (chatCmd && this.chatCommandService) {
@@ -1578,6 +1623,89 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     };
   }
 
+  /**
+   * A typed reply in an IM channel (Lark, WeChat) from the user an ask_user_question question is
+   * addressed to answers that question: parsed into answers (option codes or the user's own
+   * words), answered through the question service, and recorded as a synthetic command turn
+   * whose reply is a short receipt. Returns null when the message is not an answer (no pending
+   * question, another sender, attachments, a command, a redelivery, or the answer did not take),
+   * in which case it is dispatched as usual.
+   */
+  private async tryAnswerPendingQuestion(params: {
+    envelope: InboundEnvelope;
+    userId: string;
+    sessionId: string;
+    spaceId: string;
+    idempotencyKey: string;
+    timestamp: string;
+  }): Promise<InternalRuntimeDispatchResult | null> {
+    const { envelope, userId, sessionId } = params;
+    const service = this.questionService;
+    const ctx = envelope.channelContext;
+    if (!service || typeof service.answer !== 'function') return null;
+    if (!ctx || !TEXT_ANSWER_CHANNELS.has(ctx.channel)) return null;
+    if (Array.isArray(envelope.attachments) && envelope.attachments.length > 0) return null;
+
+    let text = envelope.content.trim();
+    if (text.startsWith('/')) {
+      const steer = /^\/steer(?:\s+([\s\S]*))?$/i.exec(text);
+      if (!steer || !steer[1] || !steer[1].trim()) return null;
+      text = steer[1].trim();
+    }
+    if (!text) return null;
+
+    let pending: PendingQuestionLike | undefined;
+    try {
+      pending = service
+        .listPending({ userId, sessionId })
+        .filter(isPendingQuestionLike)
+        .find((q) => q.routeResolved !== false && q.questions.length > 0);
+    } catch {
+      return null;
+    }
+    if (!pending) return null;
+
+    // A redelivery of a message that was already handled (as an answer or as a turn) is not
+    // re-interpreted: the ordinary path reports it as a duplicate.
+    const existing = this.db
+      .prepare('SELECT 1 AS ok FROM idempotency_records WHERE user_id = ? AND idempotency_key = ? LIMIT 1')
+      .get(userId, params.idempotencyKey);
+    if (existing) return null;
+
+    // Only the user the question is addressed to (the sender of the asking turn) answers it.
+    if (ctx.senderId && pending.turnId) {
+      const askingSender = this.senderOfTurn(userId, pending.turnId);
+      if (askingSender && askingSender !== ctx.senderId) return null;
+    }
+
+    const answers = parseQuestionReply(pending.questions, text);
+    let status: string;
+    try {
+      const result = await service.answer(pending.id, answers, { userId, decidedBy: `${ctx.channel}-text` });
+      status = result.status;
+    } catch {
+      return null;
+    }
+    if (status !== 'answered') return null;
+
+    return await this.dispatchChatCommand({ ...params, syntheticReply: QUESTION_ANSWER_RECEIPT });
+  }
+
+  /** The channel sender id recorded for a turn's inbound message, if any. */
+  private senderOfTurn(userId: string, turnId: string): string | undefined {
+    try {
+      const row = this.db
+        .prepare('SELECT payload FROM delivery_inbox WHERE user_id = ? AND turn_id = ? LIMIT 1')
+        .get(userId, turnId) as { payload?: string | null } | undefined;
+      if (!row?.payload) return undefined;
+      const parsed = JSON.parse(row.payload);
+      const sender = parsed?.channelContext?.senderId;
+      return typeof sender === 'string' && sender.length > 0 ? sender : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async dispatchChatCommand(params: {
     envelope: InboundEnvelope;
     userId: string;
@@ -1585,6 +1713,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     spaceId: string;
     idempotencyKey: string;
     timestamp: string;
+    /** Reply of an already handled input (a question answer): skip command execution. */
+    syntheticReply?: string;
   }): Promise<InternalRuntimeDispatchResult> {
     const { envelope, userId, sessionId, spaceId, idempotencyKey, timestamp } = params;
     const incomingHash = computeCanonicalRequestHash(sessionId, envelope.content, undefined, envelope.replyToMessageId);
@@ -1648,24 +1778,29 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       };
     }
 
-    // 2. Execute command
-    const commandRes = await this.chatCommandService!.execute({
-      userId,
-      sessionId,
-      spaceId,
-      content: envelope.content,
-      idempotencyKey,
-      channelContext: envelope.channelContext,
-    });
-    if (commandRes.fallbackToOrdinary) {
-      // /steer <text> could not be injected (nothing running, or the steer was rejected):
-      // deliver the text as an ordinary message so the user's input is never dropped.
-      const ordinaryContent = envelope.content.trim().replace(/^\/steer\b\s*/i, '');
-      if (ordinaryContent) {
-        return await this.dispatchInbound({ ...envelope, content: ordinaryContent });
+    // 2. Execute command (unless the input was already handled, e.g. a question answer)
+    let replyText: string;
+    if (typeof params.syntheticReply === 'string') {
+      replyText = params.syntheticReply;
+    } else {
+      const commandRes = await this.chatCommandService!.execute({
+        userId,
+        sessionId,
+        spaceId,
+        content: envelope.content,
+        idempotencyKey,
+        channelContext: envelope.channelContext,
+      });
+      if (commandRes.fallbackToOrdinary) {
+        // /steer <text> could not be injected (nothing running, or the steer was rejected):
+        // deliver the text as an ordinary message so the user's input is never dropped.
+        const ordinaryContent = envelope.content.trim().replace(/^\/steer\b\s*/i, '');
+        if (ordinaryContent) {
+          return await this.dispatchInbound({ ...envelope, content: ordinaryContent });
+        }
       }
+      replyText = commandRes.replyText;
     }
-    let replyText = commandRes.replyText;
     if (envelope.channelContext?.fallbackNotice) {
       replyText = `${envelope.channelContext.fallbackNotice}\n\n${replyText}`;
     }
