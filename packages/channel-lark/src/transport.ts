@@ -338,11 +338,18 @@ export function buildStreamingStatusLine(params: {
   lastActivityAt?: number;
   staleThresholdMs?: number;
   runningTool?: string;
+  /** The agent waits for the user's answer to an `ask_user_question` question. */
+  waitingForAnswer?: boolean;
 }): string {
   const elapsedBucket = Math.max(0, Math.floor(params.elapsedMs / 5000) * 5000);
   const now = params.nowMs ?? Date.now();
   const nowBucket = Math.floor(now / 5000) * 5000;
   const timeSec = `<local_datetime millisecond='${nowBucket}' format_type='time_sec'></local_datetime>`;
+
+  if (params.waitingForAnswer) {
+    // Silence is expected while the agent waits for the user: no "no new events" notice.
+    return `<font color='grey'>⏳ 已用 ${formatDuration(elapsedBucket)} · 更新 ${timeSec}</font> <font color='orange'>· 等待你回答（见下方提问卡片，也可直接回复）</font>`;
+  }
 
   let toolNotice = '';
   if (params.runningTool) {
@@ -958,6 +965,46 @@ export class FakeLarkTransport implements LarkTransport {
 
   get sentReplies(): readonly SentReplyRecord[] {
     return this._sentReplies;
+  }
+
+  /** Interactive cards sent with `sendInteractiveCard` (test inspection). */
+  public readonly sentCards: Array<{
+    chatId: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    card: Record<string, unknown>;
+    uuid?: string;
+    messageId: string;
+  }> = [];
+  /** Card patches made with `patchInteractiveCard` (test inspection). */
+  public readonly patchedCards: Array<{ messageId: string; card: Record<string, unknown> }> = [];
+  public failNextCard = false;
+
+  async sendInteractiveCard(params: {
+    chatId: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    card: Record<string, unknown>;
+    uuid?: string;
+  }): Promise<OutboundReplyResult> {
+    if (!this._connected) return { success: false, error: 'FakeLarkTransport is not connected' };
+    if (this.failNextCard) {
+      this.failNextCard = false;
+      return { success: false, error: 'Simulated card send failure' };
+    }
+    const existing = params.uuid ? this.sentCards.find((c) => c.uuid === params.uuid) : undefined;
+    if (existing) return { success: true, messageId: existing.messageId };
+    const messageId = `om_card_${this.sentCards.length + 1}_${Math.random().toString(36).slice(2, 8)}`;
+    this.sentCards.push({ ...params, messageId });
+    return { success: true, messageId };
+  }
+
+  async patchInteractiveCard(params: { messageId: string; card: Record<string, unknown> }): Promise<{ success: boolean; error?: string }> {
+    if (!this._connected) return { success: false, error: 'FakeLarkTransport is not connected' };
+    this.patchedCards.push({ messageId: params.messageId, card: params.card });
+    return { success: true };
   }
 
   get addedReactions(): readonly FakeReactionRecord[] {
@@ -2890,6 +2937,92 @@ export class CredentialedLarkTransport implements LarkTransport {
       stream.on('error', onError);
       stream.on('end', onEnd);
     });
+  }
+
+  /**
+   * Sends an interactive card (JSON 2.0) as a reply in the target thread, or as a new chat
+   * message when there is no reply target. Same reply / thread fallback rules as `sendReply`.
+   */
+  async sendInteractiveCard(params: {
+    chatId: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    card: Record<string, unknown>;
+    uuid?: string;
+  }): Promise<OutboundReplyResult> {
+    if (!this.apiClient) {
+      return {
+        success: false,
+        error: `Live Lark card skipped (${REAL_LARK_CREDENTIAL_ACCEPTANCE}): ${REAL_LARK_CREDENTIAL_SKIP_REASON}`,
+      };
+    }
+    const content = JSON.stringify(params.card);
+    try {
+      const target = resolveReplyTarget({
+        rootId: params.rootId,
+        threadId: params.threadId,
+        replyToMessageId: params.replyToMessageId,
+      });
+      const ok = (res: any): OutboundReplyResult =>
+        res?.code === 0 || res?.data?.message_id
+          ? { success: true, messageId: res.data?.message_id }
+          : { success: false, error: res?.msg || `Lark API card send failed with code ${res?.code}` };
+      if (target.messageId) {
+        const replyFn = this.apiClient.im?.message?.reply || this.apiClient.im?.v1?.message?.reply;
+        const doReply = async (replyInThread: boolean, msgId: string) =>
+          await replyFn({
+            path: { message_id: msgId },
+            params: params.uuid ? { uuid: params.uuid } : undefined,
+            data: { content, msg_type: 'interactive', reply_in_thread: replyInThread, uuid: params.uuid },
+          });
+        const fallbackTarget =
+          params.replyToMessageId && !params.replyToMessageId.startsWith('omt_') ? params.replyToMessageId : target.messageId;
+        let res: any;
+        try {
+          res = await doReply(target.replyInThread, target.messageId);
+        } catch (firstErr) {
+          const errCode = getLarkApiErrorCode(firstErr);
+          if (target.replyInThread && errCode && LARK_THREAD_REPLY_UNSUPPORTED_CODES.has(errCode) && fallbackTarget) {
+            res = await doReply(false, fallbackTarget);
+          } else {
+            throw firstErr;
+          }
+        }
+        if (target.replyInThread && res?.code && LARK_THREAD_REPLY_UNSUPPORTED_CODES.has(res.code) && fallbackTarget) {
+          res = await doReply(false, fallbackTarget);
+        }
+        return ok(res);
+      }
+      const res = await this.apiClient.im.message.create({
+        params: { receive_id_type: 'chat_id', ...(params.uuid ? { uuid: params.uuid } : {}) },
+        data: { receive_id: params.chatId, content, msg_type: 'interactive', uuid: params.uuid },
+      });
+      return ok(res);
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : 'Unknown Lark API error' };
+    }
+  }
+
+  /** Replaces an interactive card message sent by this bot (`im.message.patch`; needs `update_multi`). */
+  async patchInteractiveCard(params: { messageId: string; card: Record<string, unknown> }): Promise<{ success: boolean; error?: string }> {
+    if (!this.apiClient) {
+      return { success: false, error: 'Live Lark card patch skipped: no API client' };
+    }
+    try {
+      const patchFn = this.apiClient?.im?.v1?.message?.patch || this.apiClient?.im?.message?.patch;
+      if (typeof patchFn !== 'function') return { success: false, error: 'im.message.patch is not available' };
+      const res: any = await patchFn({
+        path: { message_id: params.messageId },
+        data: { content: JSON.stringify(params.card) },
+      });
+      if (res && typeof res.code === 'number' && res.code !== 0) {
+        return { success: false, error: res.msg || `Lark API card patch failed with code ${res.code}` };
+      }
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : 'Unknown Lark API error' };
+    }
   }
 
   /**

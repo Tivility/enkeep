@@ -104,6 +104,10 @@ export interface LarkParsedCardAction {
   readonly operatorId: string;
   readonly operatorUserId?: string;
   readonly operatorUnionId?: string;
+  /** Form container submit: `{ <component name>: value }` (multi-select values are arrays). */
+  readonly formValue?: Record<string, unknown>;
+  /** Name of the form component that triggered the callback (the submit button). */
+  readonly componentName?: string;
 }
 
 export interface LarkParsedReactionCreated {
@@ -339,6 +343,17 @@ export interface LarkTransport {
   stop(): Promise<void>;
   onEvent(handler: LarkEventHandler): void;
   removeEventHandler?(handler: LarkEventHandler): void;
+  /** Sends (or replies with) an interactive card message (card JSON 2.0). */
+  sendInteractiveCard?(params: {
+    chatId: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    card: Record<string, unknown>;
+    uuid?: string;
+  }): Promise<OutboundReplyResult>;
+  /** Replaces the content of an interactive card message sent by this bot (`im.message.patch`). */
+  patchInteractiveCard?(params: { messageId: string; card: Record<string, unknown> }): Promise<{ success: boolean; error?: string }>;
   sendReply(params: {
     chatId: string;
     rootId?: string;

@@ -353,6 +353,8 @@ export class StreamingReplyTracker {
   private readonly withStatusBar: boolean;
   private readonly isCotActive: boolean;
   private readonly toolStatusEntries: CardToolStatusEntry[] = [];
+  /** An ask_user_question call is running: the turn waits for the user's answer. */
+  private waitingForAnswer = false;
   private lastPushedToolStatus = '';
   private currentStreamId: string | null = null;
   private streamEnded = false;
@@ -634,8 +636,11 @@ export class StreamingReplyTracker {
       } else if (evt.type === 'tool_status') {
         const name = evt.toolName || 'subagent';
         const lowerName = name.toLowerCase();
-        // D10: Filter out AskUserQuestion from tools timeline
+        // D10: Filter out AskUserQuestion from tools timeline; it only drives the "waiting for
+        // your answer" status line (the question itself is a separate question card).
         if (lowerName === 'askuserquestion' || lowerName === 'ask_user_question') {
+          if (evt.status === 'started') this.waitingForAnswer = true;
+          else if (evt.status === 'completed' || evt.status === 'failed') this.waitingForAnswer = false;
           continue;
         }
 
@@ -870,6 +875,7 @@ export class StreamingReplyTracker {
                 nowMs: now,
                 lastActivityAt: this.lastActivityAt,
                 runningTool: activeRunningTool,
+                waitingForAnswer: this.waitingForAnswer,
               })
             : undefined;
 

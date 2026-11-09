@@ -23,3 +23,4 @@ export * from './cli-credential-bridge.js';
 export * from './cot.js';
 export * from './background-panel.js';
 export * from './sender-name.js';
+export * from './question-card.js';

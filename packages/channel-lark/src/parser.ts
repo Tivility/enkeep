@@ -913,6 +913,13 @@ export function parseLarkCardAction(rawEvent: LarkRawEvent | null | undefined): 
     (rawEvent.sender as any)?.sender_id?.union_id ??
     undefined;
 
+  const rawFormValue = rawAction.form_value;
+  const formValue =
+    rawFormValue && typeof rawFormValue === 'object' && !Array.isArray(rawFormValue)
+      ? (rawFormValue as Record<string, unknown>)
+      : undefined;
+  const componentName = typeof rawAction.name === 'string' && rawAction.name ? rawAction.name : undefined;
+
   return {
     eventType: 'card.action.trigger',
     actionType,
@@ -924,6 +931,8 @@ export function parseLarkCardAction(rawEvent: LarkRawEvent | null | undefined): 
     operatorId,
     operatorUserId,
     operatorUnionId,
+    ...(formValue ? { formValue } : {}),
+    ...(componentName ? { componentName } : {}),
   };
 }
 

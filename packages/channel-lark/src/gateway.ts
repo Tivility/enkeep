@@ -60,6 +60,16 @@ import {
   createFeishuSenderNameResolver,
   type FeishuSenderNameResolver,
 } from './sender-name.js';
+import {
+  QUESTION_CARD_ACTION,
+  answersFromCardAction,
+  buildQuestionCard,
+  buildSettledQuestionCard,
+  parseQuestionCardActionValue,
+  type LarkQuestionAnswer,
+  type LarkQuestionCardState,
+  type LarkQuestionView,
+} from './question-card.js';
 
 /**
  * Lark built-in reaction emoji types:
@@ -110,7 +120,36 @@ export interface LarkChannelGatewayOptions {
     sessionId?: string;
     senderId?: string;
   }) => Promise<boolean> | boolean;
+  /**
+   * Pending `ask_user_question` questions (the platform QuestionBridge, structurally). Enables
+   * the question card callback (`answer_question`). Without it, question card clicks are refused.
+   */
+  questionService?: LarkQuestionService;
+  /** Max time a question card callback waits for the runtime before answering "提交中…". Default 2500 ms. */
+  questionAnswerTimeoutMs?: number;
 }
+
+/** Outcome of answering a question (the platform `QuestionAnswerResult`, structurally). */
+export interface LarkQuestionAnswerResult {
+  readonly ok: boolean;
+  readonly status: string;
+  readonly answers?: readonly LarkQuestionAnswer[];
+  readonly error?: string;
+}
+
+/** The subset of the platform QuestionBridge the Lark gateway uses. */
+export interface LarkQuestionService {
+  getPending(id: string, userId?: string): LarkQuestionView | undefined;
+  getSettled?(id: string, userId?: string): { question: LarkQuestionView; outcome: string } | undefined;
+  answer(
+    id: string,
+    answers: unknown,
+    options?: { userId?: string; decidedBy?: string }
+  ): Promise<LarkQuestionAnswerResult>;
+}
+
+/** decidedBy label of answers given on a Lark question card. */
+export const LARK_QUESTION_CARD_DECIDED_BY = 'lark-card';
 
 export interface InboundHandlingResult {
   readonly handled: boolean;
@@ -134,6 +173,8 @@ export interface InboundHandlingResult {
     readonly type: 'info' | 'warning' | 'error' | 'success';
     readonly content: string;
   };
+  /** Card callback response: replaces the clicked card (JSON 2.0 card). */
+  readonly card?: { readonly type: 'raw'; readonly data: Record<string, unknown> };
 }
 
 /** Lark chat ids look like `oc_<hex>`. */
@@ -200,6 +241,8 @@ export class LarkChannelGateway {
     sessionId?: string;
     senderId?: string;
   }) => Promise<boolean> | boolean;
+  private questionService?: LarkQuestionService;
+  private readonly questionAnswerTimeoutMs: number;
 
   constructor(options: LarkChannelGatewayOptions) {
     this.account = options.account;
@@ -215,6 +258,8 @@ export class LarkChannelGateway {
     this.configuredWithThinkingPanel = options.withThinkingPanel;
     this.coalesceWindowMs = options.coalesceWindowMs ?? COALESCE_WINDOW_MS;
     this.isOperatorAllowedCallback = options.isOperatorAllowed;
+    this.questionService = options.questionService;
+    this.questionAnswerTimeoutMs = options.questionAnswerTimeoutMs ?? 2500;
     this.cotManager = new LarkCotManager({
       enabled: options.enableCot ?? false,
       apiClient: options.cotApiClient ?? ((this.transport as any).apiClient || (this.transport as any).getApiClient?.()),
@@ -2023,7 +2068,10 @@ export class LarkChannelGateway {
       return { handled: false, ignoredReason: 'parse_error' };
     }
 
-    // 2. Only handle stop_reply action
+    // 2. Question card answers; otherwise only handle stop_reply action
+    if (parsedAction.actionType === QUESTION_CARD_ACTION) {
+      return await this.handleQuestionCardAction(parsedAction);
+    }
     if (parsedAction.actionType !== 'stop_reply') {
       return { handled: false, ignoredReason: 'parse_error' };
     }
@@ -2138,6 +2186,163 @@ export class LarkChannelGateway {
         content: '已停止回复',
       },
     };
+  }
+
+  // ──────────────────────────── ask_user_question cards ────────────────────────────
+
+  /** Attaches (or replaces) the question service after construction. */
+  setQuestionService(service: LarkQuestionService | undefined): void {
+    this.questionService = service;
+  }
+
+  /**
+   * Sends the question card for a pending question as a reply in the asking turn's thread.
+   * `uuid` makes the send idempotent on Lark's side.
+   */
+  async sendQuestionCard(params: {
+    question: LarkQuestionView;
+    chatId: string;
+    rootId?: string;
+    threadId?: string;
+    replyToMessageId?: string;
+    senderId?: string;
+    uuid?: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    if (typeof this.transport.sendInteractiveCard !== 'function') {
+      return { success: false, error: 'transport cannot send interactive cards' };
+    }
+    const card = buildQuestionCard(params.question, { senderId: params.senderId });
+    return this.transport.sendInteractiveCard({
+      chatId: params.chatId,
+      rootId: params.rootId,
+      threadId: params.threadId,
+      replyToMessageId: params.replyToMessageId,
+      card,
+      uuid: params.uuid,
+    });
+  }
+
+  /** Replaces a sent question card with its settled state. */
+  async updateQuestionCard(params: {
+    messageId: string;
+    question: LarkQuestionView;
+    state: LarkQuestionCardState;
+  }): Promise<{ success: boolean; error?: string }> {
+    if (typeof this.transport.patchInteractiveCard !== 'function') {
+      return { success: false, error: 'transport cannot patch interactive cards' };
+    }
+    return this.transport.patchInteractiveCard({
+      messageId: params.messageId,
+      card: buildSettledQuestionCard(params.question, params.state),
+    });
+  }
+
+  /**
+   * A click on a question card (one-click option button or form submit): checks that the
+   * operator is the person the question is addressed to, maps the card values back to answers
+   * and answers through the question service. Lark needs a response within 3 s, so a slow
+   * runtime gets "提交中…" and the card is updated later from the question's settled event.
+   */
+  private async handleQuestionCardAction(parsedAction: LarkParsedCardAction): Promise<InboundHandlingResult> {
+    const value = parseQuestionCardActionValue(parsedAction.actionValue);
+    if (!value) {
+      return { handled: false, ignoredReason: 'parse_error' };
+    }
+    const service = this.questionService;
+    if (!service) {
+      return { handled: true, toast: { type: 'error', content: '提交失败，请直接在话题里打字回复' } };
+    }
+
+    const isAllowed = await this.verifyOperatorPermission({
+      operatorId: parsedAction.operatorId,
+      chatId: parsedAction.chatId,
+      turnId: value.turnId,
+      sessionId: value.sessionId,
+      senderId: value.sid,
+    });
+    if (!isAllowed) {
+      return {
+        handled: true,
+        ignoredReason: 'permission_denied',
+        toast: { type: 'warning', content: '只有提问对象可以回答' },
+      };
+    }
+
+    const userId = this.userId;
+    const pending = service.getPending(value.qid, userId);
+    if (!pending) {
+      const settled = service.getSettled?.(value.qid, userId);
+      if (settled?.outcome === 'expired') {
+        return {
+          handled: true,
+          sessionRouteId: value.sessionId,
+          toast: { type: 'info', content: '已超时，Agent 已按推荐继续；需要修正请直接回复' },
+          card: { type: 'raw', data: buildSettledQuestionCard(settled.question, { kind: 'expired' }) },
+        };
+      }
+      return {
+        handled: true,
+        sessionRouteId: value.sessionId,
+        toast: { type: 'info', content: settled ? '这个问题已经结束' : '这个问题已失效' },
+      };
+    }
+
+    const answers = answersFromCardAction(pending, parsedAction.actionValue, parsedAction.formValue);
+    if (!answers) {
+      return { handled: true, toast: { type: 'warning', content: '请至少回答一题' } };
+    }
+
+    const answerPromise = service
+      .answer(value.qid, answers, { userId, decidedBy: LARK_QUESTION_CARD_DECIDED_BY })
+      .catch((): LarkQuestionAnswerResult => ({ ok: false, status: 'failed' }));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), this.questionAnswerTimeoutMs);
+    });
+    const result = await Promise.race([answerPromise, timeout]);
+    if (timer) clearTimeout(timer);
+
+    if (result === 'timeout') {
+      return { handled: true, sessionRouteId: value.sessionId, toast: { type: 'info', content: '提交中…' } };
+    }
+    switch (result.status) {
+      case 'answered':
+        return {
+          handled: true,
+          sessionRouteId: value.sessionId,
+          turnId: value.turnId,
+          toast: { type: 'success', content: '已提交' },
+          card: {
+            type: 'raw',
+            data: buildSettledQuestionCard(pending, {
+              kind: 'answered',
+              answers: (result.answers as LarkQuestionAnswer[] | undefined) ?? answers,
+            }),
+          },
+        };
+      case 'already_settled':
+      case 'already_answering':
+        return { handled: true, sessionRouteId: value.sessionId, toast: { type: 'info', content: '已在其他地方回答' } };
+      case 'expired':
+        return {
+          handled: true,
+          sessionRouteId: value.sessionId,
+          toast: { type: 'info', content: '已超时，Agent 已按推荐继续；需要修正请直接回复' },
+          card: { type: 'raw', data: buildSettledQuestionCard(pending, { kind: 'expired' }) },
+        };
+      case 'invalid':
+        return {
+          handled: true,
+          sessionRouteId: value.sessionId,
+          toast: { type: 'warning', content: `答案无效：${result.error ?? '格式不符'}` },
+        };
+      default:
+        return {
+          handled: true,
+          sessionRouteId: value.sessionId,
+          toast: { type: 'error', content: '提交失败，请直接在话题里打字回复' },
+        };
+    }
   }
 
   /**
