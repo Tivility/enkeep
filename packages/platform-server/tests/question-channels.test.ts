@@ -270,7 +270,7 @@ describe('QuestionChannelNotifier', () => {
     });
   });
 
-  it('falls back to a text question when the card cannot be sent, and answers for the user when nothing can', async () => {
+  it('falls back to a text question when the card cannot be sent, and leaves the question pending when nothing can', async () => {
     addOrigin(db, 'turn_test_lark_02', LARK_ROUTE, 'lark', LARK_ACCOUNT, `${CHAT}:${THREAD}`);
     lark.failCard = true;
     transport.ask('call_test_q_lark_02', LARK_DSH, 'turn_test_lark_02');
@@ -283,9 +283,31 @@ describe('QuestionChannelNotifier', () => {
     lark.failText = true;
     transport.ask('call_test_q_lark_03', LARK_DSH, 'turn_test_lark_03');
     await notifier.idle();
-    expect(transport.answers).toEqual([
-      { questionId: 'call_test_q_lark_03', answers: [{ id: 'scope', selected: [], custom: QUESTION_FALLBACK_TEXT }] },
-    ]);
+    // A failed delivery does not use up the question: it stays for the Web UI, a reply or its timeout.
+    expect(transport.answers).toHaveLength(0);
+    expect(bridge.getPending('call_test_q_lark_03', ALICE)).toBeDefined();
+  });
+
+  it('keeps a Web UI turn’s question on a Lark-bound session in the Web UI (no card, no automatic answer)', async () => {
+    addOrigin(db, 'turn_test_lark_old', LARK_ROUTE, 'lark', LARK_ACCOUNT, `${CHAT}:${THREAD}`);
+    db.prepare(`INSERT INTO turn_runs (id, user_id, space_id, route_id, turn_id, status) VALUES ('run_test_web_01', ?, ?, ?, 'turn_test_web_on_lark', 'running')`).run(ALICE, SPACE, LARK_ROUTE);
+    transport.ask('call_test_q_web_on_lark', LARK_DSH, 'turn_test_web_on_lark');
+    await notifier.idle();
+    expect(lark.cards).toHaveLength(0);
+    expect(transport.answers).toHaveLength(0);
+  });
+
+  it('follows an autonomous turn to the IM turn that started it', async () => {
+    addOrigin(db, 'turn_test_lark_parent', LARK_ROUTE, 'lark', LARK_ACCOUNT, `${CHAT}:${THREAD}`);
+    db.prepare(`INSERT INTO web_events (id, session_id, user_id, type, payload) VALUES ('evt_test_auto_01', ?, ?, 'turn_status', ?)`).run(
+      LARK_ROUTE,
+      ALICE,
+      JSON.stringify({ turnId: 'turn_test_lark_auto', originTurnId: 'turn_test_lark_parent', status: 'running' })
+    );
+    transport.ask('call_test_q_auto_01', LARK_DSH, 'turn_test_lark_auto');
+    await notifier.idle();
+    expect(lark.cards).toHaveLength(1);
+    expect(lark.cards[0].chatId).toBe(CHAT);
   });
 
   it('sends WeChat questions as text to the asking contact', async () => {
@@ -316,11 +338,13 @@ describe('QuestionChannelNotifier', () => {
   it('answers at once for channels without a question surface and for scheduled task turns', async () => {
     transport.ask('call_test_q_qq_01', QQ_DSH, 'turn_test_qq_01');
     await notifier.idle();
-    expect(transport.answers.map((a) => a.questionId)).toEqual(['call_test_q_qq_01']);
+    expect(transport.answers).toEqual([
+      { questionId: 'call_test_q_qq_01', answers: [{ id: 'scope', selected: [], custom: QUESTION_FALLBACK_TEXT }] },
+    ]);
 
     db.prepare(`INSERT INTO platform_tasks (id, user_id, title) VALUES ('task_test_01', ?, 'Synthetic task')`).run(ALICE);
     db.prepare(`INSERT INTO task_runs (id, task_id, user_id, status, turn_id) VALUES ('trun_test_01', 'task_test_01', ?, 'running', 'turn_test_task_01')`).run(ALICE);
-    addOrigin(db, 'turn_test_task_01', LARK_ROUTE, 'lark', LARK_ACCOUNT, `${CHAT}:${THREAD}`);
+    addOrigin(db, 'turn_test_lark_earlier', LARK_ROUTE, 'lark', LARK_ACCOUNT, `${CHAT}:${THREAD}`);
     transport.ask('call_test_q_task_01', LARK_DSH, 'turn_test_task_01');
     await notifier.idle();
     expect(transport.answers.map((a) => a.questionId)).toEqual(['call_test_q_qq_01', 'call_test_q_task_01']);
@@ -500,5 +524,19 @@ describe('typed IM reply answers a pending question (delivery gateway)', () => {
 
     expect(transport.answers).toHaveLength(0);
     expect(bridge.listPending({ userId: ALICE })).toHaveLength(1);
+  });
+
+  it('does not answer a question that never reached this channel account', async () => {
+    // The pending question belongs to the Lark turn; a WeChat message on the same route is not its answer.
+    const wechat = await gateway.dispatchInbound({
+      id: `deliv_${'0'.repeat(30)}77`,
+      userId: ALICE,
+      sessionId: LARK_ROUTE,
+      content: 'A',
+      timestamp: new Date().toISOString(),
+      channelContext: { channel: 'wechat', accountId: WECHAT_ACCOUNT, chatId: PEER, nativeContextId: `wechat:${PEER}`, senderId: PEER },
+    } as any);
+    expect(wechat.executionMode).not.toBe('command');
+    expect(transport.answers).toHaveLength(0);
   });
 });

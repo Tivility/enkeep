@@ -2244,6 +2244,8 @@ export class LarkChannelGateway {
    * runtime gets "提交中…" and the card is updated later from the question's settled event.
    */
   private async handleQuestionCardAction(parsedAction: LarkParsedCardAction): Promise<InboundHandlingResult> {
+    // Lark's 3 s response window covers the permission check (which may call the Lark API) too.
+    const startedAt = Date.now();
     const value = parseQuestionCardActionValue(parsedAction.actionValue);
     if (!value) {
       return { handled: false, ignoredReason: 'parse_error' };
@@ -2297,7 +2299,7 @@ export class LarkChannelGateway {
       .catch((): LarkQuestionAnswerResult => ({ ok: false, status: 'failed' }));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), this.questionAnswerTimeoutMs);
+      timer = setTimeout(() => resolve('timeout'), Math.max(100, this.questionAnswerTimeoutMs - (Date.now() - startedAt)));
     });
     const result = await Promise.race([answerPromise, timeout]);
     if (timer) clearTimeout(timer);

@@ -42,6 +42,7 @@ import { parseChatCommand, ChatCommandService } from '../chat/chat-command-servi
 import { DELIVERY_ID_REGEX } from '@enkeep/platform-operations';
 import type { UserQuestion } from '@enkeep/dsh-external-interaction/user-questions';
 import { parseQuestionReply } from '../interactions/question-text.js';
+import { questionOutboxId } from '../interactions/question-channel-notifier.js';
 
 export interface TurnExecutionResult {
   replyText: string;
@@ -1672,6 +1673,10 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       .get(userId, params.idempotencyKey);
     if (existing) return null;
 
+    // Only a question that reached this channel account (its card / text was sent here, or the
+    // asking turn came from here) can be answered from it: a Web or Jarvis question is not.
+    if (!this.questionReachedChannel(userId, pending, ctx.channel, ctx.accountId)) return null;
+
     // Only the user the question is addressed to (the sender of the asking turn) answers it.
     if (ctx.senderId && pending.turnId) {
       const askingSender = this.senderOfTurn(userId, pending.turnId);
@@ -1689,6 +1694,23 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     if (status !== 'answered') return null;
 
     return await this.dispatchChatCommand({ ...params, syntheticReply: QUESTION_ANSWER_RECEIPT });
+  }
+
+  /** Whether a pending question was delivered to (or asked from) this channel account. */
+  private questionReachedChannel(userId: string, question: PendingQuestionLike, channel: string, accountId: string): boolean {
+    try {
+      const delivered = this.db
+        .prepare('SELECT 1 AS ok FROM channel_outbox WHERE id = ? AND user_id = ? AND account_id = ? LIMIT 1')
+        .get(questionOutboxId(userId, question.id), userId, accountId);
+      if (delivered) return true;
+      if (!question.turnId) return false;
+      const origin = this.db
+        .prepare('SELECT 1 AS ok FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? AND channel = ? AND account_id = ? LIMIT 1')
+        .get(question.turnId, userId, channel, accountId);
+      return Boolean(origin);
+    } catch {
+      return false;
+    }
   }
 
   /** The channel sender id recorded for a turn's inbound message, if any. */

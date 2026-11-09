@@ -108,6 +108,7 @@ export interface QuestionChannelNotifierOptions {
 }
 
 interface TurnOriginRow {
+  turn_id: string;
   account_id: string;
   channel: string;
   chat_id: string;
@@ -116,6 +117,8 @@ interface TurnOriginRow {
   root_id: string | null;
   thread_id: string | null;
 }
+
+const ORIGIN_COLUMNS = 'turn_id, account_id, channel, chat_id, native_context_id, reply_to_message_id, root_id, thread_id';
 
 /** How the notifier decided to handle a question (exposed for tests). */
 export type QuestionDeliveryDecision =
@@ -186,25 +189,38 @@ export class QuestionChannelNotifier {
     }
   }
 
-  /** Where a question goes (no side effects). */
+  /**
+   * Where a question goes (no side effects). The asking turn decides: its own channel origin (an
+   * autonomous turn follows the turn that started it), a scheduled task, or a platform turn
+   * without an origin (the Web UI). Only a question re-read without a turn id falls back to the
+   * session's latest IM origin. Web questions are never sent to IM nor answered automatically.
+   */
   decide(question: BridgedQuestion): QuestionDeliveryDecision {
-    if (!question.routeResolved) return { kind: 'fallback', reason: 'no_route' };
-    if (question.turnId && this.isTaskTurn(question.userId, question.turnId)) {
-      return { kind: 'fallback', reason: 'task_turn' };
-    }
+    // Without a session route only the Web UI's unfiltered list can show it.
+    if (!question.routeResolved) return { kind: 'skip', reason: 'web' };
     const route = this.db
       .prepare('SELECT channel FROM session_routes WHERE id = ? AND user_id = ? LIMIT 1')
       .get(question.sessionId, question.userId) as { channel?: string } | undefined;
-    const origin = this.originOf(question);
-    const channel = origin?.channel ?? route?.channel;
+    if (!route) return { kind: 'skip', reason: 'web' };
+
+    const resolved = question.turnId ? this.resolveTurn(question.userId, question.sessionId, question.turnId) : undefined;
+    let origin: TurnOriginRow | undefined;
+    if (resolved?.kind === 'task') return { kind: 'fallback', reason: 'task_turn' };
+    if (resolved?.kind === 'web') return { kind: 'skip', reason: 'web' };
+    if (resolved?.kind === 'origin') {
+      origin = resolved.origin;
+    } else if (route.channel === 'lark' || route.channel === 'wechat') {
+      origin = this.latestOrigin(question.userId, question.sessionId, route.channel);
+    }
+
+    const channel = origin?.channel ?? route.channel;
     switch (channel) {
       case 'lark':
-        return origin ? { kind: 'lark', origin } : { kind: 'fallback', reason: 'no_origin' };
+        return origin ? { kind: 'lark', origin } : { kind: 'skip', reason: 'web' };
       case 'wechat':
-        return origin ? { kind: 'wechat', origin } : { kind: 'fallback', reason: 'no_origin' };
+        return origin ? { kind: 'wechat', origin } : { kind: 'skip', reason: 'web' };
       case 'web':
-      case undefined:
-        return route ? { kind: 'skip', reason: 'web' } : { kind: 'fallback', reason: 'no_route' };
+        return { kind: 'skip', reason: 'web' };
       case 'jarvis':
         return { kind: 'skip', reason: 'jarvis' };
       default:
@@ -241,6 +257,7 @@ export class QuestionChannelNotifier {
     const decision = this.decide(question);
     if (decision.kind === 'skip') return;
     if (decision.kind === 'fallback') {
+      if (!this.started) return;
       await this.fallback(question, decision.reason);
       return;
     }
@@ -250,7 +267,12 @@ export class QuestionChannelNotifier {
       decision.kind === 'lark'
         ? await this.deliverLark(question, origin, outboxId)
         : await this.deliverWeChat(question, origin, outboxId);
-    if (!delivered) await this.fallback(question, `${decision.kind}_delivery_failed`);
+    if (!delivered) {
+      // Not answered automatically: the question stays pending for the Web UI, a later typed
+      // reply, a redelivery (WeChat outbox redrive) or its timeout. A transient error or a
+      // platform shutdown must not use up the user's question.
+      this.logger.warn('question not delivered; left pending', { channel: decision.kind });
+    }
   }
 
   private async deliverLark(question: BridgedQuestion, origin: TurnOriginRow, outboxId: string): Promise<boolean> {
@@ -264,7 +286,7 @@ export class QuestionChannelNotifier {
       ...(origin.thread_id ? { threadId: origin.thread_id } : {}),
       ...(origin.reply_to_message_id ? { replyToMessageId: origin.reply_to_message_id } : {}),
     };
-    const senderId = question.turnId ? this.senderOfTurn(question.userId, question.turnId) : undefined;
+    const senderId = origin.turn_id ? this.senderOfTurn(question.userId, origin.turn_id) : undefined;
     let mode: 'card' | 'text' = 'card';
     let result: { success: boolean; messageId?: string; error?: string };
     try {
@@ -369,28 +391,62 @@ export class QuestionChannelNotifier {
 
   // ──────────────────────────── DB helpers ────────────────────────────
 
-  private isTaskTurn(userId: string, turnId: string): boolean {
+  /**
+   * Where the asking turn came from: its channel origin, a scheduled task, a platform turn
+   * without an origin (Web UI), or unknown. An autonomous turn (continuation) has neither and
+   * follows the turn that started it (origin_turn_id / its turn_status event), up to 20 hops.
+   */
+  private resolveTurn(
+    userId: string,
+    routeId: string,
+    turnId: string
+  ): { kind: 'origin'; origin: TurnOriginRow } | { kind: 'task' } | { kind: 'web' } | { kind: 'unknown' } {
+    const seen = new Set<string>();
+    let current: string | undefined = turnId;
+    for (let hop = 0; current && hop < 20 && !seen.has(current); hop++) {
+      seen.add(current);
+      const origin = this.db
+        .prepare(`SELECT ${ORIGIN_COLUMNS}, origin_turn_id FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? LIMIT 1`)
+        .get(current, userId) as (TurnOriginRow & { origin_turn_id?: string | null }) | undefined;
+      if (origin?.channel) return { kind: 'origin', origin };
+      try {
+        if (this.db.prepare('SELECT 1 AS ok FROM task_runs WHERE user_id = ? AND turn_id = ? LIMIT 1').get(userId, current)) {
+          return { kind: 'task' };
+        }
+      } catch {}
+      if (this.db.prepare('SELECT 1 AS ok FROM turn_runs WHERE user_id = ? AND route_id = ? AND turn_id = ? LIMIT 1').get(userId, routeId, current)) {
+        return { kind: 'web' };
+      }
+      current = origin?.origin_turn_id ?? this.autonomousOriginOf(userId, routeId, current);
+    }
+    return { kind: 'unknown' };
+  }
+
+  /** The `originTurnId` of an autonomous turn's own `turn_status` event. */
+  private autonomousOriginOf(userId: string, routeId: string, turnId: string): string | undefined {
     try {
-      return Boolean(
-        this.db.prepare('SELECT 1 AS ok FROM task_runs WHERE user_id = ? AND turn_id = ? LIMIT 1').get(userId, turnId)
-      );
+      const row = this.db
+        .prepare(
+          `SELECT json_extract(payload, '$.originTurnId') AS origin FROM web_events
+            WHERE session_id = ? AND user_id = ? AND type = 'turn_status'
+              AND json_extract(payload, '$.turnId') = ?
+              AND json_extract(payload, '$.originTurnId') IS NOT NULL
+            ORDER BY rowid DESC LIMIT 1`
+        )
+        .get(routeId, userId, turnId) as { origin?: string | null } | undefined;
+      return typeof row?.origin === 'string' && row.origin.length > 0 ? row.origin : undefined;
     } catch {
-      return false;
+      return undefined;
     }
   }
 
-  /** The asking turn's channel origin; else the session's latest origin. */
-  private originOf(question: BridgedQuestion): TurnOriginRow | undefined {
-    const columns = 'account_id, channel, chat_id, native_context_id, reply_to_message_id, root_id, thread_id';
-    if (question.turnId) {
-      const row = this.db
-        .prepare(`SELECT ${columns} FROM channel_turn_origins WHERE turn_id = ? AND user_id = ? LIMIT 1`)
-        .get(question.turnId, question.userId) as TurnOriginRow | undefined;
-      if (row) return row;
-    }
+  /** The session's latest origin in a channel (questions re-read without a turn id). */
+  private latestOrigin(userId: string, routeId: string, channel: string): TurnOriginRow | undefined {
     return this.db
-      .prepare(`SELECT ${columns} FROM channel_turn_origins WHERE session_id = ? AND user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`)
-      .get(question.sessionId, question.userId) as TurnOriginRow | undefined;
+      .prepare(
+        `SELECT ${ORIGIN_COLUMNS} FROM channel_turn_origins WHERE session_id = ? AND user_id = ? AND channel = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(routeId, userId, channel) as TurnOriginRow | undefined;
   }
 
   private senderOfTurn(userId: string, turnId: string): string | undefined {
