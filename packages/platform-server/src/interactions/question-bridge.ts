@@ -10,7 +10,8 @@
  * runtime, answers through the transport (the first answer wins) and emits `asked` / `settled`
  * exactly once per question.
  *
- * Channels (Web, Jarvis, later Lark) share one instance. An answer that arrives after the
+ * Channels (Web, Jarvis, and Lark / WeChat through QuestionChannelNotifier) share one instance.
+ * An answer that arrives after the
  * question expired is refused by the runtime (`question/expired`); the bridge reports `expired`
  * with the question so the channel can deliver the answer as the user's next message
  * (`formatLateQuestionAnswers`).

@@ -96,6 +96,7 @@ import {
 import type { IExternalInteractionService } from '@enkeep/dsh-external-interaction';
 import type { ApprovalBridge } from '../interactions/approval-bridge.js';
 import type { QuestionBridge } from '../interactions/question-bridge.js';
+import { QuestionChannelNotifier } from '../interactions/question-channel-notifier.js';
 import {
   HappyClawMigrationService,
 } from '../imports/happyclaw-migration-service.js';
@@ -555,6 +556,8 @@ export class PlatformServer {
   public readonly externalInteractionService?: IExternalInteractionService;
   public readonly approvalBridge?: ApprovalBridge;
   public readonly questionBridge?: QuestionBridge;
+  /** Delivers runtime questions to Lark / WeChat (cards or text) and answers unreachable ones. */
+  public readonly questionChannelNotifier?: QuestionChannelNotifier;
   public readonly mountReconciler?: RuntimeMountReconciler;
   public readonly spaceMountService?: SpaceMountService;
   public readonly browserService?: BrowserService;
@@ -1133,6 +1136,16 @@ export class PlatformServer {
       this.taskWorker.wechatRuntimeManager = this.wechatRuntimeManager;
     }
 
+    // ask_user_question questions of IM sessions go to the asking turn's channel (Lark card / WeChat text)
+    if (this.questionBridge) {
+      this.questionChannelNotifier = new QuestionChannelNotifier({
+        db,
+        bridge: this.questionBridge,
+        lark: () => this.channelRuntimeManager,
+        wechat: () => this.wechatRuntimeManager,
+      });
+    }
+
     // task_route failure notifications go out through the same IM runtimes as task results
     if (typeof this.taskNotificationService.setTaskRouteSender === 'function') {
       this.taskNotificationService.setTaskRouteSender(async (params) => {
@@ -1477,6 +1490,9 @@ export class PlatformServer {
         await this.wechatRuntimeManager.start();
       }
 
+      // 5.61 Deliver ask_user_question questions to IM channels
+      this.questionChannelNotifier?.start();
+
       // 5.65 Start channel connection endpoints (e.g. Jarvis)
       for (const endpoint of this.connectionEndpoints) {
         await endpoint.start?.();
@@ -1536,6 +1552,7 @@ export class PlatformServer {
       }
 
       // Roll back channel runtime managers if started
+      this.questionChannelNotifier?.stop();
       await this.stopConnectionEndpoints(rollbackErrors);
       if (this.wechatRuntimeManager) {
         try {
@@ -1698,6 +1715,8 @@ export class PlatformServer {
       if (this.runtimeAutoUpgrader) {
         this.runtimeAutoUpgrader.stop();
       }
+
+      this.questionChannelNotifier?.stop();
 
       // 2.5 Stop channel runtime manager
       await this.stopConnectionEndpoints(errors);
