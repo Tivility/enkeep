@@ -24,6 +24,7 @@ export interface ParsedChatCommand {
   raw: string;
   isConfirm?: boolean;
   all?: boolean;
+  title?: string;
   legacy?: 'where' | 'list' | 'bind' | 'unbind' | 'newws' | 'new' | 'clear' | 'reset';
   word?: string;
   closest?: string;
@@ -47,6 +48,7 @@ export const HELP_USAGE = `Available commands:
   /session list - 列出当前工作区有效会话 (别名: /session ls)
   /session use <短ID/标题/main> - 固定到会话 (main 跟随主会话)
   /session new [标题] - 新建会话并固定
+  /session fork [<短ID/标题/main> [新标题]] - 复制会话的完整历史为新会话并固定 (默认复制当前会话)
   /session clear - 清空当前会话 (主会话被共享时需 /session clear confirm)
   /session cache [long|short|none|default] - 查看或设置当前会话 Prompt 缓存保留策略
   /session window [<tokens>|default] - 查看或设置当前会话上下文窗口上限
@@ -87,6 +89,7 @@ export const SESSION_USAGE = `用法:
   /session list - 列出当前工作区会话 (别名: /session ls)
   /session use <短ID/标题/main> - 固定到会话 (main 跟随主会话)
   /session new [标题] - 新建会话并固定
+  /session fork [<短ID/标题/main> [新标题]] - 复制会话的完整历史为新会话并固定 (默认复制当前会话)
   /session clear - 清空当前会话
   /session clear confirm - 确认清空共享主会话
   /session cache [long|short|none|default] - 查看或设置当前会话 Prompt 缓存保留策略
@@ -503,6 +506,20 @@ export function parseChatCommand(
         action: 'new',
         target: subRest || undefined,
         arg: subRest || undefined,
+        raw: trimmed,
+      };
+    }
+    if (sub === 'fork') {
+      const [sourceToken, ...titleTokens] = subRest ? subRest.split(/\s+/) : [];
+      const forkTitle = titleTokens.join(' ').trim();
+      return {
+        command: 'session',
+        type: 'session',
+        subcommand: 'fork',
+        action: 'fork',
+        target: sourceToken || undefined,
+        arg: sourceToken || undefined,
+        title: forkTitle || undefined,
         raw: trimmed,
       };
     }
@@ -998,6 +1015,19 @@ export interface ChatCommandServiceOptions {
       title?: string | null;
       [key: string]: unknown;
     }>;
+    forkSession?: (
+      userId: string,
+      sessionId: string,
+      options?: {
+        title?: string;
+        targetSpaceId?: string;
+        idempotencyKey?: string;
+      }
+    ) => Promise<{
+      id: string;
+      title?: string | null;
+      [key: string]: unknown;
+    }>;
   };
   taskOperations?: (userId: string) => {
     createTask: (input: {
@@ -1364,7 +1394,7 @@ export class ChatCommandService {
       return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'home' || ((parsed.subcommand === 'cache' || parsed.subcommand === 'window') && Boolean(parsed.target || parsed.arg));
     }
     if (parsed.command === 'session' || parsed.command === 'ses') {
-      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'clear' || ((parsed.subcommand === 'cache' || parsed.subcommand === 'window') && Boolean(parsed.target || parsed.arg));
+      return parsed.subcommand === 'use' || parsed.subcommand === 'new' || parsed.subcommand === 'fork' || parsed.subcommand === 'clear' || ((parsed.subcommand === 'cache' || parsed.subcommand === 'window') && Boolean(parsed.target || parsed.arg));
     }
     if (parsed.command === 'bg') {
       return parsed.subcommand === 'stop';
@@ -2286,6 +2316,8 @@ export class ChatCommandService {
         return await this.executeSessionUseCommand(params, parsed);
       case 'new':
         return await this.executeSessionNewCommand(params, parsed);
+      case 'fork':
+        return await this.executeSessionForkCommand(params, parsed);
       case 'clear':
         return await this.executeSessionClearCommand(params, parsed);
       case 'cache':
@@ -2753,35 +2785,166 @@ export class ChatCommandService {
     const bindingTargetCtx = isTopic ? nativeContextId : targetCtxId;
     if (this.db && accountId && bindingTargetCtx) {
       try {
-        let chatActivationMode = 'mention';
-        if (targetCtxId) {
-          const chatBinding = this.db.prepare(
-            'SELECT activation_mode FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
-          ).get(userId, accountId, targetCtxId) as { activation_mode?: string } | undefined;
-          if (chatBinding?.activation_mode) {
-            chatActivationMode = chatBinding.activation_mode;
-          }
-        }
-
-        const existing = this.db.prepare(
-          'SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
-        ).get(userId, accountId, bindingTargetCtx) as { id: string } | undefined;
-
-        if (existing) {
-          this.db.prepare('UPDATE channel_bindings SET space_id = ?, session_route_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(targetSpaceId, createdSession.id, existing.id);
-        } else {
-          const newId = `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
-          this.db.prepare(`
-            INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, session_route_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-          `).run(newId, userId, accountId, targetSpaceId, bindingTargetCtx, chatActivationMode, createdSession.id);
-        }
+        this.pinSessionToChannelContext({
+          userId,
+          accountId,
+          chatContextId: targetCtxId,
+          bindingContextId: bindingTargetCtx,
+          spaceId: targetSpaceId,
+          sessionRouteId: createdSession.id,
+        });
       } catch (err: unknown) {
         return { replyText: `新建会话成功但固定失败: ${err instanceof Error ? err.message : String(err)}` };
       }
     }
 
     return { replyText: `已新建会话并固定: ${shortId}${createdSession.title ? ` (${createdSession.title})` : ''}` };
+  }
+
+  /**
+   * Pins a session to a channel context (topic-level or chat-level binding).
+   * A new binding inherits the chat-level activation mode; an existing one keeps its own.
+   */
+  private pinSessionToChannelContext(input: {
+    userId: string;
+    accountId: string;
+    chatContextId: string | null;
+    bindingContextId: string;
+    spaceId: string;
+    sessionRouteId: string;
+  }): void {
+    if (!this.db) {
+      throw new Error('数据库未连接');
+    }
+    const { userId, accountId, chatContextId, bindingContextId, spaceId, sessionRouteId } = input;
+
+    let chatActivationMode = 'mention';
+    if (chatContextId) {
+      const chatBinding = this.db.prepare(
+        'SELECT activation_mode FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+      ).get(userId, accountId, chatContextId) as { activation_mode?: string } | undefined;
+      if (chatBinding?.activation_mode) {
+        chatActivationMode = chatBinding.activation_mode;
+      }
+    }
+
+    const existing = this.db.prepare(
+      'SELECT id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+    ).get(userId, accountId, bindingContextId) as { id: string } | undefined;
+
+    if (existing) {
+      this.db.prepare('UPDATE channel_bindings SET space_id = ?, session_route_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(spaceId, sessionRouteId, existing.id);
+    } else {
+      const newId = `cb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+      this.db.prepare(`
+        INSERT INTO channel_bindings (id, user_id, account_id, space_id, native_context_id, activation_mode, session_route_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(newId, userId, accountId, spaceId, bindingContextId, chatActivationMode, sessionRouteId);
+    }
+  }
+
+  private async executeSessionForkCommand(
+    params: { userId: string; sessionId: string; spaceId: string; idempotencyKey?: string; channelContext?: ChatCommandChannelContext },
+    parsed: ParsedChatCommand
+  ): Promise<{ replyText: string }> {
+    const { userId, sessionId, spaceId, idempotencyKey } = params;
+    const { channel, accountId, chatNativeContextId, nativeContextId, isTopic } = this.getChatAndTopicIds(params);
+
+    if (!this.platformApi?.forkSession) {
+      return { replyText: '平台服务未连接，无法分叉会话。' };
+    }
+    if (!this.db) {
+      return { replyText: '数据库未连接，无法分叉会话。' };
+    }
+
+    const targetCtxId = chatNativeContextId || nativeContextId;
+    if (channel !== 'web' && (!accountId || !targetCtxId)) {
+      return { replyText: '当前会话缺少渠道上下文，无法分叉。' };
+    }
+
+    // Source sessions are resolved within the workspace this context is bound to (same scope as /session list).
+    let targetSpaceId = spaceId;
+    try {
+      const bindingRow = accountId && targetCtxId
+        ? this.db.prepare(
+          'SELECT space_id FROM channel_bindings WHERE user_id = ? AND account_id = ? AND native_context_id = ?'
+        ).get(userId, accountId, targetCtxId) as { space_id?: string } | undefined
+        : undefined;
+      if (bindingRow?.space_id) {
+        targetSpaceId = bindingRow.space_id;
+      } else {
+        const routeRow = this.db.prepare('SELECT space_id FROM session_routes WHERE id = ? AND user_id = ?').get(sessionId, userId) as { space_id?: string } | undefined;
+        if (routeRow?.space_id) targetSpaceId = routeRow.space_id;
+      }
+    } catch {}
+
+    const activeSessions = this.db.prepare(
+      "SELECT id, title FROM session_routes WHERE space_id = ? AND user_id = ? AND status = 'active'"
+    ).all(targetSpaceId, userId) as Array<{ id: string; title: string | null }>;
+
+    const rawSource = parsed.target?.trim();
+    let sourceSession: { id: string; title: string | null } | undefined;
+    if (rawSource) {
+      const spaceRow = this.db.prepare('SELECT canonical_session_id FROM spaces WHERE id = ? AND user_id = ?').get(targetSpaceId, userId) as { canonical_session_id?: string | null } | undefined;
+      const matchRes = matchSessionInSpace(rawSource, activeSessions, spaceRow?.canonical_session_id);
+      if (matchRes.ambiguous) {
+        return { replyText: `会话标识 "${rawSource}" 存在歧义，请使用更长的短 ID 或完整会话 ID。` };
+      }
+      if (!matchRes.matched) {
+        return { replyText: `未找到会话 "${rawSource}"。请使用 /session list 查看可用会话。` };
+      }
+      sourceSession = matchRes.matched;
+    } else {
+      sourceSession = activeSessions.find((s) => s.id === sessionId);
+      if (!sourceSession) {
+        return { replyText: '当前会话不在本工作区的有效会话中，请指定源会话: /session fork <短ID/标题/main> [新标题]' };
+      }
+    }
+
+    const effectiveIdempotencyKey = idempotencyKey && UUID_V4_REGEX.test(idempotencyKey) ? idempotencyKey.toLowerCase() : randomUUID();
+    let forked: { id: string; title?: string | null };
+    try {
+      forked = await this.platformApi.forkSession(userId, sourceSession.id, {
+        ...(parsed.title ? { title: parsed.title } : {}),
+        targetSpaceId,
+        idempotencyKey: effectiveIdempotencyKey,
+      });
+    } catch (err: unknown) {
+      const code = (err as { code?: unknown } | null)?.code;
+      if (code === 'TURN_ACTIVE') {
+        return { replyText: '源会话正在执行，结束后再 fork。' };
+      }
+      return { replyText: `分叉会话失败: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    let allIds = [...activeSessions.map((s) => s.id), forked.id];
+    try {
+      const rows = this.db.prepare("SELECT id FROM session_routes WHERE space_id = ? AND user_id = ? AND status = 'active'").all(targetSpaceId, userId) as Array<{ id: string }>;
+      allIds = rows.map((r) => r.id);
+    } catch {}
+    const forkedShortId = computeSessionShortId(forked.id, allIds);
+    const sourceShortId = computeSessionShortId(sourceSession.id, allIds);
+    const forkedLabel = `${forkedShortId}${forked.title ? ` (${forked.title})` : ''}`;
+
+    if (channel === 'web') {
+      return { replyText: `已分叉会话 ${forkedLabel}，源会话 ${sourceShortId} 不受影响。请在侧栏切换打开。` };
+    }
+
+    const bindingTargetCtx = isTopic ? nativeContextId! : targetCtxId!;
+    try {
+      this.pinSessionToChannelContext({
+        userId,
+        accountId: accountId!,
+        chatContextId: targetCtxId,
+        bindingContextId: bindingTargetCtx,
+        spaceId: targetSpaceId,
+        sessionRouteId: forked.id,
+      });
+    } catch (err: unknown) {
+      return { replyText: `分叉会话 ${forkedLabel} 已创建但固定失败: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    return { replyText: `已分叉并固定: ${forkedLabel}，源会话 ${sourceShortId} 不受影响` };
   }
 
   private async executeMentionCommand(

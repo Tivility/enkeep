@@ -675,6 +675,15 @@ export interface DeliveryRuntimeGatewayOptions {
         forceNew?: boolean;
       }
     ) => Promise<any>;
+    forkSession?: (
+      userId: string,
+      sessionId: string,
+      options?: {
+        title?: string;
+        targetSpaceId?: string;
+        idempotencyKey?: string;
+      }
+    ) => Promise<any>;
     checkChatAdmin?: (params: {
       channel: string;
       accountId?: string | null;
@@ -867,6 +876,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
     const createSpaceFn = options.chatCommandDeps?.createSpace ?? (options as any).platformApi?.createSpace;
     const listSpacesFn = options.chatCommandDeps?.listSpaces ?? (options as any).platformApi?.listSpaces;
     const createSessionFn = options.chatCommandDeps?.createSession ?? (options as any).platformApi?.createSession;
+    const forkSessionFn = options.chatCommandDeps?.forkSession ?? (options as any).platformApi?.forkSession;
     const checkChatAdminFn = options.chatCommandDeps?.checkChatAdmin ?? options.checkChatAdmin;
     const taskOps = options.chatCommandDeps?.taskOperations ?? options.taskOperations;
     this.chatCommandService =
@@ -874,13 +884,14 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       (this.modelSelectionService
         ? new ChatCommandService({
             modelSelectionService: this.modelSelectionService,
-            platformApi: (resetSessionFn || compactSessionFn || createTaskFn || createSpaceFn || listSpacesFn || createSessionFn) ? {
+            platformApi: (resetSessionFn || compactSessionFn || createTaskFn || createSpaceFn || listSpacesFn || createSessionFn || forkSessionFn) ? {
               resetSession: resetSessionFn,
               compactSession: compactSessionFn,
               createTask: createTaskFn,
               createSpace: createSpaceFn,
               listSpaces: listSpacesFn,
               createSession: createSessionFn,
+              forkSession: forkSessionFn,
             } : undefined,
             taskOperations: taskOps,
             checkChatAdmin: checkChatAdminFn,
@@ -986,6 +997,15 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         forceNew?: boolean;
       }
     ) => Promise<any>;
+    forkSession?: (
+      userId: string,
+      sessionId: string,
+      options?: {
+        title?: string;
+        targetSpaceId?: string;
+        idempotencyKey?: string;
+      }
+    ) => Promise<any>;
     checkChatAdmin?: (params: {
       channel: string;
       accountId?: string | null;
@@ -1007,6 +1027,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         ...(deps.createSpace ? { createSpace: deps.createSpace } : {}),
         ...(deps.listSpaces ? { listSpaces: deps.listSpaces } : {}),
         ...(deps.createSession ? { createSession: deps.createSession } : {}),
+        ...(deps.forkSession ? { forkSession: deps.forkSession } : {}),
       });
       if (deps.taskOperations) {
         this.chatCommandService.setTaskOperations(deps.taskOperations);

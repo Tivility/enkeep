@@ -893,6 +893,9 @@ export class PlatformServer {
           : undefined,
         createSpace: this.platformApi.createSpace.bind(this.platformApi),
         listSpaces: this.platformApi.listSpaces.bind(this.platformApi),
+        forkSession: typeof this.platformApi.forkSession === 'function'
+          ? this.platformApi.forkSession.bind(this.platformApi)
+          : undefined,
         taskOperations: (userId: string) => this.operationsService.forTenant(userId).tasks,
       });
     }
