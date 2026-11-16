@@ -27,6 +27,7 @@ import {
   DaemonRpcEncoder,
   DEFAULT_DAEMON_SOCKET_PATH,
   encodeDaemonMessage,
+  unserializableResponseFallback,
   type DaemonRequest,
   type DaemonStreamEvent,
 } from './daemon-protocol.js';
@@ -190,6 +191,17 @@ export async function runDaemonServer(): Promise<void> {
 
     const decoder = new DaemonRpcDecoder();
     const encoder = new DaemonRpcEncoder();
+    encoder.on('encodeError', (err: Error, message: unknown) => {
+      const fallback = unserializableResponseFallback(message, err);
+      if (fallback) encoder.write(fallback);
+      process.stderr.write(`[RuntimeDaemon] dropped unserializable message: ${err.message}\n`);
+    });
+    encoder.on('error', (err: Error) => {
+      process.stderr.write(`[RuntimeDaemon] socket encoder error: ${String(err)}\n`);
+      try {
+        socket.destroy();
+      } catch {}
+    });
 
     const streamListener = (event: DaemonStreamEvent) => {
       try {
@@ -250,6 +262,14 @@ export async function runDaemonServer(): Promise<void> {
   // Stdio fallback / direct pipe support
   const stdioDecoder = new DaemonRpcDecoder();
   const stdioEncoder = new DaemonRpcEncoder();
+  stdioEncoder.on('encodeError', (err: Error, message: unknown) => {
+    const fallback = unserializableResponseFallback(message, err);
+    if (fallback) stdioEncoder.write(fallback);
+    process.stderr.write(`[RuntimeDaemon] dropped unserializable message: ${err.message}\n`);
+  });
+  stdioEncoder.on('error', (err: Error) => {
+    process.stderr.write(`[RuntimeDaemon] stdio encoder error: ${String(err)}\n`);
+  });
 
   const stdioStreamListener = (event: DaemonStreamEvent) => {
     try {

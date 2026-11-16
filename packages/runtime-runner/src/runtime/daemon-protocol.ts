@@ -46,7 +46,6 @@ export type {
   UserQuestion,
 } from '@enkeep/dsh-external-interaction/user-questions';
 
-export const MAX_DAEMON_FRAME_SIZE = 10 * 1024 * 1024; // 10 MiB frame limit
 export const MAX_JSON_DEPTH = 64; // Safe nested levels for deep tool schemas, session events and profile snapshots
 export const DEFAULT_DAEMON_SOCKET_PATH = '/tmp/enkeep-runtime.sock';
 
@@ -102,7 +101,6 @@ export type DaemonStreamEventType =
 
 export const DAEMON_ERROR_CODES = {
   INVALID_FRAME_STRUCTURE: 'INVALID_FRAME_STRUCTURE',
-  FRAME_SIZE_EXCEEDED: 'FRAME_SIZE_EXCEEDED',
   MAX_DEPTH_EXCEEDED: 'MAX_DEPTH_EXCEEDED',
   UNKNOWN_OP: 'UNKNOWN_OP',
   INVALID_PARAMETERS: 'INVALID_PARAMETERS',
@@ -171,7 +169,7 @@ export const READ_SESSION_EVENTS_MAX_LIMIT = 1000;
 /** `readSessionEvents`: default byte budget of one page (serialized events). */
 export const READ_SESSION_EVENTS_DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 /**
- * `readSessionEvents`: hard byte cap of one page, well under {@link MAX_DAEMON_FRAME_SIZE}.
+ * `readSessionEvents`: hard byte cap of one page.
  * Larger `maxBytes` values are clamped to this; a single event above it can never be returned
  * and is reported in `omitted` instead.
  */
@@ -1097,13 +1095,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function decodeDaemonRequest(raw: string | Buffer): DaemonRequest {
   const jsonStr = typeof raw === 'string' ? raw : raw.toString('utf8');
 
-  if (Buffer.byteLength(jsonStr, 'utf8') > MAX_DAEMON_FRAME_SIZE) {
-    throw new DaemonProtocolError(
-      DAEMON_ERROR_CODES.FRAME_SIZE_EXCEEDED,
-      `Frame size exceeds ${MAX_DAEMON_FRAME_SIZE} bytes`
-    );
-  }
-
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonStr);
@@ -1185,13 +1176,6 @@ export function decodeDaemonRequest(raw: string | Buffer): DaemonRequest {
 export function decodeDaemonMessage(raw: string | Buffer): DaemonMessage {
   const jsonStr = typeof raw === 'string' ? raw : raw.toString('utf8');
 
-  if (Buffer.byteLength(jsonStr, 'utf8') > MAX_DAEMON_FRAME_SIZE) {
-    throw new DaemonProtocolError(
-      DAEMON_ERROR_CODES.FRAME_SIZE_EXCEEDED,
-      `Frame size exceeds ${MAX_DAEMON_FRAME_SIZE} bytes`
-    );
-  }
-
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonStr);
@@ -1260,16 +1244,7 @@ export function decodeDaemonMessage(raw: string | Buffer): DaemonMessage {
 export function encodeDaemonMessage(message: DaemonMessage): Buffer {
   validateJsonDepth(message);
   const json = JSON.stringify(message);
-  const buf = Buffer.from(json + '\n', 'utf8');
-
-  if (buf.length > MAX_DAEMON_FRAME_SIZE) {
-    throw new DaemonProtocolError(
-      DAEMON_ERROR_CODES.FRAME_SIZE_EXCEEDED,
-      `Serialized message exceeds maximum frame size of ${MAX_DAEMON_FRAME_SIZE} bytes`
-    );
-  }
-
-  return buf;
+  return Buffer.from(json + '\n', 'utf8');
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,7 +1255,8 @@ export function encodeDaemonMessage(message: DaemonMessage): Buffer {
  * Stream transformer for decoding NDJSON lines from stdin or socket chunks into DaemonMessage objects.
  */
 export class DaemonRpcDecoder extends Transform {
-  private buffer = '';
+  /** Pieces of the current, not yet newline-terminated line (joined once the line completes). */
+  private pending: string[] = [];
   private isClosed = false;
   private readonly stringDecoder = new StringDecoder('utf8');
 
@@ -1301,21 +1277,21 @@ export class DaemonRpcDecoder extends Transform {
             ? this.stringDecoder.write(Buffer.from(chunk, encoding))
             : this.stringDecoder.write(Buffer.from(chunk, 'utf8')))
         : '';
-    this.buffer += chunkStr;
-
-    if (Buffer.byteLength(this.buffer, 'utf8') > MAX_DAEMON_FRAME_SIZE) {
-      const err = new DaemonProtocolError(
-        DAEMON_ERROR_CODES.FRAME_SIZE_EXCEEDED,
-        `Stream buffer exceeded maximum frame size of ${MAX_DAEMON_FRAME_SIZE} bytes without newline delimiter`
-      );
-      this.isClosed = true;
-      this.destroy(err);
-      callback(err);
-      return;
+    // Only the new chunk is scanned for delimiters, so a large frame arriving in many chunks
+    // is assembled in linear time.
+    const lines: string[] = [];
+    let start = 0;
+    let newlineIdx = chunkStr.indexOf('\n', start);
+    while (newlineIdx !== -1) {
+      this.pending.push(chunkStr.slice(start, newlineIdx));
+      lines.push(this.pending.join(''));
+      this.pending = [];
+      start = newlineIdx + 1;
+      newlineIdx = chunkStr.indexOf('\n', start);
     }
-
-    const lines = this.buffer.split('\n');
-    this.buffer = lines.pop() ?? '';
+    if (start < chunkStr.length) {
+      this.pending.push(chunkStr.slice(start));
+    }
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -1351,23 +1327,14 @@ export class DaemonRpcDecoder extends Transform {
 
     const trailing = this.stringDecoder.end();
     if (trailing) {
-      this.buffer += trailing;
+      this.pending.push(trailing);
     }
+    const rest = this.pending.join('');
+    this.pending = [];
 
-    if (Buffer.byteLength(this.buffer, 'utf8') > MAX_DAEMON_FRAME_SIZE) {
-      const err = new DaemonProtocolError(
-        DAEMON_ERROR_CODES.FRAME_SIZE_EXCEEDED,
-        `Stream buffer exceeded maximum frame size of ${MAX_DAEMON_FRAME_SIZE} bytes without newline delimiter`
-      );
-      this.isClosed = true;
-      this.destroy(err);
-      callback(err);
-      return;
-    }
-
-    if (this.buffer.trim().length > 0) {
+    if (rest.trim().length > 0) {
       try {
-        const msg = decodeDaemonMessage(this.buffer.trim());
+        const msg = decodeDaemonMessage(rest.trim());
         this.push(msg);
         callback();
       } catch (err: unknown) {
@@ -1389,7 +1356,7 @@ export class DaemonRpcDecoder extends Transform {
 
   override _destroy(error: Error | null, callback: (error: Error | null) => void): void {
     this.isClosed = true;
-    this.buffer = '';
+    this.pending = [];
     this.stringDecoder.end();
     callback(error);
   }
@@ -1397,6 +1364,11 @@ export class DaemonRpcDecoder extends Transform {
 
 /**
  * Stream transformer for encoding DaemonMessage objects into NDJSON chunks.
+ *
+ * A message that cannot be serialized (e.g. too deeply nested) is dropped and reported through an
+ * `'encodeError'` event `(error, message)` instead of failing the stream: an errored encoder would
+ * break the connection and, without an `'error'` listener, take the whole process down with it.
+ * Owners reply to or reject the affected request from that event.
  */
 export class DaemonRpcEncoder extends Transform {
   constructor() {
@@ -1404,20 +1376,48 @@ export class DaemonRpcEncoder extends Transform {
   }
 
   _transform(message: DaemonMessage, _encoding: BufferEncoding, callback: TransformCallback): void {
+    let buf: Buffer;
     try {
-      const buf = encodeDaemonMessage(message);
-      this.push(buf);
-      callback();
+      buf = encodeDaemonMessage(message);
     } catch (err: unknown) {
       const protocolErr =
         err instanceof DaemonProtocolError
           ? err
           : new DaemonProtocolError(
               DAEMON_ERROR_CODES.INVALID_FRAME_STRUCTURE,
-              'Encoder error',
+              err instanceof Error ? `Encoder error: ${err.message}` : 'Encoder error',
               err
             );
-      callback(protocolErr);
+      if (this.listenerCount('encodeError') > 0) {
+        this.emit('encodeError', protocolErr, message);
+      } else {
+        process.stderr.write(`[DaemonRpcEncoder] dropped unserializable message: ${protocolErr.message}\n`);
+      }
+      callback();
+      return;
     }
+    this.push(buf);
+    callback();
   }
+}
+
+/**
+ * Builds the error response sent in place of a response that could not be serialized.
+ * Returns `null` for messages that are not responses (stream events, requests) or that are already
+ * such a fallback, so callers never loop.
+ */
+export function unserializableResponseFallback(message: unknown, error: Error): DaemonMessage | null {
+  if (!message || typeof message !== 'object') return null;
+  const msg = message as { id?: unknown; op?: unknown; ok?: unknown; event?: unknown; error?: { code?: unknown } };
+  if (typeof msg.id !== 'string' || typeof msg.ok !== 'boolean' || msg.event !== undefined) return null;
+  if (msg.ok === false && msg.error?.code === DAEMON_ERROR_CODES.INTERNAL_ERROR) return null;
+  return {
+    id: msg.id,
+    op: typeof msg.op === 'string' ? msg.op : 'unknown',
+    ok: false,
+    error: {
+      code: DAEMON_ERROR_CODES.INTERNAL_ERROR,
+      message: `Daemon response could not be serialized: ${error.message}`,
+    },
+  } as unknown as DaemonMessage;
 }

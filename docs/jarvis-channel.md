@@ -96,7 +96,7 @@ jarvisd node 和 enkeep 在同一台 Mac 上时，走 127.0.0.1 就够了，不�
 
 - **新 daemon op `readSessionEvents`**：参数 `{sessionId, afterSeq?, beforeSeq?, turns?, limit, maxBytes}`，返回 `{events, firstSeq, lastSeq, hasMore, generation}`。
   - 只读：用 DSH 的会话持久化读 header 和日志，**不激活 Agent，不写 `storages/`**。
-  - 每页受字节上限约束，不超过 10 MiB 的帧上限。`exportForkSeed` 是整段导出、还会重排 seq，不能拿来用。
+  - 每页受字节上限约束（分页大小，见 `READ_SESSION_EVENTS_*`）。`exportForkSeed` 是整段导出、还会重排 seq，不能拿来用。
 - **新 daemon op `readAttachment`**：参数 `{sessionId, attachmentId}`，给 Jarvis 的 `session.image` 用。
 - **宿主侧订阅 `turn/event`**：每个用户的 `DaemonTransport` 都订阅它的 `'stream'`。这些事件今天已经带着 DSH seq 到了宿主，只是被丢掉了。
   - 宿主不另外落库：实时的直接推，断线后用 `readSessionEvents(afterSeq)` 补。daemon 广播不带回放，所以靠这一步补洞。

@@ -4,7 +4,6 @@ import {
   DaemonRpcEncoder,
   encodeDaemonMessage,
   DAEMON_ERROR_CODES,
-  MAX_DAEMON_FRAME_SIZE,
   type DaemonMessage,
   type DaemonRequest,
   type DaemonResponse,

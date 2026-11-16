@@ -953,22 +953,30 @@ describe('Production Runtime Runner Daemon E2E Deterministic Tests', () => {
     });
   });
 
-  describe('13. Framing Protection & Memory DoS Guard', () => {
-    it('destroys stream with FRAME_SIZE_EXCEEDED when buffer exceeds 10MB limit without newline', async () => {
+  describe('13. Large Frames', () => {
+    it('keeps buffering a frame larger than 10 MiB until its newline arrives', async () => {
       const decoder = new DaemonRpcDecoder();
       let errorEmitted: any = null;
+      const received: any[] = [];
 
       decoder.on('error', (err) => {
         errorEmitted = err;
       });
+      decoder.on('data', (msg) => received.push(msg));
 
-      // Send 11MB of characters without newline
-      const largeChunk = Buffer.alloc(11 * 1024 * 1024, 0x61); // 11MB of 'a'
-      decoder.write(largeChunk);
+      const payload = 'a'.repeat(11 * 1024 * 1024);
+      const frame = Buffer.from(JSON.stringify({ id: 'big_1', op: 'health', ok: true, payload }) + '\n', 'utf8');
+      // Everything except the newline first: no error, nothing emitted yet
+      decoder.write(frame.subarray(0, frame.length - 1));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(errorEmitted).toBeNull();
+      expect(received).toHaveLength(0);
 
-      await new Promise((r) => setTimeout(r, 50));
-      expect(errorEmitted).toBeDefined();
-      expect(errorEmitted.code).toBe(DAEMON_ERROR_CODES.FRAME_SIZE_EXCEEDED);
+      decoder.write(frame.subarray(frame.length - 1));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(errorEmitted).toBeNull();
+      expect(received).toHaveLength(1);
+      expect(received[0].payload.length).toBe(payload.length);
     });
   });
 
