@@ -15,7 +15,6 @@ import {
   DAEMON_OPS,
   DAEMON_ERROR_CODES,
   DAEMON_STREAM_EVENTS,
-  MAX_DAEMON_FRAME_SIZE,
   DaemonRpcDecoder,
   DaemonRpcEncoder,
   encodeDaemonMessage,

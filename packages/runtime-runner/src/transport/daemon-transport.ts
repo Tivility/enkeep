@@ -11,7 +11,7 @@
  * - Automatic exponential backoff reconnection on unexpected disconnects.
  * - Request correlation via unique frame IDs.
  * - Backpressure bounding (max 32 concurrent requests).
- * - Payload size caps and depth validation (MAX_DAEMON_FRAME_SIZE).
+ * - Payload depth validation (MAX_JSON_DEPTH).
  * - Request timeout and cancellation support.
  * - Turn journal reconciliation on disconnect/reconnect.
  * - No raw Docker/daemon errors leaked to callers.
@@ -31,7 +31,6 @@ import {
   DAEMON_OPS,
   DAEMON_ERROR_CODES,
   DAEMON_STREAM_EVENTS,
-  MAX_DAEMON_FRAME_SIZE,
   DaemonRpcDecoder,
   DaemonRpcEncoder,
   DaemonProtocolError,
@@ -290,6 +289,21 @@ export class DaemonDockerTransport extends EventEmitter implements RuntimeTransp
       this.execHandle = handle;
       this.decoder = new DaemonRpcDecoder();
       this.encoder = new DaemonRpcEncoder();
+
+      this.encoder.on('encodeError', (err: Error, message: unknown) => {
+        const reqId = (message as { id?: unknown } | null)?.id;
+        if (typeof reqId !== 'string') return;
+        const pending = this.pendingRequests.get(reqId);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pendingRequests.delete(reqId);
+        pending.reject(new DockerDaemonError('Failed to encode daemon request frame', err));
+      });
+
+      this.encoder.on('error', (err: Error) => {
+        if (this.generation !== currentGen) return;
+        this.handleBridgeDisconnect(err);
+      });
 
       this.decoder.on('data', (message: unknown) => {
         if (this.generation !== currentGen) return;
