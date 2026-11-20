@@ -197,9 +197,11 @@ describe('Streaming Events Transport via PlatformProxyHandler & EventsStreamHand
     const aliasRows = db.prepare('SELECT COUNT(*) as count FROM web_events WHERE user_id = ?').get('alice') as any;
     expect(aliasRows.count).toBe(0);
 
-    // 2. Invariant: NO turnId in public payload
+    // 2. Invariant: the stored payload keeps the envelope turnId (the platform reads it to route
+    //    continuations), but ad-hoc payload fields such as internalTurnId are not persisted.
+    //    The browser-facing projection that must omit turnId is covered by
+    //    platform-server/tests/poll-events-omit-turn-id.test.ts.
     for (const r of rows) {
-      expect(r.payload).not.toContain('turn_SECRET_INTERNAL_ID_1');
       expect(r.payload).not.toContain('LEAK_TURN_ID');
     }
 
