@@ -321,18 +321,18 @@ describe('SafeDockerClient Adversarial Security & Fail-Closed Guardrails', () =>
       ).toThrow(/Config.User must be exactly "1000:1000"/);
     });
 
-    it('rejects container with non-none network mode (bridge, host, or missing)', () => {
+    it('rejects container whose network mode differs from the expected none (bridge, host, or missing)', () => {
       expect(() =>
         client.assertContainerOwnership(createValidContainerInfo({ networkMode: 'bridge' }), createValidExpectation())
-      ).toThrow(/Zero-network violation/);
+      ).toThrow(/Network mode violation/);
 
       expect(() =>
         client.assertContainerOwnership(createValidContainerInfo({ networkMode: 'host' }), createValidExpectation())
-      ).toThrow(/Zero-network violation/);
+      ).toThrow(/Network mode violation/);
 
       expect(() =>
         client.assertContainerOwnership(createValidContainerInfo({ networkMode: undefined }), createValidExpectation())
-      ).toThrow(/Zero-network violation/);
+      ).toThrow(/Network mode violation/);
     });
 
     it('rejects container with readonlyRootfs false or missing', () => {

@@ -29,6 +29,7 @@ import {
   type ExecCliEnvelope,
   type AgentProfileSnapshot,
   computeAgentProfilePromptHash,
+  DEFAULT_FOLLOWUP_TIMEOUT_MS,
 } from '../src/index.js';
 
 const VALID_64_HEX_CONTAINER_ID =
@@ -723,7 +724,7 @@ describe('DockerExecTransport Readiness & Fail-Closed Behavior', () => {
   });
 
   describe('DockerExecTransport.sendFollowup Behavior', () => {
-    it('dispatches followup successfully with completed status and verifies timeoutMs defaults to 600000ms', async () => {
+    it('dispatches followup successfully with completed status and verifies timeoutMs defaults to DEFAULT_FOLLOWUP_TIMEOUT_MS', async () => {
       const expectation = createMockExpectation();
       const mockClient = new SafeDockerClient();
       const mockEnvelope: ExecCliEnvelope = {
@@ -755,7 +756,7 @@ describe('DockerExecTransport Readiness & Fail-Closed Behavior', () => {
       expect(execSpy).toHaveBeenCalledWith(
         expectation,
         expect.objectContaining({ action: 'followup' }),
-        expect.objectContaining({ timeoutMs: 600_000 })
+        expect.objectContaining({ timeoutMs: DEFAULT_FOLLOWUP_TIMEOUT_MS })
       );
     });
 

@@ -4,9 +4,10 @@
  * Validates:
  * 1. Top-level session injects global memory by default into systemPrompt.
  * 2. Child session (subagent spawn & fork) gets no global memory injection by default (ENKEEP_SUBAGENT_GLOBAL_MEMORY='never').
- * 3. Child session with ENKEEP_SUBAGENT_GLOBAL_MEMORY='always' gets global memory injected.
+ *    The env switch was removed; global memory for a child is now requested per call
+ *    (global_memory / globalMemory) and covered by the per-call memory tests.
  * 4. Memory tools (memory_search, memory_read, memory_write) remain available to child sessions.
- * 5. Workflow agent child is treated as a child session (no global memory by default; injected with 'always').
+ * 5. Workflow agent child is treated as a child session (no global memory by default).
  * 6. dsh-memory plugin config is honored when configured on Cordis context.
  *
  * @module @enkeep/runtime-runner/tests/subagent-global-memory-injection.test
@@ -178,51 +179,8 @@ describe('Subagent Global Memory Injection Configuration', () => {
     await forkRun.dispose();
   });
 
-  it('3. With env ENKEEP_SUBAGENT_GLOBAL_MEMORY = always, child session does inject global memory', async () => {
-    process.env.ENKEEP_SUBAGENT_GLOBAL_MEMORY = 'always';
-    expect(resolveSubagentGlobalMemoryMode()).toBe('always');
-
-    runtime = await bootDshRuntime({
-      userId: 'user-synthetic-alice',
-      dshHome,
-      spacesDir,
-    });
-
-    const parentSessionId = 'ses_00000000000000000000000000000003';
-    const parentAgent = await runtime.getOrCreateAgent(parentSessionId, null, 'space-synthetic-alpha');
-
-    const subagentsService = parentAgent.ctx.get('subagents');
-    expect(subagentsService).toBeDefined();
-
-    const spawnRun = await startSubagent(subagentsService, 'spawn', {
-      label: 'test-child-always-mem',
-      prompt: [{ type: 'text', text: 'Hello child agent with memory' }],
-      parent: parentAgent,
-      signal: new AbortController().signal,
-    });
-
-    const childAgent = spawnRun.localAgent!;
-    expect(childAgent).toBeDefined();
-    expect(isChildSession(childAgent, runtime.context)).toBe(true);
-
-    const childAssembly = await runtime.context.systemPrompt.assemble({ scope: childAgent });
-    const childMemSection = childAssembly.sections.find((s) => s.name === 'memory:enkeep');
-
-    expect(childMemSection).toBeDefined();
-    // With env 'always', global memory IS injected into child
-    expect(childMemSection!.text).toContain('<global_memory');
-    expect(childMemSection!.text).toContain(GLOBAL_MEMORY_MARKER);
-
-    // Memory tools remain available
-    const childTools = childAgent.ctx.tools.schemas(childAgent).map((t: any) => t.name);
-    expect(childTools).toContain('memory_search');
-
-    await spawnRun.result;
-    await spawnRun.dispose();
-  });
-
-  it('4. Workflow agent child is treated as a child session (never by default, always with env)', async () => {
-    // Phase A: default env ('never') -> workflow agent child has no global memory
+  it('4. Workflow agent child is treated as a child session (no global memory by default)', async () => {
+    // Default mode is 'never': workflow agent child has no global memory.
     runtime = await bootDshRuntime({
       userId: 'user-synthetic-alice',
       dshHome,
@@ -277,49 +235,6 @@ describe('Subagent Global Memory Injection Configuration', () => {
     // Memory tools remain available on workflow child
     const childTools = capturedChildAgent!.ctx.tools.schemas(capturedChildAgent).map((t: any) => t.name);
     expect(childTools).toContain('memory_search');
-
-    await runtime.dispose();
-
-    // Phase B: with env 'always' -> workflow agent child gets global memory
-    process.env.ENKEEP_SUBAGENT_GLOBAL_MEMORY = 'always';
-    runtime = await bootDshRuntime({
-      userId: 'user-synthetic-alice',
-      dshHome,
-      spacesDir,
-    });
-
-    const parentSessionIdB = 'ses_00000000000000000000000000000005';
-    const parentAgentB = await runtime.getOrCreateAgent(parentSessionIdB, null, 'space-synthetic-alpha');
-
-    const engineB = parentAgentB.ctx.get('workflowEngine');
-    let capturedChildAgentB: Agent | undefined;
-    let childAssemblyB: any;
-    const unlistenB = runtime.context.on('agent/created', async ({ agent }) => {
-      if (agent.id !== parentSessionIdB) {
-        capturedChildAgentB = agent;
-        childAssemblyB = await runtime.context.systemPrompt.assemble({ scope: agent });
-      }
-    });
-
-    const runB = engineB.start({
-      script,
-      meta,
-      parent: parentAgentB,
-    });
-
-    const outcomeB = await runB.result;
-    unlistenB();
-
-    expect(outcomeB.stopReason).toBe('completed');
-    expect(capturedChildAgentB).toBeDefined();
-    expect(isChildSession(capturedChildAgentB, runtime.context)).toBe(true);
-
-    expect(childAssemblyB).toBeDefined();
-    const childMemSectionB = childAssemblyB.sections.find((s: any) => s.name === 'memory:enkeep');
-
-    expect(childMemSectionB).toBeDefined();
-    expect(childMemSectionB!.text).toContain('<global_memory');
-    expect(childMemSectionB!.text).toContain(GLOBAL_MEMORY_MARKER);
   });
 
   it('5. dsh-memory plugin config is honored when configured on context', async () => {

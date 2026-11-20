@@ -317,11 +317,10 @@ describe('PlatformProxyHandler PUT /api/manage/tasks/:id Tests', () => {
       expect(res.body.error.code).toBe('METHOD_NOT_ALLOWED');
     });
 
-    it('rejects GET /api/manage/tasks/:id with 405 Method Not Allowed', async () => {
+    it('supports GET /api/manage/tasks/:id (get_task) without 405 Method Not Allowed', async () => {
       const res = await sendRequest(handler, 'GET', `/api/manage/tasks/${TASK_ALICE}`);
 
-      expect(res.statusCode).toBe(405);
-      expect(res.body.error.code).toBe('METHOD_NOT_ALLOWED');
+      expect(res.statusCode).toBe(200);
     });
 
     it('supports DELETE /api/manage/tasks/:id without 405 Method Not Allowed', async () => {
