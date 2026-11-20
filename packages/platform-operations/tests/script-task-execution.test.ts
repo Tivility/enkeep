@@ -226,7 +226,11 @@ describe('Script Task Execution via Task Worker (0-Token, Exit Codes, Timeout, C
       title: 'External Signal Kill Task',
       payload: {
         type: 'script',
-        command: '/bin/sh -c "(sleep 0.1 && kill -TERM $$) & exec sleep 10"',
+        // `$$` must be the spawned shell itself. A nested `/bin/sh -c "..."` made the
+        // outer shell expand `$$`; shells that do not exec into the nested one (dash
+        // on Linux) then lost only the outer shell to SIGTERM while the inner shell
+        // and `sleep 10` kept stdio open, delaying 'close' past the test timeout.
+        command: '(sleep 0.1 && kill -TERM $$) & exec sleep 10',
         spaceId: validSpaceId,
       } as ScriptTaskPayload,
     });
