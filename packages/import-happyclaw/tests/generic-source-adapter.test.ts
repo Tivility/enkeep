@@ -321,6 +321,9 @@ describe('Multi-Scale Dynamic Temporary Databases (0, 1, 100 Conversations)', ()
     const totalChats = 100
     let totalMessagesCreated = 0
 
+    // Seed in one transaction: ~600 autocommit inserts cost ~2400 fsyncs, which on
+    // a slow or busy disk pushes this test past its timeout before the importer runs.
+    db.exec('BEGIN')
     for (let i = 1; i <= totalChats; i++) {
       const channel = i % 4 === 0 ? 'feishu' : i % 4 === 1 ? 'web' : i % 4 === 2 ? 'telegram' : 'whatsapp'
       const jid = `${channel}:chat_${i.toString().padStart(3, '0')}`
@@ -341,6 +344,7 @@ describe('Multi-Scale Dynamic Temporary Databases (0, 1, 100 Conversations)', ()
         totalMessagesCreated++
       }
     }
+    db.exec('COMMIT')
 
     db.close()
 
