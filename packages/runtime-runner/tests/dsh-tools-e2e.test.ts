@@ -407,7 +407,8 @@ describe('DSH Tools End-to-End Execution in Agent Turns', () => {
     try {
       const health = await runtime.getHealth();
       expect(health.status).toBe('ok');
-      expect(health.toolsCount).toBe(9);
+      // 9 original tools + update_task, cancel_task, list_tasks, get_task.
+      expect(health.toolsCount).toBe(13);
       expect(health.toolsOperational).toBe(true);
 
       const prompt = 'Please open website [enkeep-test-tool-call=browser_open:{"url":"https://example.com"}]';

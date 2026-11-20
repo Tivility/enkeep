@@ -93,14 +93,14 @@ describe('Container Specification Validator (Zero-Network Architecture)', () => 
   });
 
   describe('Strict Zero-Network Enforcement', () => {
-    it('rejects networkMode bridge', () => {
-      const spec: Record<string, unknown> = {
-        ...createValidSpec(),
-        networkMode: 'bridge',
-      };
-      const result = validateContainerSpec(spec);
-      expect(result.valid).toBe(false);
-      expect(result.errors.some((e) => e.includes('networkMode MUST be "none"'))).toBe(true);
+    it('accepts networkMode bridge and rejects any other non-none mode', () => {
+      const bridge = validateContainerSpec({ ...createValidSpec(), networkMode: 'bridge' });
+      expect(bridge.errors).toEqual([]);
+      expect(bridge.valid).toBe(true);
+
+      const host = validateContainerSpec({ ...createValidSpec(), networkMode: 'host' });
+      expect(host.valid).toBe(false);
+      expect(host.errors.some((e) => e.includes('networkMode MUST be "none" or "bridge"'))).toBe(true);
     });
 
     it('rejects published ports under zero-network mode', () => {

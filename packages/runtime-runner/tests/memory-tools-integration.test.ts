@@ -53,6 +53,14 @@ describe('Memory Tools Integration in DSH Runtime', () => {
       baseURL: 'http://127.0.0.1:9999/platform',
       timeoutMs: 1000,
     });
+    // Subagent spawn must register its descendant route with the platform before the child
+    // starts; nothing listens on this address, so answer only that route locally and leave
+    // the memory endpoints unreachable to keep exercising the filesystem fallback.
+    const realRequest = mockPlatformClient.request.bind(mockPlatformClient);
+    (mockPlatformClient as any).request = async (requestPath: string, options?: any) =>
+      requestPath.startsWith('/api/routes/descendant')
+        ? { status: 200, body: { success: true }, headers: {} }
+        : realRequest(requestPath, options);
 
     const runtime = await bootDshRuntime({
       userId: 'test-user',

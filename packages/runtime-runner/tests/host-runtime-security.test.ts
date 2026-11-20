@@ -195,6 +195,27 @@ describe('Host Runtime Security, Authentication & Sandbox Confinement', () => {
     it('accepts requests with valid Authorization Bearer header and matching opaque path prefix', async () => {
       let handlerInvoked = false;
       const proxyServer = new HostLlmProxyServer({
+        // The proxy no longer falls back to a local DSH home when no deployment config is
+        // given (it answers 503 missing_llm_config), so supply a synthetic one.
+        deploymentConfig: {
+          dshHome: tmpDataRoot,
+          providers: {
+            'cpa-claude': {
+              api: 'openai-completions',
+              baseURL: 'https://upstream.example.test/v1',
+              apiKeyEnv: 'CPA_TOKEN',
+              models: [{ id: 'synthetic-model' }],
+            },
+          },
+          tokens: {
+            CPA_TOKEN: 'synthetic-token',
+          },
+          defaultModel: {
+            provider: 'cpa-claude',
+            model: 'synthetic-model',
+          },
+          allowedHosts: ['upstream.example.test'],
+        },
         fetchImpl: (async () => {
           handlerInvoked = true;
           return new Response(JSON.stringify({ choices: [] }), {
