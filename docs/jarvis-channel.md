@@ -277,8 +277,10 @@ Jarvis 只根据 runtime 报的状态来决定「完成未看」和「做完了�
   ```json
   {"runtime": "enkeep", "name": "Enkeep", "agent": "dsh", "version": "<ver>", "instance": "<每个进程一个随机值>",
    "launcher": "enkeep", "launcher_model": "DeepSeek Harness",
-   "caps": {"start": true, "send": true, "interrupt": true, "rename": true, "close": true}}
+   "caps": {"start": true, "send": true, "interrupt": true, "rename": true, "close": true, "history": true}}
   ```
+
+  `history` 表示能答 `sessions.history`（见 8.4）。不认识它的 node 会忽略。
 
   node 回 `{protocol, node_version, hub, features}`。`hub` 为 false 表示 node 现在没连着 hub，这时不要等手机回答。
 - 事件 `runtime.sessions {sessions}`：
@@ -308,6 +310,7 @@ Jarvis 只根据 runtime 报的状态来决定「完成未看」和「做完了�
 | `session.send` | `{session_id, text, images?, client_msg_id}` → `{ok}`。同一个 `client_msg_id` 只投递一次，重试时直接拿第一次的结果 |
 | `session.interrupt` / `session.rename {title}` / `session.close` | → `{ok}` |
 | `session.start` | `{cwd, prompt?}` → `{session: <行>}` |
+| `sessions.history` | `{since, until?, cursor?, limit?}` → `{rows, next_cursor, complete}`。按时间段列会话，包括已归档的（Persona 议题 nwverse/persona#11529）。<br>• 时间取 `active_at`（最后一条消息的时间），没有再用 `updated_at`、`started_at`。归档会把路由的 `updated_at` 改成归档时刻，所以不靠它；<br>• 窗口 `[since, until)`，新的在前，时间相同按 `session_id` 排；`limit` 默认 200，最大 500；<br>• 窗口、排序、cursor 和参数检查照 Persona 运行时 SDK 的 `historyPage` 移植（`packages/channel-jarvis/src/history.ts`），两边要一起改；<br>• 行同会话行，另加 `archived`、`active_at`、`started_at`、`origin`、`user_messages`。已归档的路由，或已归档空间里的路由，状态报 `offline`；<br>• `origin`：第一条用户消息所在那轮是定时任务 → `automation`，来自聊天渠道或 Jarvis → `user`，其他情况（Web UI，外部定时器也走这里）不填；<br>• `user_messages`：用户消息条数，不算定时任务那几轮的提示；<br>• deleted 的路由、deleted 空间里的路由都不列。不在会话列表里的会话照样能读 `session.items`；已归档的会话 send 和 watch 回 `not_found` |
 | 其他方法 | 回 `code: unsupported` |
 
 ### 8.5 DSH 事件 → item

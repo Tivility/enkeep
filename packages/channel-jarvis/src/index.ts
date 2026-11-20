@@ -13,6 +13,7 @@
 export type {
   DshSessionEvent,
   JarvisChannelSource,
+  JarvisHistoryRow,
   JarvisSessionRow,
   JarvisSourceListener,
   PendingApprovalCard,
@@ -87,6 +88,18 @@ export {
   type MapOptions,
   type UserMessageClass,
 } from './mapper.js';
+
+export {
+  HISTORY_LIMIT,
+  HISTORY_MAX,
+  historyAt,
+  historyPage,
+  historyParams,
+  historyResult,
+  type HistoryPageResult,
+  type HistoryParams,
+  type HistoryQuery,
+} from './history.js';
 
 export {
   DEFAULT_PAGING_LIMITS,

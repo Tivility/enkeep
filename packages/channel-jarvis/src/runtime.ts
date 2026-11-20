@@ -20,6 +20,7 @@ import {
   toWireItem,
   type JarvisItem,
 } from './mapper.js';
+import { historyParams, historyResult } from './history.js';
 import { DEFAULT_PAGING_LIMITS, parseItemsQuery, readItems, type PagingLimits } from './paging.js';
 import { Peer, RpcError, describe, errorCode, type JarvisLogger, type MessageSocket } from './rpc.js';
 import type {
@@ -356,7 +357,15 @@ export class JarvisRuntime {
       instance: JARVIS_RUNTIME_INSTANCE,
       launcher: this.options.launcher ?? 'enkeep',
       launcher_model: this.options.launcherModel ?? 'DeepSeek Harness',
-      caps: { start: true, send: true, interrupt: true, rename: true, close: true },
+      caps: {
+        start: true,
+        send: true,
+        interrupt: true,
+        rename: true,
+        close: true,
+        // sessions.history (nwverse/persona#11529); nodes that predate it ignore caps they do not know.
+        ...(typeof this.source.listHistory === 'function' ? { history: true } : {}),
+      },
     };
   }
 
@@ -391,6 +400,8 @@ export class JarvisRuntime {
     const params = asRecord(raw) ?? {};
     try {
       switch (method) {
+        case 'sessions.history':
+          return await this.history(params);
         case 'session.items':
           return await this.items(params);
         case 'session.item':
@@ -434,6 +445,14 @@ export class JarvisRuntime {
       this.log.warn?.({ method, err: describe(err) }, 'jarvis runtime: request failed');
       throw new RpcError('internal error', 'internal');
     }
+  }
+
+  /** As the Persona SDK answers it (runtime-sdk lib/runtime.js at e4b2e0fa98): params checked, until defaults to now. */
+  private async history(params: Record<string, unknown>): Promise<unknown> {
+    if (typeof this.source.listHistory !== 'function') throw new RpcError('unsupported: history', 'unsupported');
+    const q = historyParams(params);
+    const until = typeof params.until === 'string' && params.until !== '' ? params.until : new Date(q.until).toISOString();
+    return historyResult(await this.source.listHistory({ since: params.since as string, until, cursor: q.cursor, limit: q.limit }));
   }
 
   private async items(params: Record<string, unknown>): Promise<unknown> {
