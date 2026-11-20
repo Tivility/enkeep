@@ -179,11 +179,12 @@ describe('Dynamic Tenant Provisioning & Runtime Lifecycle (E2E)', () => {
       const quotaRows = db.prepare('SELECT resource, limit_amount FROM quota_limits WHERE user_id = ?').all(charlieUserId) as Array<{ resource: string; limit_amount: number }>;
       expect(quotaRows.length).toBe(5);
       const quotaMap = new Map(quotaRows.map((r) => [r.resource, r.limit_amount]));
-      expect(quotaMap.get('turns')).toBe(1000);
-      expect(quotaMap.get('messages')).toBe(1000);
-      expect(quotaMap.get('tokens')).toBe(1000000);
-      expect(quotaMap.get('storage_bytes')).toBe(10485760);
-      expect(quotaMap.get('api_calls')).toBe(5000);
+      // Demo fixture quotas are unlimited (-1) for every resource
+      expect(quotaMap.get('turns')).toBe(-1);
+      expect(quotaMap.get('messages')).toBe(-1);
+      expect(quotaMap.get('tokens')).toBe(-1);
+      expect(quotaMap.get('storage_bytes')).toBe(-1);
+      expect(quotaMap.get('api_calls')).toBe(-1);
 
       const spaceRows = db.prepare('SELECT id, folder, status FROM spaces WHERE user_id = ?').all(charlieUserId) as Array<{ id: string; folder: string; status: string }>;
       expect(spaceRows.length).toBe(1);

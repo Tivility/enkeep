@@ -306,9 +306,12 @@ describe('Cross-Layer DeliveryGateway & ProviderRegistry Background Tasks Wiring
     });
 
     expect(hostCalls.list).toContain(hostDshSessionId);
-    expect(tasksRes.items).toHaveLength(1);
-    expect(tasksRes.items[0].id).toBe(syntheticChildId);
-    expect(tasksRes.items[0].shortId).toBe('h099');
+    // The subagent traced to this chat is listed, and so is the untraced
+    // workflow job (no originTurnId) because the session is bound to this chat.
+    expect(tasksRes.items).toHaveLength(2);
+    const byShortId = new Map(tasksRes.items.map((t: any) => [t.shortId, t.id]));
+    expect(byShortId.get('h099')).toBe(syntheticChildId);
+    expect(byShortId.get('h002')).toBe('job_synth_host_002');
   });
 
   it('5. Stop background task translates routeId -> dsh_session_id across HTTP API and /bg stop command', async () => {

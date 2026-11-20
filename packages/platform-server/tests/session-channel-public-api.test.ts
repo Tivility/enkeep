@@ -118,13 +118,16 @@ describe('Session Channel Public API Contract & UI Badge Reader Tests', () => {
       for (const forbiddenKey of FORBIDDEN_KEYS) {
         expect(session).not.toHaveProperty(forbiddenKey);
       }
-      // Verify only known public fields exist
+      // Verify only known public fields exist (list results also carry lastActivityAt)
       const keys = Object.keys(session).sort();
       expect(keys).toEqual([
+        'cacheRetention',
         'channel',
+        'contextWindow',
         'createdAt',
         'currentGeneration',
         'id',
+        'lastActivityAt',
         'spaceId',
         'status',
         'title',

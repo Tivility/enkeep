@@ -163,6 +163,12 @@ describe('G11-P2 Scoped Isolated Dispatcher', () => {
     };
   }
 
+  function getMessagesForSession(sessionId: string): Array<{ role: string; content: string; status: string; turn_id: string | null }> {
+    return db
+      .prepare('SELECT role, content, status, turn_id FROM web_messages WHERE user_id = ? AND session_id = ? ORDER BY created_at ASC')
+      .all(tenantAlice, sessionId) as Array<{ role: string; content: string; status: string; turn_id: string | null }>;
+  }
+
   function getMessageCountForSession(sessionId: string): number {
     const row = db
       .prepare('SELECT COUNT(*) as cnt FROM web_messages WHERE user_id = ? AND session_id = ?')
@@ -201,9 +207,19 @@ describe('G11-P2 Scoped Isolated Dispatcher', () => {
     expect(isolatedSessionId).not.toBe(validAliceSessionId);
     expect(isolatedSessionId).toMatch(/^ses_[0-9a-f]{32}$/);
 
-    // Primary session messages count is completely unchanged (0 before, 0 after)
-    const primaryMsgCountAfter = getMessageCountForSession(validAliceSessionId);
-    expect(primaryMsgCountAfter).toBe(0);
+    // The task turn never runs in the primary session; the only message posted
+    // there is the completion notice carrying the isolated reply.
+    const isolatedAssistant = getMessagesForSession(isolatedSessionId).find((m) => m.role === 'assistant');
+    expect(isolatedAssistant).toBeDefined();
+    const primaryMsgs = getMessagesForSession(validAliceSessionId);
+    expect(primaryMsgs).toEqual([
+      {
+        role: 'assistant',
+        content: `⚡ 并行任务已完成 [0123] Isolated Test Prompt Task\n\n${isolatedAssistant!.content}`,
+        status: 'delivered',
+        turn_id: null,
+      },
+    ]);
 
     // Canonical session on spaces table remains the primary session (not mutated!)
     const spaceRow = db
@@ -274,8 +290,13 @@ describe('G11-P2 Scoped Isolated Dispatcher', () => {
     expect(turnRun.status).toBe('failed');
     expect(turnRun.error).toBeTruthy();
 
-    // Primary session is still 0 messages (no contamination on failure)
-    expect(getMessageCountForSession(validAliceSessionId)).toBe(0);
+    // No task turn content reaches the primary session; only the failure notice is posted
+    const primaryMsgs = getMessagesForSession(validAliceSessionId);
+    expect(primaryMsgs.length).toBe(1);
+    expect(primaryMsgs[0].role).toBe('assistant');
+    expect(primaryMsgs[0].status).toBe('delivered');
+    expect(primaryMsgs[0].turn_id).toBeNull();
+    expect(primaryMsgs[0].content).toMatch(/^⚡ 并行任务失败 \[0123\] Isolated Test Prompt Task\n\n.*Turn execution failed/s);
   });
 
   // 4. Legacy existing_session compatibility: existing_session executes directly on primary session

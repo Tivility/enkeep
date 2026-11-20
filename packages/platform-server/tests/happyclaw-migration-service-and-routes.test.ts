@@ -612,7 +612,14 @@ describe('HappyClaw Migration Service & Backend Routes', () => {
       // 1. Session is listed in platformApi
       const sessions = await platformApi.listSessions('alice')
       expect(sessions.length).toBeGreaterThanOrEqual(1)
-      const migratedSession = sessions[0]
+      // Sessions are ordered by latest activity, so pick the web chat's session
+      // by its migrated space instead of relying on list position.
+      const spaces = await platformApi.listSpaces('alice')
+      const webSpace = spaces.find((sp) => sp.name === 'Alice Space')
+      expect(webSpace).toBeDefined()
+      const webSessions = sessions.filter((sess) => sess.spaceId === webSpace!.id)
+      expect(webSessions).toHaveLength(1)
+      const migratedSession = webSessions[0]
 
       // 2. Fetch messages for migrated session
       const history = await platformApi.listMessages('alice', migratedSession.id)

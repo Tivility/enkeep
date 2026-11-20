@@ -363,12 +363,35 @@ describe('Authenticated Operations API Producer & Governance Contract Tests', ()
         },
         body: JSON.stringify({
           title: 'Test Task',
-          command: 'bash -c "rm -rf /"', // Forbidden execution key
+          prompt: 'Summarize the notes',
+          unexpectedField: 'not part of the task contract',
         }),
       });
       expect(res.status).toBe(400);
       const body = await res.json();
-      expect(body.error.message).toContain('Unexpected field "command"');
+      expect(body.error.message).toContain('Unexpected field "unexpectedField"');
+    });
+
+    it('rejects a script command from a non-admin user with 403', async () => {
+      // "command" is a recognized key since script tasks exist; only admins may use it.
+      const res = await fetch(`${urlWithOps}/api/manage/tasks`, {
+        method: 'POST',
+        headers: {
+          Cookie: bobCookie,
+          'X-Enkeep-CSRF': testCsrfToken,
+          Origin: urlWithOps,
+          'Idempotency-Key': '22222222-3333-4444-8555-777777777777',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          title: 'Test Task',
+          command: 'bash -c "rm -rf /"',
+        }),
+      });
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error.code).toBe('FORBIDDEN');
+      expect(body.error.message).toBe('Script tasks can only be created by administrators');
     });
 
     it('allows natural language prompt mentioning bash and creates agent_prompt task', async () => {
