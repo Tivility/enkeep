@@ -645,6 +645,8 @@ describe('dsh-tools: file-security containment and TOCTOU mitigation', () => {
       const targetFile = path.join(subDir, 'doc.txt');
       fs.writeFileSync(targetFile, 'original text');
 
+      const originalSubDirIno = fs.lstatSync(subDir).ino;
+
       let readResult: unknown = null;
       let errorThrown: unknown = null;
 
@@ -654,10 +656,15 @@ describe('dsh-tools: file-security containment and TOCTOU mitigation', () => {
           filePath: 'sub/doc.txt',
           hooks: {
             beforeOpen: () => {
-              // Replace intermediate directory with a newly created directory (different inode)
+              // Replace intermediate directory with a newly created directory (different inode).
+              // Build the replacement while the original still exists: removing first and then
+              // recreating lets filesystems such as ext4 hand the freed inode straight back,
+              // which makes the swapped directory indistinguishable from the original.
+              const replacementDir = path.join(workspaceDir, 'sub-replacement');
+              fs.mkdirSync(replacementDir);
+              fs.writeFileSync(path.join(replacementDir, 'doc.txt'), 'swapped dir content');
               fs.rmSync(subDir, { recursive: true, force: true });
-              fs.mkdirSync(subDir);
-              fs.writeFileSync(path.join(subDir, 'doc.txt'), 'swapped dir content');
+              fs.renameSync(replacementDir, subDir);
             },
           },
         });
@@ -665,6 +672,7 @@ describe('dsh-tools: file-security containment and TOCTOU mitigation', () => {
         errorThrown = err;
       }
 
+      expect(fs.lstatSync(subDir).ino).not.toBe(originalSubDirIno);
       expect(readResult).toBeNull();
       expect(errorThrown).toBeInstanceOf(FileSecurityError);
       const secErr = asFileSecurityError(errorThrown);
