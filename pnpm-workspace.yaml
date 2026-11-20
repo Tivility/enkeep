@@ -31,3 +31,8 @@ minimumReleaseAgeExclude:
 
 patchedDependencies:
   '@deepseek-ai/dsh-llm-pi-ai@0.2.1-rc.5': patches/@deepseek-ai__dsh-llm-pi-ai@0.2.1-rc.5.patch
+  # dsh-session and the persistence-jsonl verifier worker (which bundles its own copy) both list
+  # 'compaction/settings' as a known event type: @tivility/dsh-compaction-window@0.1.0 appends it
+  # without `ignorable`, and rc.5 otherwise refuses to resume such logs.
+  '@deepseek-ai/dsh-session-persistence-jsonl@0.2.1-rc.5': patches/@deepseek-ai__dsh-session-persistence-jsonl@0.2.1-rc.5.patch
+  '@deepseek-ai/dsh-session@0.2.1-rc.5': patches/@deepseek-ai__dsh-session@0.2.1-rc.5.patch

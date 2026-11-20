@@ -1,0 +1,12 @@
+diff --git a/lib/worker.cjs b/lib/worker.cjs
+index 23324d4ed735d0284f966856013f3d261645d44e..2fb51abf1a5d2ed94418785a5f15b6bf3604c908 100644
+--- a/lib/worker.cjs
++++ b/lib/worker.cjs
+@@ -3137,6 +3137,7 @@ const KNOWN_SESSION_EVENT_TYPES = new Set([
+ 	"command/run",
+ 	"compaction/end",
+ 	"compaction/prune",
++	"compaction/settings",
+ 	"compaction/start",
+ 	"compaction/summary",
+ 	"deliverables/presented",
