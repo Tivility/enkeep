@@ -416,9 +416,14 @@ describe('Safe In-Container Per-Session OS File Lock & Error Sanitization', () =
         timeoutMs: 1000,
       });
 
-      // Simulate external deletion and creation of a new file with different inode
-      fs.unlinkSync(lockPath);
-      fs.writeFileSync(lockPath, 'new_successor_lock', { mode: 0o600 });
+      // Simulate a successor replacing the lock with a different inode. Build the
+      // successor beside the original and rename it over the lock path: while the
+      // original is still linked the filesystem cannot hand its inode to the new
+      // file (ext4 reuses a freed inode at once after unlink + create).
+      const successorPath = `${lockPath}.successor`;
+      fs.writeFileSync(successorPath, 'new_successor_lock', { mode: 0o600 });
+      expect(fs.statSync(successorPath).ino).not.toBe(fs.statSync(lockPath).ino);
+      fs.renameSync(successorPath, lockPath);
 
       // Calling lock1.release() should safely check inode and NOT unlink the new file
       expect(() => lock1.release()).not.toThrow();
