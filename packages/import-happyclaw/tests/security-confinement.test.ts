@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -299,6 +309,12 @@ describe('Security Confinement, Strict Rejection, and Rollback Invariants', () =
       mkdirSync(join(stagingCtx.destDir, 'seeds'), { recursive: true })
       mkdirSync(join(stagingCtx.destDir, 'spaces'), { recursive: true })
       writeFileSync(join(stagingCtx.destDir, 'file.txt'), 'hello', 'utf8')
+      // Make the destination an exact copy, permission bits included: staging
+      // creates its directories with an explicit mode while mkdirSync above
+      // follows the process umask, so copy each staging entry's mode over.
+      for (const rel of ['', 'seeds', 'spaces', 'file.txt']) {
+        chmodSync(join(stagingCtx.destDir, rel), statSync(join(stagingCtx.stagingDir, rel)).mode & 0o7777)
+      }
 
       // Commit should detect matching destination and clean staging
       expect(() => commitStaging(stagingCtx)).not.toThrow()
