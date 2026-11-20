@@ -16,6 +16,8 @@ import { ApprovalBridge } from '../src/interactions/approval-bridge.js';
 import { QuestionBridge } from '../src/interactions/question-bridge.js';
 import { RuntimeSessionEventHub } from '../src/runtime/session-event-hub.js';
 import { WeChatRuntimeManager } from '../src/channels/wechat-runtime.js';
+import { SqlitePlatformWebApiAdapter } from '../src/storage/sqlite-platform-api.js';
+import { JarvisRuntime, Peer, type JarvisHistoryRow, type MessageSocket } from '@enkeep/channel-jarvis';
 import {
   PlatformJarvisSource,
   JARVIS_SLASH_REFUSAL,
@@ -38,6 +40,38 @@ const ROUTE_WORKING = 'ses_00000000000000000000000000000005';
 const ROUTE_ARCHIVED = 'ses_00000000000000000000000000000006';
 const ROUTE_WECHAT = 'ses_00000000000000000000000000000007';
 const ROUTE_BOB = 'ses_00000000000000000000000000000099';
+/** An in-memory message socket pair (the runtime's side, the node's side). */
+function memoryPair(): [MessageSocket, MessageSocket] {
+  type Side = MessageSocket & { other?: Side; onMsg: Array<(d: string) => void>; onShut: Array<(c: number, r: string) => void>; shut: boolean };
+  const make = (): Side => {
+    const side: Side = {
+      onMsg: [],
+      onShut: [],
+      shut: false,
+      send: (data) => {
+        if (side.shut) return;
+        queueMicrotask(() => !side.other!.shut && side.other!.onMsg.forEach((l) => l(data)));
+      },
+      onMessage: (l) => void side.onMsg.push(l),
+      onClose: (l) => void side.onShut.push(l),
+      close: (code = 1000, reason = '') => {
+        for (const x of [side, side.other!]) {
+          if (x.shut) continue;
+          x.shut = true;
+          x.onShut.forEach((l) => l(code, reason));
+        }
+      },
+    };
+    return side;
+  };
+  const a = make();
+  const b = make();
+  a.other = b;
+  b.other = a;
+  return [a, b];
+}
+
+const timestampOf = (sqlite: string) => Date.parse(`${sqlite.replace(' ', 'T')}Z`);
 const dsh = (route: string) => route.replace(/^ses_0{4}/, 'ses_dddd');
 
 const tick = () => new Promise((r) => setImmediate(r));
@@ -918,6 +952,218 @@ describe('PlatformJarvisSource', () => {
       const afterReset = await revOf(ROUTE_IDLE);
       expect(afterReset).toBeGreaterThan(next);
       expect(await revOf(ROUTE_IDLE)).toBe(afterReset);
+    });
+  });
+  describe('listHistory: sessions active in a time window (nwverse/persona#11529)', () => {
+    const DAY = 24 * 3600 * 1000;
+    const SPACE_GONE = 'spc_00000000000000000000000000000003';
+    const hist = (n: number) => `ses_10000000000000000000000000${String(n).padStart(6, '0')}`;
+    type Page = { rows: JarvisHistoryRow[]; next_cursor: string; complete: boolean };
+
+    let msgCounter = 0;
+    function message(route: string, role: 'user' | 'assistant', createdAt: string, turnId: string | null = null) {
+      db.prepare(`INSERT INTO web_messages (id, session_id, user_id, role, content, status, route_key, turn_id, created_at) VALUES (?, ?, ?, ?, 'synthetic', 'delivered', 'rk', ?, ?)`)
+        .run(`msg_hist_${String(++msgCounter).padStart(6, '0')}`, route, ALICE, role, turnId, createdAt);
+    }
+
+    async function route(id: string, opts: { space?: string; createdMsAgo: number; status?: 'active' | 'archived' | 'deleted' }) {
+      await storage.forTenant(ALICE).sessionRoutes.create({ id, spaceId: opts.space ?? SPACE_A, channel: 'web', nativeContextId: id, dshSessionId: dsh(id), title: `History ${id.slice(-3)}` });
+      db.prepare(`UPDATE session_routes SET created_at = ?, updated_at = ?, status = ? WHERE id = ?`)
+        .run(sqliteTime(opts.createdMsAgo), sqliteTime(opts.createdMsAgo), opts.status ?? 'active', id);
+    }
+
+    async function allPages(s: PlatformJarvisSource, since: string, until: string, limit: number) {
+      const rows: JarvisHistoryRow[] = [];
+      let cursor = '';
+      let pages = 0;
+      for (;;) {
+        const page = await s.listHistory({ since, until, cursor, limit });
+        rows.push(...page.rows);
+        pages++;
+        expect(page.complete).toBe(true);
+        if (!page.next_cursor) return { rows, pages };
+        cursor = page.next_cursor;
+        if (pages > 100) throw new Error('no last page');
+      }
+    }
+
+    it('lists the sessions active in [since, until) newest first, every one once across pages, archived ones included', async () => {
+      // 30 sessions, one a day 31…60 days ago; every third one archived (today); the window is 55…35 days ago.
+      for (let i = 0; i < 30; i++) {
+        const id = hist(i);
+        await route(id, { createdMsAgo: (31 + i) * DAY + 3600_000, status: i % 3 === 0 ? 'archived' : 'active' });
+        message(id, 'user', iso((31 + i) * DAY + 60_000));
+        message(id, 'assistant', iso((31 + i) * DAY));
+        if (i % 3 === 0) db.prepare(`UPDATE session_routes SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(id);
+      }
+      const since = iso(54.5 * DAY);
+      const until = iso(34.5 * DAY);
+      const got = await allPages(source(), since, until, 7);
+      // Last active 31 + i days ago: in the window for i = 4 (35 days) … 23 (54 days).
+      const expected = Array.from({ length: 20 }, (_, k) => hist(k + 4));
+      expect(got.rows.map((r) => r.session_id)).toEqual(expected);
+      expect(got.pages).toBe(3);
+      for (const r of got.rows) {
+        expect(Date.parse(r.active_at!)).toBeGreaterThanOrEqual(Date.parse(since));
+        expect(Date.parse(r.active_at!)).toBeLessThan(Date.parse(until));
+      }
+      const archived = got.rows.filter((r) => r.archived);
+      expect(archived.map((r) => r.session_id)).toEqual(expected.filter((id) => Number(id.slice(-6)) % 3 === 0));
+      expect(archived.every((r) => r.status === 'offline')).toBe(true);
+      expect(got.rows.filter((r) => !r.archived).every((r) => r.archived === false && r.status !== 'offline')).toBe(true);
+      // The sessions of today (and Bob's) are not in that window; a window up to now has them, Bob's never.
+      const recent = await allPages(source(), iso(2 * DAY), iso(-1000), 500);
+      expect(recent.rows.map((r) => r.session_id)).toEqual(expect.arrayContaining([ROUTE_DONE, ROUTE_ARCHIVED]));
+      expect(recent.rows.map((r) => r.session_id)).not.toContain(ROUTE_BOB);
+      expect(recent.rows.some((r) => r.session_id.startsWith('ses_1'))).toBe(false);
+    });
+
+    it('takes active_at from the last message: archiving through the platform API does not move it', async () => {
+      const id = hist(900);
+      await route(id, { createdMsAgo: 21 * DAY });
+      const lastAt = iso(20 * DAY);
+      message(id, 'user', iso(20 * DAY + 60_000));
+      message(id, 'assistant', lastAt);
+      const api = new SqlitePlatformWebApiAdapter({ storage, messageStore: new SqliteWebMessageStore(db), db });
+      await api.archiveSession(ALICE, id);
+      expect((db.prepare('SELECT status FROM session_routes WHERE id = ?').get(id) as { status: string }).status).toBe('archived');
+
+      const s = source();
+      const thatWeek = await s.listHistory({ since: iso(25 * DAY), until: iso(15 * DAY), cursor: '', limit: 200 });
+      expect(thatWeek.rows.map((r) => r.session_id)).toEqual([id]);
+      const row = thatWeek.rows[0]!;
+      expect(row.archived).toBe(true);
+      expect(row.active_at).toBe(lastAt);
+      expect(row.started_at).toBe(new Date(timestampOf(sqliteTime(21 * DAY))).toISOString());
+      expect(Date.parse(row.updated_at)).toBeGreaterThan(Date.now() - DAY); // the archive moved updated_at, not active_at
+      expect(row).toMatchObject({ space_id: SPACE_A, title: 'History 900', cwd: '/home/dsh/spaces/alice-main', status: 'offline' });
+      const today = await s.listHistory({ since: iso(DAY), until: iso(-1000), cursor: '', limit: 200 });
+      expect(today.rows.map((r) => r.session_id)).not.toContain(id);
+    });
+
+    it('lists a route of an archived space as archived; never a deleted route or one of a deleted space', async () => {
+      db.prepare(`INSERT INTO spaces (id, user_id, name, folder, status) VALUES (?, ?, 'Gone', 'gone', 'deleted')`).run(SPACE_GONE, ALICE);
+      await route(hist(1), { createdMsAgo: 5 * DAY, status: 'deleted' });
+      await route(hist(2), { createdMsAgo: 5 * DAY, space: SPACE_GONE });
+      await route(hist(3), { createdMsAgo: 5 * DAY, space: SPACE_B, status: 'archived' });
+      await route(hist(4), { createdMsAgo: 5 * DAY, space: SPACE_B });
+      db.prepare(`UPDATE spaces SET status = 'archived' WHERE id = ?`).run(SPACE_B);
+      for (const n of [1, 2, 3, 4]) message(hist(n), 'user', iso(4 * DAY));
+      const page = await source().listHistory({ since: iso(6 * DAY), until: iso(3 * DAY), cursor: '', limit: 200 });
+      expect(page.rows.map((r) => r.session_id)).toEqual([hist(3), hist(4)]);
+      expect(page.rows.every((r) => r.archived && r.status === 'offline')).toBe(true);
+    });
+
+    it('sets origin from the first user turn (task → automation, chat or Jarvis → user, Web UI → unknown) and counts the user\'s own messages', async () => {
+      const at = (d: number) => iso(d * DAY);
+      // A scheduled task's single-turn session, archived afterwards.
+      await route(hist(11), { createdMsAgo: 10 * DAY, status: 'archived' });
+      const taskTurnId = 'turn_hist_task_0001';
+      taskTurn(taskTurnId, hist(11));
+      message(hist(11), 'user', at(9.9), taskTurnId);
+      message(hist(11), 'assistant', at(9.8), taskTurnId);
+      // Started in Jarvis, then two more messages from the Web UI.
+      await route(hist(12), { createdMsAgo: 10 * DAY });
+      origin('turn_hist_jarvis_0001', hist(12), 'jarvis');
+      message(hist(12), 'user', at(9.7), 'turn_hist_jarvis_0001');
+      message(hist(12), 'user', at(9.6), 'turn_hist_web_0001');
+      message(hist(12), 'user', at(9.5));
+      message(hist(12), 'assistant', at(9.4));
+      // Started from a Lark chat; a task later delivered into it (its prompt is not the user's).
+      await route(hist(13), { createdMsAgo: 10 * DAY });
+      origin('turn_hist_lark_0001', hist(13), 'lark');
+      message(hist(13), 'user', at(9.3), 'turn_hist_lark_0001');
+      taskTurn('turn_hist_task_0002', hist(13));
+      message(hist(13), 'user', at(9.2), 'turn_hist_task_0002');
+      // Web UI (no origin record): unknown.
+      await route(hist(14), { createdMsAgo: 10 * DAY });
+      message(hist(14), 'user', at(9.1), 'turn_hist_web_0002');
+      // No message at all: updated_at (its creation) places it; nothing known.
+      await route(hist(15), { createdMsAgo: 9 * DAY });
+
+      const page = await source().listHistory({ since: at(11), until: at(8), cursor: '', limit: 200 });
+      const mine = page.rows.filter((r) => r.session_id.startsWith('ses_1'));
+      const by = new Map(mine.map((r) => [r.session_id, r]));
+      expect(mine.map((r) => r.session_id)).toEqual([hist(15), hist(14), hist(13), hist(12), hist(11)]);
+      expect(by.get(hist(11))).toMatchObject({ origin: 'automation', user_messages: 0, archived: true });
+      expect(by.get(hist(12))).toMatchObject({ origin: 'user', user_messages: 3, archived: false });
+      expect(by.get(hist(13))).toMatchObject({ origin: 'user', user_messages: 1 });
+      expect(by.get(hist(14))!.origin).toBeUndefined();
+      expect(by.get(hist(14))!.user_messages).toBe(1);
+      expect(by.get(hist(15))).toMatchObject({ user_messages: 0, updated_at: new Date(timestampOf(sqliteTime(9 * DAY))).toISOString() });
+      expect(by.get(hist(15))!.origin).toBeUndefined();
+      expect(by.get(hist(15))!.active_at).toBeUndefined();
+    });
+
+    it('reads through the per-session indexes, never scanning or sorting all of the user\'s rows', async () => {
+      await route(hist(21), { createdMsAgo: 3 * DAY, status: 'archived' });
+      taskTurn('turn_hist_task_0021', hist(21));
+      message(hist(21), 'user', iso(2 * DAY), 'turn_hist_task_0021');
+      const statements: string[] = [];
+      const prepare = db.prepare.bind(db);
+      (db as any).prepare = (sql: string) => {
+        statements.push(sql);
+        return prepare(sql);
+      };
+      try {
+        await source().listHistory({ since: iso(30 * DAY), until: iso(-1000), cursor: '', limit: 200 });
+      } finally {
+        (db as any).prepare = prepare;
+      }
+      const touchingBigTables = [...new Set(statements)].filter((sql) => /\b(web_events|web_messages|turn_runs|channel_turn_origins|task_runs)\b/.test(sql));
+      expect(touchingBigTables.some((sql) => sql.includes('COUNT(*)'))).toBe(true);
+      for (const sql of touchingBigTables) {
+        const args = (sql.match(/\?/g) ?? []).map(() => 'x');
+        const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args) as Array<{ detail: string }>).map((r) => r.detail).join(' | ');
+        expect(plan, sql).not.toMatch(/idx_\w+_user(_id)?\b|TEMP B-TREE|SCAN (web_|turn_runs|channel_turn_origins|task_runs)/);
+      }
+    });
+
+    it('a fake node pages sessions.history through JarvisRuntime to the end; an archived row reads items but refuses send and watch', async () => {
+      for (let i = 0; i < 12; i++) {
+        await route(hist(100 + i), { createdMsAgo: (40 + i) * DAY, status: i % 2 ? 'archived' : 'active' });
+        message(hist(100 + i), 'user', iso((40 + i) * DAY));
+      }
+      reader.logs.set(dsh(hist(101)), [
+        { seq: 0, type: 'user/message', time: Date.now() - 41 * DAY, surfaceOp: 'append', data: { id: 'msg_u0', role: 'user', content: [{ type: 'text', text: 'synthetic question' }], source: { kind: 'user' } } },
+      ]);
+      const [runtimeSide, nodeSide] = memoryPair();
+      const node = new Peer(nodeSide, { idPrefix: 'n', defaultTimeoutMs: 3000 });
+      let hello: Record<string, unknown> | undefined;
+      node.setEventHandler(() => {});
+      node.setRequestHandler(async (method, params) => {
+        if (method === 'runtime.hello') {
+          hello = params as Record<string, unknown>;
+          return { protocol: 1, node_version: '0.0.0-test', hub: true, features: [] };
+        }
+        return {};
+      });
+      const runtime = new JarvisRuntime(runtimeSide, source(), { version: '0.0.0-test', log: {} });
+      try {
+        await runtime.start();
+        expect((hello!.caps as Record<string, unknown>).history).toBe(true);
+        const rows: JarvisHistoryRow[] = [];
+        let cursor = '';
+        let pages = 0;
+        do {
+          const page = (await node.call('sessions.history', { since: iso(60 * DAY), until: iso(30 * DAY), cursor, limit: 5 })) as Page;
+          rows.push(...page.rows);
+          expect(page.complete).toBe(true);
+          cursor = page.next_cursor;
+          pages++;
+        } while (cursor);
+        expect(pages).toBe(3);
+        expect(rows.map((r) => r.session_id)).toEqual(Array.from({ length: 12 }, (_, i) => hist(100 + i)));
+        expect(rows.filter((r) => r.archived).length).toBe(6);
+
+        const items = (await node.call('session.items', { session_id: hist(101) })) as { items: unknown[] };
+        expect(items.items.length).toBeGreaterThan(0);
+        await expect(node.call('session.send', { session_id: hist(101), text: 'hi', client_msg_id: 'hist-send-0001' })).rejects.toMatchObject({ code: 'not_found' });
+        await expect(node.call('session.watch', { session_id: hist(101) })).rejects.toMatchObject({ code: 'not_found' });
+        expect(fakeGateway.dispatchInbound).not.toHaveBeenCalled();
+      } finally {
+        runtime.stop();
+      }
     });
   });
 });

@@ -23,7 +23,11 @@ import type { DatabaseSync } from 'node:sqlite';
 import {
   RpcError,
   errorCode,
+  historyPage,
   type DshSessionEvent,
+  type HistoryPageResult,
+  type HistoryParams,
+  type JarvisHistoryRow,
   type JarvisChannelSource,
   type JarvisLogger,
   type JarvisSessionRow,
@@ -297,6 +301,57 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     const rest = rows.filter((r) => r.status !== 'working' && r.status !== 'blocked').sort(byNewest);
     const picked = [...always, ...rest.slice(0, Math.max(0, JARVIS_LIST_MAX_SESSIONS - always.length))];
     return picked.sort(byNewest);
+  }
+
+  /**
+   * Sessions active in a time window, archived ones included (`sessions.history`, nwverse/persona#11529). Deleted
+   * routes, and routes of deleted spaces, are never listed. Unlike {@link getSession} this does not drop inactive
+   * routes: an archived route (or one in an archived space) is listed with `archived: true` and status `offline`.
+   *
+   * The time key is `active_at`, the newest message (or the live activity the hub saw), and not the route's
+   * `updated_at`: archiving a route moves its `updated_at` to the moment of archiving. Window, order and cursor are
+   * `historyPage`'s, applied to cheap time-only rows first; only the rows of the page are built in full.
+   */
+  async listHistory(params: HistoryParams): Promise<HistoryPageResult<JarvisHistoryRow>> {
+    this.authorize();
+    const routes = this.db
+      .prepare(`${ROUTE_SELECT} WHERE r.user_id = ? AND r.status != 'deleted' AND (s.status IS NULL OR s.status != 'deleted')`)
+      .all(this.userId) as unknown as RouteRow[];
+    const keys = routes.map((route) => {
+      const lastMessageAt = this.lastMessageAtOf(route.id);
+      const activeMs = Math.max(timestampMs(lastMessageAt) ?? 0, this.options.events?.lastActivityAt(this.userId, route.dsh_session_id) ?? 0);
+      const startedMs = timestampMs(route.created_at);
+      return {
+        session_id: route.id,
+        ...(activeMs > 0 ? { active_at: new Date(activeMs).toISOString() } : {}),
+        updated_at: new Date(this.activityMs(route, lastMessageAt) || this.now()).toISOString(),
+        ...(startedMs !== undefined ? { started_at: new Date(startedMs).toISOString() } : {}),
+        route,
+        lastMessageAt,
+      };
+    });
+    // Nothing is pruned from the platform's session tables: what the database holds for the window is all of it.
+    const page = historyPage(keys, params, { complete: true });
+    const rows = await Promise.all(
+      page.rows.map(async (key): Promise<JarvisHistoryRow> => {
+        const { route } = key;
+        const archived = !isActive(route.status) || !isActive(route.space_status);
+        const base = await this.rowOf(route, key.lastMessageAt);
+        const origin = this.historyOriginOf(route.id);
+        return {
+          ...base,
+          // An archived session takes no turns (send and watch answer not_found): never working or blocked.
+          ...(archived ? { status: 'offline' as const } : {}),
+          updated_at: key.updated_at,
+          archived,
+          ...(key.active_at ? { active_at: key.active_at } : {}),
+          ...(key.started_at ? { started_at: key.started_at } : {}),
+          ...(origin ? { origin } : {}),
+          user_messages: this.userMessagesOf(route.id),
+        };
+      })
+    );
+    return { rows, next_cursor: page.next_cursor, complete: page.complete };
   }
 
   async getSession(sessionId: string): Promise<JarvisSessionRow | null> {
@@ -1017,6 +1072,38 @@ export class PlatformJarvisSource implements JarvisChannelSource {
     const mode = executionMode ?? 'container';
     const dir = this.options.runtimeSpacesDir?.({ userId: this.userId, executionMode: mode }) ?? DEFAULT_RUNTIME_SPACES_DIR;
     return path.posix.join(dir, folder);
+  }
+
+  /**
+   * Who started the session, from the turn of its first user message: a scheduled task's turn (`task_runs`) →
+   * `automation`; a turn that came in from a chat channel or Jarvis (`channel_turn_origins`) → `user`. Anything else
+   * (the Web UI, which external schedulers also post to, or no message) is not known: undefined.
+   */
+  private historyOriginOf(routeId: string): 'user' | 'automation' | undefined {
+    const first = this.db
+      .prepare("SELECT turn_id FROM web_messages WHERE session_id = ? AND +user_id = ? AND role = 'user' ORDER BY rowid ASC LIMIT 1")
+      .get(routeId, this.userId) as { turn_id: string | null } | undefined;
+    const turnId = first?.turn_id;
+    if (!turnId) return undefined;
+    if (this.db.prepare('SELECT 1 AS x FROM task_runs WHERE turn_id = ? AND +user_id = ? LIMIT 1').get(turnId, this.userId) !== undefined) {
+      return 'automation';
+    }
+    const origin = this.db
+      .prepare('SELECT channel FROM channel_turn_origins WHERE turn_id = ? AND +user_id = ? LIMIT 1')
+      .get(turnId, this.userId) as { channel: string | null } | undefined;
+    return origin?.channel ? 'user' : undefined;
+  }
+
+  /** The session's user messages, less the prompts of scheduled task turns (through the session index). */
+  private userMessagesOf(routeId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM web_messages m
+          WHERE m.session_id = ? AND +m.user_id = ? AND m.role = 'user'
+            AND (m.turn_id IS NULL OR NOT EXISTS (SELECT 1 FROM task_runs t WHERE t.turn_id = m.turn_id AND +t.user_id = m.user_id))`
+      )
+      .get(routeId, this.userId) as { n: number | bigint } | undefined;
+    return Number(row?.n ?? 0);
   }
 
   /** When the session's newest message was written (its newest row by rowid; one indexed read). */

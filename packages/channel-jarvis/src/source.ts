@@ -11,6 +11,8 @@
  * (DSH seq + 1) and items. The source never deals in Jarvis items.
  */
 
+import type { HistoryPageResult, HistoryParams } from './history.js';
+
 /** A DSH persisted session event as the runtime returns it (`SessionEvent`; seq counts from 0). */
 export interface DshSessionEvent {
   seq: number;
@@ -35,6 +37,22 @@ export interface JarvisSessionRow {
   space_id?: string;
   space_name?: string;
   model?: string;
+}
+
+/**
+ * One session as `sessions.history` lists it (nwverse/persona#11529): a {@link JarvisSessionRow} plus whether it is
+ * archived and the optional fields below, relayed as given. Deleted sessions are never listed.
+ */
+export interface JarvisHistoryRow extends JarvisSessionRow {
+  archived: boolean;
+  /** RFC 3339: when the session was last active (its last message). The window and the order use it first. */
+  active_at?: string;
+  /** RFC 3339: when the session was created (the last fallback for the time). */
+  started_at?: string;
+  /** `automation` when a scheduled run started it, `user` when a person did; left out when unknown. */
+  origin?: 'user' | 'automation';
+  /** How many messages the user wrote in the session; left out when it cannot be counted. */
+  user_messages?: number;
 }
 
 export interface ReadEventsQuery {
@@ -116,6 +134,11 @@ export interface JarvisSourceListener {
 export interface JarvisChannelSource {
   /** The user's sessions worth listing (the engine adds the phone's recent ones it asks about). */
   listSessions(): Promise<JarvisSessionRow[]>;
+  /**
+   * Sessions active in a time window, inactive (archived) ones included, one page at a time (`sessions.history`).
+   * Optional: when present the engine declares `caps.history` in `runtime.hello`. Page with `historyPage`.
+   */
+  listHistory?(params: HistoryParams): Promise<HistoryPageResult<JarvisHistoryRow>>;
   /** One session's row, also for sessions not in the list; null when it is not this user's. */
   getSession(sessionId: string): Promise<JarvisSessionRow | null>;
   readEvents(sessionId: string, query: ReadEventsQuery): Promise<ReadEventsResult>;
