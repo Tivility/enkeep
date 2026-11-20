@@ -3085,6 +3085,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             forkedSession = await platformApi.createSession(user.id, {
               spaceId: targetSpaceId || session.spaceId,
               title: branchTitle,
+              forceNew: true,
             });
           }
 
@@ -3952,6 +3953,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
             forkedSession = await platformApi.createSession(user.id, {
               spaceId: targetSpaceId || sourceSession.spaceId,
               title: branchTitle,
+              forceNew: true,
             });
           }
 
@@ -4062,6 +4064,7 @@ export function createPlatformServerHandler(options: PlatformServerHandlerOption
           forkedSession = await platformApi.createSession(user.id, {
             spaceId: targetSpaceId || sourceSession.spaceId,
             title: branchTitle,
+            forceNew: true,
           });
         }
 

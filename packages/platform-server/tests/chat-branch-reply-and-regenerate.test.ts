@@ -181,7 +181,7 @@ describe('Chat Operations: Regenerate, Edit User Message, and Reply References (
         'X-Enkeep-CSRF': testCsrfToken,
         Origin: baseUrl,
       },
-      body: JSON.stringify({ spaceId: aliceSpaceId, title: 'Chat for Regenerate' }),
+      body: JSON.stringify({ spaceId: aliceSpaceId, title: 'Chat for Regenerate', forceNew: true }),
     });
     const sessJson = await sessRes.json();
     if (sessRes.status !== 201) {
@@ -262,7 +262,7 @@ describe('Chat Operations: Regenerate, Edit User Message, and Reply References (
         'X-Enkeep-CSRF': testCsrfToken,
         Origin: baseUrl,
       },
-      body: JSON.stringify({ spaceId: aliceSpaceId, title: 'Chat for Edit' }),
+      body: JSON.stringify({ spaceId: aliceSpaceId, title: 'Chat for Edit', forceNew: true }),
     });
     const session = (await sessRes.json()).data;
 
@@ -329,7 +329,7 @@ describe('Chat Operations: Regenerate, Edit User Message, and Reply References (
         'X-Enkeep-CSRF': testCsrfToken,
         Origin: baseUrl,
       },
-      body: JSON.stringify({ spaceId: aliceSpaceId, title: 'Chat with Reply' }),
+      body: JSON.stringify({ spaceId: aliceSpaceId, title: 'Chat with Reply', forceNew: true }),
     });
     const session = (await sessRes.json()).data;
 
@@ -552,5 +552,110 @@ describe('Chat Operations: Regenerate, Edit User Message, and Reply References (
 
     // Clean up mock active turn
     db.prepare(`DELETE FROM turn_runs WHERE id = 'tr_active_mock'`).run();
+  });
+
+  describe('First-turn branches start a new session instead of reusing the source', () => {
+    const jsonHeaders = () => ({
+      'Content-Type': 'application/json',
+      Cookie: aliceCookie,
+      'X-Enkeep-CSRF': testCsrfToken,
+      Origin: baseUrl,
+    });
+
+    async function listMessages(sessionId: string): Promise<any[]> {
+      const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/messages`, {
+        headers: { Cookie: aliceCookie },
+      });
+      expect(res.status).toBe(200);
+      return (await res.json()).data.messages;
+    }
+
+    // A fresh space whose canonical session is the source: the branch must not
+    // resolve back to it.
+    async function seedFirstTurn(name: string, folder: string, prompt: string, idempotencyKey: string) {
+      const spaceRes = await fetch(`${baseUrl}/api/spaces`, {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({ name, folder }),
+      });
+      expect(spaceRes.status).toBe(201);
+      const spaceId = (await spaceRes.json()).data.id as string;
+
+      const sessRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({ spaceId, title: name }),
+      });
+      expect(sessRes.status).toBe(201);
+      const sourceId = (await sessRes.json()).data.id as string;
+
+      const sendRes = await fetch(`${baseUrl}/api/sessions/${sourceId}/messages`, {
+        method: 'POST',
+        headers: { ...jsonHeaders(), 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({ content: prompt }),
+      });
+      expect(sendRes.status).toBe(200);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const msgs = await listMessages(sourceId);
+      expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant']);
+      return { spaceId, sourceId, userMsg: msgs[0], assistantMsg: msgs[1] };
+    }
+
+    async function expectBranchedAway(sourceId: string, before: any[], newSessionId: string, expectedPrompt: string) {
+      expect(newSessionId).toBeDefined();
+      expect(newSessionId).not.toBe(sourceId);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const sourceAfter = await listMessages(sourceId);
+      expect(sourceAfter.map((m) => m.id)).toEqual(before.map((m) => m.id));
+
+      const branchMsgs = await listMessages(newSessionId);
+      expect(branchMsgs.length).toBeGreaterThanOrEqual(1);
+      expect(branchMsgs[0].role).toBe('user');
+      expect(branchMsgs[0].content).toBe(expectedPrompt);
+    }
+
+    it('6. Regenerating the first reply delivers the prompt into a new session, not the source', async () => {
+      const seed = await seedFirstTurn('First Turn Regenerate', 'first-turn-regenerate', 'First-turn regenerate prompt', 'f1111111-1111-4111-a111-111111111111');
+      const before = await listMessages(seed.sourceId);
+
+      const res = await fetch(`${baseUrl}/api/sessions/${seed.sourceId}/regenerate`, {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({ sourceMessageId: seed.assistantMsg.id }),
+      });
+      expect(res.status).toBe(201);
+      const json = await res.json();
+      await expectBranchedAway(seed.sourceId, before, json.data.newSessionId, 'First-turn regenerate prompt');
+    });
+
+    it('7. Editing the first user message via the session route delivers into a new session, not the source', async () => {
+      const seed = await seedFirstTurn('First Turn Session Edit', 'first-turn-session-edit', 'First-turn original', 'f2222222-2222-4222-a222-222222222222');
+      const before = await listMessages(seed.sourceId);
+
+      const res = await fetch(`${baseUrl}/api/sessions/${seed.sourceId}/messages/${seed.userMsg.id}/edit`, {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({ content: 'First-turn edited via session route' }),
+      });
+      expect(res.status).toBe(201);
+      const json = await res.json();
+      await expectBranchedAway(seed.sourceId, before, json.data.newSessionId, 'First-turn edited via session route');
+    });
+
+    it('8. Editing the first user message via the message route delivers into a new session, not the source', async () => {
+      const seed = await seedFirstTurn('First Turn Message Edit', 'first-turn-message-edit', 'First-turn original two', 'f3333333-3333-4333-a333-333333333333');
+      const before = await listMessages(seed.sourceId);
+
+      const res = await fetch(`${baseUrl}/api/messages/${seed.userMsg.id}/edit`, {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({ content: 'First-turn edited via message route' }),
+      });
+      expect(res.status).toBe(201);
+      const json = await res.json();
+      await expectBranchedAway(seed.sourceId, before, json.data.newSessionId, 'First-turn edited via message route');
+    });
   });
 });
