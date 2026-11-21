@@ -606,7 +606,11 @@ describe('Storage Module P0/P1 Integration: Metering, Dual Reconciliation, Reset
           ('msg_2', '${routeId}', '${aliceId}', 'assistant', 'Hello human', 'delivered', '${routeId}', datetime('now', '-1 minutes'));
       `);
 
-      const dualReconcile = new DualStorageReconcileService({ db });
+      // dshHome must be passed explicitly; use an empty runtime home so the
+      // session JSONL is genuinely missing rather than unreadable.
+      const dshHome = path.join(tempDir, 'reconcile-dsh-home');
+      fs.mkdirSync(path.join(dshHome, 'sessions'), { recursive: true });
+      const dualReconcile = new DualStorageReconcileService({ db, dshHome });
 
       // Scenario A: DSH JSONL is missing
       const reportMissing = await dualReconcile.reconcileSession(aliceId, routeId);

@@ -65,17 +65,13 @@ export const ALLOWED_DEMO_DATA_ENTRIES = Object.freeze(
 );
 
 /**
- * Safe, explicit demo fixture quota limits for Alice and Bob.
+ * Explicit demo fixture quota limits for demo tenants.
  *
- * Configured according to deterministic E2E test capacity requirements:
- * - turns: 1000
- * - messages: 1000
- * - tokens: 1000000
- * - storage_bytes: 10485760 (10MB)
- * - api_calls: 5000
+ * Every resource is -1 (unlimited) so local demos and E2E runs are never
+ * blocked by quota: turns, messages, tokens, storage_bytes and api_calls.
  *
  * NOTE: These are strictly demo fixture policies for local development/testing,
- * NOT unmetered or production defaults. Production requires explicit administrative quota provisioning.
+ * NOT production defaults. Production requires explicit administrative quota provisioning.
  */
 export const DEMO_FIXTURE_QUOTA_LIMITS: Readonly<Record<string, number>> = Object.freeze({
   turns: -1,

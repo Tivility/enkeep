@@ -550,9 +550,9 @@ describe('OperationsTenantQuotaProvider Multi-Metric Turn Bundle Adapter', () =>
   });
 
   describe('Default TTL and Constructor Configuration', () => {
-    it('defaults to 900 seconds when options are omitted', () => {
+    it('defaults to 2100 seconds when options are omitted', () => {
       const provider = createOperationsTenantQuotaProvider(operationsService);
-      expect(provider.getDefaultTtlSeconds()).toBe(900);
+      expect(provider.getDefaultTtlSeconds()).toBe(2100);
     });
 
     it('accepts valid finite positive safe integer for defaultTtlSeconds', () => {

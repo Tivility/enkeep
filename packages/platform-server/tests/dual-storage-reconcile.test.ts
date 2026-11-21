@@ -49,7 +49,11 @@ describe('Dual Storage Reconciliation & Typed DSH Parser (P0 Direct Tests)', () 
       VALUES ('${routeId}', '${spaceId}', '${aliceId}', 'web', '${dshSessionId}', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
     `);
 
-    service = new DualStorageReconcileService({ db });
+    // dshHome must be passed explicitly; give the shared service its own empty
+    // runtime home so tests that build volumes under tempDir stay isolated.
+    const dshHome = path.join(tempDir, 'dsh-home');
+    fs.mkdirSync(path.join(dshHome, 'sessions'), { recursive: true });
+    service = new DualStorageReconcileService({ db, dshHome });
   });
 
   afterEach(() => {

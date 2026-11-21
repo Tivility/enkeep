@@ -184,7 +184,7 @@ describe('Quota Atomic Lifecycle & Single-Transaction Gateway Finalize E2E', () 
     expect(tokensUsage.reserved).toBe(0);
   });
 
-  it('guarantees assistant message is NEVER exposed if quota commit fails (all rolled back together)', async () => {
+  it('preserves the delivered assistant reply and releases the reservation if quota commit fails', async () => {
     const quotaRepo = operationsStorage.forTenant(testUserId).quota;
     await quotaRepo.setLimit({ resource: 'turns', limit: 10 });
     await quotaRepo.setLimit({ resource: 'messages', limit: 10 });
@@ -193,7 +193,7 @@ describe('Quota Atomic Lifecycle & Single-Transaction Gateway Finalize E2E', () 
     // Mock executor that succeeds
     const executor = {
       execute: async () => ({
-        replyText: 'This assistant message must NOT be saved if quota commit fails',
+        replyText: 'Delivered reply that survives a quota commit failure',
         usage: { totalTokens: 100 },
       }),
       cancel: async () => true,
@@ -224,20 +224,27 @@ describe('Quota Atomic Lifecycle & Single-Transaction Gateway Finalize E2E', () 
     const dispatchRes = await gateway.dispatchInbound(envelope);
     expect(dispatchRes.accepted).toBe(true);
 
-    // Drain should throw AggregateError because completion failed
+    // Drain surfaces the recorded settled quota error for auditing
     await expect(gateway.drain(1000)).rejects.toThrow();
 
-    // Verify web_messages has ZERO assistant messages (no partial leak!)
-    const messages = db.prepare("SELECT * FROM web_messages WHERE user_id = ? AND role = 'assistant'").all(testUserId);
-    expect(messages.length).toBe(0);
+    // The reply was already produced for the user: it stays delivered exactly once
+    const messages = db.prepare("SELECT content, status FROM web_messages WHERE user_id = ? AND role = 'assistant'").all(testUserId) as any[];
+    expect(messages.length).toBe(1);
+    expect(messages[0].content).toBe('Delivered reply that survives a quota commit failure');
+    expect(messages[0].status).toBe('delivered');
 
-    // Verify turn_runs is marked failed in honest failure path
-    const turnRow = db.prepare("SELECT status, error FROM turn_runs WHERE turn_id = ?").get(dispatchRes.turnId!) as any;
-    expect(turnRow.status).toBe('failed');
-
-    // Verify delivery_inbox is marked failed
+    // The turn and inbox complete normally instead of being marked failed
+    const turnRow = db.prepare("SELECT status FROM turn_runs WHERE turn_id = ?").get(dispatchRes.turnId!) as any;
+    expect(turnRow.status).toBe('completed');
     const inboxRow = db.prepare("SELECT status FROM delivery_inbox WHERE turn_id = ?").get(dispatchRes.turnId!) as any;
-    expect(inboxRow.status).toBe('failed');
+    expect(inboxRow.status).toBe('delivered');
+
+    // The reservation is released, not committed: nothing is charged or left reserved
+    for (const resource of ['turns', 'messages', 'tokens'] as const) {
+      const usage = await quotaRepo.getUsage(resource);
+      expect(usage.used).toBe(0);
+      expect(usage.reserved).toBe(0);
+    }
   });
 
   it('handles cancellation vs finalize CAS race mutually exclusively and releases quota on cancel', async () => {
