@@ -140,6 +140,8 @@ export {
   extractActualUsage,
   DEFAULT_INTERACTIVE_TURN_TIMEOUT_MS,
   DEFAULT_QUOTA_RESERVATION_GRACE_SECONDS,
+  PROVIDER_REFUSED_NOTICE,
+  isProviderPolicyRefusal,
 } from './runtime/delivery-gateway.js';
 
 // Deployment self-check (GET /api/selfcheck)

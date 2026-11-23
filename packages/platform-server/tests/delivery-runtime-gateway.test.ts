@@ -5,6 +5,8 @@ import { SqlitePlatformStorage } from '@enkeep/platform-storage-sqlite';
 import { ValidationError, PlatformError, NotFoundError } from '@enkeep/platform-core';
 import {
   DeliveryRuntimeGateway,
+  PROVIDER_REFUSED_NOTICE,
+  isProviderPolicyRefusal,
   SqliteWebMessageStore,
   PlatformServerMigrationRunner,
   ALL_PLATFORM_MIGRATIONS,
@@ -2892,6 +2894,61 @@ describe('Production DeliveryRuntimeGateway Lifecycle, CAS & Atomicity Testing',
       expect(completedEvents.length).toBe(1);
       expect(completedEvents[0].turnId).toBe(turnId);
       expect(completedEvents[0].executionResult.replyText).toBe('模型服务暂时繁忙，请稍后重试。');
+    });
+
+    it('delivers a no-retry notice when the model provider refuses the request under its usage policy', async () => {
+      const { db, storage, messageStore, profileResolver } = await setupTestEnv();
+
+      const executor = {
+        execute: async () => {
+          throw new Error("[EXECUTION_ERROR] This request was blocked as our automated systems flagged that it may violate the provider's Terms of Service.");
+        },
+        cancel: async () => true,
+      };
+
+      const gateway = new DeliveryRuntimeGateway({
+        database: db,
+        storage,
+        messageStore,
+        executor,
+        quotaMode: 'disabled',
+        profileResolver,
+      });
+
+      const completedEvents: any[] = [];
+      const failedEvents: any[] = [];
+      gateway.onTurnCompleted((event) => { completedEvents.push(event); });
+      gateway.onTurnFailed((event) => { failedEvents.push(event); });
+
+      const result = await gateway.dispatchInbound(createSampleEnvelope());
+      const turnId = result.turnId!;
+      await gateway.drain(1000);
+
+      const turnRow = db.prepare('SELECT status, error FROM turn_runs WHERE turn_id = ?').get(turnId) as { status: string; error?: string };
+      expect(turnRow.status).toBe('failed');
+      expect(turnRow.error).toBe('Provider refused the request');
+
+      const assistantMsgRow = db.prepare(`
+        SELECT content, status FROM web_messages
+        WHERE session_id = 'ses1' AND turn_id = ? AND role = 'assistant'
+      `).get(turnId) as { content: string; status: string };
+      expect(assistantMsgRow.status).toBe('delivered');
+      expect(assistantMsgRow.content).toBe(PROVIDER_REFUSED_NOTICE);
+      expect(assistantMsgRow.content).not.toContain('稍后重试');
+
+      expect(failedEvents.length).toBe(0);
+      expect(completedEvents.length).toBe(1);
+      expect(completedEvents[0].executionResult.replyText).toBe(PROVIDER_REFUSED_NOTICE);
+    });
+
+    it('recognizes provider usage-policy refusals and nothing else', () => {
+      expect(isProviderPolicyRefusal(new Error('This request was blocked as our automated systems flagged that it may violate the Terms of Service restrictions.'))).toBe(true);
+      expect(isProviderPolicyRefusal('Output blocked by content filtering policy')).toBe(true);
+      expect(isProviderPolicyRefusal(new Error('Your prompt violates our usage policy'))).toBe(true);
+      expect(isProviderPolicyRefusal(new Error('{"error":{"message":"upstream stream interrupted","type":"api_error"}}'))).toBe(false);
+      expect(isProviderPolicyRefusal(new Error('Upstream returned status 429: rate limit exceeded'))).toBe(false);
+      expect(isProviderPolicyRefusal(new Error('Request blocked by proxy'))).toBe(false);
+      expect(isProviderPolicyRefusal(undefined)).toBe(false);
     });
   });
 });
