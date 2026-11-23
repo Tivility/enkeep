@@ -395,6 +395,24 @@ export function computeTurnReservationTokens(params: {
   return Math.min(ceiling, Math.max(1, rawEstimate));
 }
 
+export const PROVIDER_REFUSED_NOTICE = '模型服务按其使用政策拦截了本轮请求，原样重试仍会被拦截。';
+
+const PROVIDER_POLICY_BLOCK_PATTERNS: readonly RegExp[] = [
+  /\b(request|output|response) (was |has been )?blocked\b[\s\S]{0,200}\b(terms of service|usage polic|acceptable use|content filtering polic)/i,
+  /\bviolates? (our|the|anthropic's|openai's) (usage polic|terms of service|acceptable use)/i,
+];
+
+/**
+ * True when the model provider rejected the request under its usage policy. Unlike rate limits or
+ * interrupted streams, sending the same turn again gets the same answer, so the user must not be
+ * told to try again later.
+ */
+export function isProviderPolicyRefusal(err: unknown): boolean {
+  if (!err) return false;
+  const msg = String((err as any)?.message || err);
+  return PROVIDER_POLICY_BLOCK_PATTERNS.some((re) => re.test(msg));
+}
+
 export function isCorruptedSessionError(err: unknown): boolean {
   if (!err) return false;
   const msg = String((err as any)?.message || err).toLowerCase();
@@ -3710,6 +3728,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         error.message.includes('Upstream model request failed')
       ));
 
+    const isProviderRefused = !isQuota && !isTimeout && isProviderPolicyRefusal(error);
+
     const safeErrorMessage = params.reason || (isQuota
       ? 'Quota exceeded'
       : isSessionCorrupted
@@ -3718,6 +3738,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       ? 'Lease lost during execution'
       : isTimeout
       ? 'TURN_TIMEOUT'
+      : isProviderRefused
+      ? 'Provider refused the request'
       : isUpstreamTransient
       ? '模型服务暂时繁忙，请稍后重试。'
       : 'Turn execution failed');
@@ -3755,6 +3777,8 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
         : '';
 
       noticeContent = `⏱️ 本轮处理超过 ${durationText}已被终止${stepClause}。请缩小范围或用 /new 开新一代后重试。`;
+    } else if (isProviderRefused) {
+      noticeContent = PROVIDER_REFUSED_NOTICE;
     } else if (isUpstreamTransient) {
       noticeContent = '模型服务暂时繁忙，请稍后重试。';
     }
@@ -3800,7 +3824,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       `).run(sessionId, userId, turnId);
 
       // 3c. If timeout or upstream transient, insert assistant system notice message into web_messages
-      if ((isTimeout || isUpstreamTransient) && noticeContent) {
+      if ((isTimeout || isUpstreamTransient || isProviderRefused) && noticeContent) {
         const existingAssistantMsg = this.db.prepare(`
           SELECT id, content, status, created_at, turn_id as turnId FROM web_messages
           WHERE session_id = ? AND user_id = ? AND turn_id = ? AND role = 'assistant'
@@ -3928,7 +3952,7 @@ export class DeliveryRuntimeGateway implements DrainableRuntimeGateway {
       inTx = false;
 
       // 6. Safely notify listeners outside the transaction
-      if ((isTimeout || isUpstreamTransient) && noticeContent) {
+      if ((isTimeout || isUpstreamTransient || isProviderRefused) && noticeContent) {
         const executionResult: TurnExecutionResult = {
           replyText: noticeContent,
           usage: { totalTokens: 0 },
