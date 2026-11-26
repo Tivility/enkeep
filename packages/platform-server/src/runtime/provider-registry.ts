@@ -677,24 +677,41 @@ export class CompositeRuntimeArtifactPort implements RuntimeArtifactPort {
 export class CompositeManagementRuntimeProvider implements ManagementRuntimeProvider {
   constructor(private readonly registry: RuntimeProviderRegistry) {}
 
+  private listUniqueManagementProviders(mode?: ExecutionMode): Array<{
+    mode: ExecutionMode;
+    managementProvider: ManagementRuntimeProvider;
+  }> {
+    const seen = new Set<ManagementRuntimeProvider>();
+    const unique: Array<{ mode: ExecutionMode; managementProvider: ManagementRuntimeProvider }> = [];
+    for (const provider of this.registry.listProviders()) {
+      if (mode && provider.mode !== mode) {
+        continue;
+      }
+      const mp = provider.managementProvider;
+      if (mp && !seen.has(mp)) {
+        seen.add(mp);
+        unique.push({ mode: provider.mode, managementProvider: mp });
+      }
+    }
+    return unique;
+  }
+
   async listRuntimes(): Promise<UserRuntimeStatus[]> {
     const results: UserRuntimeStatus[] = [];
-    for (const provider of this.registry.listProviders()) {
-      if (provider.managementProvider) {
-        try {
-          const list = await provider.managementProvider.listRuntimes();
-          if (Array.isArray(list)) {
-            for (const status of list) {
-              results.push({
-                ...status,
-                instanceId: `${status.userId}:${provider.mode}`,
-                mode: provider.mode,
-              });
-            }
+    for (const { mode, managementProvider } of this.listUniqueManagementProviders()) {
+      try {
+        const list = await managementProvider.listRuntimes();
+        if (Array.isArray(list)) {
+          for (const status of list) {
+            results.push({
+              ...status,
+              instanceId: `${status.userId}:${mode}`,
+              mode,
+            });
           }
-        } catch {
-          // continue
         }
+      } catch {
+        // continue
       }
     }
     return results;
@@ -716,20 +733,18 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
       return null;
     }
 
-    for (const provider of this.registry.listProviders()) {
-      if (provider.managementProvider) {
-        try {
-          const res = await provider.managementProvider.getUserRuntime(userId);
-          if (res) {
-            return {
-              ...res,
-              instanceId: `${userId}:${provider.mode}`,
-              mode: provider.mode,
-            };
-          }
-        } catch {
-          // continue
+    for (const { mode: providerMode, managementProvider } of this.listUniqueManagementProviders()) {
+      try {
+        const res = await managementProvider.getUserRuntime(userId);
+        if (res) {
+          return {
+            ...res,
+            instanceId: `${userId}:${providerMode}`,
+            mode: providerMode,
+          };
         }
+      } catch {
+        // continue
       }
     }
     return null;
@@ -743,18 +758,16 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
 
     if (userId) {
       if (!targetMode) {
-        // Check if multiple providers have active runtimes for this user
+        // Check if multiple distinct providers have active runtimes for this user
         const activeModes: ExecutionMode[] = [];
-        for (const provider of this.registry.listProviders()) {
-          if (provider.managementProvider) {
-            try {
-              const status = await provider.managementProvider.getUserRuntime(userId);
-              if (status && status.status === 'ok') {
-                activeModes.push(provider.mode);
-              }
-            } catch {
-              // ignore
+        for (const { mode, managementProvider } of this.listUniqueManagementProviders()) {
+          try {
+            const status = await managementProvider.getUserRuntime(userId);
+            if (status && status.status === 'ok') {
+              activeModes.push(mode);
             }
+          } catch {
+            // ignore
           }
         }
 
@@ -783,19 +796,16 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
       }
     }
 
-    // Restart all or default across providers
+    // Restart all or default across unique management providers
     let anyRestarted = false;
     const userIdsSet = new Set<string>();
     const appliedSet = new Set<string>();
     const failedList: Array<{ userId: string; error: string }> = [];
 
-    for (const provider of this.registry.listProviders()) {
-      if (targetMode && provider.mode !== targetMode) {
-        continue;
-      }
-      if (provider.managementProvider?.restartRuntime) {
+    for (const { managementProvider } of this.listUniqueManagementProviders(targetMode)) {
+      if (managementProvider.restartRuntime) {
         try {
-          const res = await provider.managementProvider.restartRuntime(userId);
+          const res = await managementProvider.restartRuntime(userId);
           if (res.restarted) anyRestarted = true;
           for (const u of res.userIds || []) userIdsSet.add(u);
           for (const u of res.appliedRuntimes || []) appliedSet.add(u);
@@ -831,10 +841,10 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
     }
 
     let stopped = false;
-    for (const provider of this.registry.listProviders()) {
-      if (provider.managementProvider?.stopRuntime) {
+    for (const { managementProvider } of this.listUniqueManagementProviders()) {
+      if (managementProvider.stopRuntime) {
         try {
-          const res = await provider.managementProvider.stopRuntime(userId);
+          const res = await managementProvider.stopRuntime(userId);
           if (res.stopped) stopped = true;
         } catch {
           // continue
@@ -860,15 +870,15 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
       return null;
     }
 
-    for (const provider of this.registry.listProviders()) {
-      if (provider.managementProvider?.ensureRuntime) {
+    for (const { mode: providerMode, managementProvider } of this.listUniqueManagementProviders()) {
+      if (managementProvider.ensureRuntime) {
         try {
-          const res = await provider.managementProvider.ensureRuntime(userId);
+          const res = await managementProvider.ensureRuntime(userId);
           if (res) {
             return {
               ...res,
-              instanceId: `${userId}:${provider.mode}`,
-              mode: provider.mode,
+              instanceId: `${userId}:${providerMode}`,
+              mode: providerMode,
             };
           }
         } catch {
@@ -880,10 +890,10 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
   }
 
   async getTargetVersion(): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord | null> {
-    for (const provider of this.registry.listProviders()) {
-      if (provider.managementProvider?.getTargetVersion) {
+    for (const { managementProvider } of this.listUniqueManagementProviders()) {
+      if (managementProvider.getTargetVersion) {
         try {
-          const res = await provider.managementProvider.getTargetVersion();
+          const res = await managementProvider.getTargetVersion();
           if (res) return res;
         } catch {}
       }
@@ -897,10 +907,10 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
     updatedBy?: string | null;
   }): Promise<import('@enkeep/platform-core').RuntimeTargetVersionRecord> {
     let lastResult: import('@enkeep/platform-core').RuntimeTargetVersionRecord | null = null;
-    for (const provider of this.registry.listProviders()) {
-      if (provider.managementProvider?.setTargetVersion) {
+    for (const { managementProvider } of this.listUniqueManagementProviders()) {
+      if (managementProvider.setTargetVersion) {
         try {
-          lastResult = await provider.managementProvider.setTargetVersion(input);
+          lastResult = await managementProvider.setTargetVersion(input);
         } catch {}
       }
     }
@@ -910,10 +920,10 @@ export class CompositeManagementRuntimeProvider implements ManagementRuntimeProv
 
   async getUpgradeStatus(): Promise<import('@enkeep/platform-core').UserRuntimeUpgradeStatus[]> {
     const statuses: import('@enkeep/platform-core').UserRuntimeUpgradeStatus[] = [];
-    for (const provider of this.registry.listProviders()) {
-      if (provider.managementProvider?.getUpgradeStatus) {
+    for (const { managementProvider } of this.listUniqueManagementProviders()) {
+      if (managementProvider.getUpgradeStatus) {
         try {
-          const res = await provider.managementProvider.getUpgradeStatus();
+          const res = await managementProvider.getUpgradeStatus();
           if (Array.isArray(res)) {
             statuses.push(...res);
           }
