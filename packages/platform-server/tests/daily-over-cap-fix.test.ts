@@ -8,11 +8,10 @@ import {
   isValidIsoDateString,
   isFileNotFoundError,
 } from '../src/tasks/pipeline-input-preparer.js';
-// Real production consumer module
 import {
   processStagedExtraction,
   commitCheckpoint,
-} from '../../../reports/task-portability/staged-bundle/scripts/workspace-task-consumer.mjs';
+} from './fixtures/workspace-task-consumer.fixture.mjs';
 
 describe('Daily Over Cap Fix & Bounded Staging Contract', () => {
   let tmpDir: string;
