@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { createConnection } from 'node:net';
-import { mkdtempSync, rmSync, copyFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DefaultAuthService } from '@enkeep/platform-auth';
@@ -1175,52 +1175,68 @@ describe('Server Configuration, Credentials & Migration Manifest Enforcement', (
     db.close();
   });
 
-  it('validates recovery snapshot DB and demo-data DB with current all migrations without write mismatch (copy snapshot temp)', async () => {
+  it('validates synthetic pre-migrated snapshot DBs with current all migrations without write mismatch (copy snapshot temp)', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'enkeep-mig-snapshot-test-'));
     try {
-      const demoDbPath = join(tempDir, 'demo-platform.db');
-      copyFileSync(join(__dirname, '../../../.demo-data/platform.db'), demoDbPath);
+      // Build a synthetic pre-migrated DB (v31) in tempDir so this test runs cleanly without .demo-data/ or reports/
+      const seedDbPath = join(tempDir, 'seed-v31.db');
+      const seedDb = new DatabaseSync(seedDbPath);
+      const seedRunner = new PlatformServerMigrationRunner(seedDb);
+      await seedRunner.migrate(ALL_PLATFORM_MIGRATIONS.slice(0, 31));
+      seedDb.close();
 
-      const demoDb = new DatabaseSync(demoDbPath);
-      const demoRunner = new PlatformServerMigrationRunner(demoDb);
-      const currentVer = await demoRunner.getCurrentVersion();
-      expect(currentVer).toBeGreaterThanOrEqual(31);
-      // Validates that existing migrations match without mismatch
-      const applied = await demoRunner.getAppliedMigrations();
+      const copiedDbPath = join(tempDir, 'copied-platform.db');
+      copyFileSync(seedDbPath, copiedDbPath);
+
+      const copiedDb = new DatabaseSync(copiedDbPath);
+      const copiedRunner = new PlatformServerMigrationRunner(copiedDb);
+      const initialVer = await copiedRunner.getCurrentVersion();
+      expect(initialVer).toBe(31);
+      await expect(copiedRunner.validateAppliedMigrations(ALL_PLATFORM_MIGRATIONS)).resolves.not.toThrow();
+
+      // Upgrade the copied synthetic DB to the latest migration set and validate integrity
+      await copiedRunner.migrate(ALL_PLATFORM_MIGRATIONS);
+      const currentVer = await copiedRunner.getCurrentVersion();
+      expect(currentVer).toBe(ALL_PLATFORM_MIGRATIONS.length);
+      const applied = await copiedRunner.getAppliedMigrations();
       expect(applied.length).toBe(currentVer);
       expect(applied[0].version).toBe(1);
       expect(applied[0].checksum).toBe(ALL_PLATFORM_MIGRATIONS[0].checksum);
       expect(applied[0].checksum).toBe('dad9c52bb64d8435f055bd7305c55689061ea2a0d564123c7d39d12f390804d2');
 
       // Verify PRAGMA integrity_check and foreign_key_check
-      const integrity = demoDb.prepare('PRAGMA integrity_check;').all() as Array<{ integrity_check: string }>;
+      const integrity = copiedDb.prepare('PRAGMA integrity_check;').all() as Array<{ integrity_check: string }>;
       expect(integrity[0].integrity_check).toBe('ok');
-      const fk = demoDb.prepare('PRAGMA foreign_key_check;').all();
+      const fk = copiedDb.prepare('PRAGMA foreign_key_check;').all();
       expect(fk.length).toBe(0);
 
-      demoDb.close();
+      copiedDb.close();
 
-      // Test recovery snapshot DB copy if it exists
-      const snapSourcePath = join(__dirname, '../../../reports/recovery-snapshots/platform-before-warm-reset-20260830.db');
-      if (existsSync(snapSourcePath)) {
-        const snapDbPath = join(tempDir, 'snapshot.db');
-        copyFileSync(snapSourcePath, snapDbPath);
+      // Also verify copying and validating a synthetic early-version (v1) snapshot DB
+      const snapSeedPath = join(tempDir, 'seed-v1.db');
+      const snapSeedDb = new DatabaseSync(snapSeedPath);
+      const snapSeedRunner = new PlatformServerMigrationRunner(snapSeedDb);
+      await snapSeedRunner.migrate(ALL_PLATFORM_MIGRATIONS.slice(0, 1));
+      snapSeedDb.close();
 
-        const snapDb = new DatabaseSync(snapDbPath);
-        const snapRunner = new PlatformServerMigrationRunner(snapDb);
-        const snapApplied = await snapRunner.getAppliedMigrations();
-        expect(snapApplied.length).toBeGreaterThanOrEqual(1);
-        expect(snapApplied[0].version).toBe(1);
-        expect(snapApplied[0].checksum).toBe('dad9c52bb64d8435f055bd7305c55689061ea2a0d564123c7d39d12f390804d2');
-        expect(snapApplied[0].checksum).toBe(ALL_PLATFORM_MIGRATIONS[0].checksum);
+      const snapDbPath = join(tempDir, 'snapshot.db');
+      copyFileSync(snapSeedPath, snapDbPath);
 
-        const snapIntegrity = snapDb.prepare('PRAGMA integrity_check;').all() as Array<{ integrity_check: string }>;
-        expect(snapIntegrity[0].integrity_check).toBe('ok');
-        const snapFk = snapDb.prepare('PRAGMA foreign_key_check;').all();
-        expect(snapFk.length).toBe(0);
+      const snapDb = new DatabaseSync(snapDbPath);
+      const snapRunner = new PlatformServerMigrationRunner(snapDb);
+      await expect(snapRunner.validateAppliedMigrations(ALL_PLATFORM_MIGRATIONS)).resolves.not.toThrow();
+      const snapApplied = await snapRunner.getAppliedMigrations();
+      expect(snapApplied.length).toBe(1);
+      expect(snapApplied[0].version).toBe(1);
+      expect(snapApplied[0].checksum).toBe('dad9c52bb64d8435f055bd7305c55689061ea2a0d564123c7d39d12f390804d2');
+      expect(snapApplied[0].checksum).toBe(ALL_PLATFORM_MIGRATIONS[0].checksum);
 
-        snapDb.close();
-      }
+      const snapIntegrity = snapDb.prepare('PRAGMA integrity_check;').all() as Array<{ integrity_check: string }>;
+      expect(snapIntegrity[0].integrity_check).toBe('ok');
+      const snapFk = snapDb.prepare('PRAGMA foreign_key_check;').all();
+      expect(snapFk.length).toBe(0);
+
+      snapDb.close();
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
